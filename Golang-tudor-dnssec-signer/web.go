@@ -95,10 +95,10 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *
 
 	// Build detailed zone response
 	response := struct {
-		Domain    string          `json:"domain"`
-		Status    string          `json:"status"`
-		Zone      *ZoneState      `json:"zone"`
-		DSRecords string          `json:"ds_records,omitempty"`
+		Domain    string     `json:"domain"`
+		Status    string     `json:"status"`
+		Zone      *ZoneState `json:"zone"`
+		DSRecords string     `json:"ds_records,omitempty"`
 	}{
 		Domain: domain,
 		Status: zoneState.Status(),
