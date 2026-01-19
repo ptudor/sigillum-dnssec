@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 )
 
@@ -39,7 +40,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *State) {
 		response.Status = "unhealthy"
 	}
 
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Debug("[HEALTH] Failed to encode response", "error", err)
+	}
 }
 
 // healthzHandler returns simple OK for kubernetes probes
@@ -48,10 +51,14 @@ func healthzHandler(w http.ResponseWriter, r *http.Request, state *State) {
 
 	if status.Summary.Errors > 0 {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("UNHEALTHY"))
+		if _, err := w.Write([]byte("UNHEALTHY")); err != nil {
+			slog.Debug("[HEALTH] Failed to write response", "error", err)
+		}
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		slog.Debug("[HEALTH] Failed to write response", "error", err)
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -27,16 +28,29 @@ func NewKeyGenerator(cfg *Config) *KeyGenerator {
 
 // GenerateKSK generates a new Key Signing Key
 func (kg *KeyGenerator) GenerateKSK(domain string) (*KeyState, error) {
-	return kg.generateKey(domain, true)
+	return kg.generateKey(domain, true, "")
 }
 
 // GenerateZSK generates a new Zone Signing Key
 func (kg *KeyGenerator) GenerateZSK(domain string) (*KeyState, error) {
-	return kg.generateKey(domain, false)
+	return kg.generateKey(domain, false, "")
 }
 
-func (kg *KeyGenerator) generateKey(domain string, isKSK bool) (*KeyState, error) {
-	algorithm := kg.cfg.GetZoneAlgorithm(domain)
+// GenerateKSKWithAlgorithm generates a new Key Signing Key with a specific algorithm
+func (kg *KeyGenerator) GenerateKSKWithAlgorithm(domain, algorithm string) (*KeyState, error) {
+	return kg.generateKey(domain, true, algorithm)
+}
+
+// GenerateZSKWithAlgorithm generates a new Zone Signing Key with a specific algorithm
+func (kg *KeyGenerator) GenerateZSKWithAlgorithm(domain, algorithm string) (*KeyState, error) {
+	return kg.generateKey(domain, false, algorithm)
+}
+
+func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride string) (*KeyState, error) {
+	algorithm := algorithmOverride
+	if algorithm == "" {
+		algorithm = kg.cfg.GetZoneAlgorithm(domain)
+	}
 
 	var lifetime time.Duration
 	var keyType string
@@ -108,10 +122,14 @@ func generateDNSSECKey(domain, algorithm string, flags uint16) (*dns.DNSKEY, []b
 		if err != nil {
 			return nil, nil, fmt.Errorf("generating ECDSA P-256 key: %w", err)
 		}
-		// Public key for P-256: X || Y (32 bytes each)
-		pubBytes := append(privKey.PublicKey.X.Bytes(), privKey.PublicKey.Y.Bytes()...)
+		// Public key for P-256: X || Y (32 bytes each, zero-padded)
+		pubBytes := make([]byte, 64)
+		privKey.PublicKey.X.FillBytes(pubBytes[:32])
+		privKey.PublicKey.Y.FillBytes(pubBytes[32:])
 		dnskey.PublicKey = base64.StdEncoding.EncodeToString(pubBytes)
-		privateKey = privKey.D.Bytes()
+		// Private key D also needs zero-padding
+		privateKey = make([]byte, 32)
+		privKey.D.FillBytes(privateKey)
 
 	case "ECDSAP384SHA384":
 		dnskey.Algorithm = dns.ECDSAP384SHA384
@@ -119,10 +137,14 @@ func generateDNSSECKey(domain, algorithm string, flags uint16) (*dns.DNSKEY, []b
 		if err != nil {
 			return nil, nil, fmt.Errorf("generating ECDSA P-384 key: %w", err)
 		}
-		// Public key for P-384: X || Y (48 bytes each)
-		pubBytes := append(privKey.PublicKey.X.Bytes(), privKey.PublicKey.Y.Bytes()...)
+		// Public key for P-384: X || Y (48 bytes each, zero-padded)
+		pubBytes := make([]byte, 96)
+		privKey.PublicKey.X.FillBytes(pubBytes[:48])
+		privKey.PublicKey.Y.FillBytes(pubBytes[48:])
 		dnskey.PublicKey = base64.StdEncoding.EncodeToString(pubBytes)
-		privateKey = privKey.D.Bytes()
+		// Private key D also needs zero-padding
+		privateKey = make([]byte, 48)
+		privKey.D.FillBytes(privateKey)
 
 	default:
 		return nil, nil, fmt.Errorf("unsupported algorithm: %s", algorithm)
@@ -249,20 +271,7 @@ func parsePrivateKeyFromFile(content string) ([]byte, error) {
 
 // splitLines splits content into lines
 func splitLines(content string) []string {
-	var lines []string
-	var current string
-	for _, c := range content {
-		if c == '\n' {
-			lines = append(lines, current)
-			current = ""
-		} else {
-			current += string(c)
-		}
-	}
-	if current != "" {
-		lines = append(lines, current)
-	}
-	return lines
+	return strings.Split(content, "\n")
 }
 
 // AlgorithmName returns the name of a DNSSEC algorithm

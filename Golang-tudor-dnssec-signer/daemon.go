@@ -76,7 +76,9 @@ func (d *Daemon) Shutdown() {
 	if d.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		d.server.Shutdown(ctx)
+		if err := d.server.Shutdown(ctx); err != nil {
+			slog.Warn("[DAEMON] Error during server shutdown", "error", err)
+		}
 	}
 	d.mu.Unlock()
 }
@@ -241,15 +243,21 @@ func (d *Daemon) runHealthServer() {
 	RegisterHealthHandlers(mux, d.state)
 
 	server := &http.Server{
-		Addr:    "127.0.0.1:8054",
-		Handler: mux,
+		Addr:              "127.0.0.1:8054",
+		Handler:           mux,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
 		<-d.ctx.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		server.Shutdown(ctx)
+		if err := server.Shutdown(ctx); err != nil {
+			slog.Debug("[WEB] Error during health server shutdown", "error", err)
+		}
 	}()
 
 	slog.Debug("[WEB] Starting health server", "listen", server.Addr)
