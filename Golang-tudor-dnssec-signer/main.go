@@ -370,13 +370,15 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	// Print DS records
+	// Print DS records - load actual key for proper DS computation
+	kskKey, _, err := keyGen.LoadKeyPair(domain, "ksk")
+	if err != nil {
+		return fmt.Errorf("loading KSK for DS: %w", err)
+	}
+
 	fmt.Printf("\nDomain %s added successfully.\n\n", domain)
 	fmt.Println("Add the following DS record to your registrar:")
-	dsOutput, err := FormatDSRecords(domain, ksk)
-	if err != nil {
-		return fmt.Errorf("formatting DS records: %w", err)
-	}
+	dsOutput := FormatDSRecordsFromKey(domain, kskKey)
 	fmt.Println(dsOutput)
 
 	return nil
