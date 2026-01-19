@@ -180,7 +180,18 @@ Created: %s
 func (kg *KeyGenerator) LoadKeyPair(domain, keyType string) (*dns.DNSKEY, []byte, error) {
 	keysDir := kg.cfg.KeysDir()
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
+	return kg.loadKeyPairFromPath(baseName)
+}
 
+// loadKeyPairByID loads a backup key pair by its key ID
+func (kg *KeyGenerator) loadKeyPairByID(domain, keyType string, keyID uint16) (*dns.DNSKEY, []byte, error) {
+	keysDir := kg.cfg.KeysDir()
+	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
+	return kg.loadKeyPairFromPath(baseName)
+}
+
+// loadKeyPairFromPath loads a key pair from the given base path
+func (kg *KeyGenerator) loadKeyPairFromPath(baseName string) (*dns.DNSKEY, []byte, error) {
 	// Read public key
 	keyFile := baseName + ".key"
 	keyData, err := os.ReadFile(keyFile)

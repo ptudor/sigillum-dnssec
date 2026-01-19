@@ -56,15 +56,20 @@ func executeHookSync(cmd string) error {
 	return command.Run()
 }
 
-// copyFile copies a file from src to dst
+// copyFile copies a file from src to dst, preserving permissions
 func copyFile(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.Create(dst)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
 	if err != nil {
 		return err
 	}
