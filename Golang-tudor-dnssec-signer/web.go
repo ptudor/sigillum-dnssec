@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
 
 //go:embed templates/*.html
@@ -31,8 +32,12 @@ func NewWebServer(cfg *Config, state *State) *http.Server {
 	RegisterHealthHandlers(mux, state)
 
 	return &http.Server{
-		Addr:    cfg.Web.Listen,
-		Handler: mux,
+		Addr:              cfg.Web.Listen,
+		Handler:           mux,
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 }
 
@@ -74,7 +79,9 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request, state *State) {
 		return
 	}
 
-	w.Write(data)
+	if _, err := w.Write(data); err != nil {
+		slog.Debug("[WEB] Failed to write response", "error", err)
+	}
 }
 
 func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
@@ -114,5 +121,7 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *
 		}
 	}
 
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Debug("[WEB] Failed to encode response", "error", err)
+	}
 }

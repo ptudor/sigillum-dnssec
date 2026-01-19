@@ -282,24 +282,16 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 		slog.Warn("[ROLLOVER] Failed to backup old ZSK", "error", err)
 	}
 
-	// Temporarily override algorithm for key generation
-	oldConfigAlgo := rm.cfg.DNSSEC.Algorithm
-	rm.cfg.DNSSEC.Algorithm = targetAlgorithm
-
-	// Generate new keys with target algorithm
+	// Generate new keys with target algorithm (using explicit algorithm to avoid race conditions)
 	keyGen := NewKeyGenerator(rm.cfg)
-	newKSK, err := keyGen.GenerateKSK(domain)
+	newKSK, err := keyGen.GenerateKSKWithAlgorithm(domain, targetAlgorithm)
 	if err != nil {
-		rm.cfg.DNSSEC.Algorithm = oldConfigAlgo
 		return fmt.Errorf("generating new KSK: %w", err)
 	}
-	newZSK, err := keyGen.GenerateZSK(domain)
+	newZSK, err := keyGen.GenerateZSKWithAlgorithm(domain, targetAlgorithm)
 	if err != nil {
-		rm.cfg.DNSSEC.Algorithm = oldConfigAlgo
 		return fmt.Errorf("generating new ZSK: %w", err)
 	}
-
-	rm.cfg.DNSSEC.Algorithm = oldConfigAlgo
 
 	// Set up rollover state
 	zoneState.Rollover = &RolloverState{
