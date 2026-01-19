@@ -29,6 +29,9 @@ type DNSSECConfig struct {
 	NSECVersion       string   `toml:"nsec_version"`
 	NSEC3Iterations   int      `toml:"nsec3_iterations"`
 	NSEC3Salt         string   `toml:"nsec3_salt"`
+	DNSKEYTtl         uint32   `toml:"dnskey_ttl"`         // TTL for DNSKEY records (0 = use SOA TTL)
+	RolloverPrepublish Duration `toml:"rollover_prepublish"` // Time before expiry to prepublish new key
+	RolloverSwitch     Duration `toml:"rollover_switch"`     // Time to wait before switching to new key
 }
 
 // WebConfig holds web UI settings
@@ -42,6 +45,7 @@ type ZoneConfig struct {
 	Path        string   `toml:"path"`
 	KSKLifetime Duration `toml:"ksk_lifetime,omitempty"`
 	ZSKLifetime Duration `toml:"zsk_lifetime,omitempty"`
+	Algorithm   string   `toml:"algorithm,omitempty"` // Per-zone algorithm override for algorithm rollover
 }
 
 // HooksConfig holds hook settings
@@ -139,6 +143,9 @@ func DefaultConfig() *Config {
 			NSECVersion:       "nsec3",
 			NSEC3Iterations:   0,
 			NSEC3Salt:         "",
+			DNSKEYTtl:         0,                                   // 0 = use SOA TTL
+			RolloverPrepublish: Duration{14 * 24 * time.Hour},     // 14 days before expiry
+			RolloverSwitch:     Duration{7 * 24 * time.Hour},      // 7 days to switch signing
 		},
 		Web: WebConfig{
 			Enabled: false,
@@ -172,12 +179,19 @@ func LoadConfig(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	// Validate algorithm
 	validAlgorithms := map[string]bool{
-		"ED25519":        true,
+		"ED25519":         true,
 		"ECDSAP256SHA256": true,
 		"ECDSAP384SHA384": true,
 	}
 	if !validAlgorithms[c.DNSSEC.Algorithm] {
 		return fmt.Errorf("unsupported algorithm %q (supported: ED25519, ECDSAP256SHA256, ECDSAP384SHA384)", c.DNSSEC.Algorithm)
+	}
+
+	// Validate per-zone algorithms
+	for domain, zone := range c.Zones {
+		if zone.Algorithm != "" && !validAlgorithms[zone.Algorithm] {
+			return fmt.Errorf("zone %q has unsupported algorithm %q", domain, zone.Algorithm)
+		}
 	}
 
 	// Validate NSEC version
@@ -245,6 +259,14 @@ func (c *Config) GetZoneZSKLifetime(domain string) time.Duration {
 		return zone.ZSKLifetime.Duration
 	}
 	return c.DNSSEC.ZSKLifetime.Duration
+}
+
+// GetZoneAlgorithm returns the algorithm for a zone, using zone-specific override if set
+func (c *Config) GetZoneAlgorithm(domain string) string {
+	if zone, ok := c.Zones[domain]; ok && zone.Algorithm != "" {
+		return zone.Algorithm
+	}
+	return c.DNSSEC.Algorithm
 }
 
 // KeysDir returns the path to the keys directory

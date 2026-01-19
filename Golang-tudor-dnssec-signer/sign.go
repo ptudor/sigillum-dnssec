@@ -55,7 +55,7 @@ func (s *Signer) SignAll() error {
 		}
 
 		if err := s.SignZone(domain); err != nil {
-			slog.Error("Failed to sign zone", "domain", domain, "error", err)
+			slog.Error("[SIGN] Failed to sign zone", "domain", domain, "error", err)
 			zoneState.AddError(err.Error())
 		} else {
 			zoneState.ClearErrors()
@@ -72,7 +72,7 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("zone %s not in state", domain)
 	}
 
-	slog.Info("Signing zone", "domain", domain, "path", zoneState.Path)
+	slog.Info("[SIGN] Signing zone", "domain", domain, "path", zoneState.Path)
 
 	// Parse the zone file
 	records, serial, err := s.parseZoneFile(domain, zoneState.Path)
@@ -90,8 +90,15 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("loading keys: %w", err)
 	}
 
-	// Add all DNSKEY records (may include rollover keys)
+	// Determine DNSKEY TTL: use config value or SOA TTL
+	dnskeyTTL := s.cfg.DNSSEC.DNSKEYTtl
+	if dnskeyTTL == 0 {
+		dnskeyTTL = s.getSOATTL(records) // Use SOA record TTL as convention
+	}
+
+	// Add all DNSKEY records with appropriate TTL (may include rollover keys)
 	for _, k := range keys.dnskeys {
+		k.Hdr.Ttl = dnskeyTTL
 		records = append(records, k)
 	}
 
@@ -129,17 +136,17 @@ func (s *Signer) SignZone(domain string) error {
 	// Check for upcoming rollovers
 	s.checkRolloverWarnings(domain, zoneState)
 
-	slog.Info("Zone signed successfully", "domain", domain, "serial", serial, "output", outputPath)
+	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", serial, "output", outputPath)
 	return nil
 }
 
 // signingKeys holds all keys needed for signing, handling rollover scenarios
 type signingKeys struct {
-	dnskeys      []*dns.DNSKEY // All DNSKEYs to include in zone
-	signingKSKs  []*dns.DNSKEY // KSKs to sign DNSKEY RRset with
-	signingKSKPs [][]byte      // Private keys for signingKSKs
-	signingZSK   *dns.DNSKEY   // ZSK to sign other RRsets
-	signingZSKP  []byte        // Private key for ZSK
+	dnskeys       []*dns.DNSKEY // All DNSKEYs to include in zone
+	signingKSKs   []*dns.DNSKEY // KSKs to sign DNSKEY RRset with
+	signingKSKPs  [][]byte      // Private keys for signingKSKs
+	signingZSKs   []*dns.DNSKEY // ZSKs to sign other RRsets (multiple for algorithm rollover)
+	signingZSKPs  [][]byte      // Private keys for signingZSKs
 }
 
 // loadKeysForSigning loads all keys needed, handling rollover scenarios
@@ -161,8 +168,8 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 		return nil, fmt.Errorf("loading ZSK: %w", err)
 	}
 	keys.dnskeys = append(keys.dnskeys, zsk)
-	keys.signingZSK = zsk
-	keys.signingZSKP = zskPriv
+	keys.signingZSKs = append(keys.signingZSKs, zsk)
+	keys.signingZSKPs = append(keys.signingZSKPs, zskPriv)
 
 	// Handle rollover scenarios
 	if zoneState.Rollover != nil {
@@ -171,12 +178,12 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// KSK rollover: load old KSK too, sign with both
 			oldKSK, oldKSKPriv, err := keyGen.loadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 			if err != nil {
-				slog.Warn("Failed to load old KSK for rollover signing", "error", err)
+				slog.Warn("[SIGN] Failed to load old KSK for rollover signing", "error", err)
 			} else {
 				keys.dnskeys = append(keys.dnskeys, oldKSK)
 				keys.signingKSKs = append(keys.signingKSKs, oldKSK)
 				keys.signingKSKPs = append(keys.signingKSKPs, oldKSKPriv)
-				slog.Info("KSK rollover: signing with both old and new KSK",
+				slog.Info("[SIGN] KSK rollover: signing with both old and new KSK",
 					"old_key_id", zoneState.Rollover.OldKeyID,
 					"new_key_id", zoneState.Rollover.NewKeyID)
 			}
@@ -185,12 +192,12 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// ZSK pre-publish: load old ZSK, publish both but sign with old
 			oldZSK, oldZSKPriv, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldKeyID)
 			if err != nil {
-				slog.Warn("Failed to load old ZSK for pre-publish", "error", err)
+				slog.Warn("[SIGN] Failed to load old ZSK for pre-publish", "error", err)
 			} else {
-				// Keep old ZSK for signing
-				keys.signingZSK = oldZSK
-				keys.signingZSKP = oldZSKPriv
-				slog.Info("ZSK rollover pre-publish: publishing both, signing with old",
+				// Replace signing ZSK with old (keep new in dnskeys for publishing)
+				keys.signingZSKs = []*dns.DNSKEY{oldZSK}
+				keys.signingZSKPs = [][]byte{oldZSKPriv}
+				slog.Info("[SIGN] ZSK rollover pre-publish: publishing both, signing with old",
 					"old_key_id", zoneState.Rollover.OldKeyID,
 					"new_key_id", zoneState.Rollover.NewKeyID)
 			}
@@ -199,13 +206,38 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// ZSK signing phase: load old ZSK for publishing, sign with new
 			oldZSK, _, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldKeyID)
 			if err != nil {
-				slog.Warn("Failed to load old ZSK for publish", "error", err)
+				slog.Warn("[SIGN] Failed to load old ZSK for publish", "error", err)
 			} else {
 				keys.dnskeys = append(keys.dnskeys, oldZSK)
-				slog.Info("ZSK rollover signing: publishing both, signing with new",
+				slog.Info("[SIGN] ZSK rollover signing: publishing both, signing with new",
 					"old_key_id", zoneState.Rollover.OldKeyID,
 					"new_key_id", zoneState.Rollover.NewKeyID)
 			}
+
+		case zoneState.Rollover.Type == "algorithm" && zoneState.Rollover.State == AlgoRolloverStateDSAddWait:
+			// Algorithm rollover: load old algorithm keys, publish and sign with both algorithms
+			oldKSK, oldKSKPriv, err := keyGen.loadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
+			if err != nil {
+				slog.Warn("[SIGN] Failed to load old KSK for algorithm rollover", "error", err)
+			} else {
+				keys.dnskeys = append(keys.dnskeys, oldKSK)
+				keys.signingKSKs = append(keys.signingKSKs, oldKSK)
+				keys.signingKSKPs = append(keys.signingKSKPs, oldKSKPriv)
+			}
+
+			// Load old ZSK using stored ID
+			oldZSK, oldZSKPriv, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldZSKID)
+			if err != nil {
+				slog.Warn("[SIGN] Failed to load old ZSK for algorithm rollover", "error", err)
+			} else {
+				keys.dnskeys = append(keys.dnskeys, oldZSK)
+				keys.signingZSKs = append(keys.signingZSKs, oldZSK)
+				keys.signingZSKPs = append(keys.signingZSKPs, oldZSKPriv)
+			}
+
+			slog.Info("[SIGN] Algorithm rollover: signing with both algorithms",
+				"old_algorithm", zoneState.Rollover.OldAlgorithm,
+				"new_algorithm", zoneState.Rollover.NewAlgorithm)
 		}
 	}
 
@@ -309,12 +341,15 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 				signedRecords = append(signedRecords, rrsig)
 			}
 		} else {
-			// All other RRsets are signed with the ZSK
-			rrsig := s.createRRSIG(rrset, keys.signingZSK, domain, inception, expiration)
-			if err := s.signRRSIG(rrsig, rrset, keys.signingZSK, keys.signingZSKP); err != nil {
-				return nil, fmt.Errorf("signing RRset %s: %w", rrset[0].Header().Name, err)
+			// All other RRsets are signed with the ZSK(s)
+			// Multiple ZSKs during algorithm rollover
+			for i, zsk := range keys.signingZSKs {
+				rrsig := s.createRRSIG(rrset, zsk, domain, inception, expiration)
+				if err := s.signRRSIG(rrsig, rrset, zsk, keys.signingZSKPs[i]); err != nil {
+					return nil, fmt.Errorf("signing RRset %s with key %d: %w", rrset[0].Header().Name, zsk.KeyTag(), err)
+				}
+				signedRecords = append(signedRecords, rrsig)
 			}
-			signedRecords = append(signedRecords, rrsig)
 		}
 	}
 
@@ -384,6 +419,16 @@ func (s *Signer) getSOAMinimumTTL(records []dns.RR) uint32 {
 	for _, rr := range records {
 		if soa, ok := rr.(*dns.SOA); ok {
 			return soa.Minttl
+		}
+	}
+	return 3600 // fallback
+}
+
+// getSOATTL extracts the TTL of the SOA record itself (for DNSKEY TTL convention)
+func (s *Signer) getSOATTL(records []dns.RR) uint32 {
+	for _, rr := range records {
+		if _, ok := rr.(*dns.SOA); ok {
+			return rr.Header().Ttl
 		}
 	}
 	return 3600 // fallback

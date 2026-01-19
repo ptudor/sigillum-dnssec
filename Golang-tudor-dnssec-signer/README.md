@@ -88,6 +88,9 @@ signature_refresh = "3d"        # Re-sign when this much validity remains
 nsec_version = "nsec3"          # "nsec" or "nsec3"
 nsec3_iterations = 0            # RFC 9276 recommends 0
 nsec3_salt = ""                 # Empty salt recommended
+dnskey_ttl = 0                  # 0 = use SOA TTL (recommended)
+rollover_prepublish = "14d"     # Days before expiry to prepublish new key
+rollover_switch = "7d"          # Days to wait before switching to new key
 
 [web]
 enabled = true
@@ -101,6 +104,7 @@ path = "/etc/nsd/zones/example.com.zone"
 [zones."example.org"]
 path = "/etc/nsd/zones/example.org.zone"
 ksk_lifetime = "5y"             # Per-zone override
+algorithm = "ECDSAP256SHA256"   # Per-zone algorithm (for algorithm rollover)
 
 [hooks]
 post_sign = "systemctl reload nsd"
@@ -163,6 +167,20 @@ dnssec-tudor rollover complete example.com --config config.toml
 # Check rollover status
 dnssec-tudor rollover status example.com --config config.toml
 ```
+
+### Algorithm Rollover
+
+To change algorithms (e.g., ECDSA to ED25519), use the algorithm rollover command:
+
+```bash
+# Start algorithm rollover (generates new keys with target algorithm)
+dnssec-tudor rollover algorithm example.com ED25519 --config config.toml
+
+# After publishing new DS at registrar, complete rollover
+dnssec-tudor rollover complete example.com --config config.toml
+```
+
+During algorithm rollover, the zone is signed with both the old and new algorithm keys until you complete the rollover.
 
 ## NSD Integration
 

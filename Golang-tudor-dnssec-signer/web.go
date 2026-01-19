@@ -44,7 +44,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 
 	tmpl, err := template.ParseFS(templateFS, "templates/index.html")
 	if err != nil {
-		slog.Error("Failed to parse template", "error", err)
+		slog.Error("[WEB] Failed to parse template", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -61,7 +61,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tmpl.Execute(w, data); err != nil {
-		slog.Error("Failed to execute template", "error", err)
+		slog.Error("[WEB] Failed to execute template", "error", err)
 	}
 }
 
