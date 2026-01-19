@@ -1,0 +1,24 @@
+# Build artifacts
+dnssec-tudor
+dnssec-tudor-*
+
+# Test artifacts
+testdata/keys/
+testdata/signed/
+testdata/state.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Keys (never commit)
+*.private
+*.key
+
+# State files
+state.json
