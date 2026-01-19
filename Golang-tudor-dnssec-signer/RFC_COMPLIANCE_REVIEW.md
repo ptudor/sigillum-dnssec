@@ -2,7 +2,9 @@
 
 **Reviewer perspective**: Skeptical RFC author who has seen too many broken DNSSEC implementations.
 
-**Status**: Several issues identified that should be fixed before production use.
+**Status**: Critical issues have been fixed. Some medium/low priority items remain.
+
+**Last Updated**: 2026-01-19
 
 ---
 
@@ -10,87 +12,39 @@
 
 ### 1. NSEC/NSEC3 TTL Must Match SOA Minimum (RFC 4035 §2.3)
 
-**Current**: Hardcoded to 3600 seconds.
+**Status**: ✅ FIXED
 
 **RFC 4035 §2.3**: "The TTL value for any NSEC RR SHOULD be the same as the minimum TTL value field in the zone SOA RR."
 
-**Impact**: Some validators may reject responses or cache incorrectly.
-
-**Fix needed in sign.go**:
-```go
-// Get SOA minimum TTL for NSEC/NSEC3
-var soaMinTTL uint32 = 3600 // fallback
-for _, rr := range records {
-    if soa, ok := rr.(*dns.SOA); ok {
-        soaMinTTL = soa.Minttl
-        break
-    }
-}
-```
+**Fix applied in sign.go**: The `getSOAMinimumTTL()` function extracts the SOA minimum TTL and passes it to `generateNSECChain()` and `generateNSEC3Chain()`.
 
 ### 2. Empty Non-Terminals Missing from NSEC3 Chain (RFC 5155 §7.1)
 
-**Current**: Only names with actual records are hashed.
+**Status**: ✅ FIXED
 
-**RFC 5155 §7.1**: "Each owner name within the zone that has authoritative RRsets MUST have a corresponding NSEC3 RR. Owner names for which the only RRsets are glue records... MUST NOT have NSEC3 RRs. **Empty non-terminals** (names that have no RRsets but have subdomains that do) MUST have NSEC3 RRs."
+**RFC 5155 §7.1**: "Empty non-terminals (names that have no RRsets but have subdomains that do) MUST have NSEC3 RRs."
 
-**Example**: If zone has `sub.example.com` but not `example.com` itself as a name with records, there's still an empty non-terminal at `example.com` that needs an NSEC3 record.
+**Fix applied in sign.go**: The `addEmptyNonTerminals()` function walks up the label tree for each name and adds intermediate names that don't have records.
 
-**Impact**: NXDOMAIN proofs may be incorrect, causing validation failures.
+### 3. NSEC3 Type Bitmap for Empty Non-Terminals
 
-**Fix needed**: Build set of all names including empty non-terminals:
-```go
-// Add empty non-terminals
-for name := range names {
-    labels := dns.SplitDomainName(name)
-    for i := 1; i < len(labels); i++ {
-        parent := strings.Join(labels[i:], ".") + "."
-        if !names[parent] {
-            names[parent] = true
-            // Empty non-terminal has no types
-            typesByName[parent] = make(map[uint16]bool)
-        }
-    }
-}
-```
+**Status**: ✅ FIXED
 
-### 3. NSEC3 Type Bitmap Missing NSEC3 Type Itself
+**RFC 5155 §7.1**: "If an NSEC3 RR exists only to match an empty non-terminal node, the Type Bit Maps field MUST be empty."
 
-**Current**: NSEC3 records don't include NSEC3 in their type bitmap.
-
-**RFC 5155 §7.1**: The type bitmap "MUST NOT include the type value for RRSIG or NSEC3."
-
-**Wait, this is actually CORRECT** - my mistake. NSEC3 records should NOT include NSEC3 in the type bitmap. But they also shouldn't include RRSIG in the type bitmap per the RFC... let me check.
-
-Actually, re-reading RFC 5155 §7.1: "The Type Bit Maps field of every NSEC3 RR in a signed zone MUST indicate the presence of all types present at the original owner name, except for the types solely contributed by an NSEC3 RR itself. That is, if an NSEC3 RR exists only to match an empty non-terminal node, the Type Bit Maps field MUST be empty."
-
-**Current code adds RRSIG unconditionally**:
-```go
-types = append(types, dns.TypeRRSIG)
-```
-
-This is wrong for empty non-terminals!
+**Fix applied in sign.go**: RRSIG is only added to the type bitmap when the name has actual RRsets (i.e., `len(typesByName[name]) > 0`).
 
 ---
 
 ## HIGH PRIORITY ISSUES (Interoperability problems)
 
-### 4. Canonical DNS Name Ordering is Wrong (RFC 4034 §6.1)
+### 4. Canonical DNS Name Ordering (RFC 4034 §6.1)
 
-**Current**:
-```go
-sort.Slice(sortedNames, func(i, j int) bool {
-    return dns.CanonicalName(sortedNames[i]) < dns.CanonicalName(sortedNames[j])
-})
-```
+**Status**: ✅ FIXED
 
-**Problem**: `dns.CanonicalName()` lowercases the name, but canonical ordering per RFC 4034 §6.1 requires comparing labels right-to-left, not lexicographically comparing the full name.
+**RFC 4034 §6.1**: "For the purposes of DNS security, owner names are ordered in canonical order by treating individual labels as unsigned left-justified octet strings."
 
-**RFC 4034 §6.1**: "For the purposes of DNS security, owner names are ordered in canonical order by treating individual labels as unsigned left-justified octet strings. The absence of a octet sorts before a zero value octet, and upper case letters are treated as lower case letters."
-
-**Example**: `a.example.com` should sort BEFORE `z.example.com`, but `example.com` should sort BEFORE both. Current lexicographic sort gets this wrong.
-
-**Fix**: Use `dns.Compare()` or implement proper canonical ordering.
+**Fix applied in sign.go**: Implemented `canonicalLess()` function that compares labels from right to left (rightmost label first).
 
 ### 5. DNSKEY TTL Should Match Zone TTL Convention
 
@@ -112,22 +66,11 @@ This is actually fine for fresh signing, but something to be aware of.
 
 ### 7. Wildcard Label Count (RFC 4035 §5.3.1)
 
-**Current**:
-```go
-Labels: uint8(dns.CountLabel(rrset[0].Header().Name)),
-```
+**Status**: ✅ FIXED
 
-**RFC 4035 §5.3.1**: "For each authoritative RRset in a signed zone, there MUST be at least one RRSIG record... The Labels field of every RRSIG RR MUST equal the number of labels in the RRset's owner name, excluding the root label and excluding the leftmost label if it is a wildcard."
+**RFC 4035 §5.3.1**: "The Labels field of every RRSIG RR MUST equal the number of labels in the RRset's owner name, excluding the root label and excluding the leftmost label if it is a wildcard."
 
-**Impact**: Wildcard records (`*.example.com`) need special handling. The labels field should be 2, not 3.
-
-**Fix**:
-```go
-labels := dns.CountLabel(rrset[0].Header().Name)
-if strings.HasPrefix(rrset[0].Header().Name, "*.") {
-    labels--
-}
-```
+**Fix applied in sign.go**: The `createRRSIG()` function now decrements the label count if the name starts with `*.`.
 
 ### 8. Delegation Points and Glue Records (RFC 4035 §2.2)
 
@@ -176,16 +119,23 @@ SaltLength: uint8(len(salt) / 2), // Salt is hex encoded
 
 ---
 
-## SUMMARY OF REQUIRED FIXES
+## SUMMARY OF FIXES
 
-| Priority | Issue | Effort |
+| Priority | Issue | Status |
 |----------|-------|--------|
-| CRITICAL | NSEC/NSEC3 TTL from SOA minimum | Small |
-| CRITICAL | Empty non-terminals in NSEC3 | Medium |
-| CRITICAL | NSEC3 type bitmap for ENTs | Small |
-| HIGH | Canonical name ordering | Medium |
-| MEDIUM | Wildcard label count | Small |
-| MEDIUM | Don't sign at delegation points | Medium |
+| CRITICAL | NSEC/NSEC3 TTL from SOA minimum | ✅ Fixed |
+| CRITICAL | Empty non-terminals in NSEC3 | ✅ Fixed |
+| CRITICAL | NSEC3 type bitmap for ENTs | ✅ Fixed |
+| HIGH | Canonical name ordering | ✅ Fixed |
+| MEDIUM | Wildcard label count | ✅ Fixed |
+| MEDIUM | Don't sign at delegation points | Not yet implemented |
+
+### Remaining Items (Not Critical for v1)
+
+- Delegation point detection (medium complexity, rarely needed for simple zones)
+- DNSKEY TTL matching zone convention (best practice)
+- Configurable rollover timing constants
+- Algorithm rollover support
 
 ---
 
@@ -220,11 +170,19 @@ Before going live:
 
 ## CONCLUSION
 
-The core signing logic is sound and uses miekg/dns correctly for the cryptographic operations. The main issues are around edge cases in NSEC/NSEC3 chain generation that could cause validation failures for NXDOMAIN responses or zones with complex structure.
+The critical RFC compliance issues have been addressed:
+- NSEC/NSEC3 chains now use SOA minimum TTL
+- Empty non-terminals are properly included in NSEC3 chains
+- Type bitmaps for empty non-terminals are correct
+- Canonical DNS name ordering follows RFC 4034 §6.1
+- Wildcard label counts are correct per RFC 4035 §5.3.1
 
-**Recommendation**: Fix the CRITICAL issues before production use. The HIGH issues are important for correctness but may not cause immediate failures depending on zone structure.
+**Ready for testing**: The implementation should now produce valid signed zones for typical authoritative DNS scenarios. Verify with `ldns-verify-zone` and online validators like dnsviz.net before production use.
+
+**Known limitations**: Delegation point detection is not implemented. If your zone contains delegations (NS records pointing to child zones), you may need to handle these manually or ensure glue records are not present in the unsigned zone file.
 
 ---
 
-*Review Date: 2026-01-19*
+*Initial Review: 2026-01-19*
+*Fixes Applied: 2026-01-19*
 *Reviewer: Claude (playing skeptical RFC author)*
