@@ -1,0 +1,26 @@
+# Test configuration for dnssec-tudor
+
+output_dir = "testdata/signed"
+data_dir = "testdata"
+poll_interval = "1m"
+
+[dnssec]
+algorithm = "ED25519"
+ksk_lifetime = "3y"
+zsk_lifetime = "90d"
+signature_validity = "14d"
+signature_refresh = "3d"
+nsec_version = "nsec3"
+nsec3_iterations = 0
+nsec3_salt = ""
+
+[web]
+enabled = false
+listen = "127.0.0.1:8053"
+
+[zones]
+[zones."example.com"]
+path = "testdata/zones/example.com.zone"
+
+[hooks]
+# post_sign = "echo 'Zone signed'"
