@@ -49,7 +49,7 @@ type RolloverState struct {
 	OldAlgorithm string    `json:"old_algorithm,omitempty"` // For algorithm rollover
 	NewAlgorithm string    `json:"new_algorithm,omitempty"` // For algorithm rollover
 	Started      time.Time `json:"started"`
-	Action       string    `json:"action"`                  // Human-readable next step
+	Action       string    `json:"action"` // Human-readable next step
 }
 
 // ZSK rollover states (automatic)
@@ -163,22 +163,22 @@ func (z *ZoneState) Status() string {
 
 // StatusOutput represents the JSON output for the status command
 type StatusOutput struct {
-	Timestamp time.Time                  `json:"timestamp"`
+	Timestamp time.Time                    `json:"timestamp"`
 	Zones     map[string]*ZoneStatusOutput `json:"zones"`
-	Summary   StatusSummary              `json:"summary"`
+	Summary   StatusSummary                `json:"summary"`
 }
 
 // ZoneStatusOutput represents per-zone status in the output
 type ZoneStatusOutput struct {
-	Status          string         `json:"status"`
-	Serial          uint32         `json:"serial,omitempty"`
-	LastSigned      time.Time      `json:"last_signed,omitempty"`
-	SignaturesExp   time.Time      `json:"signatures_expire,omitempty"`
-	KSK             *KeyState      `json:"ksk,omitempty"`
-	ZSK             *KeyState      `json:"zsk,omitempty"`
-	Rollover        *RolloverState `json:"rollover,omitempty"`
-	Warnings        []string       `json:"warnings,omitempty"`
-	Errors          []string       `json:"errors,omitempty"`
+	Status        string         `json:"status"`
+	Serial        uint32         `json:"serial,omitempty"`
+	LastSigned    time.Time      `json:"last_signed,omitempty"`
+	SignaturesExp time.Time      `json:"signatures_expire,omitempty"`
+	KSK           *KeyState      `json:"ksk,omitempty"`
+	ZSK           *KeyState      `json:"zsk,omitempty"`
+	Rollover      *RolloverState `json:"rollover,omitempty"`
+	Warnings      []string       `json:"warnings,omitempty"`
+	Errors        []string       `json:"errors,omitempty"`
 }
 
 // StatusSummary provides a summary of all zones

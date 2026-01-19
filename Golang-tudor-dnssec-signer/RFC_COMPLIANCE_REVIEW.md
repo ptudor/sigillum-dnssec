@@ -74,20 +74,19 @@ This is actually fine for fresh signing, but something to be aware of.
 
 ### 8. Delegation Points and Glue Records (RFC 4035 §2.2)
 
-**Current**: Signs all records in zone file.
+**Status**: ✅ FIXED
 
 **RFC 4035 §2.2**: "A signed zone MUST include a DNSKEY RRset at the zone apex. A signed zone MAY have an NSEC RR at a delegation point. A signed zone SHOULD NOT include any RRSIG records for any NS or glue address records at a delegation point."
 
-**Impact**: If zone file contains NS records for delegated subzones (delegation points), they should NOT be signed. Only the DS record (if any) should be signed.
+**Fix applied in sign.go**: The `findDelegationPoints()` function identifies NS records at non-apex names (delegation points) and A/AAAA records for NS targets at or below delegation points (glue records). The `signRecordsWithKeys()` function skips signing these records. Additionally, `generateNSECChain()` and `generateNSEC3Chain()` correctly omit RRSIG from the type bitmap at delegation points that have only NS (no DS) records.
 
 ### 9. NSEC3 Salt Encoding
 
-**Current**:
-```go
-SaltLength: uint8(len(salt) / 2), // Salt is hex encoded
-```
+**Status**: ✅ FIXED
 
-**Assumption**: Salt is hex-encoded in config. This should be documented clearly, and the code should validate it's valid hex.
+**Requirement**: Salt is hex-encoded in config. The code should validate it's valid hex.
+
+**Fix applied in config.go**: The `Validate()` function now checks that `nsec3_salt` is valid hex-encoded and doesn't exceed 255 bytes (510 hex characters).
 
 ---
 
@@ -124,14 +123,16 @@ Algorithm rollover is now supported via `dnssec-tudor rollover algorithm <domain
 | CRITICAL | NSEC3 type bitmap for ENTs | ✅ Fixed |
 | HIGH | Canonical name ordering | ✅ Fixed |
 | MEDIUM | Wildcard label count | ✅ Fixed |
+| MEDIUM | Delegation point detection | ✅ Fixed |
+| MEDIUM | NSEC3 salt hex validation | ✅ Fixed |
 | LOW | DNSKEY TTL matching zone convention | ✅ Fixed |
 | LOW | Configurable rollover timing | ✅ Fixed |
 | LOW | Algorithm rollover support | ✅ Fixed |
-| MEDIUM | Delegation point detection | Skipped (not needed for simple zones) |
 
-### Note on Delegation Points
+### Additional Improvements
 
-Delegation point detection was intentionally skipped. If your zone contains NS records pointing to child zones (delegations), you should not include glue records in the unsigned zone file. This affects very few users in the target audience (sysadmins with 10-50 domains on a single server who are authoritative for entire zones without delegations).
+- **Zone file validation**: Zones are validated before signing to catch common errors (missing SOA, missing NS at apex, duplicate SOA records).
+- **NSEC3 salt validation**: Config validation ensures salt is valid hex if provided.
 
 ---
 
@@ -166,19 +167,20 @@ Before going live:
 
 ## CONCLUSION
 
-All critical and high-priority RFC compliance issues have been addressed:
+All RFC compliance issues have been addressed:
 - NSEC/NSEC3 chains now use SOA minimum TTL
 - Empty non-terminals are properly included in NSEC3 chains
 - Type bitmaps for empty non-terminals are correct
 - Canonical DNS name ordering follows RFC 4034 §6.1
 - Wildcard label counts are correct per RFC 4035 §5.3.1
+- Delegation points and glue records are not signed per RFC 4035 §2.2
 - DNSKEY TTL defaults to SOA TTL (best practice)
 - Rollover timing is configurable (RFC 7583 guidance)
 - Algorithm rollover is fully supported
+- Zone files are validated before signing
+- NSEC3 salt configuration is validated
 
-**Ready for production**: The implementation should now produce valid signed zones for typical authoritative DNS scenarios. Verify with `ldns-verify-zone` and online validators like dnsviz.net before going live.
-
-**Intentionally skipped**: Delegation point detection. This is only needed if your zone has NS records pointing to child zones, which is uncommon for the target audience.
+**Ready for production**: The implementation produces valid signed zones for all authoritative DNS scenarios including zones with delegations. Verify with `ldns-verify-zone` and online validators like dnsviz.net before going live.
 
 ---
 

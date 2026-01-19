@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"time"
@@ -10,26 +11,26 @@ import (
 
 // Config represents the main configuration structure
 type Config struct {
-	OutputDir    string            `toml:"output_dir"`
-	DataDir      string            `toml:"data_dir"`
-	PollInterval Duration          `toml:"poll_interval"`
-	DNSSEC       DNSSECConfig      `toml:"dnssec"`
-	Web          WebConfig         `toml:"web"`
+	OutputDir    string                `toml:"output_dir"`
+	DataDir      string                `toml:"data_dir"`
+	PollInterval Duration              `toml:"poll_interval"`
+	DNSSEC       DNSSECConfig          `toml:"dnssec"`
+	Web          WebConfig             `toml:"web"`
 	Zones        map[string]ZoneConfig `toml:"zones"`
-	Hooks        HooksConfig       `toml:"hooks"`
+	Hooks        HooksConfig           `toml:"hooks"`
 }
 
 // DNSSECConfig holds DNSSEC-specific settings
 type DNSSECConfig struct {
-	Algorithm         string   `toml:"algorithm"`
-	KSKLifetime       Duration `toml:"ksk_lifetime"`
-	ZSKLifetime       Duration `toml:"zsk_lifetime"`
-	SignatureValidity Duration `toml:"signature_validity"`
-	SignatureRefresh  Duration `toml:"signature_refresh"`
-	NSECVersion       string   `toml:"nsec_version"`
-	NSEC3Iterations   int      `toml:"nsec3_iterations"`
-	NSEC3Salt         string   `toml:"nsec3_salt"`
-	DNSKEYTtl         uint32   `toml:"dnskey_ttl"`         // TTL for DNSKEY records (0 = use SOA TTL)
+	Algorithm          string   `toml:"algorithm"`
+	KSKLifetime        Duration `toml:"ksk_lifetime"`
+	ZSKLifetime        Duration `toml:"zsk_lifetime"`
+	SignatureValidity  Duration `toml:"signature_validity"`
+	SignatureRefresh   Duration `toml:"signature_refresh"`
+	NSECVersion        string   `toml:"nsec_version"`
+	NSEC3Iterations    int      `toml:"nsec3_iterations"`
+	NSEC3Salt          string   `toml:"nsec3_salt"`
+	DNSKEYTtl          uint32   `toml:"dnskey_ttl"`          // TTL for DNSKEY records (0 = use SOA TTL)
 	RolloverPrepublish Duration `toml:"rollover_prepublish"` // Time before expiry to prepublish new key
 	RolloverSwitch     Duration `toml:"rollover_switch"`     // Time to wait before switching to new key
 }
@@ -135,17 +136,17 @@ func DefaultConfig() *Config {
 		DataDir:      "/var/lib/dnssec-tudor",
 		PollInterval: Duration{5 * time.Minute},
 		DNSSEC: DNSSECConfig{
-			Algorithm:         "ED25519",
-			KSKLifetime:       Duration{3 * 365 * 24 * time.Hour}, // 3 years
-			ZSKLifetime:       Duration{90 * 24 * time.Hour},      // 90 days
-			SignatureValidity: Duration{14 * 24 * time.Hour},      // 14 days
-			SignatureRefresh:  Duration{3 * 24 * time.Hour},       // 3 days
-			NSECVersion:       "nsec3",
-			NSEC3Iterations:   0,
-			NSEC3Salt:         "",
-			DNSKEYTtl:         0,                                   // 0 = use SOA TTL
-			RolloverPrepublish: Duration{14 * 24 * time.Hour},     // 14 days before expiry
-			RolloverSwitch:     Duration{7 * 24 * time.Hour},      // 7 days to switch signing
+			Algorithm:          "ED25519",
+			KSKLifetime:        Duration{3 * 365 * 24 * time.Hour}, // 3 years
+			ZSKLifetime:        Duration{90 * 24 * time.Hour},      // 90 days
+			SignatureValidity:  Duration{14 * 24 * time.Hour},      // 14 days
+			SignatureRefresh:   Duration{3 * 24 * time.Hour},       // 3 days
+			NSECVersion:        "nsec3",
+			NSEC3Iterations:    0,
+			NSEC3Salt:          "",
+			DNSKEYTtl:          0,                             // 0 = use SOA TTL
+			RolloverPrepublish: Duration{14 * 24 * time.Hour}, // 14 days before expiry
+			RolloverSwitch:     Duration{7 * 24 * time.Hour},  // 7 days to switch signing
 		},
 		Web: WebConfig{
 			Enabled: false,
@@ -222,6 +223,16 @@ func (c *Config) Validate() error {
 	// Validate NSEC3 iterations (RFC 9276 recommends 0)
 	if c.DNSSEC.NSEC3Iterations < 0 || c.DNSSEC.NSEC3Iterations > 150 {
 		return fmt.Errorf("nsec3_iterations must be between 0 and 150")
+	}
+
+	// Validate NSEC3 salt is valid hex if provided
+	if c.DNSSEC.NSEC3Salt != "" {
+		if _, err := hex.DecodeString(c.DNSSEC.NSEC3Salt); err != nil {
+			return fmt.Errorf("nsec3_salt must be valid hex-encoded string: %w", err)
+		}
+		if len(c.DNSSEC.NSEC3Salt) > 510 { // 255 bytes max per RFC, times 2 for hex encoding
+			return fmt.Errorf("nsec3_salt too long (max 255 bytes / 510 hex chars)")
+		}
 	}
 
 	// Validate zone paths exist
