@@ -1,8 +1,20 @@
 package main
 
 import (
+	"expvar"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// Expvar metrics for /debug/vars endpoint (mirrors Prometheus metrics)
+var (
+	expvarZonesTotal          = expvar.NewInt("dnssec_zones_total")
+	expvarZonesHealthy        = expvar.NewInt("dnssec_zones_healthy")
+	expvarZonesActionRequired = expvar.NewInt("dnssec_zones_action_required")
+	expvarZonesErrors         = expvar.NewInt("dnssec_zones_errors")
+	expvarSigningOpsSuccess   = expvar.NewInt("dnssec_signing_operations_success")
+	expvarSigningOpsFailure   = expvar.NewInt("dnssec_signing_operations_failure")
 )
 
 // Prometheus metrics for DNSSEC signing operations
@@ -147,6 +159,12 @@ func UpdateZoneMetrics(state *State) {
 	zonesHealthy.Set(float64(healthy))
 	zonesActionRequired.Set(float64(actionRequired))
 	zonesWithErrors.Set(float64(errors))
+
+	// Update expvar metrics to mirror Prometheus
+	expvarZonesTotal.Set(int64(total))
+	expvarZonesHealthy.Set(int64(healthy))
+	expvarZonesActionRequired.Set(int64(actionRequired))
+	expvarZonesErrors.Set(int64(errors))
 }
 
 // RecordSigningOperation records metrics for a signing operation
@@ -157,6 +175,13 @@ func RecordSigningOperation(domain string, durationSeconds float64, success bool
 	}
 	signingOperationsTotal.WithLabelValues(domain, status).Inc()
 	signingDurationSeconds.WithLabelValues(domain).Observe(durationSeconds)
+
+	// Update expvar counters
+	if success {
+		expvarSigningOpsSuccess.Add(1)
+	} else {
+		expvarSigningOpsFailure.Add(1)
+	}
 }
 
 // RecordHookExecution records metrics for a hook execution
