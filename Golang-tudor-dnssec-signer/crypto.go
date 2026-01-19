@@ -38,7 +38,11 @@ func FormatDSRecords(domain string, keyState *KeyState) (string, error) {
 	// Format for registrar
 	sb.WriteString(";; Registrar format:\n")
 	sb.WriteString(fmt.Sprintf("Key Tag: %d\n", keyState.ID))
-	sb.WriteString(fmt.Sprintf("Algorithm: %d (%s)\n", AlgorithmFromName(keyState.Algorithm), keyState.Algorithm))
+	algNum, err := AlgorithmFromName(keyState.Algorithm)
+	if err != nil {
+		return "", fmt.Errorf("invalid algorithm in key state: %w", err)
+	}
+	sb.WriteString(fmt.Sprintf("Algorithm: %d (%s)\n", algNum, keyState.Algorithm))
 	sb.WriteString("Digest Type: 2 (SHA-256)\n")
 	sb.WriteString("Digest: [computed when keys are loaded]\n")
 

@@ -340,6 +340,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("zone file does not exist: %s", zonePath)
 	}
 
+	// Validate zone file is parseable and has required records
+	if err := ValidateZoneFile(domain, zonePath); err != nil {
+		return fmt.Errorf("invalid zone file: %w", err)
+	}
+
 	// Check domain not already managed
 	if state.GetZone(domain) != nil {
 		return fmt.Errorf("domain %q is already managed", domain)

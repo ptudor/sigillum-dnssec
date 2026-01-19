@@ -202,6 +202,8 @@ post_sign = "nsd-control reload"
 post_sign = "systemctl reload nsd"
 ```
 
+**Note:** Hooks have a 30-second timeout. If your hook needs longer (e.g., zone transfers to secondaries), consider having the hook trigger an async process instead.
+
 ## BIND Integration
 
 ```
@@ -295,12 +297,40 @@ ED25519 (algorithm 15) has excellent resolver support but some registrars may no
 
 ## Monitoring
 
-Health endpoints for monitoring:
+Health and metrics endpoints (on internal health server, default `127.0.0.1:8054`):
 - `GET /health` — JSON health status
 - `GET /healthz` — Simple OK/UNHEALTHY for probes
+- `GET /metrics` — Prometheus metrics
 
 ```bash
 curl http://127.0.0.1:8054/healthz
+curl http://127.0.0.1:8054/metrics
+```
+
+### Prometheus Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dnssec_tudor_zones_total` | Gauge | Total zones managed |
+| `dnssec_tudor_zones_healthy` | Gauge | Zones in healthy state |
+| `dnssec_tudor_zones_action_required` | Gauge | Zones needing action |
+| `dnssec_tudor_zones_errors` | Gauge | Zones with errors |
+| `dnssec_tudor_signing_operations_total` | Counter | Signing operations by domain/status |
+| `dnssec_tudor_signing_duration_seconds` | Histogram | Signing duration by domain |
+| `dnssec_tudor_last_signing_timestamp_seconds` | Gauge | Last successful sign time |
+| `dnssec_tudor_signature_expiry_timestamp_seconds` | Gauge | When signatures expire |
+| `dnssec_tudor_ksk_expiry_timestamp_seconds` | Gauge | KSK expiry time |
+| `dnssec_tudor_zsk_expiry_timestamp_seconds` | Gauge | ZSK expiry time |
+| `dnssec_tudor_rollover_in_progress` | Gauge | Rollover active (1/0) |
+| `dnssec_tudor_rollover_operations_total` | Counter | Rollover operations |
+| `dnssec_tudor_hook_executions_total` | Counter | Hook executions by status |
+| `dnssec_tudor_hook_duration_seconds` | Histogram | Hook execution duration |
+
+Configure the health server address in `config.toml`:
+
+```toml
+[health]
+listen = "127.0.0.1:8054"
 ```
 
 ## Troubleshooting

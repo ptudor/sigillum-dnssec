@@ -67,6 +67,8 @@ func (s *Signer) SignAll() error {
 
 // SignZone signs a single zone
 func (s *Signer) SignZone(domain string) error {
+	startTime := time.Now()
+
 	zoneState := s.state.GetZone(domain)
 	if zoneState == nil {
 		return fmt.Errorf("zone %s not in state", domain)
@@ -136,7 +138,11 @@ func (s *Signer) SignZone(domain string) error {
 	// Check for upcoming rollovers
 	s.checkRolloverWarnings(domain, zoneState)
 
-	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", serial, "output", outputPath)
+	// Record successful signing metrics
+	duration := time.Since(startTime).Seconds()
+	RecordSigningOperation(domain, duration, true)
+
+	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", serial, "output", outputPath, "duration_ms", int64(duration*1000))
 	return nil
 }
 
@@ -335,6 +341,54 @@ func (s *Signer) validateZone(domain string, records []dns.RR) error {
 				nsAtApex = true
 			}
 		}
+	}
+
+	if soaCount == 0 {
+		return fmt.Errorf("zone has no SOA record")
+	}
+	if soaCount > 1 {
+		return fmt.Errorf("zone has %d SOA records (must have exactly 1)", soaCount)
+	}
+	if !nsAtApex {
+		return fmt.Errorf("zone has no NS records at apex")
+	}
+
+	return nil
+}
+
+// ValidateZoneFile validates a zone file without requiring a full Signer.
+// It checks that the file is parseable and contains required records (SOA, NS at apex).
+func ValidateZoneFile(domain, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening zone file: %w", err)
+	}
+	defer f.Close()
+
+	apex := dns.Fqdn(domain)
+	apexLower := strings.ToLower(apex)
+
+	var soaCount int
+	var nsAtApex bool
+
+	zp := dns.NewZoneParser(f, apex, path)
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		name := strings.ToLower(rr.Header().Name)
+		switch rr.Header().Rrtype {
+		case dns.TypeSOA:
+			soaCount++
+			if name != apexLower {
+				return fmt.Errorf("SOA record at %s not at zone apex %s", name, apex)
+			}
+		case dns.TypeNS:
+			if name == apexLower {
+				nsAtApex = true
+			}
+		}
+	}
+
+	if err := zp.Err(); err != nil {
+		return fmt.Errorf("parsing zone file: %w", err)
 	}
 
 	if soaCount == 0 {

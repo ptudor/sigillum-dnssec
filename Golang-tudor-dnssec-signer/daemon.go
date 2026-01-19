@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Daemon manages the signing loop and optional web server
@@ -149,6 +151,9 @@ func (d *Daemon) signAllZones() {
 	if err := d.state.Save(); err != nil {
 		slog.Error("[DAEMON] Failed to save state", "error", err)
 	}
+
+	// Update Prometheus metrics
+	UpdateZoneMetrics(d.state)
 }
 
 func (d *Daemon) checkAndSignZone(domain string) error {
@@ -187,8 +192,10 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 	}
 
 	// Sign the zone
+	signStart := time.Now()
 	if err := d.signer.SignZone(domain); err != nil {
 		zoneState.AddError(err.Error())
+		RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
 		return err
 	}
 
@@ -238,12 +245,17 @@ func (d *Daemon) runWebServer() {
 func (d *Daemon) runHealthServer() {
 	defer d.wg.Done()
 
+	d.mu.RLock()
+	listenAddr := d.cfg.Health.Listen
+	d.mu.RUnlock()
+
 	// Health server runs on internal port for monitoring
 	mux := http.NewServeMux()
 	RegisterHealthHandlers(mux, d.state)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	server := &http.Server{
-		Addr:              "127.0.0.1:8054",
+		Addr:              listenAddr,
 		Handler:           mux,
 		ReadTimeout:       5 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,

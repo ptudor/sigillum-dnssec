@@ -65,6 +65,7 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 	// Update KSK in state (zone will now be signed with both during rollover)
 	zoneState.KSK = newKSK
 
+	RecordRolloverOperation(domain, "ksk", "start")
 	return rm.state.Save()
 }
 
@@ -101,6 +102,7 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string) error {
 		"domain", domain,
 		"note", "Old key files remain on disk for safety. You may delete them after removing the old DS from your registrar.")
 
+	RecordRolloverOperation(domain, "ksk", "complete")
 	return rm.state.Save()
 }
 
@@ -170,6 +172,7 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState)
 
 	// Don't update zoneState.ZSK yet - we keep signing with old key during pre-publish
 
+	RecordRolloverOperation(domain, "zsk", "start")
 	return rm.state.Save()
 }
 
@@ -218,6 +221,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 			zoneState.Rollover = nil
 			zoneState.ClearWarnings()
 
+			RecordRolloverOperation(domain, "zsk", "complete")
 			slog.Info("[ROLLOVER] ZSK rollover completed automatically", "domain", domain)
 			return rm.state.Save()
 		}
@@ -311,6 +315,7 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 	zoneState.KSK = newKSK
 	zoneState.ZSK = newZSK
 
+	RecordRolloverOperation(domain, "algorithm", "start")
 	return rm.state.Save()
 }
 
@@ -342,5 +347,6 @@ func (rm *RolloverManager) CompleteAlgorithmRollover(domain string) error {
 		"domain", domain,
 		"note", "Old key files remain on disk for safety. You may delete them after removing the old DS from your registrar.")
 
+	RecordRolloverOperation(domain, "algorithm", "complete")
 	return rm.state.Save()
 }

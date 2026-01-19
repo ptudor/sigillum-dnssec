@@ -297,8 +297,9 @@ func AlgorithmName(alg uint8) string {
 	return fmt.Sprintf("Unknown(%d)", alg)
 }
 
-// AlgorithmFromName returns the algorithm number from name
-func AlgorithmFromName(name string) uint8 {
+// AlgorithmFromName returns the algorithm number from name.
+// Returns an error if the algorithm name is not recognized.
+func AlgorithmFromName(name string) (uint8, error) {
 	names := map[string]uint8{
 		"ED25519":         dns.ED25519,
 		"ECDSAP256SHA256": dns.ECDSAP256SHA256,
@@ -306,7 +307,11 @@ func AlgorithmFromName(name string) uint8 {
 		"RSASHA256":       dns.RSASHA256,
 		"RSASHA512":       dns.RSASHA512,
 	}
-	return names[name]
+	alg, ok := names[name]
+	if !ok {
+		return 0, fmt.Errorf("unknown algorithm: %q", name)
+	}
+	return alg, nil
 }
 
 // ensureDir creates a directory if it doesn't exist
