@@ -44,7 +44,8 @@ type WebConfig struct {
 
 // HealthConfig holds health server settings
 type HealthConfig struct {
-	Listen string `toml:"listen"`
+	Listen          string   `toml:"listen"`
+	ShutdownTimeout Duration `toml:"shutdown_timeout"`
 }
 
 // ZoneConfig holds per-zone settings
@@ -159,7 +160,8 @@ func DefaultConfig() *Config {
 			Listen:  "127.0.0.1:8053",
 		},
 		Health: HealthConfig{
-			Listen: "127.0.0.1:8054",
+			Listen:          "127.0.0.1:8054",
+			ShutdownTimeout: Duration{30 * time.Second},
 		},
 		Zones: make(map[string]ZoneConfig),
 		Hooks: HooksConfig{},

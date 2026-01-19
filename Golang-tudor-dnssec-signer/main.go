@@ -170,9 +170,9 @@ func setupLogging() {
 	opts := &slog.HandlerOptions{Level: level}
 	var handler slog.Handler
 	if logFormat == "json" {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
+		handler = slog.NewJSONHandler(os.Stdout, opts)
 	} else {
-		handler = slog.NewTextHandler(os.Stderr, opts)
+		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
 	slog.SetDefault(slog.New(handler))
 }

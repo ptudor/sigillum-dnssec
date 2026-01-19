@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"expvar"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -47,6 +50,11 @@ func (d *Daemon) Run() error {
 		return err
 	}
 
+	// Validate startup requirements
+	if err := d.validateStartup(); err != nil {
+		return fmt.Errorf("startup validation failed: %w", err)
+	}
+
 	// Start web server if enabled
 	if d.cfg.Web.Enabled {
 		d.wg.Add(1)
@@ -75,8 +83,9 @@ func (d *Daemon) Shutdown() {
 	d.cancel()
 
 	d.mu.Lock()
+	shutdownTimeout := d.cfg.Health.ShutdownTimeout.Duration
 	if d.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := d.server.Shutdown(ctx); err != nil {
 			slog.Warn("[DAEMON] Error during server shutdown", "error", err)
@@ -109,6 +118,45 @@ func (d *Daemon) ensureDirectories() error {
 			return err
 		}
 	}
+	return nil
+}
+
+// validateStartup performs startup checks to ensure the daemon can operate correctly
+func (d *Daemon) validateStartup() error {
+	// Verify output_dir is writable
+	if err := d.checkDirWritable(d.cfg.OutputDir, "output_dir"); err != nil {
+		return err
+	}
+
+	// Verify data_dir is writable
+	if err := d.checkDirWritable(d.cfg.DataDir, "data_dir"); err != nil {
+		return err
+	}
+
+	// Verify keys_dir is writable (with secure permissions)
+	keysDir := d.cfg.KeysDir()
+	if err := d.checkDirWritable(keysDir, "keys_dir"); err != nil {
+		return err
+	}
+
+	// Verify state file is accessible
+	if err := d.state.Save(); err != nil {
+		return fmt.Errorf("cannot write state file: %w", err)
+	}
+
+	slog.Debug("[DAEMON] Startup validation passed")
+	return nil
+}
+
+// checkDirWritable verifies a directory is writable
+func (d *Daemon) checkDirWritable(dir, name string) error {
+	testFile := dir + "/.startup_check"
+	f, err := os.Create(testFile)
+	if err != nil {
+		return fmt.Errorf("%s not writable (%s): %w", name, dir, err)
+	}
+	f.Close()
+	os.Remove(testFile)
 	return nil
 }
 
@@ -251,8 +299,9 @@ func (d *Daemon) runHealthServer() {
 
 	// Health server runs on internal port for monitoring
 	mux := http.NewServeMux()
-	RegisterHealthHandlers(mux, d.state)
+	RegisterHealthHandlers(mux, d.state, d.cfg)
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/debug/vars", expvar.Handler())
 
 	server := &http.Server{
 		Addr:              listenAddr,

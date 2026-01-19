@@ -13,23 +13,33 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+// securityHeaders wraps a handler to add security headers to all responses
+func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		next(w, r)
+	}
+}
+
 // NewWebServer creates a new HTTP server for the web UI
 func NewWebServer(cfg *Config, state *State) *http.Server {
 	mux := http.NewServeMux()
 
-	// Register handlers
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// Register handlers with security headers
+	mux.HandleFunc("/", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
 		dashboardHandler(w, r, cfg, state)
-	})
-	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/status", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
 		apiStatusHandler(w, r, state)
-	})
-	mux.HandleFunc("/api/zone/", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/zone/", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
 		apiZoneHandler(w, r, cfg, state)
-	})
+	}))
 
 	// Health endpoints
-	RegisterHealthHandlers(mux, state)
+	RegisterHealthHandlers(mux, state, cfg)
 
 	return &http.Server{
 		Addr:              cfg.Web.Listen,
