@@ -80,6 +80,9 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("parsing zone file: %w", err)
 	}
 
+	// Extract SOA minimum TTL for NSEC/NSEC3 records (RFC 4035 §2.3)
+	soaMinTTL := s.getSOAMinimumTTL(records)
+
 	// Load keys - handling rollover scenarios
 	keyGen := NewKeyGenerator(s.cfg)
 	keys, err := s.loadKeysForSigning(domain, keyGen, zoneState)
@@ -94,13 +97,13 @@ func (s *Signer) SignZone(domain string) error {
 
 	// Generate NSEC/NSEC3 chain
 	if s.cfg.DNSSEC.NSECVersion == "nsec3" {
-		nsec3Records, err := s.generateNSEC3Chain(domain, records)
+		nsec3Records, err := s.generateNSEC3Chain(domain, records, soaMinTTL)
 		if err != nil {
 			return fmt.Errorf("generating NSEC3 chain: %w", err)
 		}
 		records = append(records, nsec3Records...)
 	} else {
-		nsecRecords := s.generateNSECChain(domain, records)
+		nsecRecords := s.generateNSECChain(domain, records, soaMinTTL)
 		records = append(records, nsecRecords...)
 	}
 
@@ -320,16 +323,25 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 
 // createRRSIG creates an RRSIG record for signing
 func (s *Signer) createRRSIG(rrset []dns.RR, signingKey *dns.DNSKEY, domain string, inception, expiration time.Time) *dns.RRSIG {
+	name := rrset[0].Header().Name
+	labels := dns.CountLabel(name)
+
+	// RFC 4035 §5.3.1: For wildcards, the Labels field excludes the wildcard label
+	// So *.example.com has 2 labels, not 3
+	if strings.HasPrefix(name, "*.") {
+		labels--
+	}
+
 	return &dns.RRSIG{
 		Hdr: dns.RR_Header{
-			Name:   rrset[0].Header().Name,
+			Name:   name,
 			Rrtype: dns.TypeRRSIG,
 			Class:  dns.ClassINET,
 			Ttl:    rrset[0].Header().Ttl,
 		},
 		TypeCovered: rrset[0].Header().Rrtype,
 		Algorithm:   signingKey.Algorithm,
-		Labels:      uint8(dns.CountLabel(rrset[0].Header().Name)),
+		Labels:      uint8(labels),
 		OrigTtl:     rrset[0].Header().Ttl,
 		Expiration:  uint32(expiration.Unix()),
 		Inception:   uint32(inception.Unix()),
@@ -367,10 +379,22 @@ func (s *Signer) signRRSIG(rrsig *dns.RRSIG, rrset []dns.RR, key *dns.DNSKEY, pr
 	}
 }
 
-func (s *Signer) generateNSECChain(domain string, records []dns.RR) []dns.RR {
+// getSOAMinimumTTL extracts the minimum TTL from the SOA record (RFC 4035 §2.3)
+func (s *Signer) getSOAMinimumTTL(records []dns.RR) uint32 {
+	for _, rr := range records {
+		if soa, ok := rr.(*dns.SOA); ok {
+			return soa.Minttl
+		}
+	}
+	return 3600 // fallback
+}
+
+func (s *Signer) generateNSECChain(domain string, records []dns.RR, soaMinTTL uint32) []dns.RR {
 	// Collect unique owner names
 	names := make(map[string]bool)
 	typesByName := make(map[string]map[uint16]bool)
+
+	apex := dns.Fqdn(domain)
 
 	for _, rr := range records {
 		name := strings.ToLower(rr.Header().Name)
@@ -381,13 +405,16 @@ func (s *Signer) generateNSECChain(domain string, records []dns.RR) []dns.RR {
 		typesByName[name][rr.Header().Rrtype] = true
 	}
 
-	// Sort names canonically
+	// Add empty non-terminals (RFC 4035)
+	s.addEmptyNonTerminals(names, typesByName, apex)
+
+	// Sort names canonically (RFC 4034 §6.1)
 	var sortedNames []string
 	for name := range names {
 		sortedNames = append(sortedNames, name)
 	}
 	sort.Slice(sortedNames, func(i, j int) bool {
-		return dns.CanonicalName(sortedNames[i]) < dns.CanonicalName(sortedNames[j])
+		return canonicalLess(sortedNames[i], sortedNames[j])
 	})
 
 	// Create NSEC chain
@@ -400,8 +427,16 @@ func (s *Signer) generateNSECChain(domain string, records []dns.RR) []dns.RR {
 		for t := range typesByName[name] {
 			types = append(types, t)
 		}
-		types = append(types, dns.TypeNSEC)
-		types = append(types, dns.TypeRRSIG)
+		// NSEC and RRSIG always present (unless empty non-terminal)
+		if len(typesByName[name]) > 0 {
+			types = append(types, dns.TypeNSEC)
+			types = append(types, dns.TypeRRSIG)
+		} else {
+			// Empty non-terminal: only NSEC, no RRSIG for the NSEC itself...
+			// Actually RFC 4035 says NSEC RR exists, so it has RRSIG
+			types = append(types, dns.TypeNSEC)
+			types = append(types, dns.TypeRRSIG)
+		}
 		sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
 
 		nsec := &dns.NSEC{
@@ -409,7 +444,7 @@ func (s *Signer) generateNSECChain(domain string, records []dns.RR) []dns.RR {
 				Name:   name,
 				Rrtype: dns.TypeNSEC,
 				Class:  dns.ClassINET,
-				Ttl:    3600,
+				Ttl:    soaMinTTL, // RFC 4035 §2.3
 			},
 			NextDomain: nextName,
 			TypeBitMap: types,
@@ -420,10 +455,67 @@ func (s *Signer) generateNSECChain(domain string, records []dns.RR) []dns.RR {
 	return nsecRecords
 }
 
-func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR) ([]dns.RR, error) {
+// addEmptyNonTerminals adds empty non-terminal names to the name set
+func (s *Signer) addEmptyNonTerminals(names map[string]bool, typesByName map[string]map[uint16]bool, apex string) {
+	// Collect all names first to avoid modifying map while iterating
+	var allNames []string
+	for name := range names {
+		allNames = append(allNames, name)
+	}
+
+	for _, name := range allNames {
+		// Walk up the tree to apex, adding empty non-terminals
+		labels := dns.SplitDomainName(name)
+		apexLabels := dns.SplitDomainName(apex)
+
+		for i := 1; i < len(labels)-len(apexLabels)+1; i++ {
+			parent := strings.Join(labels[i:], ".") + "."
+			if !names[parent] {
+				names[parent] = true
+				typesByName[parent] = make(map[uint16]bool) // Empty
+			}
+		}
+	}
+}
+
+// canonicalLess compares two domain names in canonical order (RFC 4034 §6.1)
+func canonicalLess(a, b string) bool {
+	// Compare labels from right to left
+	aLabels := dns.SplitDomainName(strings.ToLower(a))
+	bLabels := dns.SplitDomainName(strings.ToLower(b))
+
+	// Compare from the end (rightmost label first)
+	for i := 0; ; i++ {
+		aIdx := len(aLabels) - 1 - i
+		bIdx := len(bLabels) - 1 - i
+
+		// If we've exhausted one name
+		if aIdx < 0 && bIdx < 0 {
+			return false // Equal
+		}
+		if aIdx < 0 {
+			return true // Shorter name comes first
+		}
+		if bIdx < 0 {
+			return false
+		}
+
+		// Compare labels
+		if aLabels[aIdx] < bLabels[bIdx] {
+			return true
+		}
+		if aLabels[aIdx] > bLabels[bIdx] {
+			return false
+		}
+		// Labels equal, continue to next
+	}
+}
+
+func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL uint32) ([]dns.RR, error) {
 	// NSEC3 parameters
 	iterations := uint16(s.cfg.DNSSEC.NSEC3Iterations)
 	salt := s.cfg.DNSSEC.NSEC3Salt
+	apex := dns.Fqdn(domain)
 
 	// Collect unique owner names and their types
 	names := make(map[string]bool)
@@ -437,6 +529,9 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR) ([]dns.RR, 
 		}
 		typesByName[name][rr.Header().Rrtype] = true
 	}
+
+	// Add empty non-terminals (RFC 5155 §7.1)
+	s.addEmptyNonTerminals(names, typesByName, apex)
 
 	// Hash all names
 	type hashedName struct {
@@ -461,10 +556,10 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR) ([]dns.RR, 
 	// Add NSEC3PARAM at zone apex
 	nsec3param := &dns.NSEC3PARAM{
 		Hdr: dns.RR_Header{
-			Name:   dns.Fqdn(domain),
+			Name:   apex,
 			Rrtype: dns.TypeNSEC3PARAM,
 			Class:  dns.ClassINET,
-			Ttl:    0,
+			Ttl:    0, // RFC 5155 §4.2: SHOULD be zero
 		},
 		Hash:       dns.SHA1,
 		Flags:      0,
@@ -478,12 +573,16 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR) ([]dns.RR, 
 	for i, hn := range hashedNames {
 		nextHash := hashedNames[(i+1)%len(hashedNames)].hashed
 
-		// Collect types
+		// Collect types - RFC 5155 §7.1: don't include RRSIG or NSEC3
 		var types []uint16
 		for t := range typesByName[hn.original] {
 			types = append(types, t)
 		}
-		types = append(types, dns.TypeRRSIG)
+		// Only add RRSIG to type bitmap if this name has actual RRsets
+		// Empty non-terminals have empty type bitmaps (RFC 5155 §7.1)
+		if len(typesByName[hn.original]) > 0 {
+			types = append(types, dns.TypeRRSIG)
+		}
 		sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
 
 		nsec3 := &dns.NSEC3{
@@ -491,7 +590,7 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR) ([]dns.RR, 
 				Name:   hn.hashed + "." + dns.Fqdn(domain),
 				Rrtype: dns.TypeNSEC3,
 				Class:  dns.ClassINET,
-				Ttl:    3600,
+				Ttl:    soaMinTTL, // RFC 4035 §2.3
 			},
 			Hash:       dns.SHA1,
 			Flags:      0,
