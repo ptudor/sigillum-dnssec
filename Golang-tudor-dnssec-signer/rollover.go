@@ -36,14 +36,14 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 		return fmt.Errorf("no existing KSK found")
 	}
 
-	slog.Info("Starting KSK rollover", "domain", domain, "old_key_id", oldKSK.ID)
+	slog.Info("[ROLLOVER] Starting KSK rollover", "domain", domain, "old_key_id", oldKSK.ID)
 
 	// Generate new KSK
 	keyGen := NewKeyGenerator(rm.cfg)
 
 	// Save old KSK to backup file
 	if err := rm.backupKey(domain, "ksk", oldKSK.ID); err != nil {
-		slog.Warn("Failed to backup old KSK", "error", err)
+		slog.Warn("[ROLLOVER] Failed to backup old KSK", "error", err)
 	}
 
 	// Generate new KSK
@@ -87,7 +87,7 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string) error {
 		return fmt.Errorf("rollover not in ds_add_wait state")
 	}
 
-	slog.Info("Completing KSK rollover",
+	slog.Info("[ROLLOVER] Completing KSK rollover",
 		"domain", domain,
 		"old_key_id", zoneState.Rollover.OldKeyID,
 		"new_key_id", zoneState.Rollover.NewKeyID)
@@ -97,7 +97,7 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string) error {
 	zoneState.ClearWarnings()
 
 	// Old key files remain on disk but are no longer used
-	slog.Info("KSK rollover completed",
+	slog.Info("[ROLLOVER] KSK rollover completed",
 		"domain", domain,
 		"note", "Old key files remain on disk for safety. You may delete them after removing the old DS from your registrar.")
 
@@ -114,9 +114,12 @@ func (rm *RolloverManager) CheckZSKRollover(domain string) error {
 	now := time.Now().UTC()
 	zsk := zoneState.ZSK
 
+	// Get configurable rollover timing
+	prepublishDays := rm.cfg.DNSSEC.RolloverPrepublish.Duration.Hours() / 24
+
 	// ZSK rollover timeline:
-	// - 14 days before expiry: pre-publish new ZSK
-	// - 7 days before expiry: switch to signing with new ZSK
+	// - prepublish_days before expiry: pre-publish new ZSK
+	// - switch_days after prepublish: switch to signing with new ZSK
 	// - on expiry: remove old ZSK
 
 	daysUntilExpiry := zsk.Expires.Sub(now).Hours() / 24
@@ -126,8 +129,8 @@ func (rm *RolloverManager) CheckZSKRollover(domain string) error {
 		return rm.handleZSKRolloverState(domain, zoneState)
 	}
 
-	// Start new rollover if within 14 days of expiry
-	if daysUntilExpiry <= 14 && daysUntilExpiry > 0 {
+	// Start new rollover if within prepublish window
+	if daysUntilExpiry <= prepublishDays && daysUntilExpiry > 0 {
 		return rm.startZSKRollover(domain, zoneState)
 	}
 
@@ -141,11 +144,11 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState)
 	}
 
 	oldZSK := zoneState.ZSK
-	slog.Info("Starting automatic ZSK rollover", "domain", domain, "old_key_id", oldZSK.ID)
+	slog.Info("[ROLLOVER] Starting automatic ZSK rollover", "domain", domain, "old_key_id", oldZSK.ID)
 
 	// Backup old key
 	if err := rm.backupKey(domain, "zsk", oldZSK.ID); err != nil {
-		slog.Warn("Failed to backup old ZSK", "error", err)
+		slog.Warn("[ROLLOVER] Failed to backup old ZSK", "error", err)
 	}
 
 	// Generate new ZSK
@@ -175,11 +178,15 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 	now := time.Now().UTC()
 	daysSinceStart := now.Sub(rollover.Started).Hours() / 24
 
+	// Get configurable timing
+	switchDays := rm.cfg.DNSSEC.RolloverSwitch.Duration.Hours() / 24
+	prepublishDays := rm.cfg.DNSSEC.RolloverPrepublish.Duration.Hours() / 24
+
 	switch rollover.State {
 	case ZSKRolloverStatePrePublish:
-		// After 7 days, switch to signing with new key
-		if daysSinceStart >= 7 {
-			slog.Info("ZSK rollover: switching to new key", "domain", domain, "new_key_id", rollover.NewKeyID)
+		// After switch_days, start signing with new key
+		if daysSinceStart >= switchDays {
+			slog.Info("[ROLLOVER] ZSK rollover: switching to new key", "domain", domain, "new_key_id", rollover.NewKeyID)
 			rollover.State = ZSKRolloverStateSigning
 			rollover.Action = "Automatic: signing with new ZSK, old ZSK still published"
 
@@ -192,7 +199,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 
 			zoneState.ZSK = &KeyState{
 				ID:          newZSK.KeyTag(),
-				Algorithm:   rm.cfg.DNSSEC.Algorithm,
+				Algorithm:   rm.cfg.GetZoneAlgorithm(domain),
 				Created:     rollover.Started,
 				Expires:     rollover.Started.Add(rm.cfg.GetZoneZSKLifetime(domain)),
 				RolloverDue: rollover.Started.Add(time.Duration(float64(rm.cfg.GetZoneZSKLifetime(domain)) * 0.75)),
@@ -202,16 +209,16 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 		}
 
 	case ZSKRolloverStateSigning:
-		// After another 7 days (14 total), complete rollover
-		if daysSinceStart >= 14 {
-			slog.Info("ZSK rollover: completing", "domain", domain)
+		// After prepublish_days total, complete rollover
+		if daysSinceStart >= prepublishDays {
+			slog.Info("[ROLLOVER] ZSK rollover: completing", "domain", domain)
 			rollover.State = ZSKRolloverStateRetired
 
 			// Clear rollover state
 			zoneState.Rollover = nil
 			zoneState.ClearWarnings()
 
-			slog.Info("ZSK rollover completed automatically", "domain", domain)
+			slog.Info("[ROLLOVER] ZSK rollover completed automatically", "domain", domain)
 			return rm.state.Save()
 		}
 	}
@@ -243,4 +250,105 @@ func (rm *RolloverManager) GetRolloverStatus(domain string) *RolloverState {
 		return nil
 	}
 	return zoneState.Rollover
+}
+
+// StartAlgorithmRollover begins an algorithm rollover for a domain
+// This generates new KSK and ZSK with the target algorithm and signs with both
+func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string) error {
+	zoneState := rm.state.GetZone(domain)
+	if zoneState == nil {
+		return fmt.Errorf("zone %s not found", domain)
+	}
+
+	if zoneState.Rollover != nil {
+		return fmt.Errorf("rollover already in progress")
+	}
+
+	oldAlgorithm := zoneState.KSK.Algorithm
+	if oldAlgorithm == targetAlgorithm {
+		return fmt.Errorf("zone already using algorithm %s", targetAlgorithm)
+	}
+
+	slog.Info("[ROLLOVER] Starting algorithm rollover",
+		"domain", domain,
+		"old_algorithm", oldAlgorithm,
+		"new_algorithm", targetAlgorithm)
+
+	// Backup old keys
+	if err := rm.backupKey(domain, "ksk", zoneState.KSK.ID); err != nil {
+		slog.Warn("[ROLLOVER] Failed to backup old KSK", "error", err)
+	}
+	if err := rm.backupKey(domain, "zsk", zoneState.ZSK.ID); err != nil {
+		slog.Warn("[ROLLOVER] Failed to backup old ZSK", "error", err)
+	}
+
+	// Temporarily override algorithm for key generation
+	oldConfigAlgo := rm.cfg.DNSSEC.Algorithm
+	rm.cfg.DNSSEC.Algorithm = targetAlgorithm
+
+	// Generate new keys with target algorithm
+	keyGen := NewKeyGenerator(rm.cfg)
+	newKSK, err := keyGen.GenerateKSK(domain)
+	if err != nil {
+		rm.cfg.DNSSEC.Algorithm = oldConfigAlgo
+		return fmt.Errorf("generating new KSK: %w", err)
+	}
+	newZSK, err := keyGen.GenerateZSK(domain)
+	if err != nil {
+		rm.cfg.DNSSEC.Algorithm = oldConfigAlgo
+		return fmt.Errorf("generating new ZSK: %w", err)
+	}
+
+	rm.cfg.DNSSEC.Algorithm = oldConfigAlgo
+
+	// Set up rollover state
+	zoneState.Rollover = &RolloverState{
+		Type:         "algorithm",
+		State:        AlgoRolloverStateDSAddWait,
+		OldKeyID:     zoneState.KSK.ID,
+		NewKeyID:     newKSK.ID,
+		OldZSKID:     zoneState.ZSK.ID,
+		NewZSKID:     newZSK.ID,
+		OldAlgorithm: oldAlgorithm,
+		NewAlgorithm: targetAlgorithm,
+		Started:      time.Now().UTC(),
+		Action:       fmt.Sprintf("Publish new DS record (algorithm %s) at registrar, then run: dnssec-tudor rollover complete %s", targetAlgorithm, domain),
+	}
+
+	// Update keys to new algorithm (old keys are backed up and will be used during rollover)
+	zoneState.KSK = newKSK
+	zoneState.ZSK = newZSK
+
+	return rm.state.Save()
+}
+
+// CompleteAlgorithmRollover finalizes an algorithm rollover
+func (rm *RolloverManager) CompleteAlgorithmRollover(domain string) error {
+	zoneState := rm.state.GetZone(domain)
+	if zoneState == nil {
+		return fmt.Errorf("zone %s not found", domain)
+	}
+
+	if zoneState.Rollover == nil {
+		return fmt.Errorf("no rollover in progress")
+	}
+
+	if zoneState.Rollover.Type != "algorithm" {
+		return fmt.Errorf("current rollover is not algorithm type")
+	}
+
+	slog.Info("[ROLLOVER] Completing algorithm rollover",
+		"domain", domain,
+		"old_algorithm", zoneState.Rollover.OldAlgorithm,
+		"new_algorithm", zoneState.Rollover.NewAlgorithm)
+
+	// Clear rollover state
+	zoneState.Rollover = nil
+	zoneState.ClearWarnings()
+
+	slog.Info("[ROLLOVER] Algorithm rollover completed",
+		"domain", domain,
+		"note", "Old key files remain on disk for safety. You may delete them after removing the old DS from your registrar.")
+
+	return rm.state.Save()
 }

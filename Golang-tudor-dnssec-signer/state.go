@@ -40,12 +40,16 @@ type KeyState struct {
 
 // RolloverState represents an in-progress key rollover
 type RolloverState struct {
-	Type     string    `json:"type"`       // "ksk" or "zsk"
-	State    string    `json:"state"`      // State machine state
-	OldKeyID uint16    `json:"old_key_id"`
-	NewKeyID uint16    `json:"new_key_id"`
-	Started  time.Time `json:"started"`
-	Action   string    `json:"action"` // Human-readable next step
+	Type         string    `json:"type"`                    // "ksk", "zsk", or "algorithm"
+	State        string    `json:"state"`                   // State machine state
+	OldKeyID     uint16    `json:"old_key_id"`              // Old KSK ID (or only key for KSK/ZSK rollover)
+	NewKeyID     uint16    `json:"new_key_id"`              // New KSK ID
+	OldZSKID     uint16    `json:"old_zsk_id,omitempty"`    // Old ZSK ID (for algorithm rollover)
+	NewZSKID     uint16    `json:"new_zsk_id,omitempty"`    // New ZSK ID (for algorithm rollover)
+	OldAlgorithm string    `json:"old_algorithm,omitempty"` // For algorithm rollover
+	NewAlgorithm string    `json:"new_algorithm,omitempty"` // For algorithm rollover
+	Started      time.Time `json:"started"`
+	Action       string    `json:"action"`                  // Human-readable next step
 }
 
 // ZSK rollover states (automatic)
@@ -62,6 +66,12 @@ const (
 	KSKRolloverStateDSAddWait    = "ds_add_wait"    // Waiting for new DS at registrar
 	KSKRolloverStateDSRemoveWait = "ds_remove_wait" // Waiting for old DS removal
 	KSKRolloverStateComplete     = "complete"       // Rollover finished
+)
+
+// Algorithm rollover states (manual, requires DS update)
+const (
+	AlgoRolloverStateDSAddWait    = "algo_ds_add_wait"    // New algorithm keys published, waiting for DS
+	AlgoRolloverStateDSRemoveWait = "algo_ds_remove_wait" // Signing with new only, waiting for old DS removal
 )
 
 // NewState creates a new empty state

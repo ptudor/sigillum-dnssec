@@ -38,7 +38,7 @@ func NewDaemon(cfg *Config, state *State) *Daemon {
 
 // Run starts the daemon's main loop
 func (d *Daemon) Run() error {
-	slog.Info("Daemon starting")
+	slog.Info("[DAEMON] starting")
 
 	// Ensure directories exist
 	if err := d.ensureDirectories(); err != nil {
@@ -63,13 +63,13 @@ func (d *Daemon) Run() error {
 	<-d.ctx.Done()
 	d.wg.Wait()
 
-	slog.Info("Daemon stopped")
+	slog.Info("[DAEMON] stopped")
 	return nil
 }
 
 // Shutdown gracefully stops the daemon
 func (d *Daemon) Shutdown() {
-	slog.Info("Initiating graceful shutdown")
+	slog.Info("[DAEMON] Initiating graceful shutdown")
 	d.cancel()
 
 	d.mu.Lock()
@@ -90,7 +90,7 @@ func (d *Daemon) Reload(cfg *Config) {
 	d.signer = NewSigner(cfg, d.state)
 	d.rollover = NewRolloverManager(cfg, d.state)
 
-	slog.Info("Configuration reloaded", "zones", len(cfg.Zones))
+	slog.Info("[DAEMON] Configuration reloaded", "zones", len(cfg.Zones))
 }
 
 func (d *Daemon) ensureDirectories() error {
@@ -132,11 +132,11 @@ func (d *Daemon) signAllZones() {
 	cfg := d.cfg
 	d.mu.RUnlock()
 
-	slog.Debug("Checking zones for signing", "count", len(cfg.Zones))
+	slog.Debug("[DAEMON] Checking zones for signing", "count", len(cfg.Zones))
 
 	for domain := range cfg.Zones {
 		if err := d.checkAndSignZone(domain); err != nil {
-			slog.Error("Failed to sign zone", "domain", domain, "error", err)
+			slog.Error("[DAEMON] Failed to sign zone", "domain", domain, "error", err)
 		}
 	}
 
@@ -145,7 +145,7 @@ func (d *Daemon) signAllZones() {
 
 	// Save state
 	if err := d.state.Save(); err != nil {
-		slog.Error("Failed to save state", "error", err)
+		slog.Error("[DAEMON] Failed to save state", "error", err)
 	}
 }
 
@@ -163,7 +163,7 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 		return nil
 	}
 
-	slog.Info("Signing zone", "domain", domain, "reason", reason)
+	slog.Info("[DAEMON] Signing zone", "domain", domain, "reason", reason)
 
 	// Initialize zone state if new
 	if zoneState == nil {
@@ -214,7 +214,7 @@ func (d *Daemon) checkZSKRollovers() {
 
 		// Check if ZSK needs rollover
 		if err := d.rollover.CheckZSKRollover(domain); err != nil {
-			slog.Error("ZSK rollover check failed", "domain", domain, "error", err)
+			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
 		}
 	}
 }
@@ -226,10 +226,10 @@ func (d *Daemon) runWebServer() {
 	d.server = NewWebServer(d.cfg, d.state)
 	d.mu.Unlock()
 
-	slog.Info("Starting web server", "listen", d.cfg.Web.Listen)
+	slog.Info("[WEB] Starting server", "listen", d.cfg.Web.Listen)
 
 	if err := d.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("Web server error", "error", err)
+		slog.Error("[WEB] Server error", "error", err)
 	}
 }
 
@@ -252,8 +252,8 @@ func (d *Daemon) runHealthServer() {
 		server.Shutdown(ctx)
 	}()
 
-	slog.Debug("Starting health server", "listen", server.Addr)
+	slog.Debug("[WEB] Starting health server", "listen", server.Addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("Health server error", "error", err)
+		slog.Error("[WEB] Health server error", "error", err)
 	}
 }

@@ -19,7 +19,7 @@ func executeHook(cmd string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		slog.Debug("Executing post-sign hook", "command", cmd)
+		slog.Debug("[HOOK] Executing post-sign hook", "command", cmd)
 
 		command := exec.CommandContext(ctx, "sh", "-c", cmd)
 		command.Stdout = io.Discard
@@ -27,14 +27,14 @@ func executeHook(cmd string) {
 
 		if err := command.Run(); err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
-				slog.Error("Post-sign hook timed out", "command", cmd)
+				slog.Error("[HOOK] Post-sign hook timed out", "command", cmd)
 			} else {
-				slog.Error("Post-sign hook failed", "command", cmd, "error", err)
+				slog.Error("[HOOK] Post-sign hook failed", "command", cmd, "error", err)
 			}
 			return
 		}
 
-		slog.Debug("Post-sign hook completed successfully", "command", cmd)
+		slog.Debug("[HOOK] Post-sign hook completed successfully", "command", cmd)
 	}()
 }
 
@@ -47,7 +47,7 @@ func executeHookSync(cmd string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	slog.Debug("Executing hook synchronously", "command", cmd)
+	slog.Debug("[HOOK] Executing hook synchronously", "command", cmd)
 
 	command := exec.CommandContext(ctx, "sh", "-c", cmd)
 	command.Stdout = os.Stdout

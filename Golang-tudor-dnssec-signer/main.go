@@ -116,12 +116,19 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 
 	rolloverCompleteCmd := &cobra.Command{
 		Use:   "complete <domain>",
-		Short: "Finalize KSK rollover after DS update",
+		Short: "Finalize KSK or algorithm rollover after DS update",
 		Args:  cobra.ExactArgs(1),
 		RunE:  runRolloverComplete,
 	}
 
-	rolloverCmd.AddCommand(rolloverStartCmd, rolloverStatusCmd, rolloverCompleteCmd)
+	rolloverAlgorithmCmd := &cobra.Command{
+		Use:   "algorithm <domain> <new-algorithm>",
+		Short: "Start algorithm rollover (ED25519, ECDSAP256SHA256, ECDSAP384SHA384)",
+		Args:  cobra.ExactArgs(2),
+		RunE:  runRolloverAlgorithm,
+	}
+
+	rolloverCmd.AddCommand(rolloverStartCmd, rolloverStatusCmd, rolloverCompleteCmd, rolloverAlgorithmCmd)
 
 	// ds command
 	dsCmd := &cobra.Command{
@@ -205,7 +212,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		cfg.Web.Listen = webAddr
 	}
 
-	slog.Info("Starting dnssec-tudor daemon",
+	slog.Info("[DAEMON] Starting dnssec-tudor",
 		"version", Version,
 		"config", configPath,
 		"poll_interval", cfg.PollInterval.String(),
@@ -230,15 +237,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		case sig := <-sigCh:
 			switch sig {
 			case syscall.SIGHUP:
-				slog.Info("Received SIGHUP, reloading configuration")
+				slog.Info("[DAEMON] Received SIGHUP, reloading configuration")
 				newCfg, err := LoadConfig(configPath)
 				if err != nil {
-					slog.Error("Failed to reload config", "error", err)
+					slog.Error("[DAEMON] Failed to reload config", "error", err)
 					continue
 				}
 				daemon.Reload(newCfg)
 			case syscall.SIGINT, syscall.SIGTERM:
-				slog.Info("Received shutdown signal", "signal", sig)
+				slog.Info("[DAEMON] Received shutdown signal", "signal", sig)
 				daemon.Shutdown()
 				return nil
 			}
@@ -258,7 +265,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	slog.Info("Signing all zones", "count", len(cfg.Zones))
+	slog.Info("[CLI] Signing all zones", "count", len(cfg.Zones))
 
 	signer := NewSigner(cfg, state)
 	if err := signer.SignAll(); err != nil {
@@ -338,7 +345,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("domain %q is already managed", domain)
 	}
 
-	slog.Info("Adding domain", "domain", domain, "path", zonePath)
+	slog.Info("[CLI] Adding domain", "domain", domain, "path", zonePath)
 
 	// Generate keys
 	keyGen := NewKeyGenerator(cfg)
@@ -397,7 +404,7 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("domain %q is not managed", domain)
 	}
 
-	slog.Info("Removing domain from management", "domain", domain)
+	slog.Info("[CLI] Removing domain from management", "domain", domain)
 	state.RemoveZone(domain)
 
 	if err := state.Save(); err != nil {
@@ -426,7 +433,7 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("rollover already in progress for %s (state: %s)", domain, zoneState.Rollover.State)
 	}
 
-	slog.Info("Starting KSK rollover", "domain", domain)
+	slog.Info("[CLI] Starting KSK rollover", "domain", domain)
 
 	rollover := NewRolloverManager(cfg, state)
 	if err := rollover.StartKSKRollover(domain); err != nil {
@@ -485,7 +492,7 @@ func runRolloverStatus(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runRolloverComplete finalizes a KSK rollover
+// runRolloverComplete finalizes a KSK or algorithm rollover
 func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
@@ -503,18 +510,30 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no rollover in progress for %s", domain)
 	}
 
-	if zoneState.Rollover.Type != "ksk" {
-		return fmt.Errorf("rollover in progress is not a KSK rollover (type: %s)", zoneState.Rollover.Type)
+	rolloverMgr := NewRolloverManager(cfg, state)
+
+	switch zoneState.Rollover.Type {
+	case "ksk":
+		slog.Info("[CLI] Completing KSK rollover", "domain", domain)
+		if err := rolloverMgr.CompleteKSKRollover(domain); err != nil {
+			return fmt.Errorf("completing KSK rollover: %w", err)
+		}
+		fmt.Printf("KSK rollover completed for %s.\n", domain)
+		fmt.Println("You may now remove the OLD DS record from your registrar.")
+
+	case "algorithm":
+		slog.Info("[CLI] Completing algorithm rollover", "domain", domain)
+		if err := rolloverMgr.CompleteAlgorithmRollover(domain); err != nil {
+			return fmt.Errorf("completing algorithm rollover: %w", err)
+		}
+		fmt.Printf("Algorithm rollover completed for %s.\n", domain)
+		fmt.Println("You may now remove the OLD DS record (old algorithm) from your registrar.")
+
+	default:
+		return fmt.Errorf("cannot complete rollover type %q manually", zoneState.Rollover.Type)
 	}
 
-	slog.Info("Completing KSK rollover", "domain", domain)
-
-	rollover := NewRolloverManager(cfg, state)
-	if err := rollover.CompleteKSKRollover(domain); err != nil {
-		return fmt.Errorf("completing rollover: %w", err)
-	}
-
-	// Re-sign without old key
+	// Re-sign without old keys
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
 		return fmt.Errorf("signing zone: %w", err)
@@ -524,8 +543,67 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	fmt.Printf("KSK rollover completed for %s.\n", domain)
-	fmt.Println("You may now remove the OLD DS record from your registrar.")
+	return nil
+}
+
+// runRolloverAlgorithm starts an algorithm rollover
+func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
+	domain := args[0]
+	targetAlgorithm := args[1]
+
+	// Validate algorithm
+	validAlgorithms := map[string]bool{
+		"ED25519":         true,
+		"ECDSAP256SHA256": true,
+		"ECDSAP384SHA384": true,
+	}
+	if !validAlgorithms[targetAlgorithm] {
+		return fmt.Errorf("invalid algorithm %q (valid: ED25519, ECDSAP256SHA256, ECDSAP384SHA384)", targetAlgorithm)
+	}
+
+	cfg, state, err := loadConfigAndState()
+	if err != nil {
+		return err
+	}
+
+	zoneState := state.GetZone(domain)
+	if zoneState == nil {
+		return fmt.Errorf("domain %q is not managed", domain)
+	}
+
+	rolloverMgr := NewRolloverManager(cfg, state)
+	if err := rolloverMgr.StartAlgorithmRollover(domain, targetAlgorithm); err != nil {
+		return fmt.Errorf("starting algorithm rollover: %w", err)
+	}
+
+	// Re-sign with both algorithms
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone(domain); err != nil {
+		return fmt.Errorf("signing zone: %w", err)
+	}
+
+	if err := state.Save(); err != nil {
+		return fmt.Errorf("saving state: %w", err)
+	}
+
+	// Get new DS record
+	keyGen := NewKeyGenerator(cfg)
+	ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+	if err != nil {
+		return fmt.Errorf("loading new KSK: %w", err)
+	}
+
+	ds := ComputeDS(domain, ksk, 2) // SHA-256 digest
+
+	fmt.Printf("Algorithm rollover started for %s.\n", domain)
+	fmt.Printf("Old algorithm: %s\n", state.GetZone(domain).Rollover.OldAlgorithm)
+	fmt.Printf("New algorithm: %s\n\n", targetAlgorithm)
+	fmt.Println("Add the following DS record to your registrar:")
+	fmt.Println()
+	fmt.Println(ds.String())
+	fmt.Println()
+	fmt.Printf("After the new DS propagates, run: dnssec-tudor rollover complete %s\n", domain)
+
 	return nil
 }
 
@@ -580,14 +658,14 @@ func runDNSKEY(cmd *cobra.Command, args []string) error {
 	if zoneState.KSK != nil {
 		ksk, _, err = keyGen.LoadKeyPair(domain, "ksk")
 		if err != nil {
-			slog.Warn("Failed to load KSK", "error", err)
+			slog.Warn("[CLI] Failed to load KSK", "error", err)
 		}
 	}
 
 	if zoneState.ZSK != nil {
 		zsk, _, err = keyGen.LoadKeyPair(domain, "zsk")
 		if err != nil {
-			slog.Warn("Failed to load ZSK", "error", err)
+			slog.Warn("[CLI] Failed to load ZSK", "error", err)
 		}
 	}
 

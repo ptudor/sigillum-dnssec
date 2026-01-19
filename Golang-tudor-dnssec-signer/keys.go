@@ -36,7 +36,7 @@ func (kg *KeyGenerator) GenerateZSK(domain string) (*KeyState, error) {
 }
 
 func (kg *KeyGenerator) generateKey(domain string, isKSK bool) (*KeyState, error) {
-	algorithm := kg.cfg.DNSSEC.Algorithm
+	algorithm := kg.cfg.GetZoneAlgorithm(domain)
 
 	var lifetime time.Duration
 	var keyType string
@@ -51,7 +51,7 @@ func (kg *KeyGenerator) generateKey(domain string, isKSK bool) (*KeyState, error
 		flags = 256 // ZSK flag
 	}
 
-	slog.Info("Generating key", "domain", domain, "type", keyType, "algorithm", algorithm)
+	slog.Info("[KEY] Generating key", "domain", domain, "type", keyType, "algorithm", algorithm)
 
 	// Generate the key pair
 	dnskey, privateKey, err := generateDNSSECKey(domain, algorithm, flags)
@@ -159,7 +159,7 @@ func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 		return fmt.Errorf("writing private key file: %w", err)
 	}
 
-	slog.Debug("Saved key files", "domain", domain, "type", keyType, "key_tag", dnskey.KeyTag())
+	slog.Debug("[KEY] Saved key files", "domain", domain, "type", keyType, "key_tag", dnskey.KeyTag())
 	return nil
 }
 
