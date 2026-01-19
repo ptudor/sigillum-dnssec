@@ -16,6 +16,7 @@ func executeHook(cmd string) {
 	}
 
 	go func() {
+		startTime := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
@@ -26,6 +27,8 @@ func executeHook(cmd string) {
 		command.Stderr = io.Discard
 
 		if err := command.Run(); err != nil {
+			duration := time.Since(startTime).Seconds()
+			RecordHookExecution("post_sign", duration, false)
 			if ctx.Err() == context.DeadlineExceeded {
 				slog.Error("[HOOK] Post-sign hook timed out", "command", cmd)
 			} else {
@@ -34,7 +37,9 @@ func executeHook(cmd string) {
 			return
 		}
 
-		slog.Debug("[HOOK] Post-sign hook completed successfully", "command", cmd)
+		duration := time.Since(startTime).Seconds()
+		RecordHookExecution("post_sign", duration, true)
+		slog.Debug("[HOOK] Post-sign hook completed successfully", "command", cmd, "duration_ms", int64(duration*1000))
 	}()
 }
 

@@ -16,6 +16,7 @@ type Config struct {
 	PollInterval Duration              `toml:"poll_interval"`
 	DNSSEC       DNSSECConfig          `toml:"dnssec"`
 	Web          WebConfig             `toml:"web"`
+	Health       HealthConfig          `toml:"health"`
 	Zones        map[string]ZoneConfig `toml:"zones"`
 	Hooks        HooksConfig           `toml:"hooks"`
 }
@@ -39,6 +40,11 @@ type DNSSECConfig struct {
 type WebConfig struct {
 	Enabled bool   `toml:"enabled"`
 	Listen  string `toml:"listen"`
+}
+
+// HealthConfig holds health server settings
+type HealthConfig struct {
+	Listen string `toml:"listen"`
 }
 
 // ZoneConfig holds per-zone settings
@@ -151,6 +157,9 @@ func DefaultConfig() *Config {
 		Web: WebConfig{
 			Enabled: false,
 			Listen:  "127.0.0.1:8053",
+		},
+		Health: HealthConfig{
+			Listen: "127.0.0.1:8054",
 		},
 		Zones: make(map[string]ZoneConfig),
 		Hooks: HooksConfig{},
