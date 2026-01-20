@@ -361,6 +361,23 @@ dig DS example.com +short
 dnssec-tudor serve --config config.toml --log-level debug
 ```
 
+### Log Output Options
+
+By default, logs go to stderr. For production on FreeBSD/Linux, use syslog:
+
+```bash
+# Log to syslog (daemon facility)
+dnssec-tudor serve --config config.toml --log-output syslog
+
+# Log to a file
+dnssec-tudor serve --config config.toml --log-output /var/log/dnssec-tudor.log
+
+# Combine with JSON format for log aggregation
+dnssec-tudor serve --config config.toml --log-output syslog --log-format json
+```
+
+Environment variables are also supported: `LOG_OUTPUT`, `LOG_LEVEL`, `LOG_FORMAT`.
+
 ## Security Considerations
 
 - Private keys are stored with mode 0600

@@ -22,6 +22,7 @@ var (
 	configPath string
 	logLevel   string
 	logFormat  string
+	logOutput  string
 )
 
 func main() {
@@ -43,6 +44,7 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "/etc/dnssec-tudor/config.toml", "Path to config file")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", getEnvOrDefault("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", getEnvOrDefault("LOG_FORMAT", "text"), "Log format (text, json)")
+	rootCmd.PersistentFlags().StringVar(&logOutput, "log-output", getEnvOrDefault("LOG_OUTPUT", "stderr"), "Log output (stderr, syslog, or file path)")
 
 	// version command
 	versionCmd := &cobra.Command{
@@ -169,11 +171,41 @@ func setupLogging() {
 
 	opts := &slog.HandlerOptions{Level: level}
 	var handler slog.Handler
-	if logFormat == "json" {
-		handler = slog.NewJSONHandler(os.Stdout, opts)
-	} else {
-		handler = slog.NewTextHandler(os.Stdout, opts)
+
+	switch logOutput {
+	case "syslog":
+		if !syslogSupported() {
+			fmt.Fprintf(os.Stderr, "syslog not supported on this platform, falling back to stderr\n")
+			handler = slog.NewTextHandler(os.Stderr, opts)
+		} else {
+			var err error
+			handler, err = newSyslogHandler(level)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to connect to syslog: %v, falling back to stderr\n", err)
+				handler = slog.NewTextHandler(os.Stderr, opts)
+			}
+		}
+	case "stderr", "":
+		if logFormat == "json" {
+			handler = slog.NewJSONHandler(os.Stderr, opts)
+		} else {
+			handler = slog.NewTextHandler(os.Stderr, opts)
+		}
+	default:
+		// Treat as file path
+		f, err := os.OpenFile(logOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to open log file %s: %v, falling back to stderr\n", logOutput, err)
+			handler = slog.NewTextHandler(os.Stderr, opts)
+		} else {
+			if logFormat == "json" {
+				handler = slog.NewJSONHandler(f, opts)
+			} else {
+				handler = slog.NewTextHandler(f, opts)
+			}
+		}
 	}
+
 	slog.SetDefault(slog.New(handler))
 }
 
