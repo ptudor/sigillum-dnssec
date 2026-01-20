@@ -338,7 +338,8 @@ func runResign(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check domain is in config
-	if _, ok := cfg.Zones[domain]; !ok {
+	zoneCfg, ok := cfg.Zones[domain]
+	if !ok {
 		return fmt.Errorf("domain %q is not in config file", domain)
 	}
 
@@ -357,7 +358,13 @@ func runResign(cmd *cobra.Command, args []string) error {
 	// Execute post-sign hook if configured
 	if cfg.Hooks.PostSign != "" {
 		slog.Info("[CLI] Executing post-sign hook", "command", cfg.Hooks.PostSign)
-		executeHook(cfg.Hooks.PostSign)
+		hookEnv := &HookEnv{
+			Domain:     domain,
+			ZonePath:   zoneCfg.Path,
+			SignedPath: fmt.Sprintf("%s/%s.zone.signed", cfg.OutputDir, domain),
+			OutputDir:  cfg.OutputDir,
+		}
+		executeHook(cfg.Hooks.PostSign, hookEnv)
 	}
 
 	fmt.Printf("Zone %s re-signed successfully.\n", domain)

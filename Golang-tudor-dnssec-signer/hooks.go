@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -9,8 +10,16 @@ import (
 	"time"
 )
 
-// executeHook runs a post-sign hook command asynchronously
-func executeHook(cmd string) {
+// HookEnv contains environment variables passed to hooks
+type HookEnv struct {
+	Domain     string // The domain that was signed
+	ZonePath   string // Path to the unsigned zone file
+	SignedPath string // Path to the signed zone file
+	OutputDir  string // Output directory for signed zones
+}
+
+// executeHook runs a post-sign hook command asynchronously with environment variables
+func executeHook(cmd string, env *HookEnv) {
 	if cmd == "" {
 		return
 	}
@@ -20,26 +29,34 @@ func executeHook(cmd string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		slog.Debug("[HOOK] Executing post-sign hook", "command", cmd)
+		slog.Debug("[HOOK] Executing post-sign hook", "command", cmd, "domain", env.Domain)
 
 		command := exec.CommandContext(ctx, "sh", "-c", cmd)
 		command.Stdout = io.Discard
 		command.Stderr = io.Discard
 
+		// Set environment variables for the hook
+		command.Env = append(os.Environ(),
+			fmt.Sprintf("DNSSEC_DOMAIN=%s", env.Domain),
+			fmt.Sprintf("DNSSEC_ZONE_PATH=%s", env.ZonePath),
+			fmt.Sprintf("DNSSEC_SIGNED_PATH=%s", env.SignedPath),
+			fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", env.OutputDir),
+		)
+
 		if err := command.Run(); err != nil {
 			duration := time.Since(startTime).Seconds()
 			RecordHookExecution("post_sign", duration, false)
 			if ctx.Err() == context.DeadlineExceeded {
-				slog.Error("[HOOK] Post-sign hook timed out", "command", cmd)
+				slog.Error("[HOOK] Post-sign hook timed out", "command", cmd, "domain", env.Domain)
 			} else {
-				slog.Error("[HOOK] Post-sign hook failed", "command", cmd, "error", err)
+				slog.Error("[HOOK] Post-sign hook failed", "command", cmd, "domain", env.Domain, "error", err)
 			}
 			return
 		}
 
 		duration := time.Since(startTime).Seconds()
 		RecordHookExecution("post_sign", duration, true)
-		slog.Debug("[HOOK] Post-sign hook completed successfully", "command", cmd, "duration_ms", int64(duration*1000))
+		slog.Debug("[HOOK] Post-sign hook completed successfully", "command", cmd, "domain", env.Domain, "duration_ms", int64(duration*1000))
 	}()
 }
 
