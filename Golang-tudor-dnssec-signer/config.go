@@ -300,3 +300,28 @@ func (c *Config) KeysDir() string {
 func (c *Config) StatePath() string {
 	return c.DataDir + "/state.json"
 }
+
+// AddZoneToConfigFile appends a new zone entry to the config file
+// This preserves existing formatting and comments by appending rather than rewriting
+func AddZoneToConfigFile(configPath, domain, zonePath string) error {
+	// Open config file for appending
+	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("opening config file: %w", err)
+	}
+	defer f.Close()
+
+	// Append new zone section
+	zoneEntry := fmt.Sprintf("\n[zones.%q]\npath = %q\n", domain, zonePath)
+	if _, err := f.WriteString(zoneEntry); err != nil {
+		return fmt.Errorf("writing zone entry: %w", err)
+	}
+
+	return nil
+}
+
+// RemoveZoneFromConfig removes a zone from the in-memory config
+// Note: This does NOT modify the config file - that would require full rewriting
+func (c *Config) RemoveZoneFromConfig(domain string) {
+	delete(c.Zones, domain)
+}
