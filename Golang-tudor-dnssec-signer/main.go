@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
@@ -156,8 +157,32 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 		RunE:  runDNSKEY,
 	}
 
+	// import command
+	var importKSK, importZSK string
+	importCmd := &cobra.Command{
+		Use:   "import <domain> <zone-path>",
+		Short: "Import existing BIND-style DNSSEC keys",
+		Long: `Import existing BIND-style DNSSEC keys for a domain.
+
+Provide paths to the key files without the .key/.private extension.
+For example, if your keys are:
+  Kexample.com.+015+12345.key
+  Kexample.com.+015+12345.private
+
+Use: --ksk Kexample.com.+015+12345
+
+The command will read both .key and .private files, convert them to
+dnssec-tudor's format, and set up the zone for management.`,
+		Args: cobra.ExactArgs(2),
+		RunE: runImport,
+	}
+	importCmd.Flags().StringVar(&importKSK, "ksk", "", "Path to KSK key files (without .key/.private extension)")
+	importCmd.Flags().StringVar(&importZSK, "zsk", "", "Path to ZSK key files (without .key/.private extension)")
+	importCmd.MarkFlagRequired("ksk")
+	importCmd.MarkFlagRequired("zsk")
+
 	// Add all commands
-	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, resignCmd, statusCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd)
+	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, resignCmd, statusCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd, importCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -786,4 +811,155 @@ func runDNSKEY(cmd *cobra.Command, args []string) error {
 	dnskeyOutput := FormatDNSKEYRecordsFromKeys(domain, ksk, zsk)
 	fmt.Println(dnskeyOutput)
 	return nil
+}
+
+// runImport imports existing BIND-style keys
+func runImport(cmd *cobra.Command, args []string) error {
+	domain := args[0]
+	zonePath := args[1]
+	kskPath, _ := cmd.Flags().GetString("ksk")
+	zskPath, _ := cmd.Flags().GetString("zsk")
+
+	cfg, state, err := loadConfigAndState()
+	if err != nil {
+		return err
+	}
+
+	// Check zone file exists
+	if _, err := os.Stat(zonePath); os.IsNotExist(err) {
+		return fmt.Errorf("zone file does not exist: %s", zonePath)
+	}
+
+	// Validate zone file
+	if err := ValidateZoneFile(domain, zonePath); err != nil {
+		return fmt.Errorf("invalid zone file: %w", err)
+	}
+
+	// Check domain not already managed
+	if _, ok := cfg.Zones[domain]; ok {
+		return fmt.Errorf("domain %q is already in config file", domain)
+	}
+	if state.GetZone(domain) != nil {
+		return fmt.Errorf("domain %q is already managed (in state.json)", domain)
+	}
+
+	slog.Info("[CLI] Importing keys for domain", "domain", domain, "ksk", kskPath, "zsk", zskPath)
+
+	// Read and validate KSK
+	ksk, kskPriv, err := loadBindKeyPair(kskPath)
+	if err != nil {
+		return fmt.Errorf("loading KSK from %s: %w", kskPath, err)
+	}
+	if ksk.Flags != 257 {
+		return fmt.Errorf("KSK has wrong flags %d (expected 257 for KSK)", ksk.Flags)
+	}
+
+	// Read and validate ZSK
+	zsk, zskPriv, err := loadBindKeyPair(zskPath)
+	if err != nil {
+		return fmt.Errorf("loading ZSK from %s: %w", zskPath, err)
+	}
+	if zsk.Flags != 256 {
+		return fmt.Errorf("ZSK has wrong flags %d (expected 256 for ZSK)", zsk.Flags)
+	}
+
+	// Verify algorithms match (or warn if they don't)
+	if ksk.Algorithm != zsk.Algorithm {
+		slog.Warn("[CLI] KSK and ZSK have different algorithms",
+			"ksk_algorithm", AlgorithmName(ksk.Algorithm),
+			"zsk_algorithm", AlgorithmName(zsk.Algorithm))
+	}
+
+	// Save keys in our format
+	keyGen := NewKeyGenerator(cfg)
+	if err := keyGen.saveKeyFiles(domain, "ksk", ksk, kskPriv); err != nil {
+		return fmt.Errorf("saving KSK: %w", err)
+	}
+	if err := keyGen.saveKeyFiles(domain, "zsk", zsk, zskPriv); err != nil {
+		return fmt.Errorf("saving ZSK: %w", err)
+	}
+
+	// Create zone state
+	now := time.Now().UTC()
+	kskLifetime := cfg.GetZoneKSKLifetime(domain)
+	zskLifetime := cfg.GetZoneZSKLifetime(domain)
+
+	zoneState := &ZoneState{
+		Path: zonePath,
+		KSK: &KeyState{
+			ID:          ksk.KeyTag(),
+			Algorithm:   AlgorithmName(ksk.Algorithm),
+			Created:     now, // We don't know the original creation time
+			Expires:     now.Add(kskLifetime),
+			RolloverDue: now.Add(time.Duration(float64(kskLifetime) * 0.75)),
+		},
+		ZSK: &KeyState{
+			ID:          zsk.KeyTag(),
+			Algorithm:   AlgorithmName(zsk.Algorithm),
+			Created:     now,
+			Expires:     now.Add(zskLifetime),
+			RolloverDue: now.Add(time.Duration(float64(zskLifetime) * 0.75)),
+		},
+	}
+	state.SetZone(domain, zoneState)
+
+	// Add zone to config file
+	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+		return fmt.Errorf("adding zone to config file: %w", err)
+	}
+
+	// Add to in-memory config
+	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+
+	// Sign the zone
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone(domain); err != nil {
+		return fmt.Errorf("signing zone: %w", err)
+	}
+
+	// Save state
+	if err := state.Save(); err != nil {
+		return fmt.Errorf("saving state: %w", err)
+	}
+
+	fmt.Printf("\nDomain %s imported successfully.\n", domain)
+	fmt.Printf("  KSK: %d (%s)\n", ksk.KeyTag(), AlgorithmName(ksk.Algorithm))
+	fmt.Printf("  ZSK: %d (%s)\n", zsk.KeyTag(), AlgorithmName(zsk.Algorithm))
+	fmt.Printf("  Config updated: %s\n", configPath)
+	fmt.Printf("  Signed zone:    %s/%s.zone.signed\n\n", cfg.OutputDir, domain)
+	fmt.Println("DS record (verify this matches what's at your registrar):")
+	dsOutput := FormatDSRecordsFromKey(domain, ksk)
+	fmt.Println(dsOutput)
+
+	return nil
+}
+
+// loadBindKeyPair loads a BIND-style key pair from the given base path
+func loadBindKeyPair(basePath string) (*dns.DNSKEY, []byte, error) {
+	// Read public key
+	keyFile := basePath + ".key"
+	keyData, err := os.ReadFile(keyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading %s: %w", keyFile, err)
+	}
+
+	// Parse DNSKEY from file
+	dnskey, err := parseDNSKEYFromFile(string(keyData))
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing %s: %w", keyFile, err)
+	}
+
+	// Read private key
+	privFile := basePath + ".private"
+	privData, err := os.ReadFile(privFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading %s: %w", privFile, err)
+	}
+
+	privateKey, err := parsePrivateKeyFromFile(string(privData))
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing %s: %w", privFile, err)
+	}
+
+	return dnskey, privateKey, nil
 }
