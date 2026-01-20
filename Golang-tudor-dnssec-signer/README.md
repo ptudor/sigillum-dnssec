@@ -132,12 +132,41 @@ dnssec-tudor sign --config /etc/dnssec-tudor/config.toml
 ### Domain Management
 
 ```bash
-# Add a new domain
+# Add a new domain (generates fresh keys)
 dnssec-tudor add example.com /path/to/zone.db --config config.toml
+
+# Force re-sign a domain (bypasses change detection)
+dnssec-tudor resign example.com --config config.toml
 
 # Remove a domain (keys are NOT deleted)
 dnssec-tudor remove example.com --config config.toml
 ```
+
+### Migrating from BIND
+
+If you have existing BIND-style DNSSEC keys (from `dnssec-keygen` or similar), you can import them without changing your DS records at the registrar:
+
+```bash
+# Import existing keys
+dnssec-tudor import example.com /path/to/zone.db \
+  --ksk /path/to/Kexample.com.+015+12345 \
+  --zsk /path/to/Kexample.com.+015+67890 \
+  --config config.toml
+```
+
+The key paths are the base names without `.key`/`.private` extensions. For example, if your keys are:
+- `Kexample.com.+015+12345.key`
+- `Kexample.com.+015+12345.private`
+
+Use: `--ksk Kexample.com.+015+12345`
+
+The import command will:
+1. Read and validate the BIND-style key files
+2. Verify KSK (flag 257) and ZSK (flag 256)
+3. Convert to dnssec-tudor's format
+4. Add the zone to config.toml
+5. Sign the zone
+6. Display the DS record for verification against your registrar
 
 ### Key Information
 
