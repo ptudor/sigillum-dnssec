@@ -193,14 +193,30 @@ zone:
     zonefile: "/var/lib/dnssec-tudor/signed/example.com.zone.signed"
 ```
 
-The `post_sign` hook reloads NSD after signing:
+The `post_sign` hook reloads NSD after signing. Environment variables are available for per-zone operations:
 
 ```toml
 [hooks]
+# Reload only the signed zone (recommended)
+post_sign = "nsd-control reload $DNSSEC_DOMAIN"
+
+# Or reload all zones
 post_sign = "nsd-control reload"
-# or for systemd
+
+# For systemd-based systems
 post_sign = "systemctl reload nsd"
 ```
+
+### Hook Environment Variables
+
+The following environment variables are available in hooks:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `DNSSEC_DOMAIN` | Domain that was signed | `example.com` |
+| `DNSSEC_ZONE_PATH` | Path to unsigned zone file | `/etc/nsd/zones/example.com.zone` |
+| `DNSSEC_SIGNED_PATH` | Path to signed zone file | `/var/lib/dnssec-tudor/signed/example.com.zone.signed` |
+| `DNSSEC_OUTPUT_DIR` | Output directory | `/var/lib/dnssec-tudor/signed` |
 
 **Note:** Hooks have a 30-second timeout. If your hook needs longer (e.g., zone transfers to secondaries), consider having the hook trigger an async process instead.
 
@@ -216,7 +232,8 @@ zone "example.com" {
 
 ```toml
 [hooks]
-post_sign = "rndc reload"
+# Reload only the signed zone
+post_sign = "rndc reload $DNSSEC_DOMAIN"
 ```
 
 ## Status Output

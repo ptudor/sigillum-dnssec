@@ -253,7 +253,13 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 
 	// Execute post-sign hook
 	if cfg.Hooks.PostSign != "" {
-		executeHook(cfg.Hooks.PostSign)
+		hookEnv := &HookEnv{
+			Domain:     domain,
+			ZonePath:   zoneCfg.Path,
+			SignedPath: fmt.Sprintf("%s/%s.zone.signed", cfg.OutputDir, domain),
+			OutputDir:  cfg.OutputDir,
+		}
+		executeHook(cfg.Hooks.PostSign, hookEnv)
 	}
 
 	return nil
