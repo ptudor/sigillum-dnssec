@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -33,7 +35,10 @@ func executeHook(cmd string, env *HookEnv) {
 
 		command := exec.CommandContext(ctx, "sh", "-c", cmd)
 		command.Stdout = io.Discard
-		command.Stderr = io.Discard
+
+		// Capture stderr for error reporting
+		var stderrBuf bytes.Buffer
+		command.Stderr = &stderrBuf
 
 		// Set environment variables for the hook
 		command.Env = append(os.Environ(),
@@ -46,8 +51,11 @@ func executeHook(cmd string, env *HookEnv) {
 		if err := command.Run(); err != nil {
 			duration := time.Since(startTime).Seconds()
 			RecordHookExecution("post_sign", duration, false)
+			stderr := strings.TrimSpace(stderrBuf.String())
 			if ctx.Err() == context.DeadlineExceeded {
 				slog.Error("[HOOK] Post-sign hook timed out", "command", cmd, "domain", env.Domain)
+			} else if stderr != "" {
+				slog.Error("[HOOK] Post-sign hook failed", "command", cmd, "domain", env.Domain, "error", err, "stderr", stderr)
 			} else {
 				slog.Error("[HOOK] Post-sign hook failed", "command", cmd, "domain", env.Domain, "error", err)
 			}
