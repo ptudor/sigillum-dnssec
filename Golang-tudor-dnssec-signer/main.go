@@ -429,12 +429,26 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid zone file: %w", err)
 	}
 
-	// Check domain not already managed
+	// Check domain not already in config
+	if _, ok := cfg.Zones[domain]; ok {
+		return fmt.Errorf("domain %q is already in config file", domain)
+	}
+
+	// Check domain not already in state
 	if state.GetZone(domain) != nil {
-		return fmt.Errorf("domain %q is already managed", domain)
+		return fmt.Errorf("domain %q is already managed (in state.json)", domain)
 	}
 
 	slog.Info("[CLI] Adding domain", "domain", domain, "path", zonePath)
+
+	// Add zone to config file
+	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+		return fmt.Errorf("adding zone to config file: %w", err)
+	}
+	slog.Info("[CLI] Added zone to config file", "config", configPath)
+
+	// Add to in-memory config so signing works
+	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
 
 	// Generate keys
 	keyGen := NewKeyGenerator(cfg)
@@ -472,7 +486,9 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading KSK for DS: %w", err)
 	}
 
-	fmt.Printf("\nDomain %s added successfully.\n\n", domain)
+	fmt.Printf("\nDomain %s added successfully.\n", domain)
+	fmt.Printf("  Config updated: %s\n", configPath)
+	fmt.Printf("  Signed zone:    %s/%s.zone.signed\n\n", cfg.OutputDir, domain)
 	fmt.Println("Add the following DS record to your registrar:")
 	dsOutput := FormatDSRecordsFromKey(domain, kskKey)
 	fmt.Println(dsOutput)
@@ -500,7 +516,9 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	fmt.Printf("Domain %s removed from management.\nNote: Key files were NOT deleted.\n", domain)
+	fmt.Printf("Domain %s removed from management.\n", domain)
+	fmt.Printf("Note: Key files were NOT deleted.\n")
+	fmt.Printf("Note: You should manually remove the zone from config.toml.\n")
 	return nil
 }
 
