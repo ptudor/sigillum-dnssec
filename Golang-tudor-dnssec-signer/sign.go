@@ -260,8 +260,14 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 	// Check zone file modification time
 	info, err := os.Stat(zonePath)
 	if err != nil {
+		slog.Error("[SIGN] Cannot stat zone file", "domain", domain, "path", zonePath, "error", err)
 		return false, ""
 	}
+
+	slog.Debug("[SIGN] Checking zone mtime",
+		"domain", domain,
+		"file_mtime", info.ModTime().Format(time.RFC3339),
+		"last_signed", zoneState.LastSigned.Format(time.RFC3339))
 
 	if info.ModTime().After(zoneState.LastSigned) {
 		return true, "zone file modified"
@@ -269,8 +275,13 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 
 	// Check if serial changed
 	_, serial, err := s.parseZoneFile(domain, zonePath)
-	if err == nil && serial != zoneState.Serial {
+	if err != nil {
+		slog.Error("[SIGN] Failed to parse zone file for serial check", "domain", domain, "error", err)
+		// Still check signature expiry even if parse fails
+	} else if serial != zoneState.Serial {
 		return true, fmt.Sprintf("serial changed: %d -> %d", zoneState.Serial, serial)
+	} else {
+		slog.Debug("[SIGN] Serial unchanged", "domain", domain, "serial", serial)
 	}
 
 	// Check signature expiry
@@ -278,6 +289,11 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 	if time.Now().After(refreshTime) {
 		return true, "signatures approaching expiry"
 	}
+
+	slog.Debug("[SIGN] Signatures still valid",
+		"domain", domain,
+		"expires", zoneState.SignaturesExp.Format(time.RFC3339),
+		"refresh_at", refreshTime.Format(time.RFC3339))
 
 	// Check for active rollover
 	if zoneState.Rollover != nil {

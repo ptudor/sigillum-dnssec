@@ -215,6 +215,7 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 	zoneCfg := cfg.Zones[domain]
 	needsSign, reason := d.signer.NeedsSign(domain, zoneCfg.Path, zoneState)
 	if !needsSign {
+		slog.Debug("[DAEMON] Zone does not need signing", "domain", domain, "path", zoneCfg.Path)
 		return nil
 	}
 
