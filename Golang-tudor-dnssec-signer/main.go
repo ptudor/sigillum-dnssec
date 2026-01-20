@@ -71,6 +71,14 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 		RunE:  runSign,
 	}
 
+	// resign command (force re-sign a specific domain)
+	resignCmd := &cobra.Command{
+		Use:   "resign <domain>",
+		Short: "Force re-sign a specific domain (bypasses change detection)",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runResign,
+	}
+
 	// status command
 	var statusDomain string
 	statusCmd := &cobra.Command{
@@ -149,7 +157,7 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 	}
 
 	// Add all commands
-	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, statusCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd)
+	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, resignCmd, statusCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -310,6 +318,50 @@ func runSign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("generating status: %w", err)
 	}
 	fmt.Println(string(jsonData))
+
+	return nil
+}
+
+// runResign forces a re-sign of a specific domain
+func runResign(cmd *cobra.Command, args []string) error {
+	domain := args[0]
+
+	cfg, state, err := loadConfigAndState()
+	if err != nil {
+		return err
+	}
+
+	// Check domain is managed
+	zoneState := state.GetZone(domain)
+	if zoneState == nil {
+		return fmt.Errorf("domain %q is not managed (not in state.json)", domain)
+	}
+
+	// Check domain is in config
+	if _, ok := cfg.Zones[domain]; !ok {
+		return fmt.Errorf("domain %q is not in config file", domain)
+	}
+
+	slog.Info("[CLI] Force re-signing zone", "domain", domain)
+
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone(domain); err != nil {
+		return fmt.Errorf("signing failed: %w", err)
+	}
+
+	// Save state
+	if err := state.Save(); err != nil {
+		return fmt.Errorf("saving state: %w", err)
+	}
+
+	// Execute post-sign hook if configured
+	if cfg.Hooks.PostSign != "" {
+		slog.Info("[CLI] Executing post-sign hook", "command", cfg.Hooks.PostSign)
+		executeHook(cfg.Hooks.PostSign)
+	}
+
+	fmt.Printf("Zone %s re-signed successfully.\n", domain)
+	fmt.Printf("Signed zone written to: %s/%s.zone.signed\n", cfg.OutputDir, domain)
 
 	return nil
 }
