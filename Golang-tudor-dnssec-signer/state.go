@@ -102,6 +102,36 @@ func LoadState(path string) (*State, error) {
 	return state, nil
 }
 
+// ReloadFromDisk reloads the state from disk, merging any new zones added by CLI commands.
+// This preserves zones added by CLI while keeping daemon's in-memory updates for managed zones.
+func (s *State) ReloadFromDisk() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		// No state file yet, nothing to merge
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading state file: %w", err)
+	}
+
+	diskState := &State{Zones: make(map[string]*ZoneState)}
+	if err := json.Unmarshal(data, diskState); err != nil {
+		return fmt.Errorf("parsing state file: %w", err)
+	}
+
+	// Merge: add any zones from disk that we don't have in memory (CLI additions)
+	for domain, diskZone := range diskState.Zones {
+		if _, exists := s.Zones[domain]; !exists {
+			s.Zones[domain] = diskZone
+		}
+	}
+
+	return nil
+}
+
 // Save persists the state to disk
 func (s *State) Save() error {
 	s.mu.RLock()

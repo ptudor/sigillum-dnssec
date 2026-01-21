@@ -94,16 +94,17 @@ func (d *Daemon) Shutdown() {
 	d.mu.Unlock()
 }
 
-// Reload updates the daemon's configuration
-func (d *Daemon) Reload(cfg *Config) {
+// Reload updates the daemon's configuration and state
+func (d *Daemon) Reload(cfg *Config, state *State) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	d.cfg = cfg
-	d.signer = NewSigner(cfg, d.state)
-	d.rollover = NewRolloverManager(cfg, d.state)
+	d.state = state
+	d.signer = NewSigner(cfg, state)
+	d.rollover = NewRolloverManager(cfg, state)
 
-	slog.Info("[DAEMON] Configuration reloaded", "zones", len(cfg.Zones))
+	slog.Info("[DAEMON] Configuration and state reloaded", "zones", len(cfg.Zones))
 }
 
 func (d *Daemon) ensureDirectories() error {
@@ -183,6 +184,11 @@ func (d *Daemon) signAllZones() {
 	d.mu.RLock()
 	cfg := d.cfg
 	d.mu.RUnlock()
+
+	// Reload state from disk to pick up any zones added by CLI commands
+	if err := d.state.ReloadFromDisk(); err != nil {
+		slog.Warn("[DAEMON] Failed to reload state from disk", "error", err)
+	}
 
 	slog.Debug("[DAEMON] Checking zones for signing", "count", len(cfg.Zones))
 

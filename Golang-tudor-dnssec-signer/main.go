@@ -302,13 +302,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 		case sig := <-sigCh:
 			switch sig {
 			case syscall.SIGHUP:
-				slog.Info("[DAEMON] Received SIGHUP, reloading configuration")
+				slog.Info("[DAEMON] Received SIGHUP, reloading configuration and state")
 				newCfg, err := LoadConfig(configPath)
 				if err != nil {
 					slog.Error("[DAEMON] Failed to reload config", "error", err)
 					continue
 				}
-				daemon.Reload(newCfg)
+				newState, err := LoadState(newCfg.StatePath())
+				if err != nil {
+					slog.Error("[DAEMON] Failed to reload state", "error", err)
+					continue
+				}
+				daemon.Reload(newCfg, newState)
 			case syscall.SIGINT, syscall.SIGTERM:
 				slog.Info("[DAEMON] Received shutdown signal", "signal", sig)
 				daemon.Shutdown()
