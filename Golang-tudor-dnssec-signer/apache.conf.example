@@ -1,0 +1,27 @@
+# =============================================================================
+# DNSSEC Signer Dashboard - tudor-dnssec-signer
+# HTTP on 127.0.0.1:8053 (optional, internal only)
+#
+# Installation:
+#   1. Copy to /usr/local/etc/apache24/Includes/dnssec-signer.conf
+#   2. Ensure mod_proxy, mod_proxy_http, mod_proxy_balancer are loaded
+#   3. Restart Apache: service apache24 restart
+#
+# Note: The web UI is optional. Enable it by starting the daemon with --web :8053
+# This dashboard is for internal use only - shows key status, DS records, etc.
+# =============================================================================
+
+<Proxy "balancer://dnssec-backend">
+    BalancerMember "http://127.0.0.1:8053"
+    ProxySet lbmethod=byrequests
+</Proxy>
+
+# Web dashboard (GET only, internal)
+<Location "/dnssec-status/">
+    <LimitExcept GET HEAD>
+        Require all denied
+    </LimitExcept>
+    ProxyPass "balancer://dnssec-backend/"
+    ProxyPassReverse "balancer://dnssec-backend/"
+    Require ip 127.0.0.1 ::1
+</Location>
