@@ -63,14 +63,23 @@ type ChainLink struct {
 
 // ValidationResult represents the complete validation result
 type ValidationResult struct {
-	Domain      string           `json:"domain"`
-	QueryType   string           `json:"query_type"`
-	Result      ValidationStatus `json:"result"`
-	Chain       []ZoneResult     `json:"chain"`
-	DurationMs  int64            `json:"duration_ms"`
-	Timestamp   time.Time        `json:"timestamp"`
-	Errors      []string         `json:"errors,omitempty"`
-	Warnings    []string         `json:"warnings,omitempty"`
+	Domain       string            `json:"domain"`
+	QueryType    string            `json:"query_type"`
+	Result       ValidationStatus  `json:"result"`
+	Chain        []ZoneResult      `json:"chain"`
+	CNAMEChains  []CNAMEChainResult `json:"cname_chains,omitempty"` // CNAME targets validated
+	DurationMs   int64             `json:"duration_ms"`
+	Timestamp    time.Time         `json:"timestamp"`
+	Errors       []string          `json:"errors,omitempty"`
+	Warnings     []string          `json:"warnings,omitempty"`
+}
+
+// CNAMEChainResult represents validation of a CNAME target
+type CNAMEChainResult struct {
+	Source string           `json:"source"` // The name that has the CNAME
+	Target string           `json:"target"` // The CNAME target
+	Result ValidationStatus `json:"result"` // Validation result for target's chain
+	Chain  []ZoneResult     `json:"chain"`  // The target's zone chain
 }
 
 // SSEEvent represents a Server-Sent Event
@@ -118,11 +127,18 @@ type ErrorEvent struct {
 
 // CompleteEvent is sent when validation is complete
 type CompleteEvent struct {
-	Result     ValidationStatus `json:"result"`
-	Chain      []ZoneResult     `json:"chain"`
-	DurationMs int64            `json:"duration_ms"`
-	Errors     []string         `json:"errors,omitempty"`
-	Warnings   []string         `json:"warnings,omitempty"`
+	Result      ValidationStatus   `json:"result"`
+	Chain       []ZoneResult       `json:"chain"`
+	CNAMEChains []CNAMEChainResult `json:"cname_chains,omitempty"`
+	DurationMs  int64              `json:"duration_ms"`
+	Errors      []string           `json:"errors,omitempty"`
+	Warnings    []string           `json:"warnings,omitempty"`
+}
+
+// CNAMEEvent is sent when a CNAME is detected and being followed
+type CNAMEEvent struct {
+	Source string `json:"source"` // The name with the CNAME
+	Target string `json:"target"` // The CNAME target
 }
 
 // Disagreement represents a disagreement between nameservers

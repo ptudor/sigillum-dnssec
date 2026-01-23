@@ -56,26 +56,36 @@ func (v *Validator) emitEvent(eventType string, data interface{}) {
 
 // Validate performs DNSSEC validation for a domain
 func (v *Validator) Validate(ctx context.Context, domain string) (*ValidationResult, error) {
+	return v.ValidateWithDepth(ctx, domain, 0)
+}
+
+// ValidateWithDepth performs DNSSEC validation with CNAME recursion depth tracking
+func (v *Validator) ValidateWithDepth(ctx context.Context, domain string, depth int) (*ValidationResult, error) {
+	const maxCNAMEDepth = 10
+
 	start := time.Now()
 
 	// Create result
 	result := &ValidationResult{
-		Domain:    NormalizeDomain(domain),
-		QueryType: "A",
-		Result:    StatusValidating,
-		Chain:     make([]ZoneResult, 0),
-		Timestamp: start,
-		Errors:    make([]string, 0),
-		Warnings:  make([]string, 0),
+		Domain:      NormalizeDomain(domain),
+		QueryType:   "A",
+		Result:      StatusValidating,
+		Chain:       make([]ZoneResult, 0),
+		CNAMEChains: make([]CNAMEChainResult, 0),
+		Timestamp:   start,
+		Errors:      make([]string, 0),
+		Warnings:    make([]string, 0),
 	}
 
-	// Emit start event
-	v.emitEvent("start", StartEvent{
-		Domain:    result.Domain,
-		QueryType: result.QueryType,
-		Timestamp: start,
-		Mode:      "extended",
-	})
+	// Emit start event (only for top-level)
+	if depth == 0 {
+		v.emitEvent("start", StartEvent{
+			Domain:    result.Domain,
+			QueryType: result.QueryType,
+			Timestamp: start,
+			Mode:      "extended",
+		})
+	}
 
 	// Check anchors
 	if v.anchors == nil || len(v.anchors.Anchors) == 0 {
@@ -89,12 +99,22 @@ func (v *Validator) Validate(ctx context.Context, domain string) (*ValidationRes
 		return result, err
 	}
 
-	// Build zone hierarchy
-	zones := SplitIntoZoneHierarchy(domain)
-
 	// Create timeout context
 	ctx, cancel := context.WithTimeout(ctx, v.totalTimeout)
 	defer cancel()
+
+	// Discover actual zone cuts instead of assuming every label is a zone
+	v.emitEvent("progress", ProgressEvent{
+		Zone:   result.Domain,
+		Action: "discovering zone cuts",
+	})
+
+	zones, err := v.resolver.DiscoverZoneCuts(ctx, domain)
+	if err != nil {
+		// Fall back to simple hierarchy if zone cut discovery fails
+		zones = SplitIntoZoneHierarchy(domain)
+		result.Warnings = append(result.Warnings, fmt.Sprintf("zone cut discovery failed, using simple hierarchy: %v", err))
+	}
 
 	// Validate each zone in order
 	var lastStatus ValidationStatus = StatusSecure
@@ -145,11 +165,12 @@ func (v *Validator) Validate(ctx context.Context, domain string) (*ValidationRes
 			result.Result = StatusBogus
 			result.DurationMs = time.Since(start).Milliseconds()
 			v.emitEvent("complete", CompleteEvent{
-				Result:     result.Result,
-				Chain:      result.Chain,
-				DurationMs: result.DurationMs,
-				Errors:     result.Errors,
-				Warnings:   result.Warnings,
+				Result:      result.Result,
+				Chain:       result.Chain,
+				CNAMEChains: result.CNAMEChains,
+				DurationMs:  result.DurationMs,
+				Errors:      result.Errors,
+				Warnings:    result.Warnings,
 			})
 			return result, nil
 		case StatusInsecure:
@@ -163,19 +184,126 @@ func (v *Validator) Validate(ctx context.Context, domain string) (*ValidationRes
 		}
 	}
 
+	// Now check for CNAMEs at the target domain
+	if depth < maxCNAMEDepth {
+		cnameResult, err := v.checkAndFollowCNAME(ctx, domain, depth)
+		if err == nil && cnameResult != nil {
+			result.CNAMEChains = append(result.CNAMEChains, *cnameResult)
+
+			// If the CNAME target is not secure, the overall result is not secure
+			switch cnameResult.Result {
+			case StatusBogus:
+				lastStatus = StatusBogus
+				result.Errors = append(result.Errors, fmt.Sprintf("CNAME target %s is bogus", cnameResult.Target))
+			case StatusInsecure:
+				if lastStatus == StatusSecure {
+					lastStatus = StatusInsecure
+					result.Warnings = append(result.Warnings, fmt.Sprintf("CNAME target %s is insecure", cnameResult.Target))
+				}
+			case StatusIndeterminate:
+				if lastStatus == StatusSecure || lastStatus == StatusInsecure {
+					lastStatus = StatusIndeterminate
+					result.Warnings = append(result.Warnings, fmt.Sprintf("CNAME target %s is indeterminate", cnameResult.Target))
+				}
+			}
+		}
+	}
+
 	result.Result = lastStatus
 	result.DurationMs = time.Since(start).Milliseconds()
 
-	// Emit complete event
-	v.emitEvent("complete", CompleteEvent{
-		Result:     result.Result,
-		Chain:      result.Chain,
-		DurationMs: result.DurationMs,
-		Errors:     result.Errors,
-		Warnings:   result.Warnings,
-	})
+	// Emit complete event (only for top-level)
+	if depth == 0 {
+		v.emitEvent("complete", CompleteEvent{
+			Result:      result.Result,
+			Chain:       result.Chain,
+			CNAMEChains: result.CNAMEChains,
+			DurationMs:  result.DurationMs,
+			Errors:      result.Errors,
+			Warnings:    result.Warnings,
+		})
+	}
 
 	return result, nil
+}
+
+// checkAndFollowCNAME checks if the domain has a CNAME and validates the target
+func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, depth int) (*CNAMEChainResult, error) {
+	// First, find the authoritative zone for this domain
+	// The zone is the closest ancestor that has NS records
+	zones, err := v.resolver.DiscoverZoneCuts(ctx, domain)
+	if err != nil || len(zones) == 0 {
+		return nil, err
+	}
+
+	// The last zone in the list is the authoritative zone for this domain
+	authZone := zones[len(zones)-1]
+
+	// Get nameservers for the authoritative zone
+	nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, authZone)
+	if err != nil || len(nsRecords) == 0 {
+		return nil, fmt.Errorf("no nameservers for zone %s", authZone)
+	}
+
+	// Collect NS addresses
+	var nsAddresses []string
+	for _, ns := range nsRecords {
+		for _, addr := range ns.Addresses {
+			nsAddresses = append(nsAddresses, addr.String())
+		}
+	}
+
+	// Query A record from authoritative servers to check for CNAME
+	var queryResult *dnspkg.QueryResult
+	for _, addr := range nsAddresses {
+		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, dns.TypeA)
+		if err == nil && result.Error == "" {
+			queryResult = result
+			break
+		}
+	}
+
+	if queryResult == nil {
+		return nil, nil // Could not query authoritative servers
+	}
+
+	// Check for CNAME in the response
+	if len(queryResult.CNAME) == 0 {
+		return nil, nil // No CNAME, nothing to follow
+	}
+
+	// Found a CNAME
+	cname := queryResult.CNAME[0]
+	target := cname.Target
+
+	// Emit CNAME event
+	v.emitEvent("cname", CNAMEEvent{
+		Source: domain,
+		Target: target,
+	})
+
+	v.emitEvent("progress", ProgressEvent{
+		Zone:   target,
+		Action: "following CNAME (fresh validation from root)",
+	})
+
+	// Validate the CNAME target from scratch (fresh zone chain from root)
+	targetResult, err := v.ValidateWithDepth(ctx, target, depth+1)
+	if err != nil {
+		return &CNAMEChainResult{
+			Source: domain,
+			Target: target,
+			Result: StatusIndeterminate,
+			Chain:  nil,
+		}, nil
+	}
+
+	return &CNAMEChainResult{
+		Source: domain,
+		Target: target,
+		Result: targetResult.Result,
+		Chain:  targetResult.Chain,
+	}, nil
 }
 
 // validateZone validates a single zone

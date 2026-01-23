@@ -25,6 +25,11 @@ func NewQuerier(timeout time.Duration) *Querier {
 
 // Query performs a DNS query to the specified server
 func (q *Querier) Query(ctx context.Context, server, qname string, qtype uint16) (*QueryResult, error) {
+	return q.QueryWithRecursion(ctx, server, qname, qtype, false)
+}
+
+// QueryWithRecursion performs a DNS query with specified recursion setting
+func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, qtype uint16, recurse bool) (*QueryResult, error) {
 	result := &QueryResult{
 		Server: server,
 		IP:     server,
@@ -34,7 +39,7 @@ func (q *Querier) Query(ctx context.Context, server, qname string, qtype uint16)
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(qname), qtype)
 	msg.SetEdns0(4096, true) // Enable DNSSEC OK (DO) bit
-	msg.RecursionDesired = false // We want authoritative answers
+	msg.RecursionDesired = recurse
 
 	// Create client
 	client := &dns.Client{
@@ -168,6 +173,13 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 				Name: v.Ns,
 			}
 			result.NS = append(result.NS, ns)
+
+		case *dns.CNAME:
+			cname := CNAMERecord{
+				Name:   v.Hdr.Name,
+				Target: v.Target,
+			}
+			result.CNAME = append(result.CNAME, cname)
 		}
 	}
 }

@@ -86,6 +86,11 @@
             console.warn('Warning:', data.message);
         });
 
+        eventSource.addEventListener('cname', function(e) {
+            const data = JSON.parse(e.data);
+            addCNAMEIndicator(data.source, data.target);
+        });
+
         eventSource.addEventListener('error', function(e) {
             if (e.data) {
                 const data = JSON.parse(e.data);
@@ -332,11 +337,40 @@
         hideStatus();
 
         // Update badges
-        resultBadgesEl.innerHTML = '<span class="badge ' + data.result + '">' + data.result + '</span>';
+        var badgeHtml = '<span class="badge ' + data.result + '">' + data.result + '</span>';
+
+        // Add CNAME chain indicator if present
+        if (data.cname_chains && data.cname_chains.length > 0) {
+            data.cname_chains.forEach(function(chain) {
+                badgeHtml += '<span class="badge ' + chain.result + '">CNAME: ' + chain.result + '</span>';
+            });
+        }
+        resultBadgesEl.innerHTML = badgeHtml;
 
         // Update timing
         durationValueEl.textContent = data.duration_ms + 'ms';
-        zonesCountEl.textContent = data.chain ? data.chain.length : 0;
+
+        // Count zones including CNAME chains
+        var zoneCount = data.chain ? data.chain.length : 0;
+        if (data.cname_chains) {
+            data.cname_chains.forEach(function(chain) {
+                if (chain.chain) {
+                    zoneCount += chain.chain.length;
+                }
+            });
+        }
+        zonesCountEl.textContent = zoneCount;
+
+        // Add CNAME chain zones to visualization and tabs
+        if (data.cname_chains && data.cname_chains.length > 0) {
+            data.cname_chains.forEach(function(cnameChain) {
+                if (cnameChain.chain) {
+                    cnameChain.chain.forEach(function(zoneResult) {
+                        addZoneCard(zoneResult.zone, zoneResult.status, zoneResult);
+                    });
+                }
+            });
+        }
 
         // Update raw JSON
         rawJsonEl.textContent = JSON.stringify(data, null, 2);
@@ -378,6 +412,30 @@
         const div = document.createElement('div');
         div.textContent = str;
         return div.innerHTML;
+    }
+
+    // Add CNAME indicator to chain visualization
+    function addCNAMEIndicator(source, target) {
+        // Add arrow indicating CNAME
+        const arrow = document.createElement('span');
+        arrow.className = 'chain-arrow cname-arrow';
+        arrow.textContent = '\u2192 CNAME \u2192';
+        arrow.setAttribute('aria-label', 'CNAME redirect');
+        chainVisualizationEl.appendChild(arrow);
+
+        // Add card for CNAME target
+        const card = document.createElement('div');
+        card.className = 'zone-card cname-target';
+        card.setAttribute('role', 'button');
+        card.setAttribute('tabindex', '0');
+        card.setAttribute('aria-label', 'CNAME target ' + target);
+        card.dataset.zone = target;
+
+        const displayName = target.replace(/\.$/, '');
+        card.innerHTML = '<span class="zone-name">' + escapeHtml(displayName) + '</span>' +
+            '<span class="zone-status">CNAME</span>';
+
+        chainVisualizationEl.appendChild(card);
     }
 
     // Initialize on DOM ready

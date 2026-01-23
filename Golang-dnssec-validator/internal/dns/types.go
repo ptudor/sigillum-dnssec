@@ -71,23 +71,30 @@ type NSRecord struct {
 	Addresses []net.IP `json:"addresses,omitempty"`
 }
 
+// CNAMERecord represents a CNAME record
+type CNAMERecord struct {
+	Name   string `json:"name"`   // The alias name
+	Target string `json:"target"` // The canonical name
+}
+
 // QueryResult represents the result of a DNS query
 type QueryResult struct {
-	Server      string          `json:"server"`
-	IP          string          `json:"ip"`
-	RTT         time.Duration   `json:"rtt_ns"`
-	Truncated   bool            `json:"truncated,omitempty"`
-	Authoritative bool          `json:"authoritative,omitempty"`
-	RCode       int             `json:"rcode"`
-	RCodeName   string          `json:"rcode_name"`
-	Error       string          `json:"error,omitempty"`
-	DNSKEY      []DNSKEYRecord  `json:"dnskey,omitempty"`
-	DS          []DSRecord      `json:"ds,omitempty"`
-	RRSIG       []RRSIGRecord   `json:"rrsig,omitempty"`
-	NSEC        []NSECRecord    `json:"nsec,omitempty"`
-	NSEC3       []NSEC3Record   `json:"nsec3,omitempty"`
-	NS          []NSRecord      `json:"ns,omitempty"`
-	RawResponse []byte          `json:"raw_response,omitempty"`
+	Server        string         `json:"server"`
+	IP            string         `json:"ip"`
+	RTT           time.Duration  `json:"rtt_ns"`
+	Truncated     bool           `json:"truncated,omitempty"`
+	Authoritative bool           `json:"authoritative,omitempty"`
+	RCode         int            `json:"rcode"`
+	RCodeName     string         `json:"rcode_name"`
+	Error         string         `json:"error,omitempty"`
+	DNSKEY        []DNSKEYRecord `json:"dnskey,omitempty"`
+	DS            []DSRecord     `json:"ds,omitempty"`
+	RRSIG         []RRSIGRecord  `json:"rrsig,omitempty"`
+	NSEC          []NSECRecord   `json:"nsec,omitempty"`
+	NSEC3         []NSEC3Record  `json:"nsec3,omitempty"`
+	NS            []NSRecord     `json:"ns,omitempty"`
+	CNAME         []CNAMERecord  `json:"cname,omitempty"`
+	RawResponse   []byte         `json:"raw_response,omitempty"`
 }
 
 // RootAnchors represents the root trust anchor file structure
