@@ -356,6 +356,18 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 	if zone == "." {
 		// Use root servers
 		nsAddresses = dnspkg.GetRootServers()
+		// Create nameserver entries for root servers
+		nsResult := NameserverResult{
+			Name:      "root-servers",
+			Addresses: make([]AddressResult, 0, len(nsAddresses)),
+		}
+		for _, addr := range nsAddresses {
+			nsResult.Addresses = append(nsResult.Addresses, AddressResult{
+				IP:     addr,
+				Status: StatusValidating,
+			})
+		}
+		result.Nameservers = append(result.Nameservers, nsResult)
 	} else {
 		// Resolve NS for the zone
 		nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, zone)
@@ -384,18 +396,33 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		return nil, fmt.Errorf("no nameserver addresses found for %s", zone)
 	}
 
-	// Query DNSKEY from the first responding server
-	var dnskeyResult *dnspkg.QueryResult
-	for _, addr := range nsAddresses {
-		v.emitEvent("progress", ProgressEvent{
-			Zone:   zone,
-			Server: addr,
-			Action: "querying DNSKEY",
-		})
+	// Query DNSKEY from ALL nameservers in parallel
+	v.emitEvent("progress", ProgressEvent{
+		Zone:   zone,
+		Action: fmt.Sprintf("querying %d nameservers", len(nsAddresses)),
+	})
 
-		queryResult, err := v.resolver.QueryDNSKEYAuthoritative(ctx, addr, zone)
-		if err == nil && queryResult.Error == "" && queryResult.RCode == 0 {
-			dnskeyResult = queryResult
+	serverResults, disagreements := v.ValidateMultipleServers(ctx, zone, nsAddresses)
+	result.Disagreements = disagreements
+
+	// Update nameserver results with per-server status
+	serverResultMap := make(map[string]AddressResult)
+	for _, sr := range serverResults {
+		serverResultMap[sr.IP] = sr
+	}
+	for i, ns := range result.Nameservers {
+		for j, addr := range ns.Addresses {
+			if sr, ok := serverResultMap[addr.IP]; ok {
+				result.Nameservers[i].Addresses[j] = sr
+			}
+		}
+	}
+
+	// Find the first successful response
+	var dnskeyResult *dnspkg.QueryResult
+	for _, sr := range serverResults {
+		if sr.Response != nil && sr.Status == StatusSecure {
+			dnskeyResult = sr.Response
 			break
 		}
 	}
@@ -404,6 +431,13 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		result.Status = StatusIndeterminate
 		result.AddError("failed to query DNSKEY from any nameserver")
 		return result, nil
+	}
+
+	// Report disagreements as warnings
+	if len(disagreements) > 0 {
+		for _, d := range disagreements {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Nameserver %s: %s (expected %s, got %s)", d.IP, d.Issue, d.Expected, d.Got))
+		}
 	}
 
 	// Store DNSKEY records
