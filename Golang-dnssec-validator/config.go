@@ -39,7 +39,7 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		ListenAddr:       ":8080",
+		ListenAddr:       ":8791",
 		ShutdownTimeout:  30 * time.Second,
 		RootAnchorsPath:  "/etc/dnssec-validator/root-anchors.json",
 		RootAnchorsURL:   "https://internet.any53.com/dns/anchors/root-anchors.json",
