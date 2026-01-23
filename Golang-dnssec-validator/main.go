@@ -28,6 +28,7 @@ func main() {
 		LogError("main", err, "action", "setup_logging")
 		os.Exit(1)
 	}
+	defer CloseLogFile()
 
 	// Log startup
 	LogStartup(Version, BuildTime, config)

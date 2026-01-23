@@ -32,6 +32,7 @@ type Config struct {
 	// Logging
 	LogFormat string
 	LogLevel  string
+	LogFile   string // Path to log file (empty = stdout)
 
 	// Static files
 	StaticDir string
@@ -83,6 +84,7 @@ func LoadConfig() (*Config, error) {
 	// Logging
 	cfg.LogFormat = getEnv("LOG_FORMAT", cfg.LogFormat)
 	cfg.LogLevel = getEnv("LOG_LEVEL", cfg.LogLevel)
+	cfg.LogFile = getEnv("LOG_FILE", cfg.LogFile)
 
 	// Static files
 	cfg.StaticDir = getEnv("STATIC_DIR", cfg.StaticDir)

@@ -19,6 +19,9 @@ func GenerateRequestID() string {
 	return hex.EncodeToString(b)
 }
 
+// logFile holds the log file handle for cleanup
+var logFile *os.File
+
 // SetupLogging configures the global slog logger based on configuration
 func SetupLogging(cfg *Config) error {
 	level := parseLogLevel(cfg.LogLevel)
@@ -27,16 +30,34 @@ func SetupLogging(cfg *Config) error {
 		Level: level,
 	}
 
+	// Determine output destination
+	output := os.Stdout
+	if cfg.LogFile != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open log file %s: %w", cfg.LogFile, err)
+		}
+		logFile = f
+		output = f
+	}
+
 	var handler slog.Handler
 	switch strings.ToLower(cfg.LogFormat) {
 	case "json":
-		handler = slog.NewJSONHandler(os.Stdout, opts)
+		handler = slog.NewJSONHandler(output, opts)
 	default:
-		handler = slog.NewTextHandler(os.Stdout, opts)
+		handler = slog.NewTextHandler(output, opts)
 	}
 
 	slog.SetDefault(slog.New(handler))
 	return nil
+}
+
+// CloseLogFile closes the log file if one was opened
+func CloseLogFile() {
+	if logFile != nil {
+		logFile.Close()
+	}
 }
 
 func parseLogLevel(level string) slog.Level {
