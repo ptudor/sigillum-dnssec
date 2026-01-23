@@ -40,7 +40,8 @@ func main() {
 		anchors := anchorsStore.Get()
 		LogInfo("main", "loaded root trust anchors",
 			"count", len(anchors.Anchors),
-			"source", anchors.Source,
+			"loaded_from", anchors.LoadedFrom,
+			"data_source", anchors.Source,
 		)
 	}
 

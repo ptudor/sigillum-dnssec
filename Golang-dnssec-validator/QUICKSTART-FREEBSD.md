@@ -9,10 +9,11 @@ cd /path/to/Golang-dnssec-validator
 make build-freebsd
 ```
 
-## 2. Install Binary
+## 2. Install Binary and Wrapper
 
 ```sh
 install -m 755 dnssec-validator /usr/local/sbin/
+install -m 755 freebsd/dnssec-validator.sh /usr/local/sbin/
 ```
 
 ## 3. Create Environment File
@@ -99,6 +100,7 @@ open https://www.any53.com/dnssec/
 | File | Destination |
 |------|-------------|
 | `dnssec-validator` | `/usr/local/sbin/dnssec-validator` |
+| `freebsd/dnssec-validator.sh` | `/usr/local/sbin/dnssec-validator.sh` |
 | `freebsd/dnssec_validator` | `/usr/local/etc/rc.d/dnssec_validator` |
 | `freebsd/apache-dnssec-validator.conf` | `/usr/local/etc/apache24/Includes/dnssec-validator.conf` |
 | `.env` | `/usr/local/etc/tudordns/dnssec-validator.env` |
