@@ -140,19 +140,8 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 
 		// Check if this zone was already validated (e.g., from main chain when following CNAME)
 		if cachedResult, ok := validatedZones[zone]; ok {
-			// Reuse cached result
-			v.emitEvent("progress", ProgressEvent{
-				Zone:   zone,
-				Action: "reusing cached validation",
-			})
+			// Reuse cached result - add to chain but don't emit duplicate zone event
 			result.Chain = append(result.Chain, *cachedResult)
-
-			// Emit zone event for cached result
-			v.emitEvent("zone", ZoneEvent{
-				Zone:       zone,
-				Status:     cachedResult.Status,
-				ZoneResult: cachedResult,
-			})
 
 			// Track overall status from cached result
 			switch cachedResult.Status {
