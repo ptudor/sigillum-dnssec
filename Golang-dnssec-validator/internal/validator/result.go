@@ -19,19 +19,19 @@ const (
 
 // ZoneResult represents the validation result for a single zone
 type ZoneResult struct {
-	Zone         string              `json:"zone"`
-	Status       ValidationStatus    `json:"status"`
-	Nameservers  []NameserverResult  `json:"nameservers"`
-	DNSKEY       []dns.DNSKEYRecord  `json:"dnskey,omitempty"`
-	DS           []dns.DSRecord      `json:"ds,omitempty"`
-	RRSIG        []dns.RRSIGRecord   `json:"rrsig,omitempty"`
-	NSEC         []dns.NSECRecord    `json:"nsec,omitempty"`
-	NSEC3        []dns.NSEC3Record   `json:"nsec3,omitempty"`
-	ChainLink    *ChainLink          `json:"chain_link,omitempty"`
-	Warnings     []string            `json:"warnings,omitempty"`
-	Errors       []string            `json:"errors,omitempty"`
-	QueryTimeNs  int64               `json:"query_time_ns"`
-	Timestamp    time.Time           `json:"timestamp"`
+	Zone        string             `json:"zone"`
+	Status      ValidationStatus   `json:"status"`
+	Nameservers []NameserverResult `json:"nameservers"`
+	DNSKEY      []dns.DNSKEYRecord `json:"dnskey,omitempty"`
+	DS          []dns.DSRecord     `json:"ds,omitempty"`
+	RRSIG       []dns.RRSIGRecord  `json:"rrsig,omitempty"`
+	NSEC        []dns.NSECRecord   `json:"nsec,omitempty"`
+	NSEC3       []dns.NSEC3Record  `json:"nsec3,omitempty"`
+	ChainLink   *ChainLink         `json:"chain_link,omitempty"`
+	Warnings    []string           `json:"warnings,omitempty"`
+	Errors      []string           `json:"errors,omitempty"`
+	QueryTimeNs int64              `json:"query_time_ns"`
+	Timestamp   time.Time          `json:"timestamp"`
 }
 
 // NameserverResult represents the result from a single nameserver
@@ -42,36 +42,36 @@ type NameserverResult struct {
 
 // AddressResult represents the result from a single IP address
 type AddressResult struct {
-	IP       string             `json:"ip"`
-	Status   ValidationStatus   `json:"status"`
-	RTTNs    int64              `json:"rtt_ns"`
-	Error    string             `json:"error,omitempty"`
-	Response *dns.QueryResult   `json:"response,omitempty"`
+	IP       string           `json:"ip"`
+	Status   ValidationStatus `json:"status"`
+	RTTNs    int64            `json:"rtt_ns"`
+	Error    string           `json:"error,omitempty"`
+	Response *dns.QueryResult `json:"response,omitempty"`
 }
 
 // ChainLink represents the chain of trust link between parent and child zones
 type ChainLink struct {
-	ParentZone   string           `json:"parent_zone"`
-	ChildZone    string           `json:"child_zone"`
-	ParentDS     []dns.DSRecord   `json:"parent_ds,omitempty"`
+	ParentZone   string            `json:"parent_zone"`
+	ChildZone    string            `json:"child_zone"`
+	ParentDS     []dns.DSRecord    `json:"parent_ds,omitempty"`
 	ChildKSK     *dns.DNSKEYRecord `json:"child_ksk,omitempty"`
-	DSMatchesKSK bool             `json:"ds_matches_ksk"`
-	Algorithm    string           `json:"algorithm"`
-	DigestType   string           `json:"digest_type"`
-	KeyTag       uint16           `json:"key_tag"`
+	DSMatchesKSK bool              `json:"ds_matches_ksk"`
+	Algorithm    string            `json:"algorithm"`
+	DigestType   string            `json:"digest_type"`
+	KeyTag       uint16            `json:"key_tag"`
 }
 
 // ValidationResult represents the complete validation result
 type ValidationResult struct {
-	Domain       string            `json:"domain"`
-	QueryType    string            `json:"query_type"`
-	Result       ValidationStatus  `json:"result"`
-	Chain        []ZoneResult      `json:"chain"`
-	CNAMEChains  []CNAMEChainResult `json:"cname_chains,omitempty"` // CNAME targets validated
-	DurationMs   int64             `json:"duration_ms"`
-	Timestamp    time.Time         `json:"timestamp"`
-	Errors       []string          `json:"errors,omitempty"`
-	Warnings     []string          `json:"warnings,omitempty"`
+	Domain      string             `json:"domain"`
+	QueryType   string             `json:"query_type"`
+	Result      ValidationStatus   `json:"result"`
+	Chain       []ZoneResult       `json:"chain"`
+	CNAMEChains []CNAMEChainResult `json:"cname_chains,omitempty"` // CNAME targets validated
+	DurationMs  int64              `json:"duration_ms"`
+	Timestamp   time.Time          `json:"timestamp"`
+	Errors      []string           `json:"errors,omitempty"`
+	Warnings    []string           `json:"warnings,omitempty"`
 }
 
 // CNAMEChainResult represents validation of a CNAME target
@@ -105,10 +105,10 @@ type ZoneEvent struct {
 
 // ProgressEvent is sent during validation to show progress
 type ProgressEvent struct {
-	Zone    string `json:"zone"`
-	Server  string `json:"server"`
-	IP      string `json:"ip,omitempty"`
-	Action  string `json:"action"` // querying, validating, etc.
+	Zone   string `json:"zone"`
+	Server string `json:"server"`
+	IP     string `json:"ip,omitempty"`
+	Action string `json:"action"` // querying, validating, etc.
 }
 
 // WarningEvent is sent for non-fatal issues

@@ -9,11 +9,11 @@ import (
 
 // AnchorsStore manages the root trust anchors with thread-safe access
 type AnchorsStore struct {
-	mu        sync.RWMutex
-	anchors   *dns.RootAnchors
-	loadedAt  time.Time
-	path      string
-	url       string
+	mu       sync.RWMutex
+	anchors  *dns.RootAnchors
+	loadedAt time.Time
+	path     string
+	url      string
 }
 
 // NewAnchorsStore creates a new anchors store

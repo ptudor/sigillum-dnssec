@@ -27,12 +27,22 @@ func NewHandlers(anchorsStore *AnchorsStore, config *Config) *Handlers {
 // HandleValidateSSE handles SSE validation requests
 func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
+	statusCode := "200" // Track actual status for metrics
+	requestID := GenerateRequestID()
+
+	// Set request ID header for tracing
+	w.Header().Set("X-Request-ID", requestID)
+
 	defer func() {
-		RecordAPIRequest("/validate", r.Method, "200", time.Since(startTime).Seconds())
+		RecordAPIRequest("/validate", r.Method, statusCode, time.Since(startTime).Seconds())
 	}()
+
+	// Log incoming request
+	LogRequest(requestID, r.Method, r.URL.Path, extractClientIP(r))
 
 	// Only GET requests
 	if r.Method != http.MethodGet {
+		statusCode = "405"
 		writeProblemDetails(w, ErrTypeMethodNotAllowed, "Method Not Allowed",
 			http.StatusMethodNotAllowed, "only GET method is supported", r.URL.Path)
 		return
@@ -41,6 +51,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	// Get domain parameter
 	domain := r.URL.Query().Get("domain")
 	if domain == "" {
+		statusCode = "400"
 		writeProblemDetails(w, ErrTypeInvalidDomain, "Invalid Domain",
 			http.StatusBadRequest, "domain parameter is required", r.URL.Path)
 		return
@@ -49,6 +60,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	// Validate domain format
 	domain = strings.TrimSpace(domain)
 	if !isValidDomain(domain) {
+		statusCode = "400"
 		writeProblemDetails(w, ErrTypeInvalidDomain, "Invalid Domain",
 			http.StatusBadRequest, "invalid domain name format", r.URL.Path)
 		return
@@ -63,6 +75,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	// Create SSE writer
 	sse, err := NewSSEWriter(w)
 	if err != nil {
+		statusCode = "500"
 		writeProblemDetails(w, ErrTypeInternalServerError, "Internal Server Error",
 			http.StatusInternalServerError, "streaming not supported", r.URL.Path)
 		return
@@ -77,6 +90,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	// Get anchors
 	anchors := h.anchorsStore.Get()
 	if anchors == nil || len(anchors.Anchors) == 0 {
+		statusCode = "503"
 		sse.WriteEvent("error", validator.ErrorEvent{
 			Message: "root trust anchors not available",
 			Fatal:   true,
@@ -90,6 +104,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		h.config.TotalTimeout,
 		h.config.MaxConcurrent,
 		anchors,
+		h.config.RecursiveResolver,
 	)
 
 	// Set up event callback
@@ -104,6 +119,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	// Run validation
 	result, err := v.Validate(ctx, domain)
 	if err != nil && result == nil {
+		statusCode = "500"
 		sse.WriteEvent("error", validator.ErrorEvent{
 			Message: err.Error(),
 			Fatal:   true,
@@ -113,12 +129,19 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Record metrics
 	RecordValidation(string(result.Result), float64(result.DurationMs)/1000.0)
-	LogValidation(domain, string(result.Result), result.DurationMs)
+	LogValidation(requestID, domain, string(result.Result), result.DurationMs)
 }
 
 // HandleValidateJSON handles JSON validation requests
 func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
+	requestID := GenerateRequestID()
+
+	// Set request ID header for tracing
+	w.Header().Set("X-Request-ID", requestID)
+
+	// Log incoming request
+	LogRequest(requestID, r.Method, r.URL.Path, extractClientIP(r))
 
 	// Only GET requests
 	if r.Method != http.MethodGet {
@@ -161,6 +184,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		h.config.TotalTimeout,
 		h.config.MaxConcurrent,
 		anchors,
+		h.config.RecursiveResolver,
 	)
 
 	// Create context with timeout
@@ -178,7 +202,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 
 	// Record metrics
 	RecordValidation(string(result.Result), float64(result.DurationMs)/1000.0)
-	LogValidation(domain, string(result.Result), result.DurationMs)
+	LogValidation(requestID, domain, string(result.Result), result.DurationMs)
 
 	// Write JSON response
 	setSecurityHeaders(w)

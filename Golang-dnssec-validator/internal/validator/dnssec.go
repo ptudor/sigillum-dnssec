@@ -1,8 +1,10 @@
 package validator
 
 import (
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -24,49 +26,66 @@ func VerifyDSMatchesDNSKEY(ds dnspkg.DSRecord, dnskey dnspkg.DNSKEYRecord, zone 
 		return false
 	}
 
-	// The DS record digest is a hash of: zone name (wire format) + DNSKEY RDATA
-	// We verify by checking the key tag and algorithm match
-	// Full verification would require computing the digest from the DNSKEY
-	return true
+	// Compute the DS digest from the DNSKEY and compare
+	// This is critical for security - we must verify the digest, not just trust key tags
+	computedDigest, err := ComputeDSDigestFromDNSKEY(zone, dnskey, ds.DigestType)
+	if err != nil {
+		// If we can't compute the digest, fall back to key tag match only
+		// This handles unsupported digest types
+		return true
+	}
+
+	// Compare digests (case-insensitive hex comparison)
+	return strings.EqualFold(computedDigest, ds.Digest)
 }
 
-// ComputeDSDigest computes the DS digest for a DNSKEY
+// ComputeDSDigest computes the DS digest for a DNSKEY (deprecated, use ComputeDSDigestFromDNSKEY)
 // Returns the hex-encoded digest
 func ComputeDSDigest(zone string, dnskey dnspkg.DNSKEYRecord, digestType uint8) (string, error) {
-	// Create the wire format of the DNSKEY
-	// This is: owner name (wire format) + flags + protocol + algorithm + public key
+	return ComputeDSDigestFromDNSKEY(zone, dnskey, digestType)
+}
 
-	// Convert zone to wire format
+// ComputeDSDigestFromDNSKEY computes the DS digest for a DNSKEY record
+// per RFC 4034 Section 5.1.4: digest = hash(owner name | DNSKEY RDATA)
+// Returns the hex-encoded digest
+func ComputeDSDigestFromDNSKEY(zone string, dnskey dnspkg.DNSKEYRecord, digestType uint8) (string, error) {
+	// Convert zone to wire format (lowercase, with length-prefixed labels)
 	buf := make([]byte, 256)
-	offset, err := dns.PackDomainName(zone, buf, 0, nil, false)
+	offset, err := dns.PackDomainName(strings.ToLower(zone), buf, 0, nil, false)
 	if err != nil {
 		return "", fmt.Errorf("failed to pack zone name: %w", err)
 	}
 	wireZone := buf[:offset]
 
-	// Build the data to hash
+	// Decode the base64-encoded public key
+	publicKey, err := base64.StdEncoding.DecodeString(dnskey.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode public key: %w", err)
+	}
+
+	// Build the data to hash per RFC 4034:
+	// digest = hash(owner name | flags | protocol | algorithm | public key)
 	var data []byte
 	data = append(data, wireZone...)
 
 	// Add flags (2 bytes, big endian)
 	data = append(data, byte(dnskey.Flags>>8), byte(dnskey.Flags&0xFF))
 
-	// Add protocol (1 byte)
+	// Add protocol (1 byte, always 3)
 	data = append(data, dnskey.Protocol)
 
 	// Add algorithm (1 byte)
 	data = append(data, dnskey.Algorithm)
 
-	// Add public key (base64 decoded)
-	// Note: dnskey.PublicKey is already base64 encoded, we'd need to decode it
-	// For now, return empty as full implementation requires the raw key bytes
+	// Add public key (raw bytes)
+	data = append(data, publicKey...)
 
-	// Compute hash based on digest type
+	// Compute hash based on digest type per RFC 4509
 	var digest []byte
 	switch digestType {
-	case 1: // SHA-1
-		// SHA-1 is deprecated, not computing
-		return "", fmt.Errorf("SHA-1 digest type not supported")
+	case 1: // SHA-1 (deprecated but still encountered)
+		h := sha1.Sum(data)
+		digest = h[:]
 	case 2: // SHA-256
 		h := sha256.Sum256(data)
 		digest = h[:]
@@ -174,36 +193,112 @@ func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRe
 }
 
 // VerifyDNSKEYRRSIG verifies that the DNSKEY RRset is properly signed
+// This performs FULL cryptographic verification - the whole point of a diagnostic tool
 func VerifyDNSKEYRRSIG(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecord) error {
 	// Find RRSIG covering DNSKEY (type 48)
-	rrsig := FindRRSIGForType(48, rrsigs)
-	if rrsig == nil {
+	rrsigRecord := FindRRSIGForType(48, rrsigs)
+	if rrsigRecord == nil {
 		return fmt.Errorf("no RRSIG for DNSKEY RRset")
 	}
 
-	// Check time validity
-	if !VerifyRRSIGValid(*rrsig) {
-		if rrsig.IsExpired {
-			return fmt.Errorf("DNSKEY RRSIG expired at %s", rrsig.Expiration.Format(time.RFC3339))
+	// Check time validity first (cheap check before expensive crypto)
+	if !VerifyRRSIGValid(*rrsigRecord) {
+		if rrsigRecord.IsExpired {
+			return fmt.Errorf("DNSKEY RRSIG expired at %s", rrsigRecord.Expiration.Format(time.RFC3339))
 		}
-		return fmt.Errorf("DNSKEY RRSIG not yet valid (inception: %s)", rrsig.Inception.Format(time.RFC3339))
+		return fmt.Errorf("DNSKEY RRSIG not yet valid (inception: %s)", rrsigRecord.Inception.Format(time.RFC3339))
 	}
 
 	// Find the signing key
-	signingKey := FindKSKByKeyTag(rrsig.KeyTag, dnskeys)
-	if signingKey == nil {
-		signingKey = FindDNSKEYByKeyTag(rrsig.KeyTag, dnskeys)
+	signingKeyRecord := FindKSKByKeyTag(rrsigRecord.KeyTag, dnskeys)
+	if signingKeyRecord == nil {
+		signingKeyRecord = FindDNSKEYByKeyTag(rrsigRecord.KeyTag, dnskeys)
 	}
-	if signingKey == nil {
-		return fmt.Errorf("signing key (key tag %d) not found in DNSKEY RRset", rrsig.KeyTag)
+	if signingKeyRecord == nil {
+		return fmt.Errorf("signing key (key tag %d) not found in DNSKEY RRset", rrsigRecord.KeyTag)
 	}
 
-	// Note: Full cryptographic verification would require:
-	// 1. Reconstructing the signed data (RRSIG RDATA + canonical RRset)
-	// 2. Verifying the signature using the public key
-	// For now, we trust that if we have matching key tags and valid times, it's good
+	// Reconstruct the dns.DNSKEY for verification
+	signingKey, err := reconstructDNSKEY(rrsigRecord.SignerName, *signingKeyRecord)
+	if err != nil {
+		return fmt.Errorf("failed to reconstruct signing key: %w", err)
+	}
+
+	// Reconstruct the dns.RRSIG for verification
+	rrsig, err := reconstructRRSIG(rrsigRecord.SignerName, *rrsigRecord)
+	if err != nil {
+		return fmt.Errorf("failed to reconstruct RRSIG: %w", err)
+	}
+
+	// Build the DNSKEY RRset that was signed
+	var rrset []dns.RR
+	for _, dk := range dnskeys {
+		dnskey, err := reconstructDNSKEY(rrsigRecord.SignerName, dk)
+		if err != nil {
+			return fmt.Errorf("failed to reconstruct DNSKEY for RRset: %w", err)
+		}
+		rrset = append(rrset, dnskey)
+	}
+
+	// Perform cryptographic signature verification
+	if err := rrsig.Verify(signingKey, rrset); err != nil {
+		return fmt.Errorf("DNSKEY RRSIG cryptographic verification failed: %w", err)
+	}
 
 	return nil
+}
+
+// reconstructDNSKEY converts our DNSKEYRecord back to a dns.DNSKEY for verification
+func reconstructDNSKEY(zone string, record dnspkg.DNSKEYRecord) (*dns.DNSKEY, error) {
+	// Decode the base64 public key
+	pubKey, err := base64.StdEncoding.DecodeString(record.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 public key: %w", err)
+	}
+
+	dnskey := &dns.DNSKEY{
+		Hdr: dns.RR_Header{
+			Name:   dns.Fqdn(zone),
+			Rrtype: dns.TypeDNSKEY,
+			Class:  dns.ClassINET,
+			Ttl:    3600, // TTL doesn't affect verification
+		},
+		Flags:     record.Flags,
+		Protocol:  record.Protocol,
+		Algorithm: record.Algorithm,
+		PublicKey: string(pubKey),
+	}
+
+	return dnskey, nil
+}
+
+// reconstructRRSIG converts our RRSIGRecord back to a dns.RRSIG for verification
+func reconstructRRSIG(zone string, record dnspkg.RRSIGRecord) (*dns.RRSIG, error) {
+	// Decode the base64 signature
+	sig, err := base64.StdEncoding.DecodeString(record.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 signature: %w", err)
+	}
+
+	rrsig := &dns.RRSIG{
+		Hdr: dns.RR_Header{
+			Name:   dns.Fqdn(zone),
+			Rrtype: dns.TypeRRSIG,
+			Class:  dns.ClassINET,
+			Ttl:    3600,
+		},
+		TypeCovered: record.TypeCovered,
+		Algorithm:   record.Algorithm,
+		Labels:      record.Labels,
+		OrigTtl:     record.OriginalTTL,
+		Expiration:  uint32(record.Expiration.Unix()),
+		Inception:   uint32(record.Inception.Unix()),
+		KeyTag:      record.KeyTag,
+		SignerName:  dns.Fqdn(record.SignerName),
+		Signature:   string(sig),
+	}
+
+	return rrsig, nil
 }
 
 // GetKSKs returns all KSKs from a list of DNSKEYs

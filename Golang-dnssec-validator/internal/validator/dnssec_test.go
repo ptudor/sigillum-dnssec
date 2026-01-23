@@ -1,0 +1,351 @@
+package validator
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	dns "github.com/ptudor/dnssec-validator/internal/dns"
+)
+
+func TestVerifyRRSIGValid(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		rrsig    dns.RRSIGRecord
+		expected bool
+	}{
+		{
+			name: "valid signature",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(-1 * time.Hour),
+				Expiration: now.Add(1 * time.Hour),
+			},
+			expected: true,
+		},
+		{
+			name: "expired signature",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(-2 * time.Hour),
+				Expiration: now.Add(-1 * time.Hour),
+				IsExpired:  true,
+			},
+			expected: false,
+		},
+		{
+			name: "not yet valid",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(1 * time.Hour),
+				Expiration: now.Add(2 * time.Hour),
+			},
+			expected: false,
+		},
+		{
+			name: "inception equals now",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(-1 * time.Second),
+				Expiration: now.Add(1 * time.Hour),
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := VerifyRRSIGValid(tt.rrsig)
+			if result != tt.expected {
+				t.Errorf("VerifyRRSIGValid() = %v, expected %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestFindRRSIGForType(t *testing.T) {
+	rrsigs := []dns.RRSIGRecord{
+		{TypeCovered: 1, KeyTag: 12345},  // A
+		{TypeCovered: 48, KeyTag: 23456}, // DNSKEY
+		{TypeCovered: 43, KeyTag: 34567}, // DS
+		{TypeCovered: 28, KeyTag: 45678}, // AAAA
+	}
+
+	tests := []struct {
+		name        string
+		rrtype      uint16
+		expectFound bool
+		expectTag   uint16
+	}{
+		{name: "find DNSKEY RRSIG", rrtype: 48, expectFound: true, expectTag: 23456},
+		{name: "find DS RRSIG", rrtype: 43, expectFound: true, expectTag: 34567},
+		{name: "find A RRSIG", rrtype: 1, expectFound: true, expectTag: 12345},
+		{name: "not found", rrtype: 15, expectFound: false}, // MX
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FindRRSIGForType(tt.rrtype, rrsigs)
+			if tt.expectFound {
+				if result == nil {
+					t.Errorf("FindRRSIGForType(%d) returned nil, expected non-nil", tt.rrtype)
+				} else if result.KeyTag != tt.expectTag {
+					t.Errorf("FindRRSIGForType(%d).KeyTag = %d, expected %d", tt.rrtype, result.KeyTag, tt.expectTag)
+				}
+			} else {
+				if result != nil {
+					t.Errorf("FindRRSIGForType(%d) returned non-nil, expected nil", tt.rrtype)
+				}
+			}
+		})
+	}
+}
+
+func TestFindKSKByKeyTag(t *testing.T) {
+	dnskeys := []dns.DNSKEYRecord{
+		{KeyTag: 12345, Flags: 256, IsKSK: false, IsZSK: true}, // ZSK
+		{KeyTag: 23456, Flags: 257, IsKSK: true, IsZSK: false}, // KSK
+		{KeyTag: 34567, Flags: 256, IsKSK: false, IsZSK: true}, // ZSK
+	}
+
+	tests := []struct {
+		name        string
+		keyTag      uint16
+		expectFound bool
+	}{
+		{name: "find KSK", keyTag: 23456, expectFound: true},
+		{name: "ZSK not returned", keyTag: 12345, expectFound: false},
+		{name: "not found", keyTag: 65535, expectFound: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FindKSKByKeyTag(tt.keyTag, dnskeys)
+			if tt.expectFound && result == nil {
+				t.Errorf("FindKSKByKeyTag(%d) returned nil, expected non-nil", tt.keyTag)
+			} else if !tt.expectFound && result != nil {
+				t.Errorf("FindKSKByKeyTag(%d) returned non-nil, expected nil", tt.keyTag)
+			}
+		})
+	}
+}
+
+func TestFindDNSKEYByKeyTag(t *testing.T) {
+	dnskeys := []dns.DNSKEYRecord{
+		{KeyTag: 12345, Flags: 256},
+		{KeyTag: 23456, Flags: 257},
+	}
+
+	result := FindDNSKEYByKeyTag(12345, dnskeys)
+	if result == nil {
+		t.Error("FindDNSKEYByKeyTag should find ZSK")
+	}
+
+	result = FindDNSKEYByKeyTag(23456, dnskeys)
+	if result == nil {
+		t.Error("FindDNSKEYByKeyTag should find KSK")
+	}
+
+	result = FindDNSKEYByKeyTag(65535, dnskeys)
+	if result != nil {
+		t.Error("FindDNSKEYByKeyTag should return nil for non-existent tag")
+	}
+}
+
+func TestGetKSKsAndZSKs(t *testing.T) {
+	dnskeys := []dns.DNSKEYRecord{
+		{KeyTag: 1, IsKSK: false, IsZSK: true},
+		{KeyTag: 2, IsKSK: true, IsZSK: false},
+		{KeyTag: 3, IsKSK: false, IsZSK: true},
+		{KeyTag: 4, IsKSK: true, IsZSK: false},
+	}
+
+	ksks := GetKSKs(dnskeys)
+	if len(ksks) != 2 {
+		t.Errorf("GetKSKs returned %d keys, expected 2", len(ksks))
+	}
+
+	zsks := GetZSKs(dnskeys)
+	if len(zsks) != 2 {
+		t.Errorf("GetZSKs returned %d keys, expected 2", len(zsks))
+	}
+}
+
+func TestComputeDSDigestFromDNSKEY(t *testing.T) {
+	// Test with a known DNSKEY record
+	// This is a simplified test - real verification would need actual key material
+	dnskey := dns.DNSKEYRecord{
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: 13,         // ECDSAP256SHA256
+		PublicKey: "dGVzdA==", // base64 encoded "test"
+	}
+
+	// Test SHA-256 digest (type 2)
+	digest, err := ComputeDSDigestFromDNSKEY("example.com.", dnskey, 2)
+	if err != nil {
+		t.Errorf("ComputeDSDigestFromDNSKEY failed: %v", err)
+	}
+	if digest == "" {
+		t.Error("ComputeDSDigestFromDNSKEY returned empty digest")
+	}
+	// Digest should be uppercase hex
+	if digest != strings.ToUpper(digest) {
+		t.Error("Digest should be uppercase hex")
+	}
+
+	// Test SHA-384 digest (type 4)
+	digest384, err := ComputeDSDigestFromDNSKEY("example.com.", dnskey, 4)
+	if err != nil {
+		t.Errorf("ComputeDSDigestFromDNSKEY with SHA-384 failed: %v", err)
+	}
+	if len(digest384) != 96 { // SHA-384 = 48 bytes = 96 hex chars
+		t.Errorf("SHA-384 digest should be 96 hex chars, got %d", len(digest384))
+	}
+
+	// Test SHA-1 digest (type 1) - deprecated but should work
+	digest1, err := ComputeDSDigestFromDNSKEY("example.com.", dnskey, 1)
+	if err != nil {
+		t.Errorf("ComputeDSDigestFromDNSKEY with SHA-1 failed: %v", err)
+	}
+	if len(digest1) != 40 { // SHA-1 = 20 bytes = 40 hex chars
+		t.Errorf("SHA-1 digest should be 40 hex chars, got %d", len(digest1))
+	}
+
+	// Test unsupported digest type
+	_, err = ComputeDSDigestFromDNSKEY("example.com.", dnskey, 99)
+	if err == nil {
+		t.Error("ComputeDSDigestFromDNSKEY should fail for unsupported digest type")
+	}
+
+	// Test invalid base64 public key
+	badKey := dns.DNSKEYRecord{
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: 13,
+		PublicKey: "not-valid-base64!!!",
+	}
+	_, err = ComputeDSDigestFromDNSKEY("example.com.", badKey, 2)
+	if err == nil {
+		t.Error("ComputeDSDigestFromDNSKEY should fail for invalid base64")
+	}
+}
+
+func TestVerifyDSMatchesDNSKEY(t *testing.T) {
+	// Create a DNSKEY and compute its DS digest
+	dnskey := dns.DNSKEYRecord{
+		KeyTag:    12345,
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: 13,
+		PublicKey: "dGVzdA==",
+	}
+
+	// Compute the actual digest
+	digest, _ := ComputeDSDigestFromDNSKEY("example.com.", dnskey, 2)
+
+	// Create matching DS record
+	matchingDS := dns.DSRecord{
+		KeyTag:     12345,
+		Algorithm:  13,
+		DigestType: 2,
+		Digest:     digest,
+	}
+
+	// Should match
+	if !VerifyDSMatchesDNSKEY(matchingDS, dnskey, "example.com.") {
+		t.Error("VerifyDSMatchesDNSKEY should return true for matching DS")
+	}
+
+	// Wrong key tag
+	wrongTagDS := dns.DSRecord{
+		KeyTag:     65535,
+		Algorithm:  13,
+		DigestType: 2,
+		Digest:     digest,
+	}
+	if VerifyDSMatchesDNSKEY(wrongTagDS, dnskey, "example.com.") {
+		t.Error("VerifyDSMatchesDNSKEY should return false for wrong key tag")
+	}
+
+	// Wrong algorithm
+	wrongAlgDS := dns.DSRecord{
+		KeyTag:     12345,
+		Algorithm:  8, // Different algorithm
+		DigestType: 2,
+		Digest:     digest,
+	}
+	if VerifyDSMatchesDNSKEY(wrongAlgDS, dnskey, "example.com.") {
+		t.Error("VerifyDSMatchesDNSKEY should return false for wrong algorithm")
+	}
+}
+
+func TestReconstructDNSKEY(t *testing.T) {
+	record := dns.DNSKEYRecord{
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: 13,
+		PublicKey: "dGVzdA==", // base64 "test"
+	}
+
+	dnskey, err := reconstructDNSKEY("example.com.", record)
+	if err != nil {
+		t.Errorf("reconstructDNSKEY failed: %v", err)
+	}
+
+	if dnskey.Flags != 257 {
+		t.Errorf("Flags = %d, expected 257", dnskey.Flags)
+	}
+	if dnskey.Protocol != 3 {
+		t.Errorf("Protocol = %d, expected 3", dnskey.Protocol)
+	}
+	if dnskey.Algorithm != 13 {
+		t.Errorf("Algorithm = %d, expected 13", dnskey.Algorithm)
+	}
+	if dnskey.Hdr.Name != "example.com." {
+		t.Errorf("Name = %s, expected example.com.", dnskey.Hdr.Name)
+	}
+
+	// Test invalid base64
+	badRecord := dns.DNSKEYRecord{
+		PublicKey: "not-valid-base64!!!",
+	}
+	_, err = reconstructDNSKEY("example.com.", badRecord)
+	if err == nil {
+		t.Error("reconstructDNSKEY should fail for invalid base64")
+	}
+}
+
+func TestReconstructRRSIG(t *testing.T) {
+	now := time.Now()
+	record := dns.RRSIGRecord{
+		TypeCovered: 48,
+		Algorithm:   13,
+		Labels:      2,
+		OriginalTTL: 3600,
+		Expiration:  now.Add(24 * time.Hour),
+		Inception:   now.Add(-1 * time.Hour),
+		KeyTag:      12345,
+		SignerName:  "example.com.",
+		Signature:   "dGVzdA==", // base64 "test"
+	}
+
+	rrsig, err := reconstructRRSIG("example.com.", record)
+	if err != nil {
+		t.Errorf("reconstructRRSIG failed: %v", err)
+	}
+
+	if rrsig.TypeCovered != 48 {
+		t.Errorf("TypeCovered = %d, expected 48", rrsig.TypeCovered)
+	}
+	if rrsig.KeyTag != 12345 {
+		t.Errorf("KeyTag = %d, expected 12345", rrsig.KeyTag)
+	}
+
+	// Test invalid base64
+	badRecord := dns.RRSIGRecord{
+		Signature: "not-valid-base64!!!",
+	}
+	_, err = reconstructRRSIG("example.com.", badRecord)
+	if err == nil {
+		t.Error("reconstructRRSIG should fail for invalid base64")
+	}
+}

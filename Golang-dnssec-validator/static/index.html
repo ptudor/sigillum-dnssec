@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="DNSSEC Validator - Troubleshoot and validate DNSSEC chains of trust">
+    <meta name="description" content="DNSSEC Validator - Troubleshoot and validate DNSSEC chains of trust from root to domain">
+    <meta name="theme-color" content="#0f0f1a">
     <title>DNSSEC Validator</title>
     <link rel="stylesheet" href="style.css">
 </head>
@@ -13,7 +14,7 @@
     <div class="container">
         <header class="header">
             <h1>DNSSEC Validator</h1>
-            <p class="subtitle">Validate the chain of trust from root to domain</p>
+            <p class="subtitle">Cryptographically verify the chain of trust from root to domain</p>
         </header>
 
         <main id="main-content">
@@ -23,21 +24,37 @@
                     <input type="text" id="domain-input" name="domain"
                            placeholder="Enter domain (e.g., iana.org)"
                            autocomplete="off" autocapitalize="none" autocorrect="off"
-                           spellcheck="false" required>
+                           spellcheck="false" required
+                           pattern="[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]">
                     <select id="mode-select" name="mode" aria-label="Validation mode">
                         <option value="extended">Extended</option>
                         <option value="quick">Quick</option>
                     </select>
                     <button type="submit" id="validate-btn">Validate</button>
                 </div>
+                <div class="example-domains">
+                    Try:
+                    <button type="button" class="example-btn" data-domain="iana.org">iana.org</button>
+                    <button type="button" class="example-btn" data-domain="cloudflare.com">cloudflare.com</button>
+                    <button type="button" class="example-btn" data-domain="dnssec-failed.org">dnssec-failed.org</button>
+                </div>
             </form>
 
-            <div id="status" class="status" role="status" aria-live="polite"></div>
+            <div id="status" class="status" role="status" aria-live="polite">
+                <span class="spinner" aria-hidden="true"></span>
+                <span class="status-text"></span>
+            </div>
 
             <section id="results" class="results hidden" aria-label="Validation results">
                 <div class="result-summary" id="result-summary">
                     <div class="result-query">
                         <span class="query-name" id="query-name"></span>
+                        <button type="button" class="copy-btn" id="copy-link-btn" title="Copy link to results" aria-label="Copy link to results">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                        </button>
                     </div>
                     <div class="result-badges" id="result-badges"></div>
                 </div>
@@ -63,9 +80,24 @@
             </section>
         </main>
 
+        <details class="about-section">
+            <summary>About this tool</summary>
+            <div class="about-content">
+                <p><strong>DNSSEC Validator</strong> performs iterative DNSSEC validation from the root zone down to your target domain. Unlike a recursive resolver that simply gives you a pass/fail, this tool shows you exactly what's happening at each step:</p>
+                <ul>
+                    <li><strong>Zone discovery</strong> - Identifies actual zone cuts (delegation points) in the DNS hierarchy</li>
+                    <li><strong>DNSKEY verification</strong> - Fetches and cryptographically verifies DNSKEY records at each zone</li>
+                    <li><strong>DS chain validation</strong> - Verifies that each zone's KSK matches the DS record in its parent zone</li>
+                    <li><strong>Signature validation</strong> - Checks RRSIG validity periods and cryptographic signatures</li>
+                    <li><strong>CNAME following</strong> - Automatically validates CNAME target chains</li>
+                </ul>
+                <p>Validation results: <span class="badge secure">secure</span> (full chain verified), <span class="badge insecure">insecure</span> (zone not signed), <span class="badge bogus">bogus</span> (validation failed), <span class="badge indeterminate">indeterminate</span> (could not determine).</p>
+            </div>
+        </details>
+
         <footer class="footer">
-            <p>Query authoritative nameservers to validate DNSSEC chain of trust</p>
-            <p><a href="/api/anchors">View Root Trust Anchors</a> | <a href="/metrics">Metrics</a></p>
+            <p>Queries authoritative nameservers directly using <a href="https://www.iana.org/dnssec/files" target="_blank" rel="noopener">IANA root trust anchors</a></p>
+            <p><a href="api/anchors">View Root Trust Anchors</a> | <a href="api/validate?domain=example.com">JSON API</a> | <a href="metrics">Metrics</a></p>
         </footer>
     </div>
 

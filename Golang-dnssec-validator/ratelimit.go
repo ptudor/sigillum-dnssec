@@ -114,7 +114,44 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// trustedProxies contains CIDR ranges of trusted reverse proxies
+// Only requests from these ranges will have X-Forwarded-For headers trusted
+var trustedProxies = []string{
+	"127.0.0.0/8",    // localhost
+	"10.0.0.0/8",     // private class A
+	"172.16.0.0/12",  // private class B
+	"192.168.0.0/16", // private class C
+	"::1/128",        // IPv6 localhost
+	"fc00::/7",       // IPv6 unique local
+}
+
+var trustedProxyNets []*net.IPNet
+
+func init() {
+	for _, cidr := range trustedProxies {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			trustedProxyNets = append(trustedProxyNets, network)
+		}
+	}
+}
+
+// isFromTrustedProxy checks if the remote address is from a trusted proxy
+func isFromTrustedProxy(remoteAddr string) bool {
+	ip := net.ParseIP(remoteAddr)
+	if ip == nil {
+		return false
+	}
+	for _, network := range trustedProxyNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // extractClientIP gets the client IP from the request
+// Only trusts X-Forwarded-For when request comes from a trusted proxy
 func extractClientIP(r *http.Request) string {
 	// Get the direct connection IP
 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -122,17 +159,27 @@ func extractClientIP(r *http.Request) string {
 		remoteIP = r.RemoteAddr
 	}
 
-	// Check X-Forwarded-For header (first IP in the chain)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
+	// Only trust proxy headers if request is from a trusted proxy
+	if isFromTrustedProxy(remoteIP) {
+		// Check X-Forwarded-For header (first IP in the chain is the client)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			ips := strings.Split(xff, ",")
+			if len(ips) > 0 {
+				clientIP := strings.TrimSpace(ips[0])
+				// Validate it's a real IP, not garbage
+				if net.ParseIP(clientIP) != nil {
+					return clientIP
+				}
+			}
 		}
-	}
 
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+		// Check X-Real-IP header
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			clientIP := strings.TrimSpace(xri)
+			if net.ParseIP(clientIP) != nil {
+				return clientIP
+			}
+		}
 	}
 
 	return remoteIP
