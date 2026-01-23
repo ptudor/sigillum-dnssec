@@ -17,7 +17,7 @@ rcvar="dnssec_validator_enable"
 load_rc_config $name
 
 : ${dnssec_validator_enable:="NO"}
-: ${dnssec_validator_user:="www"}
+: ${dnssec_validator_user:="dnssec-validator"}
 
 pidfile="/var/run/${name}.pid"
 procname="/usr/local/sbin/dnssec-validator"
