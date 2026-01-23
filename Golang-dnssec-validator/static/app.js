@@ -456,27 +456,10 @@
         // Update timing
         durationValueEl.textContent = data.duration_ms + 'ms';
 
-        // Count zones including CNAME chains
-        var zoneCount = data.chain ? data.chain.length : 0;
-        if (data.cname_chains) {
-            data.cname_chains.forEach(function(chain) {
-                if (chain.chain) {
-                    zoneCount += chain.chain.length;
-                }
-            });
-        }
-        zonesCountEl.textContent = zoneCount;
+        // Count unique zones (seenZones tracks all zones added via SSE)
+        zonesCountEl.textContent = seenZones.size;
 
-        // Add CNAME chain zones to visualization and tabs
-        if (data.cname_chains && data.cname_chains.length > 0) {
-            data.cname_chains.forEach(function(cnameChain) {
-                if (cnameChain.chain) {
-                    cnameChain.chain.forEach(function(zoneResult) {
-                        addZoneCard(zoneResult.zone, zoneResult.status, zoneResult);
-                    });
-                }
-            });
-        }
+        // Note: CNAME chain zones are already added via SSE events, don't re-add here
 
         // Update raw JSON
         rawJsonEl.textContent = JSON.stringify(data, null, 2);
