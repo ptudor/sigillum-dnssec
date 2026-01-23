@@ -187,6 +187,12 @@ func (r *Resolver) CheckZoneCut(ctx context.Context, domain string) (bool, error
 		return false, err
 	}
 
+	// SERVFAIL often means DNSSEC validation failed - the zone EXISTS but is broken
+	// Treat this as a zone cut so we can validate and report the actual DNSSEC error
+	if resp.Rcode == dns.RcodeServerFailure {
+		return true, nil
+	}
+
 	// Check if we got NS records in the answer section
 	// (not just in the authority section which would be a referral)
 	for _, rr := range resp.Answer {
