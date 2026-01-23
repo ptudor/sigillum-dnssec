@@ -20,9 +20,11 @@ load_rc_config $name
 : ${dnssec_validator_user:="www"}
 
 pidfile="/var/run/${name}.pid"
-# Use wrapper script which sources env file before exec
-# (daemon command strips environment, wrapper works around this)
-command="/usr/local/sbin/dnssec-validator.sh"
+procname="/usr/local/sbin/dnssec-validator"
+
+# Use daemon(8) to properly daemonize, with wrapper to source env file
+command="/usr/sbin/daemon"
+command_args="-p ${pidfile} -u ${dnssec_validator_user} /usr/local/sbin/dnssec-validator.sh"
 
 start_precmd="${name}_prestart"
 stop_postcmd="${name}_poststop"
