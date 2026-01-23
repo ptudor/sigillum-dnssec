@@ -56,11 +56,16 @@ func (v *Validator) emitEvent(eventType string, data interface{}) {
 
 // Validate performs DNSSEC validation for a domain
 func (v *Validator) Validate(ctx context.Context, domain string) (*ValidationResult, error) {
-	return v.ValidateWithDepth(ctx, domain, 0)
+	return v.validateWithCache(ctx, domain, 0, make(map[string]*ZoneResult))
 }
 
 // ValidateWithDepth performs DNSSEC validation with CNAME recursion depth tracking
 func (v *Validator) ValidateWithDepth(ctx context.Context, domain string, depth int) (*ValidationResult, error) {
+	return v.validateWithCache(ctx, domain, depth, make(map[string]*ZoneResult))
+}
+
+// validateWithCache performs DNSSEC validation with a cache of already-validated zones
+func (v *Validator) validateWithCache(ctx context.Context, domain string, depth int, validatedZones map[string]*ZoneResult) (*ValidationResult, error) {
 	const maxCNAMEDepth = 10
 
 	start := time.Now()
@@ -133,6 +138,49 @@ func (v *Validator) ValidateWithDepth(ctx context.Context, domain string, depth 
 		default:
 		}
 
+		// Check if this zone was already validated (e.g., from main chain when following CNAME)
+		if cachedResult, ok := validatedZones[zone]; ok {
+			// Reuse cached result
+			v.emitEvent("progress", ProgressEvent{
+				Zone:   zone,
+				Action: "reusing cached validation",
+			})
+			result.Chain = append(result.Chain, *cachedResult)
+
+			// Emit zone event for cached result
+			v.emitEvent("zone", ZoneEvent{
+				Zone:       zone,
+				Status:     cachedResult.Status,
+				ZoneResult: cachedResult,
+			})
+
+			// Track overall status from cached result
+			switch cachedResult.Status {
+			case StatusBogus:
+				lastStatus = StatusBogus
+				result.Result = StatusBogus
+				result.DurationMs = time.Since(start).Milliseconds()
+				v.emitEvent("complete", CompleteEvent{
+					Result:      result.Result,
+					Chain:       result.Chain,
+					CNAMEChains: result.CNAMEChains,
+					DurationMs:  result.DurationMs,
+					Errors:      result.Errors,
+					Warnings:    result.Warnings,
+				})
+				return result, nil
+			case StatusInsecure:
+				if lastStatus == StatusSecure {
+					lastStatus = StatusInsecure
+				}
+			case StatusIndeterminate:
+				if lastStatus == StatusSecure || lastStatus == StatusInsecure {
+					lastStatus = StatusIndeterminate
+				}
+			}
+			continue
+		}
+
 		// Emit progress
 		v.emitEvent("progress", ProgressEvent{
 			Zone:   zone,
@@ -147,6 +195,9 @@ func (v *Validator) ValidateWithDepth(ctx context.Context, domain string, depth 
 			zoneResult.Status = StatusIndeterminate
 			zoneResult.AddError(err.Error())
 		}
+
+		// Cache the result for potential reuse
+		validatedZones[zone] = zoneResult
 
 		result.Chain = append(result.Chain, *zoneResult)
 
@@ -186,7 +237,7 @@ func (v *Validator) ValidateWithDepth(ctx context.Context, domain string, depth 
 
 	// Now check for CNAMEs at the target domain
 	if depth < maxCNAMEDepth {
-		cnameResult, err := v.checkAndFollowCNAME(ctx, domain, depth)
+		cnameResult, err := v.checkAndFollowCNAME(ctx, domain, depth, validatedZones)
 		if err == nil && cnameResult != nil {
 			result.CNAMEChains = append(result.CNAMEChains, *cnameResult)
 
@@ -228,7 +279,7 @@ func (v *Validator) ValidateWithDepth(ctx context.Context, domain string, depth 
 }
 
 // checkAndFollowCNAME checks if the domain has a CNAME and validates the target
-func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, depth int) (*CNAMEChainResult, error) {
+func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, depth int, validatedZones map[string]*ZoneResult) (*CNAMEChainResult, error) {
 	// First, find the authoritative zone for this domain
 	// The zone is the closest ancestor that has NS records
 	zones, err := v.resolver.DiscoverZoneCuts(ctx, domain)
@@ -284,11 +335,11 @@ func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, dept
 
 	v.emitEvent("progress", ProgressEvent{
 		Zone:   target,
-		Action: "following CNAME (fresh validation from root)",
+		Action: "following CNAME (reusing validated zones)",
 	})
 
-	// Validate the CNAME target from scratch (fresh zone chain from root)
-	targetResult, err := v.ValidateWithDepth(ctx, target, depth+1)
+	// Validate the CNAME target, reusing already-validated zones
+	targetResult, err := v.validateWithCache(ctx, target, depth+1, validatedZones)
 	if err != nil {
 		return &CNAMEChainResult{
 			Source: domain,
