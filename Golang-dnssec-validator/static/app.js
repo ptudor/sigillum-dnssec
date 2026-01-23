@@ -23,6 +23,9 @@
     let currentResult = null;
     let selectedZone = null;
     let eventSource = null;
+    let currentDepth = 0;
+    let seenZones = new Set();
+    let inCnameChain = false;
 
     // Initialize
     function init() {
@@ -166,6 +169,9 @@
     function resetResults() {
         currentResult = null;
         selectedZone = null;
+        currentDepth = 0;
+        seenZones = new Set();
+        inCnameChain = false;
         chainVisualizationEl.innerHTML = '';
         zoneTabsEl.innerHTML = '';
         zoneContentEl.innerHTML = '';
@@ -197,74 +203,101 @@
         }
     }
 
-    // Add zone card to visualization
-    function addZoneCard(zone, status, zoneResult) {
-        // Add arrow if not first
-        if (chainVisualizationEl.children.length > 0) {
-            const arrow = document.createElement('span');
-            arrow.className = 'chain-arrow';
-            arrow.textContent = '\u2192';
-            arrow.setAttribute('aria-hidden', 'true');
-            chainVisualizationEl.appendChild(arrow);
+    // Build tree indent string
+    function getIndent(depth) {
+        if (depth === 0) return '';
+        var indent = '';
+        for (var i = 0; i < depth - 1; i++) {
+            indent += '    ';
         }
+        indent += '\u2514\u2500\u2500 '; // └──
+        return indent;
+    }
 
-        // Create card
-        const card = document.createElement('div');
-        card.className = 'zone-card ' + status;
-        card.setAttribute('role', 'button');
-        card.setAttribute('tabindex', '0');
-        card.setAttribute('aria-label', 'Zone ' + zone + ' status ' + status);
-        card.dataset.zone = zone;
+    // Add zone item to tree visualization
+    function addZoneCard(zone, status, zoneResult) {
+        var isCached = seenZones.has(zone);
+        seenZones.add(zone);
+
+        // Create tree item
+        var item = document.createElement('div');
+        item.className = 'zone-item ' + status + (isCached ? ' cached' : '');
+        item.setAttribute('role', 'button');
+        item.setAttribute('tabindex', '0');
+        item.setAttribute('aria-label', 'Zone ' + zone + ' status ' + status + (isCached ? ' (cached)' : ''));
+        item.dataset.zone = zone;
 
         // Zone name (display friendly)
-        const displayName = zone === '.' ? 'root' : zone.replace(/\.$/, '');
-        card.innerHTML = `
-            <span class="zone-name">${escapeHtml(displayName)}</span>
-            <span class="zone-status">${getStatusIcon(status)}</span>
-            ${zoneResult && zoneResult.query_time_ns ? `<span class="zone-rtt">${formatRTT(zoneResult.query_time_ns)}</span>` : ''}
-        `;
+        var displayName = zone === '.' ? '.' : zone;
+
+        // Build item HTML
+        var html = '<span class="zone-indent" aria-hidden="true">' + getIndent(currentDepth) + '</span>';
+        html += '<span class="zone-status-icon ' + status + '">' + getStatusIcon(status) + '</span>';
+        html += '<span class="zone-name">' + escapeHtml(displayName) + '</span>';
+        if (isCached) {
+            html += '<span class="zone-cached-label">(cached)</span>';
+        }
+        if (zoneResult && zoneResult.query_time_ns && !isCached) {
+            html += '<span class="zone-rtt">' + formatRTT(zoneResult.query_time_ns) + '</span>';
+        }
+        item.innerHTML = html;
 
         // Store zone result
         if (zoneResult) {
-            card.dataset.result = JSON.stringify(zoneResult);
+            item.dataset.result = JSON.stringify(zoneResult);
         }
 
         // Click handler
-        card.addEventListener('click', function() {
+        item.addEventListener('click', function() {
             selectZone(zone, zoneResult);
         });
-        card.addEventListener('keypress', function(e) {
+        item.addEventListener('keypress', function(e) {
             if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
                 selectZone(zone, zoneResult);
             }
         });
 
-        chainVisualizationEl.appendChild(card);
+        chainVisualizationEl.appendChild(item);
 
-        // Add tab
-        const tab = document.createElement('button');
-        tab.className = 'zone-tab';
-        tab.setAttribute('role', 'tab');
-        tab.textContent = displayName;
-        tab.dataset.zone = zone;
-        tab.addEventListener('click', function() {
-            selectZone(zone, zoneResult);
-        });
-        zoneTabsEl.appendChild(tab);
+        // Add tab (skip cached zones to avoid duplicates)
+        if (!isCached) {
+            var tab = document.createElement('button');
+            tab.className = 'zone-tab';
+            tab.setAttribute('role', 'tab');
+            tab.textContent = zone === '.' ? 'root' : zone.replace(/\.$/, '');
+            tab.dataset.zone = zone;
+            tab.addEventListener('click', function() {
+                selectZone(zone, zoneResult);
+            });
+            zoneTabsEl.appendChild(tab);
+        }
 
         // Auto-select first zone
         if (!selectedZone) {
             selectZone(zone, zoneResult);
         }
+
+        // Increment depth for next zone
+        currentDepth++;
     }
 
     // Select a zone to show details
     function selectZone(zone, zoneResult) {
         selectedZone = zone;
 
-        // Update card selection
-        document.querySelectorAll('.zone-card').forEach(function(card) {
-            card.classList.toggle('selected', card.dataset.zone === zone);
+        // Update tree item selection (only select first match to handle cached duplicates)
+        var foundFirst = false;
+        document.querySelectorAll('.zone-item').forEach(function(item) {
+            if (item.dataset.zone === zone && !foundFirst) {
+                item.classList.add('selected');
+                foundFirst = true;
+            } else if (item.dataset.zone === zone) {
+                // Don't select duplicate cached entries
+                item.classList.remove('selected');
+            } else {
+                item.classList.remove('selected');
+            }
         });
 
         // Update tab selection
@@ -520,35 +553,21 @@
 
     // Add CNAME indicator to chain visualization
     function addCNAMEIndicator(source, target) {
-        // Add arrow indicating CNAME
-        const arrow = document.createElement('span');
-        arrow.className = 'chain-arrow cname-arrow';
-        arrow.textContent = '\u2192 CNAME \u2192';
-        arrow.setAttribute('aria-label', 'CNAME redirect');
-        chainVisualizationEl.appendChild(arrow);
+        // Create CNAME indicator row
+        var indicator = document.createElement('div');
+        indicator.className = 'cname-indicator';
+        indicator.setAttribute('aria-label', 'CNAME from ' + source + ' to ' + target);
 
-        // Add card for CNAME target
-        const card = document.createElement('div');
-        card.className = 'zone-card cname-target';
-        card.setAttribute('role', 'button');
-        card.setAttribute('tabindex', '0');
-        card.setAttribute('aria-label', 'CNAME target ' + target);
-        card.dataset.zone = target;
+        var html = '<span class="zone-indent" aria-hidden="true">' + getIndent(currentDepth) + '</span>';
+        html += '<span class="cname-label">\u2192 CNAME</span>';
+        html += '<span class="cname-target">' + escapeHtml(target) + '</span>';
+        indicator.innerHTML = html;
 
-        const displayName = target.replace(/\.$/, '');
-        card.innerHTML = '<span class="zone-name">' + escapeHtml(displayName) + '</span>' +
-            '<span class="zone-status">CNAME</span>';
+        chainVisualizationEl.appendChild(indicator);
 
-        // Keyboard handler for accessibility
-        card.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                // CNAME cards scroll into view when focused
-                card.scrollIntoView({ behavior: 'smooth', inline: 'center' });
-            }
-        });
-
-        chainVisualizationEl.appendChild(card);
+        // Reset depth for CNAME chain (starts fresh from root)
+        currentDepth = 0;
+        inCnameChain = true;
     }
 
     // Initialize on DOM ready

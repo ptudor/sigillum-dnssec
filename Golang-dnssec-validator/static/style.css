@@ -362,125 +362,123 @@ body {
     color: var(--accent);
 }
 
-/* Chain Visualization */
+/* Chain Visualization - Vertical Tree */
 .chain-visualization {
     display: flex;
-    align-items: center;
-    gap: 0.25rem;
-    padding: 1.25rem;
-    overflow-x: auto;
+    flex-direction: column;
+    padding: 1rem 1.25rem;
     background: var(--bg-primary);
-    position: relative;
-    /* Scroll snap for better UX on mobile */
-    scroll-snap-type: x proximity;
-    -webkit-overflow-scrolling: touch;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.8125rem;
 }
 
-/* Scroll indicator gradients - show when content overflows */
-.chain-visualization::before,
-.chain-visualization::after {
-    content: '';
-    position: sticky;
-    top: 0;
-    bottom: 0;
-    width: 24px;
-    min-height: 100%;
-    pointer-events: none;
-    z-index: 1;
+.zone-tree {
+    display: flex;
+    flex-direction: column;
+}
+
+.zone-item {
+    display: flex;
+    align-items: center;
+    padding: 0.375rem 0;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: background 0.15s;
+}
+
+.zone-item:hover {
+    background: var(--bg-secondary);
+}
+
+.zone-item.selected {
+    background: var(--bg-tertiary);
+}
+
+.zone-indent {
+    display: inline-flex;
+    align-items: center;
+    color: var(--border);
+    white-space: pre;
+    user-select: none;
+}
+
+.zone-status-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.25rem;
+    height: 1.25rem;
+    margin-right: 0.5rem;
+    font-size: 0.875rem;
     flex-shrink: 0;
 }
 
-.chain-visualization::before {
-    left: 0;
-    background: linear-gradient(to right, var(--bg-primary), transparent);
-    margin-right: -24px;
-}
+.zone-status-icon.secure { color: var(--success); }
+.zone-status-icon.insecure { color: var(--insecure); }
+.zone-status-icon.bogus { color: var(--error); }
+.zone-status-icon.indeterminate { color: var(--warning); }
+.zone-status-icon.validating { color: var(--accent); }
 
-.chain-visualization::after {
-    right: 0;
-    background: linear-gradient(to left, var(--bg-primary), transparent);
-    margin-left: -24px;
-}
-
-.zone-card {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 0.75rem 1rem;
-    background: var(--bg-secondary);
-    border-radius: var(--radius);
-    border: 2px solid var(--border);
-    min-width: 80px;
-    cursor: pointer;
-    transition: border-color 0.15s, transform 0.1s;
-    scroll-snap-align: center;
-}
-
-.zone-card:hover {
-    border-color: var(--accent-dim);
-}
-
-.zone-card.selected {
-    border-color: var(--accent);
-}
-
-.zone-card.secure {
-    border-color: var(--success);
-}
-
-.zone-card.insecure {
-    border-color: var(--insecure);
-}
-
-.zone-card.bogus {
-    border-color: var(--error);
-}
-
-.zone-card.indeterminate {
-    border-color: var(--warning);
-}
-
-.zone-card .zone-name {
-    font-family: "SF Mono", Monaco, monospace;
-    font-size: 0.875rem;
-    font-weight: 500;
+.zone-name {
     color: var(--text-primary);
-    margin-bottom: 0.25rem;
+    font-weight: 500;
 }
 
-.zone-card .zone-status {
-    font-size: 1.25rem;
+.zone-item.cached .zone-name {
+    color: var(--text-secondary);
 }
 
-.zone-card .zone-rtt {
+.zone-cached-label {
     font-size: 0.6875rem;
     color: var(--text-muted);
-    margin-top: 0.25rem;
+    margin-left: 0.5rem;
+    font-weight: normal;
+}
+
+.zone-rtt {
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    margin-left: auto;
+    padding-left: 1rem;
+}
+
+/* CNAME indicator */
+.cname-indicator {
+    display: flex;
+    align-items: center;
+    padding: 0.5rem 0;
+    margin: 0.25rem 0;
+}
+
+.cname-indicator .zone-indent {
+    color: var(--dnssec);
+}
+
+.cname-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0.5rem;
+    background: var(--dnssec-bg);
+    border: 1px solid var(--dnssec);
+    border-radius: var(--radius-sm);
+    color: var(--dnssec);
+    font-size: 0.75rem;
+    font-weight: 500;
+}
+
+.cname-target {
+    color: var(--text-primary);
+    margin-left: 0.5rem;
+}
+
+/* Legacy card styles removed - using tree view now */
+.zone-card {
+    display: none;
 }
 
 .chain-arrow {
-    color: var(--text-muted);
-    font-size: 1.25rem;
-    flex-shrink: 0;
-}
-
-.chain-arrow.cname-arrow {
-    color: var(--dnssec);
-    font-size: 0.875rem;
-    font-weight: 500;
-    padding: 0 0.5rem;
-}
-
-.zone-card.cname-target {
-    border-color: var(--dnssec);
-    background: var(--dnssec-bg);
-}
-
-.zone-card.cname-target .zone-status {
-    font-size: 0.6875rem;
-    color: var(--dnssec);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    display: none;
 }
 
 /* Result Timing */
