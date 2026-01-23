@@ -19,12 +19,16 @@ load_rc_config $name
 : ${dnssec_validator_enable:="NO"}
 : ${dnssec_validator_user:="dnssec-validator"}
 
+# Explicitly disable rc.subr env magic
+dnssec_validator_env=""
+
 pidfile="/var/run/${name}.pid"
 procname="/usr/local/sbin/dnssec-validator"
 
 # Use daemon(8) to properly daemonize, with wrapper to source env file
+# Note: using su -m instead of daemon -u to avoid login.conf issues
 command="/usr/sbin/daemon"
-command_args="-p ${pidfile} -u ${dnssec_validator_user} /usr/local/sbin/dnssec-validator.sh"
+command_args="-p ${pidfile} -S -T dnssec_validator /usr/bin/su -m ${dnssec_validator_user} -c /usr/local/sbin/dnssec-validator.sh"
 
 start_precmd="${name}_prestart"
 stop_postcmd="${name}_poststop"
