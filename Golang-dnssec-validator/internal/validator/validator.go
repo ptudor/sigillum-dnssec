@@ -1,0 +1,457 @@
+package validator
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/miekg/dns"
+	dnspkg "github.com/ptudor/dnssec-validator/internal/dns"
+)
+
+// EventCallback is called when validation events occur
+type EventCallback func(event SSEEvent)
+
+// Validator performs DNSSEC validation
+type Validator struct {
+	resolver      *dnspkg.Resolver
+	anchors       *dnspkg.RootAnchors
+	queryTimeout  time.Duration
+	totalTimeout  time.Duration
+	maxConcurrent int
+	eventCallback EventCallback
+}
+
+// NewValidator creates a new DNSSEC validator
+func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, anchors *dnspkg.RootAnchors) *Validator {
+	return &Validator{
+		resolver:      dnspkg.NewResolver(queryTimeout, ""),
+		anchors:       anchors,
+		queryTimeout:  queryTimeout,
+		totalTimeout:  totalTimeout,
+		maxConcurrent: maxConcurrent,
+	}
+}
+
+// SetEventCallback sets the callback for validation events
+func (v *Validator) SetEventCallback(cb EventCallback) {
+	v.eventCallback = cb
+}
+
+// SetAnchors updates the trust anchors
+func (v *Validator) SetAnchors(anchors *dnspkg.RootAnchors) {
+	v.anchors = anchors
+}
+
+// emitEvent sends an event to the callback if set
+func (v *Validator) emitEvent(eventType string, data interface{}) {
+	if v.eventCallback != nil {
+		v.eventCallback(SSEEvent{
+			Type: eventType,
+			Data: data,
+		})
+	}
+}
+
+// Validate performs DNSSEC validation for a domain
+func (v *Validator) Validate(ctx context.Context, domain string) (*ValidationResult, error) {
+	start := time.Now()
+
+	// Create result
+	result := &ValidationResult{
+		Domain:    NormalizeDomain(domain),
+		QueryType: "A",
+		Result:    StatusValidating,
+		Chain:     make([]ZoneResult, 0),
+		Timestamp: start,
+		Errors:    make([]string, 0),
+		Warnings:  make([]string, 0),
+	}
+
+	// Emit start event
+	v.emitEvent("start", StartEvent{
+		Domain:    result.Domain,
+		QueryType: result.QueryType,
+		Timestamp: start,
+		Mode:      "extended",
+	})
+
+	// Check anchors
+	if v.anchors == nil || len(v.anchors.Anchors) == 0 {
+		err := fmt.Errorf("no root trust anchors available")
+		result.Result = StatusIndeterminate
+		result.Errors = append(result.Errors, err.Error())
+		v.emitEvent("error", ErrorEvent{
+			Message: err.Error(),
+			Fatal:   true,
+		})
+		return result, err
+	}
+
+	// Build zone hierarchy
+	zones := SplitIntoZoneHierarchy(domain)
+
+	// Create timeout context
+	ctx, cancel := context.WithTimeout(ctx, v.totalTimeout)
+	defer cancel()
+
+	// Validate each zone in order
+	var lastStatus ValidationStatus = StatusSecure
+	for _, zone := range zones {
+		select {
+		case <-ctx.Done():
+			result.Result = StatusIndeterminate
+			result.Errors = append(result.Errors, "validation timeout")
+			v.emitEvent("error", ErrorEvent{
+				Zone:    zone,
+				Message: "validation timeout",
+				Fatal:   true,
+			})
+			result.DurationMs = time.Since(start).Milliseconds()
+			return result, ctx.Err()
+		default:
+		}
+
+		// Emit progress
+		v.emitEvent("progress", ProgressEvent{
+			Zone:   zone,
+			Action: "validating",
+		})
+
+		// Validate this zone
+		zoneResult, err := v.validateZone(ctx, zone, zones)
+		if err != nil {
+			// Zone validation error
+			zoneResult = NewZoneResult(zone)
+			zoneResult.Status = StatusIndeterminate
+			zoneResult.AddError(err.Error())
+		}
+
+		result.Chain = append(result.Chain, *zoneResult)
+
+		// Emit zone event
+		v.emitEvent("zone", ZoneEvent{
+			Zone:       zone,
+			Status:     zoneResult.Status,
+			ZoneResult: zoneResult,
+		})
+
+		// Track overall status
+		switch zoneResult.Status {
+		case StatusBogus:
+			lastStatus = StatusBogus
+			// Stop validation on bogus
+			result.Result = StatusBogus
+			result.DurationMs = time.Since(start).Milliseconds()
+			v.emitEvent("complete", CompleteEvent{
+				Result:     result.Result,
+				Chain:      result.Chain,
+				DurationMs: result.DurationMs,
+				Errors:     result.Errors,
+				Warnings:   result.Warnings,
+			})
+			return result, nil
+		case StatusInsecure:
+			if lastStatus == StatusSecure {
+				lastStatus = StatusInsecure
+			}
+		case StatusIndeterminate:
+			if lastStatus == StatusSecure || lastStatus == StatusInsecure {
+				lastStatus = StatusIndeterminate
+			}
+		}
+	}
+
+	result.Result = lastStatus
+	result.DurationMs = time.Since(start).Milliseconds()
+
+	// Emit complete event
+	v.emitEvent("complete", CompleteEvent{
+		Result:     result.Result,
+		Chain:      result.Chain,
+		DurationMs: result.DurationMs,
+		Errors:     result.Errors,
+		Warnings:   result.Warnings,
+	})
+
+	return result, nil
+}
+
+// validateZone validates a single zone
+func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []string) (*ZoneResult, error) {
+	result := NewZoneResult(zone)
+	start := time.Now()
+
+	// Get nameservers for this zone
+	var nsAddresses []string
+	if zone == "." {
+		// Use root servers
+		nsAddresses = dnspkg.GetRootServers()
+	} else {
+		// Resolve NS for the zone
+		nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, zone)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve NS for %s: %w", zone, err)
+		}
+
+		// Collect all addresses
+		for _, ns := range nsRecords {
+			nsResult := NameserverResult{
+				Name:      ns.Name,
+				Addresses: make([]AddressResult, 0),
+			}
+			for _, addr := range ns.Addresses {
+				nsAddresses = append(nsAddresses, addr.String())
+				nsResult.Addresses = append(nsResult.Addresses, AddressResult{
+					IP:     addr.String(),
+					Status: StatusValidating,
+				})
+			}
+			result.Nameservers = append(result.Nameservers, nsResult)
+		}
+	}
+
+	if len(nsAddresses) == 0 {
+		return nil, fmt.Errorf("no nameserver addresses found for %s", zone)
+	}
+
+	// Query DNSKEY from the first responding server
+	var dnskeyResult *dnspkg.QueryResult
+	for _, addr := range nsAddresses {
+		v.emitEvent("progress", ProgressEvent{
+			Zone:   zone,
+			Server: addr,
+			Action: "querying DNSKEY",
+		})
+
+		queryResult, err := v.resolver.QueryDNSKEYAuthoritative(ctx, addr, zone)
+		if err == nil && queryResult.Error == "" && queryResult.RCode == 0 {
+			dnskeyResult = queryResult
+			break
+		}
+	}
+
+	if dnskeyResult == nil {
+		result.Status = StatusIndeterminate
+		result.AddError("failed to query DNSKEY from any nameserver")
+		return result, nil
+	}
+
+	// Store DNSKEY records
+	result.DNSKEY = dnskeyResult.DNSKEY
+	result.RRSIG = dnskeyResult.RRSIG
+	result.NSEC = dnskeyResult.NSEC
+	result.NSEC3 = dnskeyResult.NSEC3
+
+	// Check if zone is signed
+	if len(result.DNSKEY) == 0 {
+		// Zone might be insecure - check for DS in parent
+		if zone != "." {
+			parentZone := GetParentZone(zone)
+			dsResult, err := v.queryDSFromParent(ctx, zone, parentZone, nsAddresses)
+			if err != nil || len(dsResult) == 0 {
+				// No DS in parent = insecure delegation
+				result.Status = StatusInsecure
+				return result, nil
+			}
+			// DS exists but no DNSKEY = bogus
+			result.Status = StatusBogus
+			result.AddError("DS exists in parent but zone has no DNSKEY")
+			return result, nil
+		}
+		// Root without DNSKEY is bogus
+		result.Status = StatusBogus
+		result.AddError("root zone has no DNSKEY")
+		return result, nil
+	}
+
+	// Verify DNSKEY RRSIG
+	if err := VerifyDNSKEYRRSIG(result.DNSKEY, result.RRSIG); err != nil {
+		result.Status = StatusBogus
+		result.AddError(fmt.Sprintf("DNSKEY RRSIG verification failed: %v", err))
+		return result, nil
+	}
+
+	// Validate chain of trust
+	if zone == "." {
+		// Root zone - verify against trust anchors
+		activeAnchors := dnspkg.GetActiveAnchors(v.anchors)
+		link, err := VerifyRootTrustAnchor(result.DNSKEY, activeAnchors)
+		if err != nil {
+			result.Status = StatusBogus
+			result.AddError(fmt.Sprintf("root trust anchor verification failed: %v", err))
+			return result, nil
+		}
+		result.ChainLink = link
+	} else {
+		// Non-root zone - verify DS from parent
+		parentZone := GetParentZone(zone)
+		dsRecords, err := v.queryDSFromParent(ctx, zone, parentZone, nsAddresses)
+		if err != nil {
+			result.Status = StatusIndeterminate
+			result.AddError(fmt.Sprintf("failed to query DS from parent: %v", err))
+			return result, nil
+		}
+
+		if len(dsRecords) == 0 {
+			// No DS = insecure delegation
+			result.Status = StatusInsecure
+			return result, nil
+		}
+
+		result.DS = dsRecords
+
+		// Validate DS matches DNSKEY
+		link, err := ValidateChainLink(dsRecords, result.DNSKEY, zone)
+		if err != nil {
+			result.Status = StatusBogus
+			result.AddError(fmt.Sprintf("chain of trust validation failed: %v", err))
+			return result, nil
+		}
+		result.ChainLink = link
+	}
+
+	result.Status = StatusSecure
+	result.QueryTimeNs = time.Since(start).Nanoseconds()
+
+	return result, nil
+}
+
+// queryDSFromParent queries DS records for a zone from its parent
+func (v *Validator) queryDSFromParent(ctx context.Context, zone, parentZone string, fallbackServers []string) ([]dnspkg.DSRecord, error) {
+	// First try to get parent NS
+	var parentNS []string
+	if parentZone == "." {
+		parentNS = dnspkg.GetRootServers()
+	} else {
+		nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, parentZone)
+		if err == nil {
+			for _, ns := range nsRecords {
+				for _, addr := range ns.Addresses {
+					parentNS = append(parentNS, addr.String())
+				}
+			}
+		}
+	}
+
+	// Fall back to provided servers if no parent NS found
+	if len(parentNS) == 0 {
+		parentNS = fallbackServers
+	}
+
+	// Query DS from parent nameservers
+	for _, addr := range parentNS {
+		result, err := v.resolver.QueryDSAuthoritative(ctx, addr, zone)
+		if err == nil && result.Error == "" && result.RCode == 0 {
+			return result.DS, nil
+		}
+		// NXDOMAIN or no DS records
+		if result != nil && result.RCode == dns.RcodeNameError {
+			return nil, nil // Zone doesn't exist in parent
+		}
+	}
+
+	return nil, fmt.Errorf("failed to query DS from parent zone")
+}
+
+// ValidateQuick performs quick validation using only the first responding server
+func (v *Validator) ValidateQuick(ctx context.Context, domain string) (*ValidationResult, error) {
+	// For quick mode, we use the same logic but stop at first response
+	return v.Validate(ctx, domain)
+}
+
+// ValidateExtended performs extended validation querying all authoritative servers
+func (v *Validator) ValidateExtended(ctx context.Context, domain string) (*ValidationResult, error) {
+	return v.Validate(ctx, domain)
+}
+
+// ValidateMultipleServers queries all servers in parallel and checks for consensus
+func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, servers []string) ([]AddressResult, []Disagreement) {
+	results := make([]AddressResult, len(servers))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	disagreements := make([]Disagreement, 0)
+
+	// Limit concurrency
+	semaphore := make(chan struct{}, v.maxConcurrent)
+
+	for i, server := range servers {
+		wg.Add(1)
+		go func(idx int, srv string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			queryResult, _ := v.resolver.QueryDNSKEYAuthoritative(ctx, srv, zone)
+			result := AddressResult{
+				IP:     srv,
+				Status: StatusSecure,
+			}
+
+			if queryResult == nil {
+				result.Status = StatusIndeterminate
+				result.Error = "query failed"
+			} else if queryResult.Error != "" {
+				result.Status = StatusIndeterminate
+				result.Error = queryResult.Error
+			} else if queryResult.RCode != 0 {
+				result.Status = StatusIndeterminate
+				result.Error = queryResult.RCodeName
+			} else {
+				result.RTTNs = queryResult.RTT.Nanoseconds()
+				result.Response = queryResult
+			}
+
+			mu.Lock()
+			results[idx] = result
+			mu.Unlock()
+		}(i, server)
+	}
+
+	wg.Wait()
+
+	// Check for disagreements
+	// Compare DNSKEY responses across servers
+	var referenceKeys []dnspkg.DNSKEYRecord
+	for _, r := range results {
+		if r.Response != nil && len(r.Response.DNSKEY) > 0 {
+			if referenceKeys == nil {
+				referenceKeys = r.Response.DNSKEY
+			} else {
+				// Compare with reference
+				if !compareDNSKEYSets(referenceKeys, r.Response.DNSKEY) {
+					disagreements = append(disagreements, Disagreement{
+						IP:       r.IP,
+						Issue:    "DNSKEY mismatch",
+						Expected: fmt.Sprintf("%d keys", len(referenceKeys)),
+						Got:      fmt.Sprintf("%d keys", len(r.Response.DNSKEY)),
+					})
+				}
+			}
+		}
+	}
+
+	return results, disagreements
+}
+
+// compareDNSKEYSets compares two sets of DNSKEY records
+func compareDNSKEYSets(a, b []dnspkg.DNSKEYRecord) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Create map of key tags
+	aKeys := make(map[uint16]bool)
+	for _, k := range a {
+		aKeys[k.KeyTag] = true
+	}
+
+	for _, k := range b {
+		if !aKeys[k.KeyTag] {
+			return false
+		}
+	}
+
+	return true
+}
