@@ -33,6 +33,10 @@ dnssec_validator_prestart()
 {
     # Create log directory if needed (app writes to LOG_FILE from env)
     install -d -o ${dnssec_validator_user} /var/log/tudordns
+
+    # Pre-create pidfile so daemon -u can write to it
+    touch ${pidfile}
+    chown ${dnssec_validator_user} ${pidfile}
 }
 
 dnssec_validator_poststop()
