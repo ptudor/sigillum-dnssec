@@ -2,7 +2,6 @@ package dns
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
@@ -111,7 +110,7 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 				Flags:     v.Flags,
 				Protocol:  v.Protocol,
 				Algorithm: v.Algorithm,
-				PublicKey: base64.StdEncoding.EncodeToString([]byte(v.PublicKey)),
+				PublicKey: v.PublicKey, // miekg/dns already provides base64
 				KeyTag:    v.KeyTag(),
 				IsKSK:     v.Flags == 257, // Zone Key (256) + SEP (1)
 				IsZSK:     v.Flags == 256, // Zone Key only
@@ -137,7 +136,7 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 				Inception:   time.Unix(int64(v.Inception), 0),
 				KeyTag:      v.KeyTag,
 				SignerName:  v.SignerName,
-				Signature:   base64.StdEncoding.EncodeToString([]byte(v.Signature)),
+				Signature:   v.Signature, // miekg/dns already provides base64
 			}
 			// Check validity
 			now := time.Now()
