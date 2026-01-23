@@ -5,15 +5,8 @@ import (
 	"time"
 )
 
-// ValidationStatus represents the DNSSEC validation state
-type ValidationStatus string
-
-const (
-	StatusSecure        ValidationStatus = "secure"        // Full chain of trust verified
-	StatusInsecure      ValidationStatus = "insecure"      // Zone not signed (no DS in parent)
-	StatusBogus         ValidationStatus = "bogus"         // Validation failed
-	StatusIndeterminate ValidationStatus = "indeterminate" // Cannot determine (timeout, SERVFAIL)
-)
+// Note: ValidationStatus is defined in internal/validator/result.go
+// Do not duplicate it here to avoid import cycles.
 
 // DNSKEYRecord represents a DNSKEY record
 type DNSKEYRecord struct {
@@ -57,12 +50,12 @@ type NSECRecord struct {
 
 // NSEC3Record represents an NSEC3 record
 type NSEC3Record struct {
-	Algorithm   uint8    `json:"algorithm"`
-	Flags       uint8    `json:"flags"`
-	Iterations  uint16   `json:"iterations"`
-	Salt        string   `json:"salt"` // Hex
-	NextHashed  string   `json:"next_hashed"`
-	TypeBitmap  []string `json:"type_bitmap"`
+	Algorithm  uint8    `json:"algorithm"`
+	Flags      uint8    `json:"flags"`
+	Iterations uint16   `json:"iterations"`
+	Salt       string   `json:"salt"` // Hex
+	NextHashed string   `json:"next_hashed"`
+	TypeBitmap []string `json:"type_bitmap"`
 }
 
 // NSRecord represents a nameserver record
@@ -170,20 +163,20 @@ func RCodeName(rcode int) string {
 // TypeName returns the human-readable RR type name
 func TypeName(t uint16) string {
 	names := map[uint16]string{
-		1:     "A",
-		2:     "NS",
-		5:     "CNAME",
-		6:     "SOA",
-		15:    "MX",
-		16:    "TXT",
-		28:    "AAAA",
-		43:    "DS",
-		46:    "RRSIG",
-		47:    "NSEC",
-		48:    "DNSKEY",
-		50:    "NSEC3",
-		51:    "NSEC3PARAM",
-		257:   "CAA",
+		1:   "A",
+		2:   "NS",
+		5:   "CNAME",
+		6:   "SOA",
+		15:  "MX",
+		16:  "TXT",
+		28:  "AAAA",
+		43:  "DS",
+		46:  "RRSIG",
+		47:  "NSEC",
+		48:  "DNSKEY",
+		50:  "NSEC3",
+		51:  "NSEC3PARAM",
+		257: "CAA",
 	}
 	if name, ok := names[t]; ok {
 		return name

@@ -7,6 +7,7 @@
     const modeSelect = document.getElementById('mode-select');
     const validateBtn = document.getElementById('validate-btn');
     const statusEl = document.getElementById('status');
+    const statusTextEl = statusEl.querySelector('.status-text');
     const resultsEl = document.getElementById('results');
     const queryNameEl = document.getElementById('query-name');
     const resultBadgesEl = document.getElementById('result-badges');
@@ -16,6 +17,7 @@
     const zoneTabsEl = document.getElementById('zone-tabs');
     const zoneContentEl = document.getElementById('zone-content');
     const rawJsonEl = document.getElementById('raw-json');
+    const copyLinkBtn = document.getElementById('copy-link-btn');
 
     // State
     let currentResult = null;
@@ -26,6 +28,21 @@
     function init() {
         form.addEventListener('submit', handleSubmit);
 
+        // Example domain buttons
+        document.querySelectorAll('.example-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var domain = this.getAttribute('data-domain');
+                domainInput.value = domain;
+                startValidation(domain, modeSelect.value);
+                updateURL(domain);
+            });
+        });
+
+        // Copy link button
+        if (copyLinkBtn) {
+            copyLinkBtn.addEventListener('click', copyLink);
+        }
+
         // Check for domain in URL
         const params = new URLSearchParams(window.location.search);
         const domain = params.get('domain');
@@ -35,17 +52,32 @@
         }
     }
 
+    // Copy current URL to clipboard
+    function copyLink() {
+        navigator.clipboard.writeText(window.location.href).then(function() {
+            copyLinkBtn.classList.add('copied');
+            setTimeout(function() {
+                copyLinkBtn.classList.remove('copied');
+            }, 1500);
+        }).catch(function(err) {
+            console.error('Failed to copy:', err);
+        });
+    }
+
+    // Update URL without reloading
+    function updateURL(domain) {
+        const url = new URL(window.location);
+        url.searchParams.set('domain', domain);
+        history.pushState({}, '', url);
+    }
+
     // Handle form submission
     function handleSubmit(e) {
         e.preventDefault();
         const domain = domainInput.value.trim();
         if (!domain) return;
 
-        // Update URL
-        const url = new URL(window.location);
-        url.searchParams.set('domain', domain);
-        history.pushState({}, '', url);
-
+        updateURL(domain);
         startValidation(domain, modeSelect.value);
     }
 
@@ -61,41 +93,46 @@
         showStatus('loading', 'Validating ' + domain + '...');
         validateBtn.disabled = true;
 
-        // Connect to SSE endpoint
-        const url = '/validate?domain=' + encodeURIComponent(domain) + '&mode=' + encodeURIComponent(mode);
-        eventSource = new EventSource(url);
+        // Connect to SSE endpoint (relative URL for path prefix support)
+        const sseUrl = 'validate?domain=' + encodeURIComponent(domain) + '&mode=' + encodeURIComponent(mode);
+        eventSource = new EventSource(sseUrl);
 
         eventSource.addEventListener('start', function(e) {
-            const data = JSON.parse(e.data);
+            const data = safeJSONParse(e.data);
+            if (!data) return;
             queryNameEl.textContent = data.domain;
             resultsEl.classList.remove('hidden');
         });
 
         eventSource.addEventListener('zone', function(e) {
-            const data = JSON.parse(e.data);
+            const data = safeJSONParse(e.data);
+            if (!data) return;
             addZoneCard(data.zone, data.status, data.zone_result);
         });
 
         eventSource.addEventListener('progress', function(e) {
-            const data = JSON.parse(e.data);
+            const data = safeJSONParse(e.data);
+            if (!data) return;
             showStatus('loading', 'Validating ' + data.zone + ' (' + data.action + ')...');
         });
 
         eventSource.addEventListener('warning', function(e) {
-            const data = JSON.parse(e.data);
+            const data = safeJSONParse(e.data);
+            if (!data) return;
             console.warn('Warning:', data.message);
         });
 
         eventSource.addEventListener('cname', function(e) {
-            const data = JSON.parse(e.data);
+            const data = safeJSONParse(e.data);
+            if (!data) return;
             addCNAMEIndicator(data.source, data.target);
         });
 
         eventSource.addEventListener('error', function(e) {
             if (e.data) {
-                const data = JSON.parse(e.data);
-                if (data.fatal) {
-                    showStatus('error', data.message);
+                const data = safeJSONParse(e.data);
+                if (data && data.fatal) {
+                    showStatus('error', data.message || 'Validation error');
                     eventSource.close();
                     validateBtn.disabled = false;
                 }
@@ -107,7 +144,12 @@
         });
 
         eventSource.addEventListener('complete', function(e) {
-            const data = JSON.parse(e.data);
+            const data = safeJSONParse(e.data);
+            if (!data) {
+                showStatus('error', 'Invalid response from server');
+                validateBtn.disabled = false;
+                return;
+            }
             completeValidation(data);
             eventSource.close();
             validateBtn.disabled = false;
@@ -138,13 +180,21 @@
     // Show status message
     function showStatus(type, message) {
         statusEl.className = 'status ' + type;
-        statusEl.textContent = message;
+        if (statusTextEl) {
+            statusTextEl.textContent = message;
+        } else {
+            statusEl.textContent = message;
+        }
     }
 
     // Hide status message
     function hideStatus() {
         statusEl.className = 'status';
-        statusEl.textContent = '';
+        if (statusTextEl) {
+            statusTextEl.textContent = '';
+        } else {
+            statusEl.textContent = '';
+        }
     }
 
     // Add zone card to visualization
@@ -292,6 +342,29 @@
             });
         }
 
+        // RRSIG records
+        if (zoneResult.rrsig && zoneResult.rrsig.length > 0) {
+            html += '<h4>RRSIG Records</h4>';
+            zoneResult.rrsig.forEach(function(rrsig) {
+                var validityClass = rrsig.is_valid ? 'secure' : (rrsig.is_expired ? 'error' : 'warning');
+                var validityText = rrsig.is_valid ? 'Valid' : (rrsig.is_expired ? 'Expired' : 'Not yet valid');
+                html += '<div class="record-card">';
+                html += '<div class="record-header">';
+                html += '<span class="record-type">RRSIG (' + getTypeName(rrsig.type_covered) + ')</span>';
+                html += '<span class="record-tag ns-status ' + validityClass + '">' + validityText + '</span>';
+                html += '</div>';
+                html += '<div class="record-data">';
+                html += 'Signer: ' + escapeHtml(rrsig.signer_name) + '<br>';
+                html += 'Key Tag: ' + rrsig.key_tag;
+                html += '</div>';
+                html += '<div class="record-meta">';
+                html += 'Valid: ' + formatDate(rrsig.inception) + ' to ' + formatDate(rrsig.expiration);
+                html += ' | Algorithm: ' + rrsig.algorithm;
+                html += '</div>';
+                html += '</div>';
+            });
+        }
+
         // Chain link
         if (zoneResult.chain_link) {
             html += '<h4>Chain of Trust</h4>';
@@ -377,6 +450,18 @@
     }
 
     // Helper functions
+
+    // Safe JSON parsing with error handling
+    function safeJSONParse(str, fallback) {
+        if (!str) return fallback || null;
+        try {
+            return JSON.parse(str);
+        } catch (e) {
+            console.error('JSON parse error:', e.message, 'Input:', str.substring(0, 100));
+            return fallback || null;
+        }
+    }
+
     function getStatusIcon(status) {
         switch (status) {
             case 'secure': return '\u2713';
@@ -407,6 +492,25 @@
         return ms.toFixed(0) + 'ms';
     }
 
+    function formatDate(dateStr) {
+        if (!dateStr) return 'N/A';
+        try {
+            var date = new Date(dateStr);
+            return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        } catch (e) {
+            return dateStr;
+        }
+    }
+
+    function getTypeName(typeNum) {
+        var types = {
+            1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 15: 'MX', 16: 'TXT',
+            28: 'AAAA', 43: 'DS', 46: 'RRSIG', 47: 'NSEC', 48: 'DNSKEY',
+            50: 'NSEC3', 51: 'NSEC3PARAM', 257: 'CAA'
+        };
+        return types[typeNum] || ('TYPE' + typeNum);
+    }
+
     function escapeHtml(str) {
         if (!str) return '';
         const div = document.createElement('div');
@@ -434,6 +538,15 @@
         const displayName = target.replace(/\.$/, '');
         card.innerHTML = '<span class="zone-name">' + escapeHtml(displayName) + '</span>' +
             '<span class="zone-status">CNAME</span>';
+
+        // Keyboard handler for accessibility
+        card.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                // CNAME cards scroll into view when focused
+                card.scrollIntoView({ behavior: 'smooth', inline: 'center' });
+            }
+        });
 
         chainVisualizationEl.appendChild(card);
     }

@@ -19,13 +19,14 @@ type Config struct {
 	RootAnchorsURL  string
 
 	// DNS query settings
-	QueryTimeout  time.Duration
-	TotalTimeout  time.Duration
-	MaxConcurrent int
+	QueryTimeout      time.Duration
+	TotalTimeout      time.Duration
+	MaxConcurrent     int
+	RecursiveResolver string // Recursive resolver for NS lookups (IP address)
 
 	// Rate limiting
-	RateLimitPerSec int
-	RateLimitBurst  int
+	RateLimitPerSec  int
+	RateLimitBurst   int
 	RateLimitCleanup time.Duration
 
 	// Logging
@@ -39,19 +40,20 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		ListenAddr:       ":8791",
-		ShutdownTimeout:  30 * time.Second,
-		RootAnchorsPath:  "/etc/dnssec-validator/root-anchors.json",
-		RootAnchorsURL:   "https://internet.any53.com/dns/anchors/root-anchors.json",
-		QueryTimeout:     5 * time.Second,
-		TotalTimeout:     30 * time.Second,
-		MaxConcurrent:    10,
-		RateLimitPerSec:  10,
-		RateLimitBurst:   30,
-		RateLimitCleanup: 5 * time.Minute,
-		LogFormat:        "json",
-		LogLevel:         "info",
-		StaticDir:        "./static",
+		ListenAddr:        ":8791",
+		ShutdownTimeout:   30 * time.Second,
+		RootAnchorsPath:   "/etc/dnssec-validator/root-anchors.json",
+		RootAnchorsURL:    "https://internet.any53.com/dns/anchors/root-anchors.json",
+		QueryTimeout:      5 * time.Second,
+		TotalTimeout:      30 * time.Second,
+		MaxConcurrent:     10,
+		RecursiveResolver: "8.8.8.8",
+		RateLimitPerSec:   10,
+		RateLimitBurst:    30,
+		RateLimitCleanup:  5 * time.Minute,
+		LogFormat:         "json",
+		LogLevel:          "info",
+		StaticDir:         "./static",
 	}
 }
 
@@ -71,6 +73,7 @@ func LoadConfig() (*Config, error) {
 	cfg.QueryTimeout = getEnvDuration("QUERY_TIMEOUT", cfg.QueryTimeout)
 	cfg.TotalTimeout = getEnvDuration("TOTAL_TIMEOUT", cfg.TotalTimeout)
 	cfg.MaxConcurrent = getEnvInt("MAX_CONCURRENT", cfg.MaxConcurrent)
+	cfg.RecursiveResolver = getEnv("RECURSIVE_RESOLVER", cfg.RecursiveResolver)
 
 	// Rate limiting
 	cfg.RateLimitPerSec = getEnvInt("RATE_LIMIT_PER_SEC", cfg.RateLimitPerSec)

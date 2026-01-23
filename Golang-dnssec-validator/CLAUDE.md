@@ -23,11 +23,13 @@ Unlike most TudorDNS services that use FastCGI behind Apache, this project runs 
 
 1. **SSE requirement**: Server-Sent Events need long-lived connections that don't work well with FastCGI's request/response model
 2. **Simpler deployment**: Public diagnostic tools benefit from standalone operation
-3. **Reverse proxy compatible**: Still runs behind Apache/nginx for HTTPS termination
+3. **Reverse proxy compatible**: Still runs behind Apache for HTTPS termination
 
 Use FastCGI for: traditional request/response APIs, services that benefit from Apache's features (mTLS, mod_security, etc.)
 
 Use standalone HTTP for: SSE/WebSocket services, simple diagnostic tools, services with streaming responses
+
+**Note**: This project uses Apache as its reverse proxy. Do not reference nginx in code or documentation.
 
 ### Build Commands
 

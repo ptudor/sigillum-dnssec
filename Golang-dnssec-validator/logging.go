@@ -1,11 +1,23 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 )
+
+// GenerateRequestID creates a unique request ID for tracing
+func GenerateRequestID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-based ID if random fails
+		return fmt.Sprintf("%x", b)
+	}
+	return hex.EncodeToString(b)
+}
 
 // SetupLogging configures the global slog logger based on configuration
 func SetupLogging(cfg *Config) error {
@@ -80,11 +92,23 @@ func LogWarn(context string, msg string, attrs ...any) {
 }
 
 // LogValidation logs a DNSSEC validation event
-func LogValidation(domain, status string, durationMs int64, attrs ...any) {
+func LogValidation(requestID, domain, status string, durationMs int64, attrs ...any) {
 	allAttrs := append([]any{
+		"request_id", requestID,
 		"domain", domain,
 		"status", status,
 		"duration_ms", durationMs,
 	}, attrs...)
 	slog.Info("[VALIDATION]", allAttrs...)
+}
+
+// LogRequest logs an incoming HTTP request
+func LogRequest(requestID, method, path, clientIP string, attrs ...any) {
+	allAttrs := append([]any{
+		"request_id", requestID,
+		"method", method,
+		"path", path,
+		"client_ip", clientIP,
+	}, attrs...)
+	slog.Debug("[REQUEST]", allAttrs...)
 }

@@ -9,11 +9,11 @@ import (
 
 // HealthStatus represents the health check response
 type HealthStatus struct {
-	Status      string            `json:"status"` // healthy, degraded, unhealthy
-	Version     string            `json:"version"`
-	BuildTime   string            `json:"build_time"`
-	Checks      map[string]string `json:"checks,omitempty"`
-	Uptime      string            `json:"uptime,omitempty"`
+	Status    string            `json:"status"` // healthy, degraded, unhealthy
+	Version   string            `json:"version"`
+	BuildTime string            `json:"build_time"`
+	Checks    map[string]string `json:"checks,omitempty"`
+	Uptime    string            `json:"uptime,omitempty"`
 }
 
 // HealthChecker provides health check functionality
@@ -115,4 +115,6 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
 	w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
+	// Note: HSTS should be configured at the reverse proxy level (Apache/nginx)
+	// to avoid issues with subdomains that may not support HTTPS
 }

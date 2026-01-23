@@ -24,9 +24,9 @@ type Validator struct {
 }
 
 // NewValidator creates a new DNSSEC validator
-func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, anchors *dnspkg.RootAnchors) *Validator {
+func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, anchors *dnspkg.RootAnchors, recursiveResolver string) *Validator {
 	return &Validator{
-		resolver:      dnspkg.NewResolver(queryTimeout, ""),
+		resolver:      dnspkg.NewResolver(queryTimeout, recursiveResolver),
 		anchors:       anchors,
 		queryTimeout:  queryTimeout,
 		totalTimeout:  totalTimeout,
@@ -481,17 +481,6 @@ func (v *Validator) queryDSFromParent(ctx context.Context, zone, parentZone stri
 	}
 
 	return nil, fmt.Errorf("failed to query DS from parent zone")
-}
-
-// ValidateQuick performs quick validation using only the first responding server
-func (v *Validator) ValidateQuick(ctx context.Context, domain string) (*ValidationResult, error) {
-	// For quick mode, we use the same logic but stop at first response
-	return v.Validate(ctx, domain)
-}
-
-// ValidateExtended performs extended validation querying all authoritative servers
-func (v *Validator) ValidateExtended(ctx context.Context, domain string) (*ValidationResult, error) {
-	return v.Validate(ctx, domain)
 }
 
 // ValidateMultipleServers queries all servers in parallel and checks for consensus
