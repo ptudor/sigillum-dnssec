@@ -2,6 +2,59 @@
 
 A web-based DNSSEC troubleshooting and validation tool with a polished UI. Think "DNSViz" or "drill" but in your browser, with real-time streaming results and comprehensive diagnostics.
 
+## Common Patterns (inherited from parent)
+
+This project follows the TudorDNS-Golang common patterns:
+
+| Pattern | Implementation |
+|---------|----------------|
+| **Transport** | Standalone HTTP (not FastCGI) — SSE requires long-lived connections |
+| **Logging** | Structured logging via `log/slog` (JSON or text) |
+| **Metrics** | Prometheus + expvar endpoints |
+| **Rate Limiting** | Per-IP token bucket algorithm |
+| **Graceful Shutdown** | SIGINT/SIGTERM with request draining |
+| **Configuration** | Environment variables with sensible defaults |
+| **Health Checks** | `/health` and `/healthz` endpoints |
+| **Database** | None — stateless validation service |
+
+### Why Standalone HTTP (not FastCGI)
+
+Unlike most TudorDNS services that use FastCGI behind Apache, this project runs as a standalone HTTP server because:
+
+1. **SSE requirement**: Server-Sent Events need long-lived connections that don't work well with FastCGI's request/response model
+2. **Simpler deployment**: Public diagnostic tools benefit from standalone operation
+3. **Reverse proxy compatible**: Still runs behind Apache/nginx for HTTPS termination
+
+Use FastCGI for: traditional request/response APIs, services that benefit from Apache's features (mTLS, mod_security, etc.)
+
+Use standalone HTTP for: SSE/WebSocket services, simple diagnostic tools, services with streaming responses
+
+### Build Commands
+
+```bash
+make build              # Build for current platform
+make build-linux        # Linux x86_64
+make build-linux-arm64  # Linux ARM64
+make build-darwin       # macOS x86_64
+make build-darwin-arm64 # macOS Apple Silicon
+make build-freebsd      # FreeBSD
+make build-all          # All platforms
+make test               # Run tests
+make clean              # Remove build artifacts
+```
+
+### Dependencies
+
+Minimal external dependencies following project conventions:
+
+- `github.com/miekg/dns` - DNS library (same as dnssec-signer)
+- `github.com/prometheus/client_golang` - Prometheus metrics
+- Standard library for everything else
+
+Go version: 1.21+ (required for `log/slog`)
+
+---
+
 ## Project Purpose
 
 This service performs iterative DNSSEC validation from the root zone down, querying authoritative nameservers at each level and streaming results back to the browser via Server-Sent Events (SSE). It validates the complete chain of trust using the IANA root trust anchors.
@@ -319,6 +372,113 @@ Serve the static web UI.
 - **Icons**: Inline SVG or minimal icon set
 - **Fonts**: System font stack (no external fonts)
 
+### CSS Standards (style.css)
+
+Reference the established patterns from:
+- `Golang-dns-query-server/Docs/Website/doh.css` — Dark theme, DNS-specific badges, DNSSEC indicators
+- `Golang-internet-files-mirror/Docs/Website/style.css` — Light/dark auto-switching, accessibility patterns
+
+**CSS Custom Properties (from doh.css — dark theme):**
+```css
+:root {
+    --bg-primary: #0f0f1a;
+    --bg-secondary: #1a1a2e;
+    --bg-tertiary: #252540;
+    --accent: #00d4ff;
+    --accent-dim: #0099bb;
+    --text-primary: #f0f0f0;
+    --text-secondary: #9ca3af;
+    --text-muted: #6b7280;
+    --success: #10b981;
+    --success-bg: #064e3b;
+    --warning: #f59e0b;
+    --warning-bg: #78350f;
+    --error: #ef4444;
+    --error-bg: #7f1d1d;
+    --dnssec: #8b5cf6;
+    --dnssec-bg: #4c1d95;
+    --border: #374151;
+    --radius: 8px;
+    --radius-sm: 4px;
+}
+```
+
+**Light/Dark Mode (from style.css):**
+```css
+@media (prefers-color-scheme: dark) {
+    :root {
+        --color-bg: #1a1a1a;
+        --color-text: #e0e0e0;
+        /* ... override light theme colors */
+    }
+}
+```
+
+**Required CSS Sections:**
+1. **Reset** - `*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }`
+2. **Layout** - `.container` with `max-width` and responsive padding
+3. **Components** - `.badge`, `.status`, `.results`, answer cards
+4. **Forms** - `.input-row`, focus states with `box-shadow: 0 0 0 2px var(--accent-dim)`
+5. **Accessibility** - `.visually-hidden`, `.skip-link`, focus states
+6. **Media Queries** - `@media (max-width: 480px)`, `@media (max-width: 768px)`
+7. **Accessibility Queries** - `@media (prefers-reduced-motion: reduce)`, `@media (prefers-color-scheme: dark)`
+
+**DNSSEC-specific patterns (from doh.css):**
+```css
+/* DNSSEC badge with gradient */
+.badge.dnssec-valid {
+    background: linear-gradient(135deg, #0d9488, #0891b2);
+    color: #fff;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.2);
+}
+.badge.dnssec-valid::before { content: "\2713\0020"; }  /* ✓ */
+
+.badge.dnssec-missing {
+    background: var(--warning-bg);
+    color: var(--warning);
+}
+.badge.dnssec-missing::before { content: "\26A0\0020"; }  /* ⚠ */
+
+/* Status badges */
+.badge.success { background: var(--success-bg); color: var(--success); }
+.badge.warning { background: var(--warning-bg); color: var(--warning); }
+.badge.error { background: var(--error-bg); color: var(--error); }
+```
+
+**Validation status colors for this project:**
+```css
+/* Map DNSSEC validation states to existing badge patterns */
+.status-secure { /* use .badge.dnssec-valid pattern */ }
+.status-insecure { /* use .badge with muted styling */ }
+.status-bogus { /* use .badge.error pattern */ }
+.status-indeterminate { /* use .badge.warning pattern */ }
+```
+
+**Typography:**
+- System font stack: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`
+- Mono font: `"SF Mono", Monaco, "Cascadia Code", monospace`
+
+**Accessibility (from style.css):**
+```css
+/* Skip link for keyboard users */
+.skip-link {
+    position: absolute;
+    left: -9999px;
+    /* ... becomes visible on :focus */
+}
+
+/* Focus states */
+a:focus, button:focus {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+}
+```
+
 ## Data Structures
 
 ### Zone Result
@@ -398,7 +558,9 @@ type RRSIGRecord struct {
 
 ## Configuration
 
-Environment variables (following project conventions):
+All configuration is via **environment variables** (not TOML). This follows the TudorDNS convention for web services — TOML is only used by dnssec-signer because it's a local daemon with complex zone configurations.
+
+Create a `.env` file or systemd EnvironmentFile based on `.env.example`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -408,10 +570,20 @@ Environment variables (following project conventions):
 | `QUERY_TIMEOUT` | `5s` | Per-server query timeout |
 | `TOTAL_TIMEOUT` | `30s` | Total validation timeout |
 | `MAX_CONCURRENT` | `10` | Max concurrent DNS queries |
-| `RATE_LIMIT` | `10` | Requests per IP per minute |
+| `RATE_LIMIT_PER_SEC` | `10` | Requests per second per IP |
+| `RATE_BURST_SIZE` | `30` | Max burst size per IP |
 | `LOG_FORMAT` | `json` | `json` or `text` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `STATIC_DIR` | `./static` | Path to web UI files |
+| `SHUTDOWN_TIMEOUT_SECONDS` | `30` | Graceful shutdown timeout |
+
+### Configuration Pattern Reference
+
+| Project Type | Config Method | Example |
+|--------------|---------------|---------|
+| Web services (FastCGI/HTTP) | Environment variables | rdap-proxy, dns-query, this project |
+| Local daemons with complex config | TOML files | dnssec-signer |
+| CLI tools | Command-line flags | All projects for one-shot commands |
 
 ## Deployment
 
@@ -484,25 +656,12 @@ WantedBy=multi-user.target
 
 ```go
 require (
-    github.com/miekg/dns v1.1.58      // DNS library (same as dnssec-signer)
-    github.com/prometheus/client_golang v1.19.0
+    github.com/miekg/dns v1.1.58              // DNS library (same as dnssec-signer)
+    github.com/prometheus/client_golang v1.19.0  // Prometheus metrics
 )
 ```
 
-No database required—this is a stateless validation service.
-
-## Build Commands
-
-```bash
-make build              # Build for current platform
-make build-linux        # Linux x86_64
-make build-linux-arm64  # Linux ARM64
-make build-darwin       # macOS x86_64
-make build-darwin-arm64 # macOS Apple Silicon
-make build-all          # All platforms
-make test               # Run tests
-make clean              # Remove build artifacts
-```
+No database required—this is a stateless validation service. If future features require persistence (e.g., validation history, monitoring), use MariaDB following the `go-sql-driver/mysql` pattern from other TudorDNS projects.
 
 ## Validation Algorithm
 
@@ -550,14 +709,47 @@ ValidateDomain(domain, recordType):
 
 ## Error Handling
 
-| Condition | Behavior |
-|-----------|----------|
-| Domain invalid | Return 400 with RFC 7807 error |
-| Root anchor file missing | Fall back to URL, then fail with clear error |
-| Nameserver timeout | Mark that server as `indeterminate`, continue with others |
-| All nameservers timeout | Mark zone as `indeterminate` |
-| DNSSEC validation fails | Mark zone as `bogus` with specific reason |
-| Zone not signed | Mark as `insecure` (this is valid, not an error) |
+### RFC 7807 Error Responses
+
+The `/api/*` JSON endpoints use **RFC 7807 (Problem Details for HTTP APIs)** for errors:
+
+```
+Content-Type: application/problem+json
+
+{
+  "type": "https://dnssec-validator.example.com/errors/invalid-domain",
+  "title": "Invalid Domain",
+  "status": 400,
+  "detail": "The domain 'not..valid' contains invalid characters.",
+  "instance": "/api/validate?domain=not..valid"
+}
+```
+
+The SSE endpoint (`/validate`) uses SSE `error` events instead:
+```
+event: error
+data: {"zone":"example.com.","message":"DNSKEY signature expired","fatal":true}
+```
+
+### Error Conditions
+
+| Condition | HTTP Status | Behavior |
+|-----------|-------------|----------|
+| Domain invalid | 400 | RFC 7807 error with detail |
+| Rate limited | 429 | RFC 7807 with Retry-After header |
+| Root anchor file missing | 503 | Fall back to URL, then 503 if both fail |
+| Nameserver timeout | N/A | Mark server as `indeterminate`, continue with others |
+| All nameservers timeout | N/A | Mark zone as `indeterminate` in result |
+| DNSSEC validation fails | N/A | Mark zone as `bogus` with specific reason |
+| Zone not signed | N/A | Mark as `insecure` (valid state, not an error) |
+
+### Security Headers
+
+All responses include:
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Content-Security-Policy: default-src 'self'`
+- `Referrer-Policy: strict-origin-when-cross-origin`
 
 ## Testing
 
@@ -596,17 +788,18 @@ go test -tags=integration ./...
 
 ```
 Golang-dnssec-validator/
-├── CLAUDE.md
-├── Makefile
+├── CLAUDE.md                 # This file — project spec and standards
+├── .env.example              # Environment variable template
+├── Makefile                  # Build targets (see Common Patterns)
 ├── go.mod
 ├── go.sum
 ├── main.go
 ├── cmd/
 │   └── dnssec-validator/
-│       └── main.go
+│       └── main.go           # CLI entry point
 ├── internal/
 │   ├── config/
-│   │   └── config.go
+│   │   └── config.go         # Env var parsing with defaults
 │   ├── dns/
 │   │   ├── query.go          # DNS query execution
 │   │   ├── dnssec.go         # DNSSEC validation logic
@@ -620,18 +813,52 @@ Golang-dnssec-validator/
 │   └── server/
 │       ├── server.go         # HTTP server setup
 │       ├── handlers.go       # Request handlers
-│       └── middleware.go     # Rate limiting, logging
+│       ├── middleware.go     # Rate limiting, logging
+│       └── problem.go        # RFC 7807 error responses
 ├── static/
-│   ├── index.html
-│   ├── style.css
-│   └── app.js
+│   ├── index.html            # SPA entry point
+│   ├── style.css             # CSS following TudorDNS standards (see CSS Standards)
+│   └── app.js                # Vanilla JS, no frameworks
 └── testdata/
-    ├── root-anchors.json
-    └── test-responses/
+    ├── root-anchors.json     # Test trust anchors
+    └── test-responses/       # Mock DNS responses for testing
 ```
+
+### File Embedding
+
+Static files should be embedded in the binary using Go 1.16+ `embed` directive:
+
+```go
+//go:embed static/*
+var staticFiles embed.FS
+```
+
+This enables single-binary deployment without external file dependencies.
 
 ## Related Projects
 
-- **internet-files-mirror**: Provides `root-anchors.json`
-- **dns-query-server**: DoH proxy (different purpose but similar DNS handling)
-- **tudor-dnssec-signer**: Zone signing (uses same `miekg/dns` library)
+| Project | Relationship |
+|---------|--------------|
+| **internet-files-mirror** | Provides `root-anchors.json`; reference `Docs/Website/style.css` for light/dark mode and accessibility patterns |
+| **dns-query-server** | DoH proxy; reference `Docs/Website/doh.css` for dark theme and DNSSEC badge patterns |
+| **tudor-dnssec-signer** | Zone signing (uses same `miekg/dns` library, similar DNSSEC logic) |
+
+### Integration with internet-files-mirror
+
+The root trust anchors should be fetched from your internet-files-mirror instance:
+
+```bash
+# Configure validator to use mirrored trust anchors
+ROOT_ANCHORS_PATH=/var/cache/dnssec-validator/root-anchors.json
+ROOT_ANCHORS_URL=https://internet.any53.com/dns/anchors/root-anchors.json
+```
+
+The mirror daemon handles:
+- Periodic refresh from IANA
+- Safe file replacement (never overwrites valid with error)
+- Version archiving for rollback
+
+This validator should:
+- Prefer local file if fresh (< 24h old)
+- Fall back to URL fetch if local is stale/missing
+- Cache fetched anchors locally
