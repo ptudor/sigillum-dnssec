@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# PROVIDE: dnssec_validator
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf to enable dnssec_validator:
+#
+# dnssec_validator_enable="YES"
+#
+
+. /etc/rc.subr
+
+name="dnssec_validator"
+rcvar="dnssec_validator_enable"
+
+load_rc_config $name
+
+: ${dnssec_validator_enable:="NO"}
+: ${dnssec_validator_user:="www"}
+: ${dnssec_validator_env:="/usr/local/etc/tudordns/dnssec-validator.env"}
+: ${dnssec_validator_log:="/var/log/tudordns/dnssec-validator.log"}
+
+pidfile="/var/run/${name}.pid"
+command="/usr/local/sbin/dnssec-validator"
+command_args=">> ${dnssec_validator_log} 2>&1 &"
+
+start_precmd="${name}_prestart"
+stop_postcmd="${name}_poststop"
+
+dnssec_validator_prestart()
+{
+    # Create log directory if needed
+    install -d -o ${dnssec_validator_user} /var/log/tudordns
+
+    # Load environment file
+    if [ -f "${dnssec_validator_env}" ]; then
+        . ${dnssec_validator_env}
+        export LISTEN_ADDR ROOT_ANCHORS_PATH ROOT_ANCHORS_URL
+        export QUERY_TIMEOUT TOTAL_TIMEOUT MAX_CONCURRENT
+        export RATE_LIMIT_PER_SEC RATE_BURST_SIZE
+        export LOG_LEVEL LOG_FORMAT STATIC_DIR SHUTDOWN_TIMEOUT
+    fi
+}
+
+dnssec_validator_poststop()
+{
+    rm -f ${pidfile}
+}
+
+run_rc_command "$1"
