@@ -35,9 +35,13 @@ func LoadAnchors(path string) (*RootAnchors, error) {
 		}
 	}
 	anchors.Anchors = validAnchors
+	anchors.LoadedFrom = path
 
 	return &anchors, nil
 }
+
+// UserAgent for HTTP requests (visible in server logs)
+const UserAgent = "Tudor DNSSEC-VALIDATOR/1.0"
 
 // LoadAnchorsFromURL loads root trust anchors from a URL
 func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
@@ -45,7 +49,14 @@ func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
 		Timeout: 30 * time.Second,
 	}
 
-	resp, err := client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch anchors: %w", err)
 	}
@@ -79,6 +90,7 @@ func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
 		}
 	}
 	anchors.Anchors = validAnchors
+	anchors.LoadedFrom = url
 
 	return &anchors, nil
 }

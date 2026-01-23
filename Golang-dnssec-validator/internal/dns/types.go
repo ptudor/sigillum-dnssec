@@ -95,10 +95,11 @@ type QueryResult struct {
 
 // RootAnchors represents the root trust anchor file structure
 type RootAnchors struct {
-	Source      string   `json:"source"`
+	Source      string   `json:"source"`                  // Original data source (e.g., IANA XML URL)
 	Zone        string   `json:"zone"`
 	GeneratedAt string   `json:"generatedAt"`
 	Anchors     []Anchor `json:"anchors"`
+	LoadedFrom  string   `json:"loadedFrom,omitempty"`    // Where validator loaded from (file path or URL)
 }
 
 // Anchor represents a single trust anchor
