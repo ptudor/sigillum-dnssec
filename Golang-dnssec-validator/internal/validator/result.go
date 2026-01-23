@@ -19,19 +19,22 @@ const (
 
 // ZoneResult represents the validation result for a single zone
 type ZoneResult struct {
-	Zone        string             `json:"zone"`
-	Status      ValidationStatus   `json:"status"`
-	Nameservers []NameserverResult `json:"nameservers"`
-	DNSKEY      []dns.DNSKEYRecord `json:"dnskey,omitempty"`
-	DS          []dns.DSRecord     `json:"ds,omitempty"`
-	RRSIG       []dns.RRSIGRecord  `json:"rrsig,omitempty"`
-	NSEC        []dns.NSECRecord   `json:"nsec,omitempty"`
-	NSEC3       []dns.NSEC3Record  `json:"nsec3,omitempty"`
-	ChainLink   *ChainLink         `json:"chain_link,omitempty"`
-	Warnings    []string           `json:"warnings,omitempty"`
-	Errors      []string           `json:"errors,omitempty"`
-	QueryTimeNs int64              `json:"query_time_ns"`
-	Timestamp   time.Time          `json:"timestamp"`
+	Zone           string             `json:"zone"`
+	Status         ValidationStatus   `json:"status"`
+	Nameservers    []NameserverResult `json:"nameservers"`
+	DNSKEY         []dns.DNSKEYRecord `json:"dnskey,omitempty"`
+	DS             []dns.DSRecord     `json:"ds,omitempty"`
+	RRSIG          []dns.RRSIGRecord  `json:"rrsig,omitempty"`
+	NSEC           []dns.NSECRecord   `json:"nsec,omitempty"`
+	NSEC3          []dns.NSEC3Record  `json:"nsec3,omitempty"`
+	NSEC3OptOut    bool               `json:"nsec3_opt_out,omitempty"`    // RFC 5155 opt-out flag
+	WildcardSource string             `json:"wildcard_source,omitempty"` // RFC 4034 §3.1.3 wildcard detection
+	DenialProof    *NSECProof         `json:"denial_proof,omitempty"`    // NSEC/NSEC3 proof of non-existence
+	ChainLink      *ChainLink         `json:"chain_link,omitempty"`
+	Warnings       []string           `json:"warnings,omitempty"`
+	Errors         []string           `json:"errors,omitempty"`
+	QueryTimeNs    int64              `json:"query_time_ns"`
+	Timestamp      time.Time          `json:"timestamp"`
 }
 
 // NameserverResult represents the result from a single nameserver

@@ -49,6 +49,55 @@ func TestVerifyRRSIGValid(t *testing.T) {
 			},
 			expected: true,
 		},
+		// RFC 4035 Section 5.3.1 clock skew tolerance tests
+		{
+			name: "clock skew: inception 3 min in future (within tolerance)",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(3 * time.Minute),
+				Expiration: now.Add(1 * time.Hour),
+			},
+			expected: true, // Should pass with 5-min tolerance
+		},
+		{
+			name: "clock skew: expiration 3 min in past (within tolerance)",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(-1 * time.Hour),
+				Expiration: now.Add(-3 * time.Minute),
+			},
+			expected: true, // Should pass with 5-min tolerance
+		},
+		{
+			name: "clock skew: inception 10 min in future (exceeds tolerance)",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(10 * time.Minute),
+				Expiration: now.Add(1 * time.Hour),
+			},
+			expected: false, // Should fail - too far in future
+		},
+		{
+			name: "clock skew: expiration 10 min in past (exceeds tolerance)",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(-1 * time.Hour),
+				Expiration: now.Add(-10 * time.Minute),
+			},
+			expected: false, // Should fail - too far in past
+		},
+		{
+			name: "clock skew: exactly at 5 min tolerance boundary (inception)",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(5*time.Minute - time.Second),
+				Expiration: now.Add(1 * time.Hour),
+			},
+			expected: true, // Just within tolerance
+		},
+		{
+			name: "clock skew: exactly at 5 min tolerance boundary (expiration)",
+			rrsig: dns.RRSIGRecord{
+				Inception:  now.Add(-1 * time.Hour),
+				Expiration: now.Add(-5*time.Minute + time.Second),
+			},
+			expected: true, // Just within tolerance
+		},
 	}
 
 	for _, tt := range tests {
@@ -347,5 +396,158 @@ func TestReconstructRRSIG(t *testing.T) {
 	_, err = reconstructRRSIG("example.com.", badRecord)
 	if err == nil {
 		t.Error("reconstructRRSIG should fail for invalid base64")
+	}
+}
+
+func TestValidateChainLinkMultiAlgorithm(t *testing.T) {
+	// Create DNSKEYs for two algorithms
+	dnskey13 := dns.DNSKEYRecord{
+		KeyTag:    11111,
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: 13, // ECDSAP256SHA256
+		PublicKey: "dGVzdDE=",
+		IsKSK:     true,
+	}
+	dnskey8 := dns.DNSKEYRecord{
+		KeyTag:    22222,
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: 8, // RSASHA256
+		PublicKey: "dGVzdDI=",
+		IsKSK:     true,
+	}
+
+	// Compute digests
+	digest13, _ := ComputeDSDigestFromDNSKEY("example.com.", dnskey13, 2)
+	digest8, _ := ComputeDSDigestFromDNSKEY("example.com.", dnskey8, 2)
+
+	tests := []struct {
+		name      string
+		ds        []dns.DSRecord
+		dnskeys   []dns.DNSKEYRecord
+		wantError bool
+		errorMsg  string
+	}{
+		{
+			name: "single algorithm - valid",
+			ds: []dns.DSRecord{
+				{KeyTag: 11111, Algorithm: 13, DigestType: 2, Digest: digest13},
+			},
+			dnskeys:   []dns.DNSKEYRecord{dnskey13},
+			wantError: false,
+		},
+		{
+			name: "two algorithms - both valid",
+			ds: []dns.DSRecord{
+				{KeyTag: 11111, Algorithm: 13, DigestType: 2, Digest: digest13},
+				{KeyTag: 22222, Algorithm: 8, DigestType: 2, Digest: digest8},
+			},
+			dnskeys:   []dns.DNSKEYRecord{dnskey13, dnskey8},
+			wantError: false,
+		},
+		{
+			name: "two algorithms - one missing DNSKEY (RFC 6840 violation)",
+			ds: []dns.DSRecord{
+				{KeyTag: 11111, Algorithm: 13, DigestType: 2, Digest: digest13},
+				{KeyTag: 22222, Algorithm: 8, DigestType: 2, Digest: digest8},
+			},
+			dnskeys:   []dns.DNSKEYRecord{dnskey13}, // Missing alg 8 DNSKEY
+			wantError: true,
+			errorMsg:  "algorithm 8",
+		},
+		{
+			name: "multiple DS same algorithm - one matches",
+			ds: []dns.DSRecord{
+				{KeyTag: 55555, Algorithm: 13, DigestType: 2, Digest: "wrongdigest"}, // Wrong
+				{KeyTag: 11111, Algorithm: 13, DigestType: 2, Digest: digest13},      // Correct
+			},
+			dnskeys:   []dns.DNSKEYRecord{dnskey13},
+			wantError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			link, err := ValidateChainLink(tt.ds, tt.dnskeys, "example.com.")
+
+			if tt.wantError {
+				if err == nil {
+					t.Error("expected error, got nil")
+				} else if tt.errorMsg != "" && !containsString(err.Error(), tt.errorMsg) {
+					t.Errorf("error should contain %q, got %q", tt.errorMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if link == nil || !link.DSMatchesKSK {
+					t.Error("chain link should be valid")
+				}
+			}
+		})
+	}
+}
+
+func containsString(s, substr string) bool {
+	return strings.Contains(s, substr)
+}
+
+func TestDetectWildcardSynthesis(t *testing.T) {
+	tests := []struct {
+		name       string
+		ownerName  string
+		rrsigLabel uint8
+		want       string
+	}{
+		{
+			name:       "no wildcard - labels match",
+			ownerName:  "example.com.",
+			rrsigLabel: 2, // example.com has 2 labels
+			want:       "",
+		},
+		{
+			name:       "wildcard - one extra label",
+			ownerName:  "www.example.com.",
+			rrsigLabel: 2, // Signed as *.example.com
+			want:       "*.example.com.",
+		},
+		{
+			name:       "wildcard - two extra labels",
+			ownerName:  "a.b.example.com.",
+			rrsigLabel: 2, // Signed as *.example.com
+			want:       "*.example.com.",
+		},
+		{
+			name:       "root zone - no wildcard",
+			ownerName:  ".",
+			rrsigLabel: 0,
+			want:       "",
+		},
+		{
+			name:       "TLD - no wildcard",
+			ownerName:  "com.",
+			rrsigLabel: 1,
+			want:       "",
+		},
+		{
+			name:       "wildcard at TLD level",
+			ownerName:  "example.com.",
+			rrsigLabel: 1, // Signed as *.com
+			want:       "*.com.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rrsig := dns.RRSIGRecord{
+				Labels: tt.rrsigLabel,
+			}
+			got := DetectWildcardSynthesis(tt.ownerName, rrsig)
+			if got != tt.want {
+				t.Errorf("DetectWildcardSynthesis(%q, labels=%d) = %q, want %q",
+					tt.ownerName, tt.rrsigLabel, got, tt.want)
+			}
+		})
 	}
 }

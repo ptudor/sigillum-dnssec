@@ -129,10 +129,19 @@ func FindDNSKEYByKeyTag(keyTag uint16, dnskeys []dnspkg.DNSKEYRecord) *dnspkg.DN
 	return nil
 }
 
+// ClockSkewTolerance is the allowed clock difference between validator and signer.
+// RFC 4035 Section 5.3.1 recommends validators "allow for small timing errors"
+// due to clock skew. 5 minutes is standard practice (BIND, Unbound, etc.)
+const ClockSkewTolerance = 5 * time.Minute
+
 // VerifyRRSIGValid checks if an RRSIG is currently valid (time-wise)
+// Allows for clock skew per RFC 4035 Section 5.3.1
 func VerifyRRSIGValid(rrsig dnspkg.RRSIGRecord) bool {
 	now := time.Now()
-	return now.After(rrsig.Inception) && now.Before(rrsig.Expiration)
+	// Allow clock skew: inception can be up to 5 min in future,
+	// expiration can be up to 5 min in past
+	return now.After(rrsig.Inception.Add(-ClockSkewTolerance)) &&
+		now.Before(rrsig.Expiration.Add(ClockSkewTolerance))
 }
 
 // FindRRSIGForType finds an RRSIG that covers the given type
@@ -155,7 +164,9 @@ func FindDSByKeyTag(keyTag uint16, dsRecords []dnspkg.DSRecord) *dnspkg.DSRecord
 	return nil
 }
 
-// ValidateChainLink validates the chain of trust between a DS and a DNSKEY
+// ValidateChainLink validates the chain of trust between DS and DNSKEY records.
+// Per RFC 6840 Section 5.11, if multiple algorithms are present in DS records,
+// ALL algorithms MUST have at least one valid DS→DNSKEY chain for the zone to be secure.
 func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRecord, zone string) (*ChainLink, error) {
 	link := &ChainLink{
 		ChildZone:    zone,
@@ -168,28 +179,54 @@ func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRe
 		return nil, fmt.Errorf("no DS records in parent zone")
 	}
 
-	// Find a KSK that matches one of the DS records
+	// Group DS records by algorithm (RFC 6840 §5.11 requirement)
+	algorithmDS := make(map[uint8][]dnspkg.DSRecord)
 	for _, ds := range parentDS {
-		ksk := FindKSKByKeyTag(ds.KeyTag, childDNSKEY)
-		if ksk == nil {
-			// Try to find any DNSKEY with matching key tag
-			ksk = FindDNSKEYByKeyTag(ds.KeyTag, childDNSKEY)
+		algorithmDS[ds.Algorithm] = append(algorithmDS[ds.Algorithm], ds)
+	}
+
+	// Each algorithm present MUST have at least one valid DS→DNSKEY match
+	var firstValidKSK *dnspkg.DNSKEYRecord
+	var validatedAlgorithms []uint8
+
+	for alg, dsRecords := range algorithmDS {
+		algValidated := false
+
+		for _, ds := range dsRecords {
+			// Find matching DNSKEY (prefer KSK, fall back to any key)
+			ksk := FindKSKByKeyTag(ds.KeyTag, childDNSKEY)
+			if ksk == nil {
+				ksk = FindDNSKEYByKeyTag(ds.KeyTag, childDNSKEY)
+			}
+
+			if ksk != nil && VerifyDSMatchesDNSKEY(ds, *ksk, zone) {
+				algValidated = true
+				if firstValidKSK == nil {
+					firstValidKSK = ksk
+					link.Algorithm = dnspkg.AlgorithmName(ds.Algorithm)
+					link.DigestType = dnspkg.DigestTypeName(ds.DigestType)
+					link.KeyTag = ds.KeyTag
+				}
+				break // This algorithm validated, move to next
+			}
 		}
 
-		if ksk != nil {
-			// Verify the DS matches the DNSKEY
-			if VerifyDSMatchesDNSKEY(ds, *ksk, zone) {
-				link.ChildKSK = ksk
-				link.DSMatchesKSK = true
-				link.Algorithm = dnspkg.AlgorithmName(ds.Algorithm)
-				link.DigestType = dnspkg.DigestTypeName(ds.DigestType)
-				link.KeyTag = ds.KeyTag
-				return link, nil
-			}
+		if algValidated {
+			validatedAlgorithms = append(validatedAlgorithms, alg)
+		} else {
+			// Algorithm present in DS but no valid DNSKEY = BOGUS per RFC 6840
+			return link, fmt.Errorf("algorithm %d (%s) has DS but no matching DNSKEY (RFC 6840 §5.11)",
+				alg, dnspkg.AlgorithmName(alg))
 		}
 	}
 
-	return link, fmt.Errorf("no matching DNSKEY found for any DS record")
+	if firstValidKSK == nil {
+		return link, fmt.Errorf("no matching DNSKEY found for any DS record")
+	}
+
+	link.ChildKSK = firstValidKSK
+	link.DSMatchesKSK = true
+	return link, nil
 }
 
 // VerifyDNSKEYRRSIG verifies that the DNSKEY RRset is properly signed
@@ -301,6 +338,30 @@ func reconstructRRSIG(zone string, record dnspkg.RRSIGRecord) (*dns.RRSIG, error
 	return rrsig, nil
 }
 
+// DetectWildcardSynthesis checks if an RRSIG indicates wildcard synthesis.
+// Per RFC 4034 Section 3.1.3, if the owner name has more labels than the
+// RRSIG Labels field, the response was synthesized from a wildcard.
+// Returns the wildcard source (e.g., "*.example.com.") or empty string.
+func DetectWildcardSynthesis(ownerName string, rrsig dnspkg.RRSIGRecord) string {
+	ownerLabels := GetZoneLabels(ownerName)
+
+	// Labels field in RRSIG is the number of labels in the original owner name
+	// (excluding the "*" label for wildcards and excluding the root label)
+	if ownerLabels > int(rrsig.Labels) {
+		// Response was synthesized from a wildcard
+		// Reconstruct the wildcard: take last N labels and prepend "*"
+		normalized := NormalizeDomain(ownerName)
+		labels := strings.Split(strings.TrimSuffix(normalized, "."), ".")
+
+		if int(rrsig.Labels) < len(labels) {
+			// Get the last 'Labels' labels
+			wildcardLabels := labels[len(labels)-int(rrsig.Labels):]
+			return "*." + strings.Join(wildcardLabels, ".") + "."
+		}
+	}
+	return ""
+}
+
 // GetKSKs returns all KSKs from a list of DNSKEYs
 func GetKSKs(dnskeys []dnspkg.DNSKEYRecord) []dnspkg.DNSKEYRecord {
 	var ksks []dnspkg.DNSKEYRecord
@@ -324,6 +385,7 @@ func GetZSKs(dnskeys []dnspkg.DNSKEYRecord) []dnspkg.DNSKEYRecord {
 }
 
 // VerifyRootTrustAnchor verifies that root DNSKEYs match the trust anchors
+// by computing and comparing DS digests, not just key tags (which can collide per RFC 4034 Appendix B)
 func VerifyRootTrustAnchor(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.Anchor) (*ChainLink, error) {
 	link := &ChainLink{
 		ChildZone:    ".",
@@ -331,10 +393,24 @@ func VerifyRootTrustAnchor(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.Ancho
 		DSMatchesKSK: false,
 	}
 
-	// Find a KSK that matches one of the trust anchors
+	// For each anchor, find a DNSKEY and verify digest matches
 	for _, anchor := range anchors {
 		for i, key := range dnskeys {
-			if key.KeyTag == uint16(anchor.KeyTag) && key.Algorithm == uint8(anchor.Algorithm) {
+			// Quick filter by key tag and algorithm
+			if key.KeyTag != uint16(anchor.KeyTag) || key.Algorithm != uint8(anchor.Algorithm) {
+				continue
+			}
+
+			// CRITICAL: Verify the digest, don't trust key tag alone
+			// Key tags are not unique - two different keys can have the same tag
+			computedDigest, err := ComputeDSDigestFromDNSKEY(".", key, uint8(anchor.DigestType))
+			if err != nil {
+				// Can't verify this key, try next
+				continue
+			}
+
+			// Compare digests (case-insensitive)
+			if strings.EqualFold(computedDigest, anchor.Digest) {
 				link.ChildKSK = &dnskeys[i]
 				link.DSMatchesKSK = true
 				link.Algorithm = anchor.AlgorithmName
@@ -342,8 +418,9 @@ func VerifyRootTrustAnchor(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.Ancho
 				link.KeyTag = uint16(anchor.KeyTag)
 				return link, nil
 			}
+			// Key tag matched but digest didn't - possible collision, try next key
 		}
 	}
 
-	return link, fmt.Errorf("no DNSKEY matches any trust anchor")
+	return link, fmt.Errorf("no DNSKEY matches any trust anchor (digest verification failed)")
 }
