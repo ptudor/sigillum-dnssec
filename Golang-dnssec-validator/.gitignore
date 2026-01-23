@@ -1,1 +1,3 @@
 root-anchors.json
+dnssec-validator
+.env
