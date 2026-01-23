@@ -36,6 +36,9 @@ type Config struct {
 
 	// Static files
 	StaticDir string
+
+	// Base path (for reverse proxy, e.g., "/dnssec")
+	BasePath string
 }
 
 // DefaultConfig returns a Config with sensible defaults
@@ -88,6 +91,9 @@ func LoadConfig() (*Config, error) {
 
 	// Static files
 	cfg.StaticDir = getEnv("STATIC_DIR", cfg.StaticDir)
+
+	// Base path for reverse proxy
+	cfg.BasePath = getEnv("BASE_PATH", cfg.BasePath)
 
 	// Validate
 	if err := cfg.Validate(); err != nil {

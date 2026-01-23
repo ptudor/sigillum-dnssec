@@ -64,15 +64,25 @@ func (s *Server) registerRoutes() {
 		return
 	}
 
+	// Read index.html for root path serving
+	indexHTML, _ := fs.ReadFile(staticFS, "index.html")
+
 	// Serve static files
 	fileServer := http.FileServer(http.FS(staticFS))
 	s.mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set security headers for static files
 		setSecurityHeaders(w)
-		// Serve index.html for root path
-		if r.URL.Path == "/" {
-			r.URL.Path = "/index.html"
+
+		path := r.URL.Path
+		LogDebug("static", "serving static file", "path", path, "method", r.Method)
+
+		// Serve index.html for root path or /index.html (avoid FileServer redirects)
+		if path == "/" || path == "" || path == "/index.html" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(indexHTML)
+			return
 		}
+
 		fileServer.ServeHTTP(w, r)
 	}))
 }
