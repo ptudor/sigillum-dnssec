@@ -102,19 +102,20 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 	for _, rr := range allRRs {
 		switch v := rr.(type) {
 		case *dns.DNSKEY:
+			// RFC 4034 Section 2.1.1 DNSKEY Flags:
+			// Bit 7 (value 256): Zone Key flag - key can sign zone data
+			// Bit 15 (value 1): SEP flag - Secure Entry Point (conventionally KSK)
+			// KSK = Zone Key + SEP (256 + 1 = 257)
+			// ZSK = Zone Key only (256)
 			dnskey := DNSKEYRecord{
 				Flags:     v.Flags,
 				Protocol:  v.Protocol,
 				Algorithm: v.Algorithm,
 				PublicKey: base64.StdEncoding.EncodeToString([]byte(v.PublicKey)),
 				KeyTag:    v.KeyTag(),
-				IsKSK:     v.Flags&0x0001 == 0x0001, // SEP bit
-				IsZSK:     v.Flags&0x0100 == 0x0100, // Zone Key bit
+				IsKSK:     v.Flags == 257, // Zone Key (256) + SEP (1)
+				IsZSK:     v.Flags == 256, // Zone Key only
 			}
-			// KSK has both Zone Key and SEP bits set (257)
-			// ZSK has only Zone Key bit set (256)
-			dnskey.IsKSK = v.Flags == 257
-			dnskey.IsZSK = v.Flags == 256
 			result.DNSKEY = append(result.DNSKEY, dnskey)
 
 		case *dns.DS:
@@ -146,6 +147,7 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 
 		case *dns.NSEC:
 			nsec := NSECRecord{
+				Owner:      v.Hdr.Name,
 				NextDomain: v.NextDomain,
 				TypeBitmap: make([]string, 0),
 			}
@@ -155,13 +157,20 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 			result.NSEC = append(result.NSEC, nsec)
 
 		case *dns.NSEC3:
+			// Extract hashed owner (first label before zone)
+			hashedOwner := ""
+			if idx := strings.Index(v.Hdr.Name, "."); idx > 0 {
+				hashedOwner = strings.ToUpper(v.Hdr.Name[:idx])
+			}
 			nsec3 := NSEC3Record{
-				Algorithm:  v.Hash,
-				Flags:      v.Flags,
-				Iterations: v.Iterations,
-				Salt:       strings.ToUpper(v.Salt),
-				NextHashed: strings.ToUpper(v.NextDomain),
-				TypeBitmap: make([]string, 0),
+				Owner:       v.Hdr.Name,
+				HashedOwner: hashedOwner,
+				Algorithm:   v.Hash,
+				Flags:       v.Flags,
+				Iterations:  v.Iterations,
+				Salt:        strings.ToUpper(v.Salt),
+				NextHashed:  strings.ToUpper(v.NextDomain),
+				TypeBitmap:  make([]string, 0),
 			}
 			for _, t := range v.TypeBitMap {
 				nsec3.TypeBitmap = append(nsec3.TypeBitmap, TypeName(t))

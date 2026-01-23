@@ -401,6 +401,15 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		return result, nil
 	}
 
+	// RFC 4034 §3.1.3: Detect wildcard synthesis
+	if rrsig := FindRRSIGForType(dns.TypeDNSKEY, result.RRSIG); rrsig != nil {
+		if wildcard := DetectWildcardSynthesis(zone, *rrsig); wildcard != "" {
+			result.WildcardSource = wildcard
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("Response synthesized from wildcard %s", wildcard))
+		}
+	}
+
 	// Validate chain of trust
 	if zone == "." {
 		// Root zone - verify against trust anchors
@@ -438,6 +447,22 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			return result, nil
 		}
 		result.ChainLink = link
+	}
+
+	// Check for RFC compliance warnings (informational, don't affect status)
+
+	// RFC 8624: Deprecated algorithm warnings
+	result.Warnings = append(result.Warnings, CheckAlgorithmDeprecation(result.DNSKEY)...)
+	result.Warnings = append(result.Warnings, CheckRRSIGAlgorithmDeprecation(result.RRSIG)...)
+	result.Warnings = append(result.Warnings, CheckDigestTypeDeprecation(result.DS)...)
+
+	// RFC 9276: NSEC3 iteration count warnings
+	result.Warnings = append(result.Warnings, CheckNSEC3Iterations(result.NSEC3)...)
+
+	// RFC 5155: NSEC3 opt-out status (informational)
+	if optOut, explanation := CheckNSEC3OptOut(result.NSEC3); optOut {
+		result.NSEC3OptOut = true
+		result.Warnings = append(result.Warnings, explanation)
 	}
 
 	result.Status = StatusSecure

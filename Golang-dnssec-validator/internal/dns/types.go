@@ -44,18 +44,21 @@ type RRSIGRecord struct {
 
 // NSECRecord represents an NSEC record
 type NSECRecord struct {
+	Owner      string   `json:"owner"`       // Owner name (from RR header)
 	NextDomain string   `json:"next_domain"`
 	TypeBitmap []string `json:"type_bitmap"` // Type names covered
 }
 
 // NSEC3Record represents an NSEC3 record
 type NSEC3Record struct {
-	Algorithm  uint8    `json:"algorithm"`
-	Flags      uint8    `json:"flags"`
-	Iterations uint16   `json:"iterations"`
-	Salt       string   `json:"salt"` // Hex
-	NextHashed string   `json:"next_hashed"`
-	TypeBitmap []string `json:"type_bitmap"`
+	Owner       string   `json:"owner"`       // Full owner name (hashed.zone.)
+	HashedOwner string   `json:"hashed_owner"` // Just the hashed portion (base32)
+	Algorithm   uint8    `json:"algorithm"`
+	Flags       uint8    `json:"flags"`
+	Iterations  uint16   `json:"iterations"`
+	Salt        string   `json:"salt"` // Hex
+	NextHashed  string   `json:"next_hashed"`
+	TypeBitmap  []string `json:"type_bitmap"`
 }
 
 // NSRecord represents a nameserver record
