@@ -216,15 +216,18 @@
 
     // Add zone item to tree visualization
     function addZoneCard(zone, status, zoneResult) {
-        var isCached = seenZones.has(zone);
+        // Skip if zone was already rendered (prevent duplicates from nested CNAME chains)
+        if (seenZones.has(zone)) {
+            return;
+        }
         seenZones.add(zone);
 
         // Create tree item
         var item = document.createElement('div');
-        item.className = 'zone-item ' + status + (isCached ? ' cached' : '');
+        item.className = 'zone-item ' + status;
         item.setAttribute('role', 'button');
         item.setAttribute('tabindex', '0');
-        item.setAttribute('aria-label', 'Zone ' + zone + ' status ' + status + (isCached ? ' (cached)' : ''));
+        item.setAttribute('aria-label', 'Zone ' + zone + ' status ' + status);
         item.dataset.zone = zone;
 
         // Zone name (display friendly)
@@ -234,10 +237,7 @@
         var html = '<span class="zone-indent" aria-hidden="true">' + getIndent(currentDepth) + '</span>';
         html += '<span class="zone-status-icon ' + status + '">' + getStatusIcon(status) + '</span>';
         html += '<span class="zone-name">' + escapeHtml(displayName) + '</span>';
-        if (isCached) {
-            html += '<span class="zone-cached-label">(cached)</span>';
-        }
-        if (zoneResult && zoneResult.query_time_ns && !isCached) {
+        if (zoneResult && zoneResult.query_time_ns) {
             html += '<span class="zone-rtt">' + formatRTT(zoneResult.query_time_ns) + '</span>';
         }
         item.innerHTML = html;
@@ -260,18 +260,16 @@
 
         chainVisualizationEl.appendChild(item);
 
-        // Add tab (skip cached zones to avoid duplicates)
-        if (!isCached) {
-            var tab = document.createElement('button');
-            tab.className = 'zone-tab';
-            tab.setAttribute('role', 'tab');
-            tab.textContent = zone === '.' ? 'root' : zone.replace(/\.$/, '');
-            tab.dataset.zone = zone;
-            tab.addEventListener('click', function() {
-                selectZone(zone, zoneResult);
-            });
-            zoneTabsEl.appendChild(tab);
-        }
+        // Add tab
+        var tab = document.createElement('button');
+        tab.className = 'zone-tab';
+        tab.setAttribute('role', 'tab');
+        tab.textContent = zone === '.' ? 'root' : zone.replace(/\.$/, '');
+        tab.dataset.zone = zone;
+        tab.addEventListener('click', function() {
+            selectZone(zone, zoneResult);
+        });
+        zoneTabsEl.appendChild(tab);
 
         // Auto-select first zone
         if (!selectedZone) {
@@ -286,18 +284,9 @@
     function selectZone(zone, zoneResult) {
         selectedZone = zone;
 
-        // Update tree item selection (only select first match to handle cached duplicates)
-        var foundFirst = false;
+        // Update tree item selection
         document.querySelectorAll('.zone-item').forEach(function(item) {
-            if (item.dataset.zone === zone && !foundFirst) {
-                item.classList.add('selected');
-                foundFirst = true;
-            } else if (item.dataset.zone === zone) {
-                // Don't select duplicate cached entries
-                item.classList.remove('selected');
-            } else {
-                item.classList.remove('selected');
-            }
+            item.classList.toggle('selected', item.dataset.zone === zone);
         });
 
         // Update tab selection
