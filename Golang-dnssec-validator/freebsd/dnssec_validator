@@ -17,18 +17,16 @@ rcvar="dnssec_validator_enable"
 load_rc_config $name
 
 : ${dnssec_validator_enable:="NO"}
-: ${dnssec_validator_user:="dnssec-validator"}
 
-# Explicitly disable rc.subr env magic
-dnssec_validator_env=""
+# Don't set dnssec_validator_user - rc.subr would add another su wrapper
+# We handle user switching in command_args instead
 
 pidfile="/var/run/${name}.pid"
 procname="/usr/local/sbin/dnssec-validator"
 
 # Use daemon(8) to properly daemonize, with wrapper to source env file
-# Note: using su -m instead of daemon -u to avoid login.conf issues
 command="/usr/sbin/daemon"
-command_args="-p ${pidfile} -S -T dnssec_validator /usr/bin/su -m ${dnssec_validator_user} -c /usr/local/sbin/dnssec-validator.sh"
+command_args="-p ${pidfile} -S -T dnssec_validator /usr/bin/su -m dnssec-validator -c /usr/local/sbin/dnssec-validator.sh"
 
 start_precmd="${name}_prestart"
 stop_postcmd="${name}_poststop"
@@ -36,11 +34,11 @@ stop_postcmd="${name}_poststop"
 dnssec_validator_prestart()
 {
     # Create log directory if needed (app writes to LOG_FILE from env)
-    install -d -o ${dnssec_validator_user} /var/log/tudordns
+    install -d -o dnssec-validator /var/log/tudordns
 
-    # Pre-create pidfile so daemon -u can write to it
+    # Pre-create pidfile writable by dnssec-validator user
     touch ${pidfile}
-    chown ${dnssec_validator_user} ${pidfile}
+    chown dnssec-validator ${pidfile}
 }
 
 dnssec_validator_poststop()
