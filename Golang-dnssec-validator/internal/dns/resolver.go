@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -156,4 +157,84 @@ func (r *Resolver) QueryDNSKEYAuthoritative(ctx context.Context, server, zone st
 // QueryDSAuthoritative queries DS from an authoritative server
 func (r *Resolver) QueryDSAuthoritative(ctx context.Context, server, zone string) (*QueryResult, error) {
 	return r.querier.QueryDS(ctx, server, zone)
+}
+
+// QueryRecordAuthoritative queries any record type from an authoritative server
+func (r *Resolver) QueryRecordAuthoritative(ctx context.Context, server, name string, qtype uint16) (*QueryResult, error) {
+	return r.querier.Query(ctx, server, name, qtype)
+}
+
+// QueryRecordRecursive queries any record type using the recursive resolver
+func (r *Resolver) QueryRecordRecursive(ctx context.Context, name string, qtype uint16) (*QueryResult, error) {
+	return r.querier.QueryWithRecursion(ctx, r.recursive, name, qtype, true)
+}
+
+// CheckZoneCut checks if a domain is a zone cut (has NS records)
+// Returns true if the domain has its own NS records (is a delegation point)
+func (r *Resolver) CheckZoneCut(ctx context.Context, domain string) (bool, error) {
+	// Query NS records for the domain
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(domain), dns.TypeNS)
+	msg.RecursionDesired = true
+
+	client := &dns.Client{
+		Net:     "udp",
+		Timeout: r.querier.timeout,
+	}
+
+	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(r.recursive, "53"))
+	if err != nil {
+		return false, err
+	}
+
+	// Check if we got NS records in the answer section
+	// (not just in the authority section which would be a referral)
+	for _, rr := range resp.Answer {
+		if _, ok := rr.(*dns.NS); ok {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// DiscoverZoneCuts discovers actual zone cuts between root and domain
+// Returns the list of actual zones in the chain (where NS records exist)
+func (r *Resolver) DiscoverZoneCuts(ctx context.Context, domain string) ([]string, error) {
+	// Start with root
+	zones := []string{"."}
+
+	// Normalize domain
+	domain = dns.Fqdn(domain)
+	if domain == "." {
+		return zones, nil
+	}
+
+	// Split into labels
+	labels := dns.SplitDomainName(domain)
+	if len(labels) == 0 {
+		return zones, nil
+	}
+
+	// Check each potential zone from TLD down
+	// e.g., for www.iana.org: check org., iana.org., www.iana.org.
+	for i := len(labels) - 1; i >= 0; i-- {
+		candidate := dns.Fqdn(labels[i] + "." + strings.Join(labels[i+1:], "."))
+		if i == len(labels)-1 {
+			candidate = dns.Fqdn(labels[i])
+		}
+
+		isZone, err := r.CheckZoneCut(ctx, candidate)
+		if err != nil {
+			// On error, assume it might be a zone (fail-safe)
+			zones = append(zones, candidate)
+			continue
+		}
+
+		if isZone {
+			zones = append(zones, candidate)
+		}
+	}
+
+	return zones, nil
 }

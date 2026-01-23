@@ -355,6 +355,25 @@ body {
     flex-shrink: 0;
 }
 
+.chain-arrow.cname-arrow {
+    color: var(--dnssec);
+    font-size: 0.875rem;
+    font-weight: 500;
+    padding: 0 0.5rem;
+}
+
+.zone-card.cname-target {
+    border-color: var(--dnssec);
+    background: var(--dnssec-bg);
+}
+
+.zone-card.cname-target .zone-status {
+    font-size: 0.6875rem;
+    color: var(--dnssec);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
 /* Result Timing */
 .result-timing {
     display: flex;
