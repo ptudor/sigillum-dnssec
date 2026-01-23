@@ -31,6 +31,7 @@ type ZoneResult struct {
 	WildcardSource string             `json:"wildcard_source,omitempty"` // RFC 4034 §3.1.3 wildcard detection
 	DenialProof    *NSECProof         `json:"denial_proof,omitempty"`    // NSEC/NSEC3 proof of non-existence
 	ChainLink      *ChainLink         `json:"chain_link,omitempty"`
+	Disagreements  []Disagreement     `json:"disagreements,omitempty"`
 	Warnings       []string           `json:"warnings,omitempty"`
 	Errors         []string           `json:"errors,omitempty"`
 	QueryTimeNs    int64              `json:"query_time_ns"`
