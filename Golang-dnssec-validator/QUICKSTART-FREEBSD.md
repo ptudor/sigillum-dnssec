@@ -16,9 +16,17 @@ install -m 755 dnssec-validator /usr/local/sbin/
 install -m 755 freebsd/dnssec-validator.sh /usr/local/sbin/
 ```
 
-## 3. Create Environment File
+## 3. Create Service User
 
 ```sh
+pw useradd dnssec-validator -c "DNSSEC Validator Service" -d /nonexistent -s /usr/sbin/nologin
+install -d -o dnssec-validator /var/log/tudordns
+```
+
+## 4. Create Environment File
+
+```sh
+mkdir -p /usr/local/etc/tudordns
 cat > /usr/local/etc/tudordns/dnssec-validator.env << 'EOF'
 LISTEN_ADDR=127.0.0.1:8791
 ROOT_ANCHORS_PATH=/var/www/internet.any53.com/dns/anchors/root-anchors.json
@@ -34,10 +42,11 @@ LOG_FILE=/var/log/tudordns/dnssec-validator.log
 SHUTDOWN_TIMEOUT_SECONDS=30
 EOF
 
-chmod 600 /usr/local/etc/tudordns/dnssec-validator.env
+chown root:dnssec-validator /usr/local/etc/tudordns/dnssec-validator.env
+chmod 640 /usr/local/etc/tudordns/dnssec-validator.env
 ```
 
-## 4. Install rc.d Script
+## 5. Install rc.d Script
 
 ```sh
 install -m 755 freebsd/dnssec_validator /usr/local/etc/rc.d/
@@ -49,7 +58,7 @@ Enable in `/etc/rc.conf`:
 echo 'dnssec_validator_enable="YES"' >> /etc/rc.conf
 ```
 
-## 5. Apache Configuration
+## 6. Apache Configuration
 
 Copy the include file:
 
@@ -71,13 +80,13 @@ apachectl configtest
 service apache24 reload
 ```
 
-## 6. Start Service
+## 7. Start Service
 
 ```sh
 service dnssec_validator start
 ```
 
-## 7. Verify
+## 8. Verify
 
 ```sh
 # Check service status
