@@ -287,12 +287,7 @@ func VerifyDNSKEYRRSIG(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecor
 
 // reconstructDNSKEY converts our DNSKEYRecord back to a dns.DNSKEY for verification
 func reconstructDNSKEY(zone string, record dnspkg.DNSKEYRecord) (*dns.DNSKEY, error) {
-	// Decode the base64 public key
-	pubKey, err := base64.StdEncoding.DecodeString(record.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("invalid base64 public key: %w", err)
-	}
-
+	// miekg/dns Verify() expects PublicKey as base64 - it decodes internally
 	dnskey := &dns.DNSKEY{
 		Hdr: dns.RR_Header{
 			Name:   dns.Fqdn(zone),
@@ -303,7 +298,7 @@ func reconstructDNSKEY(zone string, record dnspkg.DNSKEYRecord) (*dns.DNSKEY, er
 		Flags:     record.Flags,
 		Protocol:  record.Protocol,
 		Algorithm: record.Algorithm,
-		PublicKey: string(pubKey),
+		PublicKey: record.PublicKey, // Already base64, Verify() decodes internally
 	}
 
 	return dnskey, nil
@@ -311,12 +306,7 @@ func reconstructDNSKEY(zone string, record dnspkg.DNSKEYRecord) (*dns.DNSKEY, er
 
 // reconstructRRSIG converts our RRSIGRecord back to a dns.RRSIG for verification
 func reconstructRRSIG(zone string, record dnspkg.RRSIGRecord) (*dns.RRSIG, error) {
-	// Decode the base64 signature
-	sig, err := base64.StdEncoding.DecodeString(record.Signature)
-	if err != nil {
-		return nil, fmt.Errorf("invalid base64 signature: %w", err)
-	}
-
+	// miekg/dns Verify() expects Signature as base64 - it decodes internally
 	rrsig := &dns.RRSIG{
 		Hdr: dns.RR_Header{
 			Name:   dns.Fqdn(zone),
@@ -332,7 +322,7 @@ func reconstructRRSIG(zone string, record dnspkg.RRSIGRecord) (*dns.RRSIG, error
 		Inception:   uint32(record.Inception.Unix()),
 		KeyTag:      record.KeyTag,
 		SignerName:  dns.Fqdn(record.SignerName),
-		Signature:   string(sig),
+		Signature:   record.Signature, // Already base64, Verify() decodes internally
 	}
 
 	return rrsig, nil
