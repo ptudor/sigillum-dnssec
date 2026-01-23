@@ -19,7 +19,7 @@ install -m 755 dnssec-validator /usr/local/sbin/
 
 ```sh
 cat > /usr/local/etc/tudordns/dnssec-validator.env << 'EOF'
-LISTEN_ADDR=127.0.0.1:8080
+LISTEN_ADDR=127.0.0.1:8791
 ROOT_ANCHORS_PATH=/var/www/internet.any53.com/dns/anchors/root-anchors.json
 ROOT_ANCHORS_URL=https://internet.any53.com/dns/anchors/root-anchors.json
 QUERY_TIMEOUT=5s
@@ -125,7 +125,7 @@ Check the include file has `proxy-nokeepalive` and `no-gzip` settings.
 Check if the service is running:
 
 ```sh
-sockstat -l | grep 8080
+sockstat -l | grep 8791
 service dnssec_validator status
 ```
 
