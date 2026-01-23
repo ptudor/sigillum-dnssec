@@ -1,0 +1,637 @@
+# Golang-dnssec-validator
+
+A web-based DNSSEC troubleshooting and validation tool with a polished UI. Think "DNSViz" or "drill" but in your browser, with real-time streaming results and comprehensive diagnostics.
+
+## Project Purpose
+
+This service performs iterative DNSSEC validation from the root zone down, querying authoritative nameservers at each level and streaming results back to the browser via Server-Sent Events (SSE). It validates the complete chain of trust using the IANA root trust anchors.
+
+**Key differentiator**: Query *every* authoritative nameserver at each level (not just one), flagging inconsistencies between servers. If 4 of 5 nameservers return correct DNSSEC signatures but one returns garbage, we show that.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Browser (SPA)                                  │
+│  ┌─────────────┐  ┌─────────────────────────────────────────────────────┐  │
+│  │  Input Form │  │              Results Visualization                  │  │
+│  │  ─────────  │  │  ┌─────┐   ┌─────┐   ┌─────────┐   ┌─────────────┐  │  │
+│  │  Domain:    │  │  │  .  │ → │ net │ → │ ptudor  │ → │     www     │  │  │
+│  │  [        ] │  │  │ ✓✓✓ │   │ ✓✓✓ │   │ ✓✓✓✓    │   │ ✓✓✓✓        │  │  │
+│  │  [Validate] │  │  └─────┘   └─────┘   └─────────┘   └─────────────┘  │  │
+│  └─────────────┘  │         (cards appear progressively via SSE)        │  │
+│                   └─────────────────────────────────────────────────────┘  │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │ EventSource (SSE)
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        dnssec-validator daemon                              │
+│  ┌──────────────┐  ┌──────────────────────────────────────────────────┐    │
+│  │ HTTP Server  │  │              Validation Engine                   │    │
+│  │  /validate   │──│  1. Parse domain → zone hierarchy                │    │
+│  │  /health     │  │  2. For each zone level (root → target):         │    │
+│  │  /metrics    │  │     a. Resolve NS records                        │    │
+│  │  /           │  │     b. Query ALL authoritative IPs               │    │
+│  │  (static UI) │  │     c. Fetch DNSKEY, DS, RRSIG records           │    │
+│  └──────────────┘  │     d. Validate signatures against parent DS     │    │
+│                    │     e. Stream results back via SSE               │    │
+│                    │  3. Final validation summary                     │    │
+│                    └──────────────────────────────────────────────────┘    │
+│                                       │                                     │
+│  ┌────────────────────────────────────┴──────────────────────────────────┐ │
+│  │                        Trust Anchor Store                             │ │
+│  │  root-anchors.json (from internet-files-mirror)                       │ │
+│  │  - KSK key tags, algorithms, digests                                  │ │
+│  │  - Used to bootstrap root zone validation                             │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼ UDP/TCP :53
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Authoritative DNS Servers Worldwide                      │
+│    Root Servers    │    TLD Servers    │    Domain Authoritative NS        │
+│    a.root → m.root │    *.gtld-servers │    ns1.example.com, etc.          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Core Features
+
+### 1. Progressive Streaming Results (SSE)
+
+Results stream back as each zone level completes validation:
+
+```
+Client                                    Server
+  │                                          │
+  │  GET /validate?domain=www.ptudor.net     │
+  │  Accept: text/event-stream               │
+  │ ────────────────────────────────────────>│
+  │                                          │
+  │  event: zone                             │
+  │  data: {"zone":".","status":"validating"}│
+  │ <────────────────────────────────────────│
+  │                                          │  (queries root servers)
+  │  event: zone                             │
+  │  data: {"zone":".","status":"secure"...} │
+  │ <────────────────────────────────────────│
+  │                                          │
+  │  event: zone                             │
+  │  data: {"zone":"net.","status":"secure"} │
+  │ <────────────────────────────────────────│
+  │                                          │
+  │  event: zone                             │
+  │  data: {"zone":"ptudor.net.",...}        │
+  │ <────────────────────────────────────────│
+  │                                          │
+  │  event: zone                             │
+  │  data: {"zone":"www.ptudor.net.",...}    │
+  │ <────────────────────────────────────────│
+  │                                          │
+  │  event: complete                         │
+  │  data: {"result":"secure","chain":[...]} │
+  │ <────────────────────────────────────────│
+```
+
+### 2. Query All Authoritative Servers
+
+For each zone level, query **every** authoritative nameserver IP (both IPv4 and IPv6):
+
+```json
+{
+  "zone": "net.",
+  "nameservers": [
+    {
+      "name": "a.gtld-servers.net.",
+      "addresses": [
+        {"ip": "192.5.6.30", "status": "secure", "rtt_ms": 12},
+        {"ip": "2001:503:a83e::2:30", "status": "secure", "rtt_ms": 15}
+      ]
+    },
+    {
+      "name": "b.gtld-servers.net.",
+      "addresses": [
+        {"ip": "192.33.14.30", "status": "secure", "rtt_ms": 18},
+        {"ip": "2001:503:231d::2:30", "status": "timeout", "error": "i/o timeout"}
+      ]
+    }
+  ],
+  "consensus": "secure",
+  "disagreements": []
+}
+```
+
+Flag any server returning different results:
+
+```json
+{
+  "disagreements": [
+    {
+      "server": "ns3.example.com (192.0.2.3)",
+      "issue": "RRSIG expired",
+      "expected": "valid signature",
+      "got": "signature expired 2024-01-15"
+    }
+  ]
+}
+```
+
+### 3. DNSSEC Validation Details
+
+For each zone, capture and display:
+
+| Data | Purpose |
+|------|---------|
+| **DNSKEY records** | Zone's public keys (KSK flag 257, ZSK flag 256) |
+| **DS records** | Parent zone's hash of child's KSK |
+| **RRSIG records** | Signatures over each RRset |
+| **NSEC/NSEC3** | Authenticated denial of existence |
+| **Key tags** | Numeric identifiers linking DS → DNSKEY |
+| **Algorithms** | Cryptographic algorithm (8=RSA/SHA-256, 13=ECDSA P-256, 15=Ed25519) |
+| **Signature validity** | inception/expiration timestamps |
+| **Chain of trust** | Visual representation of DS → DNSKEY linkage |
+
+### 4. Root Trust Anchor Integration
+
+Bootstrap validation using `root-anchors.json`:
+
+```go
+type RootAnchors struct {
+    Source      string   `json:"source"`
+    Zone        string   `json:"zone"`
+    GeneratedAt string   `json:"generatedAt"`
+    Anchors     []Anchor `json:"anchors"`
+}
+
+type Anchor struct {
+    ID             string  `json:"id"`
+    KeyTag         int     `json:"keyTag"`
+    Algorithm      int     `json:"algorithm"`
+    AlgorithmName  string  `json:"algorithmName"`
+    DigestType     int     `json:"digestType"`
+    DigestTypeName string  `json:"digestTypeName"`
+    Digest         string  `json:"digest"`
+    ValidFrom      string  `json:"validFrom"`
+    ValidUntil     *string `json:"validUntil"`
+    PublicKey      string  `json:"publicKey,omitempty"`
+    Flags          int     `json:"flags,omitempty"`
+}
+```
+
+The browser can independently verify the root DNSKEY against these anchors.
+
+## SSE Event Types
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `start` | `{domain, timestamp, mode}` | Validation begun |
+| `zone` | `{zone, status, nameservers, dnskey, ds, rrsig, ...}` | Zone-level result |
+| `progress` | `{zone, server, action}` | Per-server progress updates |
+| `warning` | `{zone, message, severity}` | Non-fatal issues |
+| `error` | `{zone, message, fatal}` | Errors during validation |
+| `complete` | `{result, chain, duration_ms}` | Final summary |
+
+## API Endpoints
+
+### `GET /validate`
+
+Stream DNSSEC validation results.
+
+**Query Parameters:**
+
+| Param | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `domain` | Yes | - | Domain name to validate |
+| `type` | No | `A` | Record type to validate (A, AAAA, MX, etc.) |
+| `mode` | No | `extended` | `quick` (first responding NS) or `extended` (all NS) |
+
+**Response:** `text/event-stream`
+
+### `GET /api/validate`
+
+JSON API (non-streaming) for programmatic access.
+
+**Response:** `application/json`
+
+```json
+{
+  "domain": "www.ptudor.net",
+  "type": "A",
+  "result": "secure",
+  "chain": [
+    {"zone": ".", "status": "secure", ...},
+    {"zone": "net.", "status": "secure", ...},
+    {"zone": "ptudor.net.", "status": "secure", ...},
+    {"zone": "www.ptudor.net.", "status": "secure", ...}
+  ],
+  "duration_ms": 847
+}
+```
+
+### `GET /api/anchors`
+
+Return current root trust anchors.
+
+### `GET /health`
+
+Health check endpoint.
+
+### `GET /metrics`
+
+Prometheus metrics.
+
+### `GET /`
+
+Serve the static web UI.
+
+## Validation States
+
+| State | Meaning | UI Color |
+|-------|---------|----------|
+| `secure` | Full chain of trust verified | Green |
+| `insecure` | Zone not signed (no DS in parent) | Gray |
+| `bogus` | Validation failed (bad signature, missing key, etc.) | Red |
+| `indeterminate` | Cannot determine (timeout, SERVFAIL) | Yellow |
+
+## Web UI Design Goals
+
+**Philosophy**: Polished, accessible, informative—not "developer made this in an afternoon."
+
+### Layout
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🔐 DNSSEC Validator                              [About] [API] │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │  Enter domain:  [www.example.com          ] [Validate]  │   │
+│   │                                                         │   │
+│   │  ○ Quick (fastest responding server)                    │   │
+│   │  ● Extended (query all authoritative servers)           │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│   ┌─ Chain of Trust ────────────────────────────────────────┐   │
+│   │                                                         │   │
+│   │  ┌───┐      ┌─────┐      ┌─────────┐      ┌─────────┐   │   │
+│   │  │ . │ ───► │ net │ ───► │ example │ ───► │   www   │   │   │
+│   │  │ ✓ │      │ ✓   │      │    ✓    │      │    ✓    │   │   │
+│   │  └───┘      └─────┘      └─────────┘      └─────────┘   │   │
+│   │   12ms       18ms          24ms             8ms         │   │
+│   │                                                         │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│   ┌─ Details ───────────────────────────────────────────────┐   │
+│   │  [.] [net] [example.com] [www.example.com]              │   │
+│   │  ───────────────────────────────────────────            │   │
+│   │  Zone: example.com.                                     │   │
+│   │  Status: ✓ Secure                                       │   │
+│   │                                                         │   │
+│   │  Nameservers:                                           │   │
+│   │   ├─ ns1.example.com (93.184.216.34)     ✓  12ms       │   │
+│   │   ├─ ns1.example.com (2606:2800:220::)   ✓  15ms       │   │
+│   │   ├─ ns2.example.com (93.184.216.35)     ✓  14ms       │   │
+│   │   └─ ns2.example.com (2606:2800:221::)   ✓  18ms       │   │
+│   │                                                         │   │
+│   │  ▼ DNSKEY Records                                       │   │
+│   │  ▼ DS Records (from parent)                             │   │
+│   │  ▼ RRSIG Details                                        │   │
+│   │  ▼ Raw DNS Response                                     │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### UI Requirements
+
+1. **Progressive disclosure**: Show summary first, expand for nerd details
+2. **Real-time updates**: Cards/nodes animate in as SSE events arrive
+3. **Color-coded status**: Instant visual feedback (green/gray/red/yellow)
+4. **Responsive**: Works on mobile (stacked cards)
+5. **Dark mode**: Respect `prefers-color-scheme`
+6. **Accessible**: Proper ARIA labels, keyboard navigation
+7. **Shareable**: URL updates with query (`/validate?domain=example.com`)
+8. **Copy-friendly**: Click to copy DNSKEY, DS records, dig commands
+
+### Technology Choices
+
+- **No framework required**: Vanilla JS + CSS is fine for this scope
+- **CSS**: Custom properties for theming, CSS Grid for layout
+- **Icons**: Inline SVG or minimal icon set
+- **Fonts**: System font stack (no external fonts)
+
+## Data Structures
+
+### Zone Result
+
+```go
+type ZoneResult struct {
+    Zone         string              `json:"zone"`
+    Status       ValidationStatus    `json:"status"`
+    Nameservers  []NameserverResult  `json:"nameservers"`
+    DNSKEY       []DNSKEYRecord      `json:"dnskey,omitempty"`
+    DS           []DSRecord          `json:"ds,omitempty"`
+    RRSIG        []RRSIGRecord       `json:"rrsig,omitempty"`
+    NSEC         []NSECRecord        `json:"nsec,omitempty"`
+    NSEC3        []NSEC3Record       `json:"nsec3,omitempty"`
+    ChainLink    *ChainLink          `json:"chain_link,omitempty"`
+    Warnings     []string            `json:"warnings,omitempty"`
+    Errors       []string            `json:"errors,omitempty"`
+    QueryTime    time.Duration       `json:"query_time_ns"`
+    Timestamp    time.Time           `json:"timestamp"`
+}
+
+type NameserverResult struct {
+    Name      string           `json:"name"`
+    Addresses []AddressResult  `json:"addresses"`
+}
+
+type AddressResult struct {
+    IP       string           `json:"ip"`
+    Status   ValidationStatus `json:"status"`
+    RTT      time.Duration    `json:"rtt_ns"`
+    Error    string           `json:"error,omitempty"`
+    Response *DNSResponse     `json:"response,omitempty"`
+}
+
+type ChainLink struct {
+    ParentDS     *DSRecord     `json:"parent_ds"`
+    ChildKSK     *DNSKEYRecord `json:"child_ksk"`
+    DSMatchesKSK bool          `json:"ds_matches_ksk"`
+    Algorithm    string        `json:"algorithm"`
+}
+```
+
+### DNSSEC Records
+
+```go
+type DNSKEYRecord struct {
+    Flags     uint16 `json:"flags"`      // 256=ZSK, 257=KSK
+    Protocol  uint8  `json:"protocol"`   // Always 3
+    Algorithm uint8  `json:"algorithm"`  // 8, 13, 15, etc.
+    PublicKey string `json:"public_key"` // Base64
+    KeyTag    uint16 `json:"key_tag"`    // Computed identifier
+    IsKSK     bool   `json:"is_ksk"`
+    IsZSK     bool   `json:"is_zsk"`
+}
+
+type DSRecord struct {
+    KeyTag     uint16 `json:"key_tag"`
+    Algorithm  uint8  `json:"algorithm"`
+    DigestType uint8  `json:"digest_type"`  // 2=SHA-256, 4=SHA-384
+    Digest     string `json:"digest"`        // Hex
+}
+
+type RRSIGRecord struct {
+    TypeCovered uint16    `json:"type_covered"`
+    Algorithm   uint8     `json:"algorithm"`
+    Labels      uint8     `json:"labels"`
+    OriginalTTL uint32    `json:"original_ttl"`
+    Expiration  time.Time `json:"expiration"`
+    Inception   time.Time `json:"inception"`
+    KeyTag      uint16    `json:"key_tag"`
+    SignerName  string    `json:"signer_name"`
+    Signature   string    `json:"signature"`  // Base64
+    IsValid     bool      `json:"is_valid"`
+    IsExpired   bool      `json:"is_expired"`
+}
+```
+
+## Configuration
+
+Environment variables (following project conventions):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LISTEN_ADDR` | `:8080` | HTTP listen address |
+| `ROOT_ANCHORS_PATH` | `/etc/dnssec-validator/root-anchors.json` | Path to trust anchors |
+| `ROOT_ANCHORS_URL` | `https://internet.any53.com/dns/anchors/root-anchors.json` | Fallback URL for anchors |
+| `QUERY_TIMEOUT` | `5s` | Per-server query timeout |
+| `TOTAL_TIMEOUT` | `30s` | Total validation timeout |
+| `MAX_CONCURRENT` | `10` | Max concurrent DNS queries |
+| `RATE_LIMIT` | `10` | Requests per IP per minute |
+| `LOG_FORMAT` | `json` | `json` or `text` |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `STATIC_DIR` | `./static` | Path to web UI files |
+
+## Deployment
+
+### Standalone Mode (Recommended for this project)
+
+Unlike other TudorDNS services, this runs as a standalone HTTP server (not FastCGI) because:
+1. SSE requires long-lived connections
+2. Simpler deployment for a public diagnostic tool
+3. Can still run behind Apache/nginx as reverse proxy
+
+```
+┌──────────────┐     ┌─────────────────────┐     ┌───────────────────┐
+│    Client    │────▶│  Apache (optional)  │────▶│ dnssec-validator  │
+│   Browser    │     │  HTTPS termination  │     │    :8080          │
+└──────────────┘     └─────────────────────┘     └───────────────────┘
+```
+
+### Apache Configuration (if used)
+
+```apache
+<VirtualHost *:443>
+    ServerName dnssec.example.com
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/dnssec.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/dnssec.example.com/privkey.pem
+
+    # Proxy to validator daemon
+    ProxyPass /validate http://127.0.0.1:8080/validate
+    ProxyPassReverse /validate http://127.0.0.1:8080/validate
+
+    # SSE requires these settings
+    ProxyTimeout 300
+    SetEnv proxy-sendcl 1
+
+    # Disable buffering for SSE
+    SetEnv proxy-nokeepalive 1
+    RequestHeader set X-Forwarded-Proto "https"
+</VirtualHost>
+```
+
+### systemd Unit
+
+```ini
+[Unit]
+Description=DNSSEC Validator Service
+After=network.target
+
+[Service]
+Type=simple
+User=dnssec-validator
+Group=dnssec-validator
+ExecStart=/opt/dnssec-validator/dnssec-validator
+EnvironmentFile=/etc/dnssec-validator/env
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/dnssec-validator
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Dependencies
+
+```go
+require (
+    github.com/miekg/dns v1.1.58      // DNS library (same as dnssec-signer)
+    github.com/prometheus/client_golang v1.19.0
+)
+```
+
+No database required—this is a stateless validation service.
+
+## Build Commands
+
+```bash
+make build              # Build for current platform
+make build-linux        # Linux x86_64
+make build-linux-arm64  # Linux ARM64
+make build-darwin       # macOS x86_64
+make build-darwin-arm64 # macOS Apple Silicon
+make build-all          # All platforms
+make test               # Run tests
+make clean              # Remove build artifacts
+```
+
+## Validation Algorithm
+
+```
+ValidateDomain(domain, recordType):
+    zones = SplitIntoZoneHierarchy(domain)  // [".", "net.", "ptudor.net.", "www.ptudor.net."]
+
+    anchors = LoadRootAnchors()
+    currentKeys = anchors  // Bootstrap with root trust anchors
+
+    for each zone in zones:
+        emit SSE event: {zone, status: "validating"}
+
+        // Get nameservers for this zone
+        nsRecords = ResolveNS(zone)
+        nsAddresses = ResolveAllAddresses(nsRecords)  // Both A and AAAA
+
+        // Query ALL authoritative servers
+        results = []
+        for each ns, addrs in nsAddresses:
+            for each addr in addrs:
+                result = QueryWithDNSSEC(addr, zone, DNSKEY)
+                results.append(result)
+
+        // Check for consensus
+        if not AllAgree(results):
+            emit warning with disagreements
+
+        // Validate DNSKEY against parent DS (or root anchors)
+        dnskeys = ExtractDNSKEY(results)
+        valid = ValidateChain(currentKeys, dnskeys)
+
+        if not valid:
+            emit SSE event: {zone, status: "bogus", errors: [...]}
+            return
+
+        // This zone's DS records become trust for child zone
+        currentKeys = ExtractDS(QueryDS(parentZone, zone))
+
+        emit SSE event: {zone, status: "secure", dnskey: [...], ds: [...], ...}
+
+    // Final record query
+    emit SSE event: complete with full chain
+```
+
+## Error Handling
+
+| Condition | Behavior |
+|-----------|----------|
+| Domain invalid | Return 400 with RFC 7807 error |
+| Root anchor file missing | Fall back to URL, then fail with clear error |
+| Nameserver timeout | Mark that server as `indeterminate`, continue with others |
+| All nameservers timeout | Mark zone as `indeterminate` |
+| DNSSEC validation fails | Mark zone as `bogus` with specific reason |
+| Zone not signed | Mark as `insecure` (this is valid, not an error) |
+
+## Testing
+
+```bash
+# Unit tests
+go test ./...
+
+# Integration tests (requires network)
+go test -tags=integration ./...
+
+# Test specific domains
+./dnssec-validator -test-domain=cloudflare.com
+./dnssec-validator -test-domain=dnssec-failed.org  # Known bogus
+./dnssec-validator -test-domain=unsigned.example   # Known insecure
+```
+
+### Test Domains
+
+| Domain | Expected Result |
+|--------|-----------------|
+| `cloudflare.com` | Secure |
+| `google.com` | Secure |
+| `dnssec-failed.org` | Bogus (intentionally broken) |
+| `unsigned-zone.example` | Insecure |
+| `gov` | Secure (TLD) |
+
+## Future Enhancements
+
+1. **Batch validation**: Validate multiple domains in one request
+2. **Historical comparison**: "Was this domain secure yesterday?"
+3. **Webhook notifications**: Alert when a monitored domain goes bogus
+4. **Algorithm timeline**: Show when keys were rotated
+5. **Export formats**: PDF report, JSON download, dig commands
+
+## Project Structure
+
+```
+Golang-dnssec-validator/
+├── CLAUDE.md
+├── Makefile
+├── go.mod
+├── go.sum
+├── main.go
+├── cmd/
+│   └── dnssec-validator/
+│       └── main.go
+├── internal/
+│   ├── config/
+│   │   └── config.go
+│   ├── dns/
+│   │   ├── query.go          # DNS query execution
+│   │   ├── dnssec.go         # DNSSEC validation logic
+│   │   └── anchors.go        # Root anchor loading
+│   ├── validator/
+│   │   ├── validator.go      # Main validation orchestrator
+│   │   ├── chain.go          # Chain of trust walker
+│   │   └── result.go         # Result types
+│   ├── sse/
+│   │   └── writer.go         # SSE event formatting
+│   └── server/
+│       ├── server.go         # HTTP server setup
+│       ├── handlers.go       # Request handlers
+│       └── middleware.go     # Rate limiting, logging
+├── static/
+│   ├── index.html
+│   ├── style.css
+│   └── app.js
+└── testdata/
+    ├── root-anchors.json
+    └── test-responses/
+```
+
+## Related Projects
+
+- **internet-files-mirror**: Provides `root-anchors.json`
+- **dns-query-server**: DoH proxy (different purpose but similar DNS handling)
+- **tudor-dnssec-signer**: Zone signing (uses same `miekg/dns` library)
