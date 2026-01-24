@@ -1,3 +1,4 @@
 root-anchors.json
+dnssec-validator-freebsd-amd64
 dnssec-validator
 .env
