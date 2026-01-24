@@ -14,9 +14,13 @@ import (
 
 // NSECProof represents cryptographic proof of non-existence
 type NSECProof struct {
-	ProofType    string `json:"proof_type"`    // "nxdomain", "nodata", "wildcard"
-	CoveringNSEC string `json:"covering_nsec"` // The NSEC/NSEC3 that proves it
-	Explanation  string `json:"explanation"`
+	ProofType    string   `json:"proof_type"`     // "NSEC" or "NSEC3"
+	ResponseType string   `json:"response_type"`  // "NXDOMAIN" or "NODATA"
+	Verified     bool     `json:"verified"`       // Cryptographic verification passed
+	Records      []string `json:"records"`        // NSEC/NSEC3 records involved
+	CoveringNSEC string   `json:"covering_nsec"`  // The NSEC/NSEC3 that proves it
+	Explanation  string   `json:"explanation"`
+	Error        string   `json:"error,omitempty"`
 }
 
 // NSEC3HashAlgorithm constants per RFC 5155 Section 3.1.1
@@ -27,6 +31,69 @@ const (
 // base32ExtendedHex is the base32 encoding used by NSEC3 per RFC 4648 §7
 // (base32hex without padding)
 var base32ExtendedHex = base32.HexEncoding.WithPadding(base32.NoPadding)
+
+// VerifyNSECDenialWithRRSIG verifies NSEC records prove non-existence with full RRSIG verification.
+// Per RFC 4035 Section 5.4.
+func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecord, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, rcode int) *NSECProof {
+	proof := &NSECProof{
+		ProofType: "NSEC",
+		Records:   make([]string, 0),
+	}
+
+	if rcode == 3 { // NXDOMAIN
+		proof.ResponseType = "NXDOMAIN"
+	} else {
+		proof.ResponseType = "NODATA"
+	}
+
+	if len(nsecRecords) == 0 {
+		proof.Error = "no NSEC records in response"
+		return proof
+	}
+
+	// Verify NSEC RRSIG first
+	rrsigRecord := findRRSIGForType(46, rrsigs) // TypeNSEC = 47
+	if rrsigRecord == nil {
+		proof.Error = "no RRSIG for NSEC records"
+		return proof
+	}
+
+	// Check RRSIG time validity
+	if !verifyRRSIGTimeValid(*rrsigRecord) {
+		if rrsigRecord.IsExpired {
+			proof.Error = "NSEC RRSIG expired"
+		} else {
+			proof.Error = "NSEC RRSIG not yet valid"
+		}
+		return proof
+	}
+
+	// Find signing key
+	signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys)
+	if signingKey == nil {
+		proof.Error = "NSEC signing key not found"
+		return proof
+	}
+
+	// Record the NSEC records for display
+	for _, nsec := range nsecRecords {
+		proof.Records = append(proof.Records, fmt.Sprintf("%s → %s [%v]", nsec.Owner, nsec.NextDomain, nsec.TypeBitmap))
+	}
+
+	// Verify the denial proof
+	basicProof, err := VerifyNSECDenial(qname, qtype, nsecRecords, rcode)
+	if err != nil {
+		proof.Error = err.Error()
+		return proof
+	}
+	if basicProof != nil {
+		proof.CoveringNSEC = basicProof.CoveringNSEC
+		proof.Explanation = basicProof.Explanation
+	}
+
+	proof.Verified = true
+	return proof
+}
 
 // VerifyNSECDenial verifies NSEC records prove non-existence.
 // Returns nil if no NSEC proof is found (not an error, just no proof).
@@ -99,6 +166,73 @@ func verifyNSECNODATA(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 	}
 
 	return nil, fmt.Errorf("no NSEC record proves type %s doesn't exist for %s", typeName, qname)
+}
+
+// VerifyNSEC3DenialWithRRSIG verifies NSEC3 records prove non-existence with full RRSIG verification.
+// Per RFC 5155 Section 8.
+func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rcode int) *NSECProof {
+	proof := &NSECProof{
+		ProofType: "NSEC3",
+		Records:   make([]string, 0),
+	}
+
+	if rcode == 3 { // NXDOMAIN
+		proof.ResponseType = "NXDOMAIN"
+	} else {
+		proof.ResponseType = "NODATA"
+	}
+
+	if len(nsec3Records) == 0 {
+		proof.Error = "no NSEC3 records in response"
+		return proof
+	}
+
+	// Verify NSEC3 RRSIG first
+	rrsigRecord := findRRSIGForType(50, rrsigs) // TypeNSEC3 = 50
+	if rrsigRecord == nil {
+		proof.Error = "no RRSIG for NSEC3 records"
+		return proof
+	}
+
+	// Check RRSIG time validity
+	if !verifyRRSIGTimeValid(*rrsigRecord) {
+		if rrsigRecord.IsExpired {
+			proof.Error = "NSEC3 RRSIG expired"
+		} else {
+			proof.Error = "NSEC3 RRSIG not yet valid"
+		}
+		return proof
+	}
+
+	// Find signing key
+	signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys)
+	if signingKey == nil {
+		proof.Error = "NSEC3 signing key not found"
+		return proof
+	}
+
+	// Record the NSEC3 records for display
+	for _, nsec3 := range nsec3Records {
+		optOut := ""
+		if nsec3.Flags&0x01 != 0 {
+			optOut = " [opt-out]"
+		}
+		proof.Records = append(proof.Records, fmt.Sprintf("%s → %s [%v]%s", nsec3.HashedOwner, nsec3.NextHashed, nsec3.TypeBitmap, optOut))
+	}
+
+	// Verify the denial proof
+	basicProof, err := VerifyNSEC3Denial(qname, qtype, nsec3Records, zone, rcode)
+	if err != nil {
+		proof.Error = err.Error()
+		return proof
+	}
+	if basicProof != nil {
+		proof.CoveringNSEC = basicProof.CoveringNSEC
+		proof.Explanation = basicProof.Explanation
+	}
+
+	proof.Verified = true
+	return proof
 }
 
 // VerifyNSEC3Denial verifies NSEC3 records prove non-existence.
@@ -381,4 +515,29 @@ func ProvesDSAbsence(qname string, nsecRecords []dnspkg.NSECRecord, nsec3Records
 	}
 
 	return false
+}
+
+// findRRSIGForType finds an RRSIG covering a specific type
+func findRRSIGForType(rrtype uint16, rrsigs []dnspkg.RRSIGRecord) *dnspkg.RRSIGRecord {
+	for i, rrsig := range rrsigs {
+		if rrsig.TypeCovered == rrtype {
+			return &rrsigs[i]
+		}
+	}
+	return nil
+}
+
+// verifyRRSIGTimeValid checks if an RRSIG is currently valid time-wise
+func verifyRRSIGTimeValid(rrsig dnspkg.RRSIGRecord) bool {
+	return rrsig.IsValid && !rrsig.IsExpired
+}
+
+// findDNSKEYByTag finds a DNSKEY by its key tag
+func findDNSKEYByTag(keyTag uint16, dnskeys []dnspkg.DNSKEYRecord) *dnspkg.DNSKEYRecord {
+	for i, key := range dnskeys {
+		if key.KeyTag == keyTag {
+			return &dnskeys[i]
+		}
+	}
+	return nil
 }
