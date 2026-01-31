@@ -8,14 +8,14 @@
 # Add the following lines to /etc/rc.conf to enable dnssec_signer:
 #
 # dnssec_signer_enable="YES"
-# dnssec_signer_config="/usr/local/etc/dnssec-tudor/config.toml"
+# dnssec_signer_config="/usr/local/etc/tudordns/dnssec-signer.toml"
 # dnssec_signer_web=":8053"  # Optional: enable web UI
 #
 # Create the service user and group before starting:
 #   pw groupadd -n dnssec
 #   pw useradd -n dnssec -g dnssec -d /nonexistent -s /usr/sbin/nologin -c "DNSSEC Signer"
-#   mkdir -p /usr/local/etc/dnssec-tudor /var/db/dnssec-tudor
-#   chown dnssec:dnssec /usr/local/etc/dnssec-tudor /var/db/dnssec-tudor
+#   mkdir -p /usr/local/etc/tudordns /var/db/dnssec-tudor
+#   chown dnssec:dnssec /var/db/dnssec-tudor
 
 . /etc/rc.subr
 
@@ -27,7 +27,7 @@ load_rc_config $name
 : ${dnssec_signer_enable:="NO"}
 : ${dnssec_signer_user:="dnssec"}
 : ${dnssec_signer_group:="dnssec"}
-: ${dnssec_signer_config:="/usr/local/etc/dnssec-tudor/config.toml"}
+: ${dnssec_signer_config:="/usr/local/etc/tudordns/dnssec-signer.toml"}
 : ${dnssec_signer_pidfile:="/var/run/${name}.pid"}
 : ${dnssec_signer_logfile:="/var/log/${name}.log"}
 : ${dnssec_signer_web:=""}
