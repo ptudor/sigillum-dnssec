@@ -8,9 +8,14 @@
 # Add the following lines to /etc/rc.conf to enable dnssec_signer:
 #
 # dnssec_signer_enable="YES"
-# dnssec_signer_user="dnssec"
 # dnssec_signer_config="/usr/local/etc/dnssec-tudor/config.toml"
 # dnssec_signer_web=":8053"  # Optional: enable web UI
+#
+# Create the service user and group before starting:
+#   pw groupadd -n dnssec
+#   pw useradd -n dnssec -g dnssec -d /nonexistent -s /usr/sbin/nologin -c "DNSSEC Signer"
+#   mkdir -p /usr/local/etc/dnssec-tudor /var/db/dnssec-tudor
+#   chown dnssec:dnssec /usr/local/etc/dnssec-tudor /var/db/dnssec-tudor
 
 . /etc/rc.subr
 
