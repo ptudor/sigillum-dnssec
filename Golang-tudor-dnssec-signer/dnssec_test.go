@@ -325,10 +325,10 @@ mail	IN	A	192.0.2.30
 	zp := dns.NewZoneParser(strings.NewReader(string(signedData)), "example.com.", signedPath)
 
 	var (
-		hasDNSKEY bool
-		hasRRSIG  bool
-		hasNSEC3  bool
-		soaCount  int
+		hasDNSKEY  bool
+		hasRRSIG   bool
+		hasNSEC3   bool
+		soaCount   int
 		rrsigCount int
 	)
 

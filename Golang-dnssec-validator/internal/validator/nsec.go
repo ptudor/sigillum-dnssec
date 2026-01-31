@@ -14,11 +14,11 @@ import (
 
 // NSECProof represents cryptographic proof of non-existence
 type NSECProof struct {
-	ProofType    string   `json:"proof_type"`     // "NSEC" or "NSEC3"
-	ResponseType string   `json:"response_type"`  // "NXDOMAIN" or "NODATA"
-	Verified     bool     `json:"verified"`       // Cryptographic verification passed
-	Records      []string `json:"records"`        // NSEC/NSEC3 records involved
-	CoveringNSEC string   `json:"covering_nsec"`  // The NSEC/NSEC3 that proves it
+	ProofType    string   `json:"proof_type"`    // "NSEC" or "NSEC3"
+	ResponseType string   `json:"response_type"` // "NXDOMAIN" or "NODATA"
+	Verified     bool     `json:"verified"`      // Cryptographic verification passed
+	Records      []string `json:"records"`       // NSEC/NSEC3 records involved
+	CoveringNSEC string   `json:"covering_nsec"` // The NSEC/NSEC3 that proves it
 	Explanation  string   `json:"explanation"`
 	Error        string   `json:"error,omitempty"`
 }

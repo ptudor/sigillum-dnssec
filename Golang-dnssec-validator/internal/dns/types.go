@@ -44,14 +44,14 @@ type RRSIGRecord struct {
 
 // NSECRecord represents an NSEC record
 type NSECRecord struct {
-	Owner      string   `json:"owner"`       // Owner name (from RR header)
+	Owner      string   `json:"owner"` // Owner name (from RR header)
 	NextDomain string   `json:"next_domain"`
 	TypeBitmap []string `json:"type_bitmap"` // Type names covered
 }
 
 // NSEC3Record represents an NSEC3 record
 type NSEC3Record struct {
-	Owner       string   `json:"owner"`       // Full owner name (hashed.zone.)
+	Owner       string   `json:"owner"`        // Full owner name (hashed.zone.)
 	HashedOwner string   `json:"hashed_owner"` // Just the hashed portion (base32)
 	Algorithm   uint8    `json:"algorithm"`
 	Flags       uint8    `json:"flags"`
@@ -95,11 +95,11 @@ type QueryResult struct {
 
 // RootAnchors represents the root trust anchor file structure
 type RootAnchors struct {
-	Source      string   `json:"source"`                  // Original data source (e.g., IANA XML URL)
+	Source      string   `json:"source"` // Original data source (e.g., IANA XML URL)
 	Zone        string   `json:"zone"`
 	GeneratedAt string   `json:"generatedAt"`
 	Anchors     []Anchor `json:"anchors"`
-	LoadedFrom  string   `json:"loadedFrom,omitempty"`    // Where validator loaded from (file path or URL)
+	LoadedFrom  string   `json:"loadedFrom,omitempty"` // Where validator loaded from (file path or URL)
 }
 
 // Anchor represents a single trust anchor

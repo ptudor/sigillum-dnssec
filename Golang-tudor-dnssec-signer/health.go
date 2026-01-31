@@ -54,9 +54,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Co
 	}
 
 	response := struct {
-		Status     string        `json:"status"`
-		Summary    StatusSummary `json:"summary"`
-		DepErrors  []string      `json:"dependency_errors,omitempty"`
+		Status    string        `json:"status"`
+		Summary   StatusSummary `json:"summary"`
+		DepErrors []string      `json:"dependency_errors,omitempty"`
 	}{
 		Status:    "healthy",
 		Summary:   status.Summary,
