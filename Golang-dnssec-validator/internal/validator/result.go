@@ -19,25 +19,25 @@ const (
 
 // ZoneResult represents the validation result for a single zone
 type ZoneResult struct {
-	Zone           string             `json:"zone"`
-	Status         ValidationStatus   `json:"status"`
-	Nameservers    []NameserverResult `json:"nameservers"`
-	DNSKEY         []dns.DNSKEYRecord `json:"dnskey,omitempty"`
-	DS             []dns.DSRecord     `json:"ds,omitempty"`
-	RRSIG          []dns.RRSIGRecord  `json:"rrsig,omitempty"`
-	NSEC           []dns.NSECRecord   `json:"nsec,omitempty"`
-	NSEC3          []dns.NSEC3Record  `json:"nsec3,omitempty"`
-	NSEC3OptOut    bool               `json:"nsec3_opt_out,omitempty"`    // RFC 5155 opt-out flag
-	WildcardSource string             `json:"wildcard_source,omitempty"` // RFC 4034 §3.1.3 wildcard detection
+	Zone             string             `json:"zone"`
+	Status           ValidationStatus   `json:"status"`
+	Nameservers      []NameserverResult `json:"nameservers"`
+	DNSKEY           []dns.DNSKEYRecord `json:"dnskey,omitempty"`
+	DS               []dns.DSRecord     `json:"ds,omitempty"`
+	RRSIG            []dns.RRSIGRecord  `json:"rrsig,omitempty"`
+	NSEC             []dns.NSECRecord   `json:"nsec,omitempty"`
+	NSEC3            []dns.NSEC3Record  `json:"nsec3,omitempty"`
+	NSEC3OptOut      bool               `json:"nsec3_opt_out,omitempty"`     // RFC 5155 opt-out flag
+	WildcardSource   string             `json:"wildcard_source,omitempty"`   // RFC 4034 §3.1.3 wildcard detection
 	DenialProof      *NSECProof         `json:"denial_proof,omitempty"`      // NSEC/NSEC3 proof of non-existence
 	RecordValidation *RecordValidation  `json:"record_validation,omitempty"` // Actual record RRSIG verification
 	DSValidation     *DSValidation      `json:"ds_validation,omitempty"`     // DS RRSIG verification from parent
 	ChainLink        *ChainLink         `json:"chain_link,omitempty"`
-	Disagreements  []Disagreement     `json:"disagreements,omitempty"`
-	Warnings       []string           `json:"warnings,omitempty"`
-	Errors         []string           `json:"errors,omitempty"`
-	QueryTimeNs    int64              `json:"query_time_ns"`
-	Timestamp      time.Time          `json:"timestamp"`
+	Disagreements    []Disagreement     `json:"disagreements,omitempty"`
+	Warnings         []string           `json:"warnings,omitempty"`
+	Errors           []string           `json:"errors,omitempty"`
+	QueryTimeNs      int64              `json:"query_time_ns"`
+	Timestamp        time.Time          `json:"timestamp"`
 }
 
 // NameserverResult represents the result from a single nameserver
@@ -158,18 +158,18 @@ type Disagreement struct {
 
 // RecordValidation represents validation of an actual record (A, AAAA, MX, etc.)
 type RecordValidation struct {
-	RecordType     string `json:"record_type"`      // "A", "AAAA", "MX", etc.
-	RecordCount    int    `json:"record_count"`     // Number of records found
-	RRSIGVerified  bool   `json:"rrsig_verified"`   // RRSIG cryptographically verified
-	SigningKeyTag  uint16 `json:"signing_key_tag"`  // Key tag of ZSK that signed
-	Error          string `json:"error,omitempty"`
+	RecordType    string `json:"record_type"`     // "A", "AAAA", "MX", etc.
+	RecordCount   int    `json:"record_count"`    // Number of records found
+	RRSIGVerified bool   `json:"rrsig_verified"`  // RRSIG cryptographically verified
+	SigningKeyTag uint16 `json:"signing_key_tag"` // Key tag of ZSK that signed
+	Error         string `json:"error,omitempty"`
 }
 
 // DSValidation represents validation of DS record signature from parent
 type DSValidation struct {
 	ParentZone       string `json:"parent_zone"`
 	DSCount          int    `json:"ds_count"`
-	RRSIGVerified    bool   `json:"rrsig_verified"`    // DS RRSIG verified by parent's ZSK
+	RRSIGVerified    bool   `json:"rrsig_verified"`     // DS RRSIG verified by parent's ZSK
 	ParentSigningKey uint16 `json:"parent_signing_key"` // Parent ZSK key tag
 	Error            string `json:"error,omitempty"`
 }
