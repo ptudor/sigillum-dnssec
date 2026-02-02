@@ -7,6 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/ptudor/dnssec-validator/internal/heartbeat"
 )
 
 // Version and build information (set by ldflags)
@@ -49,6 +51,27 @@ func main() {
 	// Create and start server
 	server := NewServer(config, anchorsStore)
 
+	// Initialize heartbeat client
+	hbClient := heartbeat.NewClient(heartbeat.Config{
+		Enabled:    config.HeartbeatEnabled,
+		URL:        config.HeartbeatURL,
+		APIKey:     config.HeartbeatAPIKey,
+		App:        config.HeartbeatApp,
+		StatusURL:  config.HeartbeatStatusURL,
+		InstanceID: config.HeartbeatInstanceID,
+		Interval:   config.HeartbeatInterval,
+	})
+
+	// Start background heartbeat if enabled
+	var cancelHeartbeat context.CancelFunc
+	if hbClient.Enabled() {
+		LogInfo("main", "heartbeat monitoring enabled",
+			"app", config.HeartbeatApp,
+			"interval", config.HeartbeatInterval.String(),
+		)
+		cancelHeartbeat = hbClient.StartBackground(context.Background(), config.HeartbeatInterval)
+	}
+
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -83,6 +106,11 @@ func main() {
 	select {
 	case sig := <-sigChan:
 		LogShutdown(sig.String())
+
+		// Stop heartbeat background sender (sends "stopping" action)
+		if cancelHeartbeat != nil {
+			cancelHeartbeat()
+		}
 
 		// Create shutdown context with timeout
 		ctx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
