@@ -17,8 +17,20 @@ type Config struct {
 	DNSSEC       DNSSECConfig          `toml:"dnssec"`
 	Web          WebConfig             `toml:"web"`
 	Health       HealthConfig          `toml:"health"`
+	Heartbeat    HeartbeatConfig       `toml:"heartbeat"`
 	Zones        map[string]ZoneConfig `toml:"zones"`
 	Hooks        HooksConfig           `toml:"hooks"`
+}
+
+// HeartbeatConfig holds AnyStatus heartbeat monitoring settings
+type HeartbeatConfig struct {
+	Enabled         bool   `toml:"enabled"`
+	URL             string `toml:"url"`
+	APIKey          string `toml:"api_key"`
+	App             string `toml:"app"`
+	StatusURL       string `toml:"status_url"`
+	InstanceID      string `toml:"instance_id"`
+	IntervalMinutes int    `toml:"interval_minutes"`
 }
 
 // DNSSECConfig holds DNSSEC-specific settings
@@ -162,6 +174,12 @@ func DefaultConfig() *Config {
 		Health: HealthConfig{
 			Listen:          "127.0.0.1:8054",
 			ShutdownTimeout: Duration{30 * time.Second},
+		},
+		Heartbeat: HeartbeatConfig{
+			Enabled:         false,
+			URL:             "https://www.any53.com/any53/anystatus/heartbeat/",
+			App:             "dnssec-tudor",
+			IntervalMinutes: 5,
 		},
 		Zones: make(map[string]ZoneConfig),
 		Hooks: HooksConfig{},
