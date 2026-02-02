@@ -39,6 +39,15 @@ type Config struct {
 
 	// Base path (for reverse proxy, e.g., "/dnssec")
 	BasePath string
+
+	// Heartbeat monitoring (AnyStatus)
+	HeartbeatEnabled    bool
+	HeartbeatURL        string
+	HeartbeatAPIKey     string
+	HeartbeatApp        string
+	HeartbeatStatusURL  string
+	HeartbeatInstanceID string
+	HeartbeatInterval   time.Duration
 }
 
 // DefaultConfig returns a Config with sensible defaults
@@ -58,6 +67,11 @@ func DefaultConfig() *Config {
 		LogFormat:         "json",
 		LogLevel:          "info",
 		StaticDir:         "./static",
+		// Heartbeat defaults
+		HeartbeatEnabled:  false,
+		HeartbeatURL:      "https://www.any53.com/any53/anystatus/heartbeat/",
+		HeartbeatApp:      "dnssec-validator",
+		HeartbeatInterval: 5 * time.Minute,
 	}
 }
 
@@ -94,6 +108,15 @@ func LoadConfig() (*Config, error) {
 
 	// Base path for reverse proxy
 	cfg.BasePath = getEnv("BASE_PATH", cfg.BasePath)
+
+	// Heartbeat monitoring (AnyStatus)
+	cfg.HeartbeatEnabled = getEnvBool("HEARTBEAT_ENABLED", cfg.HeartbeatEnabled)
+	cfg.HeartbeatURL = getEnv("HEARTBEAT_URL", cfg.HeartbeatURL)
+	cfg.HeartbeatAPIKey = getEnv("HEARTBEAT_API_KEY", cfg.HeartbeatAPIKey)
+	cfg.HeartbeatApp = getEnv("HEARTBEAT_APP", cfg.HeartbeatApp)
+	cfg.HeartbeatStatusURL = getEnv("HEARTBEAT_STATUS_URL", cfg.HeartbeatStatusURL)
+	cfg.HeartbeatInstanceID = getEnv("HEARTBEAT_INSTANCE_ID", cfg.HeartbeatInstanceID)
+	cfg.HeartbeatInterval = getEnvDuration("HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
 
 	// Validate
 	if err := cfg.Validate(); err != nil {
@@ -161,6 +184,18 @@ func getEnvInt(key string, defaultVal int) int {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.Atoi(val); err == nil {
 			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvBool(key string, defaultVal bool) bool {
+	if val := os.Getenv(key); val != "" {
+		switch strings.ToLower(val) {
+		case "true", "1", "yes", "on":
+			return true
+		case "false", "0", "no", "off":
+			return false
 		}
 	}
 	return defaultVal
