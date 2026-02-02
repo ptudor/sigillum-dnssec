@@ -15,10 +15,11 @@ import (
 
 // Daemon manages the signing loop and optional web server
 type Daemon struct {
-	cfg      *Config
-	state    *State
-	signer   *Signer
-	rollover *RolloverManager
+	cfg       *Config
+	state     *State
+	signer    *Signer
+	rollover  *RolloverManager
+	heartbeat *HeartbeatClient
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -32,12 +33,13 @@ type Daemon struct {
 func NewDaemon(cfg *Config, state *State) *Daemon {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Daemon{
-		cfg:      cfg,
-		state:    state,
-		signer:   NewSigner(cfg, state),
-		rollover: NewRolloverManager(cfg, state),
-		ctx:      ctx,
-		cancel:   cancel,
+		cfg:       cfg,
+		state:     state,
+		signer:    NewSigner(cfg, state),
+		rollover:  NewRolloverManager(cfg, state),
+		heartbeat: NewHeartbeatClient(&cfg.Heartbeat),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 }
 
@@ -54,6 +56,9 @@ func (d *Daemon) Run() error {
 	if err := d.validateStartup(); err != nil {
 		return fmt.Errorf("startup validation failed: %w", err)
 	}
+
+	// Start heartbeat monitoring
+	d.heartbeat.Start()
 
 	// Start web server if enabled
 	if d.cfg.Web.Enabled {
@@ -80,6 +85,10 @@ func (d *Daemon) Run() error {
 // Shutdown gracefully stops the daemon
 func (d *Daemon) Shutdown() {
 	slog.Info("[DAEMON] Initiating graceful shutdown")
+
+	// Stop heartbeat monitoring (sends stopping heartbeat)
+	d.heartbeat.Stop()
+
 	d.cancel()
 
 	d.mu.Lock()
@@ -99,10 +108,17 @@ func (d *Daemon) Reload(cfg *Config, state *State) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	// Stop old heartbeat client
+	d.heartbeat.Stop()
+
 	d.cfg = cfg
 	d.state = state
 	d.signer = NewSigner(cfg, state)
 	d.rollover = NewRolloverManager(cfg, state)
+	d.heartbeat = NewHeartbeatClient(&cfg.Heartbeat)
+
+	// Start new heartbeat client
+	d.heartbeat.Start()
 
 	slog.Info("[DAEMON] Configuration and state reloaded", "zones", len(cfg.Zones))
 }
@@ -227,6 +243,9 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 
 	slog.Info("[DAEMON] Signing zone", "domain", domain, "reason", reason)
 
+	// Send heartbeat for signing start
+	d.heartbeat.SigningStart(domain)
+
 	// Initialize zone state if new
 	if zoneState == nil {
 		keyGen := NewKeyGenerator(cfg)
@@ -251,11 +270,13 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 	if err := d.signer.SignZone(domain); err != nil {
 		zoneState.AddError(err.Error())
 		RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
+		d.heartbeat.SigningError(domain)
 		return err
 	}
 
-	// Clear errors on success
+	// Clear errors on success and send completion heartbeat
 	zoneState.ClearErrors()
+	d.heartbeat.SigningComplete(domain, zoneState.Serial)
 
 	// Execute post-sign hook
 	if cfg.Hooks.PostSign != "" {

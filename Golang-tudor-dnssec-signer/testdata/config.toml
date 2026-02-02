@@ -18,6 +18,13 @@ nsec3_salt = ""
 enabled = false
 listen = "127.0.0.1:8053"
 
+[heartbeat]
+enabled = false
+# api_key = "your-api-key-here"
+# app = "dnssec-tudor"
+# status_url = "/dnssec/admin/"
+# interval_minutes = 5
+
 [zones]
 [zones."example.com"]
 path = "testdata/zones/example.com.zone"
