@@ -6,68 +6,134 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pelletier/go-toml/v2"
 )
+
+// Default config file paths (checked in order)
+var DefaultConfigPaths = []string{
+	"/usr/local/etc/tudordns/dnssec-validator.toml",
+	"/etc/tudordns/dnssec-validator.toml",
+	"dnssec-validator.toml",
+}
 
 // Config holds all configuration for the application
 type Config struct {
 	// HTTP Server
-	ListenAddr      string
-	ShutdownTimeout time.Duration
+	ListenAddr         string `toml:"listen_addr"`
+	ShutdownTimeoutSec int    `toml:"shutdown_timeout_seconds"`
+	ShutdownTimeout    time.Duration `toml:"-"`
 
 	// Root trust anchors
-	RootAnchorsPath string
-	RootAnchorsURL  string
+	RootAnchorsPath string `toml:"root_anchors_path"`
+	RootAnchorsURL  string `toml:"root_anchors_url"`
 
 	// DNS query settings
-	QueryTimeout      time.Duration
-	TotalTimeout      time.Duration
-	MaxConcurrent     int
-	RecursiveResolver string // Recursive resolver for NS lookups (IP address)
+	QueryTimeoutSec   int    `toml:"query_timeout_seconds"`
+	TotalTimeoutSec   int    `toml:"total_timeout_seconds"`
+	MaxConcurrent     int    `toml:"max_concurrent"`
+	RecursiveResolver string `toml:"recursive_resolver"`
+
+	// Parsed durations
+	QueryTimeout time.Duration `toml:"-"`
+	TotalTimeout time.Duration `toml:"-"`
 
 	// Rate limiting
-	RateLimitPerSec  int
-	RateLimitBurst   int
-	RateLimitCleanup time.Duration
+	RateLimit RateLimitConfig `toml:"rate_limit"`
+
+	// Legacy flat fields (populated from nested structs after load)
+	RateLimitPerSec  int           `toml:"-"`
+	RateLimitBurst   int           `toml:"-"`
+	RateLimitCleanup time.Duration `toml:"-"`
 
 	// Logging
-	LogFormat string
-	LogLevel  string
-	LogFile   string // Path to log file (empty = stdout)
+	Logging LoggingConfig `toml:"logging"`
+
+	// Legacy flat fields
+	LogFormat string `toml:"-"`
+	LogLevel  string `toml:"-"`
+	LogFile   string `toml:"-"`
 
 	// Static files
-	StaticDir string
+	StaticDir string `toml:"static_dir"`
 
 	// Base path (for reverse proxy, e.g., "/dnssec")
-	BasePath string
+	BasePath string `toml:"base_path"`
 
 	// Heartbeat monitoring (AnyStatus)
-	HeartbeatEnabled    bool
-	HeartbeatURL        string
-	HeartbeatAPIKey     string
-	HeartbeatApp        string
-	HeartbeatStatusURL  string
-	HeartbeatInstanceID string
-	HeartbeatInterval   time.Duration
+	Heartbeat HeartbeatConfig `toml:"heartbeat"`
+
+	// Legacy flat fields for heartbeat
+	HeartbeatEnabled    bool          `toml:"-"`
+	HeartbeatURL        string        `toml:"-"`
+	HeartbeatAPIKey     string        `toml:"-"`
+	HeartbeatApp        string        `toml:"-"`
+	HeartbeatStatusURL  string        `toml:"-"`
+	HeartbeatInstanceID string        `toml:"-"`
+	HeartbeatInterval   time.Duration `toml:"-"`
+}
+
+// RateLimitConfig holds rate limiting settings
+type RateLimitConfig struct {
+	PerSec     int `toml:"per_sec"`
+	Burst      int `toml:"burst"`
+	CleanupSec int `toml:"cleanup_seconds"`
+}
+
+// LoggingConfig holds logging settings
+type LoggingConfig struct {
+	Level  string `toml:"level"`
+	Format string `toml:"format"`
+	File   string `toml:"file"`
+}
+
+// HeartbeatConfig holds AnyStatus heartbeat configuration
+type HeartbeatConfig struct {
+	Enabled         bool   `toml:"enabled"`
+	URL             string `toml:"url"`
+	APIKey          string `toml:"api_key"`
+	App             string `toml:"app"`
+	StatusURL       string `toml:"status_url"`
+	InstanceID      string `toml:"instance_id"`
+	IntervalMinutes int    `toml:"interval_minutes"`
 }
 
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		ListenAddr:        ":8791",
-		ShutdownTimeout:   30 * time.Second,
-		RootAnchorsPath:   "/etc/dnssec-validator/root-anchors.json",
-		RootAnchorsURL:    "https://internet.any53.com/dns/anchors/root-anchors.json",
-		QueryTimeout:      5 * time.Second,
-		TotalTimeout:      30 * time.Second,
-		MaxConcurrent:     10,
-		RecursiveResolver: "8.8.8.8",
-		RateLimitPerSec:   10,
-		RateLimitBurst:    30,
-		RateLimitCleanup:  5 * time.Minute,
-		LogFormat:         "json",
-		LogLevel:          "info",
-		StaticDir:         "./static",
+		ListenAddr:         ":8791",
+		ShutdownTimeoutSec: 30,
+		ShutdownTimeout:    30 * time.Second,
+		RootAnchorsPath:    "/etc/dnssec-validator/root-anchors.json",
+		RootAnchorsURL:     "https://internet.any53.com/dns/anchors/root-anchors.json",
+		QueryTimeoutSec:    5,
+		TotalTimeoutSec:    30,
+		QueryTimeout:       5 * time.Second,
+		TotalTimeout:       30 * time.Second,
+		MaxConcurrent:      10,
+		RecursiveResolver:  "8.8.8.8",
+		RateLimit: RateLimitConfig{
+			PerSec:     10,
+			Burst:      30,
+			CleanupSec: 300, // 5 minutes
+		},
+		RateLimitPerSec:  10,
+		RateLimitBurst:   30,
+		RateLimitCleanup: 5 * time.Minute,
+		Logging: LoggingConfig{
+			Format: "json",
+			Level:  "info",
+		},
+		LogFormat: "json",
+		LogLevel:  "info",
+		StaticDir: "./static",
 		// Heartbeat defaults
+		Heartbeat: HeartbeatConfig{
+			Enabled:         false,
+			URL:             "https://www.any53.com/any53/anystatus/heartbeat/",
+			App:             "dnssec-validator",
+			IntervalMinutes: 5,
+		},
 		HeartbeatEnabled:  false,
 		HeartbeatURL:      "https://www.any53.com/any53/anystatus/heartbeat/",
 		HeartbeatApp:      "dnssec-validator",
@@ -75,33 +141,73 @@ func DefaultConfig() *Config {
 	}
 }
 
-// LoadConfig loads configuration from environment variables
-func LoadConfig() (*Config, error) {
+// LoadFromFile loads configuration from a TOML file.
+func LoadFromFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading config file: %w", err)
+	}
+
+	cfg := DefaultConfig()
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parsing config file: %w", err)
+	}
+
+	cfg.applyNestedToFlat()
+
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validating config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// Load loads configuration, trying TOML file first, then environment variables.
+// If configPath is empty, it checks default paths for a TOML file.
+func Load(configPath string) (*Config, error) {
+	// If explicit path provided, use it
+	if configPath != "" {
+		return LoadFromFile(configPath)
+	}
+
+	// Check default TOML paths
+	for _, path := range DefaultConfigPaths {
+		if _, err := os.Stat(path); err == nil {
+			return LoadFromFile(path)
+		}
+	}
+
+	// Fall back to environment variables
+	return LoadFromEnv()
+}
+
+// LoadFromEnv loads configuration from environment variables.
+func LoadFromEnv() (*Config, error) {
 	cfg := DefaultConfig()
 
 	// HTTP Server
 	cfg.ListenAddr = getEnv("LISTEN_ADDR", cfg.ListenAddr)
-	cfg.ShutdownTimeout = time.Duration(getEnvInt("SHUTDOWN_TIMEOUT_SECONDS", 30)) * time.Second
+	cfg.ShutdownTimeoutSec = getEnvInt("SHUTDOWN_TIMEOUT_SECONDS", cfg.ShutdownTimeoutSec)
 
 	// Root trust anchors
 	cfg.RootAnchorsPath = getEnv("ROOT_ANCHORS_PATH", cfg.RootAnchorsPath)
 	cfg.RootAnchorsURL = getEnv("ROOT_ANCHORS_URL", cfg.RootAnchorsURL)
 
 	// DNS query settings
-	cfg.QueryTimeout = getEnvDuration("QUERY_TIMEOUT", cfg.QueryTimeout)
-	cfg.TotalTimeout = getEnvDuration("TOTAL_TIMEOUT", cfg.TotalTimeout)
+	cfg.QueryTimeoutSec = getEnvInt("QUERY_TIMEOUT_SECONDS", cfg.QueryTimeoutSec)
+	cfg.TotalTimeoutSec = getEnvInt("TOTAL_TIMEOUT_SECONDS", cfg.TotalTimeoutSec)
 	cfg.MaxConcurrent = getEnvInt("MAX_CONCURRENT", cfg.MaxConcurrent)
 	cfg.RecursiveResolver = getEnv("RECURSIVE_RESOLVER", cfg.RecursiveResolver)
 
 	// Rate limiting
-	cfg.RateLimitPerSec = getEnvInt("RATE_LIMIT_PER_SEC", cfg.RateLimitPerSec)
-	cfg.RateLimitBurst = getEnvInt("RATE_LIMIT_BURST", cfg.RateLimitBurst)
-	cfg.RateLimitCleanup = getEnvDuration("RATE_LIMIT_CLEANUP", cfg.RateLimitCleanup)
+	cfg.RateLimit.PerSec = getEnvInt("RATE_LIMIT_PER_SEC", cfg.RateLimit.PerSec)
+	cfg.RateLimit.Burst = getEnvInt("RATE_LIMIT_BURST", cfg.RateLimit.Burst)
+	cfg.RateLimit.CleanupSec = getEnvInt("RATE_LIMIT_CLEANUP_SECONDS", cfg.RateLimit.CleanupSec)
 
 	// Logging
-	cfg.LogFormat = getEnv("LOG_FORMAT", cfg.LogFormat)
-	cfg.LogLevel = getEnv("LOG_LEVEL", cfg.LogLevel)
-	cfg.LogFile = getEnv("LOG_FILE", cfg.LogFile)
+	cfg.Logging.Format = getEnv("LOG_FORMAT", cfg.Logging.Format)
+	cfg.Logging.Level = getEnv("LOG_LEVEL", cfg.Logging.Level)
+	cfg.Logging.File = getEnv("LOG_FILE", cfg.Logging.File)
 
 	// Static files
 	cfg.StaticDir = getEnv("STATIC_DIR", cfg.StaticDir)
@@ -110,13 +216,15 @@ func LoadConfig() (*Config, error) {
 	cfg.BasePath = getEnv("BASE_PATH", cfg.BasePath)
 
 	// Heartbeat monitoring (AnyStatus)
-	cfg.HeartbeatEnabled = getEnvBool("HEARTBEAT_ENABLED", cfg.HeartbeatEnabled)
-	cfg.HeartbeatURL = getEnv("HEARTBEAT_URL", cfg.HeartbeatURL)
-	cfg.HeartbeatAPIKey = getEnv("HEARTBEAT_API_KEY", cfg.HeartbeatAPIKey)
-	cfg.HeartbeatApp = getEnv("HEARTBEAT_APP", cfg.HeartbeatApp)
-	cfg.HeartbeatStatusURL = getEnv("HEARTBEAT_STATUS_URL", cfg.HeartbeatStatusURL)
-	cfg.HeartbeatInstanceID = getEnv("HEARTBEAT_INSTANCE_ID", cfg.HeartbeatInstanceID)
-	cfg.HeartbeatInterval = getEnvDuration("HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
+	cfg.Heartbeat.Enabled = getEnvBool("HEARTBEAT_ENABLED", cfg.Heartbeat.Enabled)
+	cfg.Heartbeat.URL = getEnv("HEARTBEAT_URL", cfg.Heartbeat.URL)
+	cfg.Heartbeat.APIKey = getEnv("HEARTBEAT_API_KEY", cfg.Heartbeat.APIKey)
+	cfg.Heartbeat.App = getEnv("HEARTBEAT_APP", cfg.Heartbeat.App)
+	cfg.Heartbeat.StatusURL = getEnv("HEARTBEAT_STATUS_URL", cfg.Heartbeat.StatusURL)
+	cfg.Heartbeat.InstanceID = getEnv("HEARTBEAT_INSTANCE_ID", cfg.Heartbeat.InstanceID)
+	cfg.Heartbeat.IntervalMinutes = getEnvInt("HEARTBEAT_INTERVAL_MINUTES", cfg.Heartbeat.IntervalMinutes)
+
+	cfg.applyNestedToFlat()
 
 	// Validate
 	if err := cfg.Validate(); err != nil {
@@ -126,46 +234,78 @@ func LoadConfig() (*Config, error) {
 	return cfg, nil
 }
 
+// LoadConfig loads configuration (backwards compatibility - uses Load with no path).
+func LoadConfig() (*Config, error) {
+	return Load("")
+}
+
+// applyNestedToFlat copies nested struct values to flat fields for backwards compatibility.
+func (c *Config) applyNestedToFlat() {
+	// Convert seconds to durations
+	c.ShutdownTimeout = time.Duration(c.ShutdownTimeoutSec) * time.Second
+	c.QueryTimeout = time.Duration(c.QueryTimeoutSec) * time.Second
+	c.TotalTimeout = time.Duration(c.TotalTimeoutSec) * time.Second
+
+	// Rate limiting
+	c.RateLimitPerSec = c.RateLimit.PerSec
+	c.RateLimitBurst = c.RateLimit.Burst
+	c.RateLimitCleanup = time.Duration(c.RateLimit.CleanupSec) * time.Second
+
+	// Logging
+	c.LogFormat = c.Logging.Format
+	c.LogLevel = c.Logging.Level
+	c.LogFile = c.Logging.File
+
+	// Heartbeat
+	c.HeartbeatEnabled = c.Heartbeat.Enabled
+	c.HeartbeatURL = c.Heartbeat.URL
+	c.HeartbeatAPIKey = c.Heartbeat.APIKey
+	c.HeartbeatApp = c.Heartbeat.App
+	c.HeartbeatStatusURL = c.Heartbeat.StatusURL
+	c.HeartbeatInstanceID = c.Heartbeat.InstanceID
+	c.HeartbeatInterval = time.Duration(c.Heartbeat.IntervalMinutes) * time.Minute
+}
+
 // Validate checks the configuration for errors
 func (c *Config) Validate() error {
 	// Validate log level
-	switch strings.ToLower(c.LogLevel) {
+	switch strings.ToLower(c.Logging.Level) {
 	case "debug", "info", "warn", "error":
 		// Valid
 	default:
-		return fmt.Errorf("invalid LOG_LEVEL: %s (must be debug, info, warn, or error)", c.LogLevel)
+		return fmt.Errorf("invalid logging.level: %s (must be debug, info, warn, or error)", c.Logging.Level)
 	}
 
 	// Validate log format
-	switch strings.ToLower(c.LogFormat) {
+	switch strings.ToLower(c.Logging.Format) {
 	case "text", "json":
 		// Valid
 	default:
-		return fmt.Errorf("invalid LOG_FORMAT: %s (must be text or json)", c.LogFormat)
+		return fmt.Errorf("invalid logging.format: %s (must be text or json)", c.Logging.Format)
 	}
 
 	// Validate rate limiting
-	if c.RateLimitPerSec <= 0 {
-		return fmt.Errorf("RATE_LIMIT_PER_SEC must be positive")
+	if c.RateLimit.PerSec <= 0 {
+		return fmt.Errorf("rate_limit.per_sec must be positive")
 	}
-	if c.RateLimitBurst <= 0 {
-		return fmt.Errorf("RATE_LIMIT_BURST must be positive")
+	if c.RateLimit.Burst <= 0 {
+		return fmt.Errorf("rate_limit.burst must be positive")
 	}
 
 	// Validate timeouts
-	if c.QueryTimeout <= 0 {
-		return fmt.Errorf("QUERY_TIMEOUT must be positive")
+	if c.QueryTimeoutSec <= 0 {
+		return fmt.Errorf("query_timeout_seconds must be positive")
 	}
-	if c.TotalTimeout <= 0 {
-		return fmt.Errorf("TOTAL_TIMEOUT must be positive")
+	if c.TotalTimeoutSec <= 0 {
+		return fmt.Errorf("total_timeout_seconds must be positive")
 	}
-	if c.ShutdownTimeout <= 0 {
-		return fmt.Errorf("SHUTDOWN_TIMEOUT_SECONDS must be positive")
+	if c.ShutdownTimeoutSec <= 0 {
+		return fmt.Errorf("shutdown_timeout_seconds must be positive")
 	}
 
 	// Validate max concurrent
 	if c.MaxConcurrent <= 0 {
-		return fmt.Errorf("MAX_CONCURRENT must be positive")
+		return fmt.Errorf("max_concurrent must be positive")
 	}
 
 	return nil
@@ -196,15 +336,6 @@ func getEnvBool(key string, defaultVal bool) bool {
 			return true
 		case "false", "0", "no", "off":
 			return false
-		}
-	}
-	return defaultVal
-}
-
-func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
-	if val := os.Getenv(key); val != "" {
-		if d, err := time.ParseDuration(val); err == nil {
-			return d
 		}
 	}
 	return defaultVal
