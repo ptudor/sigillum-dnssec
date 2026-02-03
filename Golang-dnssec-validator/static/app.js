@@ -633,19 +633,26 @@
 
     // Initialize collapsible sections with localStorage persistence
     function initCollapsibleSections() {
-        var aboutSection = document.getElementById('about-section');
-        if (aboutSection) {
-            // Restore state from localStorage
-            var aboutCollapsed = localStorage.getItem('aboutSectionCollapsed');
-            if (aboutCollapsed === 'true') {
-                aboutSection.removeAttribute('open');
-            }
+        var sections = [
+            { id: 'about-section', key: 'aboutSectionCollapsed' },
+            { id: 'api-section', key: 'apiSectionCollapsed' }
+        ];
 
-            // Save state on toggle
-            aboutSection.addEventListener('toggle', function() {
-                localStorage.setItem('aboutSectionCollapsed', !aboutSection.open);
-            });
-        }
+        sections.forEach(function(section) {
+            var el = document.getElementById(section.id);
+            if (el) {
+                // Restore state from localStorage
+                var collapsed = localStorage.getItem(section.key);
+                if (collapsed === 'true') {
+                    el.removeAttribute('open');
+                }
+
+                // Save state on toggle
+                el.addEventListener('toggle', function() {
+                    localStorage.setItem(section.key, !el.open);
+                });
+            }
+        });
     }
 
     // Initialize on DOM ready
