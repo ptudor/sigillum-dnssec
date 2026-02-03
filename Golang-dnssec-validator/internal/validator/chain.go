@@ -136,3 +136,36 @@ func ExtractTLD(domain string) string {
 
 	return labels[len(labels)-1] + "."
 }
+
+// IsRegistrableDomain returns true if the zone is a registrable domain
+// (i.e., directly under a TLD, like "example.com" but not "www.example.com").
+// This is a simplified check - doesn't handle complex TLDs like "co.uk".
+func IsRegistrableDomain(zone string) bool {
+	zone = NormalizeDomain(zone)
+	if zone == "." {
+		return false
+	}
+	// Registrable domains have exactly 2 labels (e.g., "example.com.")
+	// This is a simple heuristic; real-world would need a public suffix list
+	return GetZoneLabels(zone) == 2
+}
+
+// GetRegistrableDomain extracts the registrable domain from a full domain.
+// e.g., "www.example.com." -> "example.com."
+// Returns empty string for TLDs and root.
+func GetRegistrableDomain(domain string) string {
+	domain = NormalizeDomain(domain)
+	labels := GetZoneLabels(domain)
+
+	if labels < 2 {
+		return ""
+	}
+
+	// Take the last 2 labels
+	parts := strings.Split(strings.TrimSuffix(domain, "."), ".")
+	if len(parts) < 2 {
+		return ""
+	}
+
+	return strings.Join(parts[len(parts)-2:], ".") + "."
+}

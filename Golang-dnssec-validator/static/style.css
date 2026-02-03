@@ -635,6 +635,67 @@ body {
     font-size: 0.6875rem;
 }
 
+/* RDAP verification badges */
+.rdap-badge {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    padding: 0.125rem 0.375rem;
+    border-radius: var(--radius-sm);
+    margin-left: 0.5rem;
+    white-space: nowrap;
+}
+
+.rdap-badge.match {
+    background: var(--success-bg);
+    color: var(--success);
+}
+
+.rdap-badge.mismatch {
+    background: var(--error-bg);
+    color: var(--error);
+}
+
+.rdap-badge.warning {
+    background: var(--warning-bg);
+    color: var(--warning);
+}
+
+/* RDAP-only record styling */
+.record-card.rdap-only {
+    border-left: 3px solid var(--warning);
+    opacity: 0.85;
+}
+
+/* RDAP status summary */
+.rdap-summary {
+    margin-top: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-primary);
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+}
+
+.rdap-status {
+    display: inline-flex;
+    align-items: center;
+}
+
+.rdap-status.success {
+    color: var(--success);
+}
+
+.rdap-status.warning {
+    color: var(--warning);
+}
+
+.rdap-status.error {
+    color: var(--error);
+}
+
+.rdap-status.muted {
+    color: var(--text-muted);
+}
+
 /* Raw JSON */
 .raw-json {
     border-top: 1px solid var(--border);

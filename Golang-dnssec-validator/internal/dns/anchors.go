@@ -41,7 +41,7 @@ func LoadAnchors(path string) (*RootAnchors, error) {
 }
 
 // UserAgent for HTTP requests (visible in server logs)
-const UserAgent = "Tudor DNSSEC-VALIDATOR/1.0"
+const UserAgent = "TUDOR-DNSSEC-VALIDATOR/1.0 (ptudor.net)"
 
 // LoadAnchorsFromURL loads root trust anchors from a URL
 func LoadAnchorsFromURL(url string) (*RootAnchors, error) {

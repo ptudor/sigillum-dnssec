@@ -17,6 +17,25 @@ const (
 	StatusValidating    ValidationStatus = "validating"    // Currently being validated
 )
 
+// DSMatchResult represents the comparison result between DNS and RDAP DS records
+type DSMatchResult string
+
+const (
+	DSMatchFull     DSMatchResult = "full"     // All DS records match
+	DSMatchPartial  DSMatchResult = "partial"  // Some match, some don't
+	DSMatchNone     DSMatchResult = "none"     // No matching DS records
+	DSMatchNoRDAP   DSMatchResult = "no_rdap"  // RDAP unavailable/no data
+	DSMatchUnsigned DSMatchResult = "unsigned" // RDAP says unsigned (no DS)
+)
+
+// RDAPSecureDNS contains DS records from RDAP for comparison with DNS
+type RDAPSecureDNS struct {
+	DelegationSigned bool           `json:"delegation_signed"`
+	DSData           []dns.DSRecord `json:"ds_data,omitempty"`
+	DSMatch          DSMatchResult  `json:"ds_match"`
+	Error            string         `json:"error,omitempty"`
+}
+
 // ZoneResult represents the validation result for a single zone
 type ZoneResult struct {
 	Zone             string             `json:"zone"`
@@ -32,6 +51,7 @@ type ZoneResult struct {
 	DenialProof      *NSECProof         `json:"denial_proof,omitempty"`      // NSEC/NSEC3 proof of non-existence
 	RecordValidation *RecordValidation  `json:"record_validation,omitempty"` // Actual record RRSIG verification
 	DSValidation     *DSValidation      `json:"ds_validation,omitempty"`     // DS RRSIG verification from parent
+	RDAPSecureDNS    *RDAPSecureDNS     `json:"rdap_secure_dns,omitempty"`   // RDAP DS record verification
 	ChainLink        *ChainLink         `json:"chain_link,omitempty"`
 	Disagreements    []Disagreement     `json:"disagreements,omitempty"`
 	Warnings         []string           `json:"warnings,omitempty"`
