@@ -87,6 +87,21 @@ body {
     color: var(--text-secondary);
 }
 
+.header .powered-by {
+    font-size: 0.75rem;
+    margin-top: 0.5rem;
+}
+
+.header .powered-by a {
+    color: var(--accent-dim);
+    text-decoration: none;
+}
+
+.header .powered-by a:hover {
+    color: var(--accent);
+    text-decoration: underline;
+}
+
 /* Query Form */
 .query-form {
     margin-bottom: 1.5rem;
