@@ -82,24 +82,35 @@
             </section>
         </main>
 
-        <details class="about-section">
+        <details class="about-section" id="about-section" open>
             <summary>About this tool</summary>
             <div class="about-content">
-                <p><strong>DNSSEC Validator</strong> performs iterative DNSSEC validation from the root zone down to your target domain. Unlike a recursive resolver that simply gives you a pass/fail, this tool shows you exactly what's happening at each step:</p>
+                <p><strong>Any53 DNSSEC Validator</strong> performs iterative DNSSEC validation from the root zone down to your target domain. Unlike a recursive resolver that simply gives you a pass/fail, this tool shows you exactly what's happening at each step:</p>
                 <ul>
                     <li><strong>Zone discovery</strong> - Identifies actual zone cuts (delegation points) in the DNS hierarchy</li>
                     <li><strong>DNSKEY verification</strong> - Fetches and cryptographically verifies DNSKEY records at each zone</li>
                     <li><strong>DS chain validation</strong> - Verifies that each zone's KSK matches the DS record in its parent zone</li>
                     <li><strong>Signature validation</strong> - Checks RRSIG validity periods and cryptographic signatures</li>
+                    <li><strong>RDAP verification</strong> - Compares DS records from DNS against the registry database via RDAP</li>
                     <li><strong>CNAME following</strong> - Automatically validates CNAME target chains</li>
                 </ul>
                 <p>Validation results: <span class="badge secure">secure</span> (full chain verified), <span class="badge insecure">insecure</span> (zone not signed), <span class="badge bogus">bogus</span> (validation failed), <span class="badge indeterminate">indeterminate</span> (could not determine).</p>
             </div>
         </details>
 
+        <details class="about-section" id="api-section">
+            <summary>JSON API</summary>
+            <div class="about-content">
+                <p>Queries authoritative nameservers directly using <a href="https://www.iana.org/dnssec/files" target="_blank" rel="noopener">IANA root trust anchors</a>.</p>
+                <ul>
+                    <li><a href="api/validate?domain=example.com">/api/validate?domain=example.com</a> - Validate a domain (JSON response)</li>
+                    <li><a href="api/anchors">/api/anchors</a> - View current root trust anchors</li>
+                </ul>
+            </div>
+        </details>
+
         <footer class="footer">
-            <p>Queries authoritative nameservers directly using <a href="https://www.iana.org/dnssec/files" target="_blank" rel="noopener">IANA root trust anchors</a></p>
-            <p><a href="api/anchors">View Root Trust Anchors</a> | <a href="api/validate?domain=example.com">JSON API</a></p>
+            <p><a href="https://www.any53.com/any53/">Any53</a></p>
         </footer>
     </div>
 
