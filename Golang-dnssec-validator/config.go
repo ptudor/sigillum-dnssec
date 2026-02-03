@@ -34,6 +34,9 @@ type Config struct {
 	MaxConcurrent     int    `toml:"max_concurrent"`
 	RecursiveResolver string `toml:"recursive_resolver"`
 
+	// RDAP settings
+	RDAPBaseURL string `toml:"rdap_base_url"`
+
 	// Parsed durations
 	QueryTimeout time.Duration `toml:"-"`
 	TotalTimeout time.Duration `toml:"-"`
@@ -111,7 +114,8 @@ func DefaultConfig() *Config {
 		QueryTimeout:       5 * time.Second,
 		TotalTimeout:       30 * time.Second,
 		MaxConcurrent:      10,
-		RecursiveResolver:  "8.8.8.8",
+		RecursiveResolver:  "127.0.0.1",
+		RDAPBaseURL:        "https://www.any53.com/rdap",
 		RateLimit: RateLimitConfig{
 			PerSec:     10,
 			Burst:      30,
@@ -198,6 +202,9 @@ func LoadFromEnv() (*Config, error) {
 	cfg.TotalTimeoutSec = getEnvInt("TOTAL_TIMEOUT_SECONDS", cfg.TotalTimeoutSec)
 	cfg.MaxConcurrent = getEnvInt("MAX_CONCURRENT", cfg.MaxConcurrent)
 	cfg.RecursiveResolver = getEnv("RECURSIVE_RESOLVER", cfg.RecursiveResolver)
+
+	// RDAP settings
+	cfg.RDAPBaseURL = getEnv("RDAP_BASE_URL", cfg.RDAPBaseURL)
 
 	// Rate limiting
 	cfg.RateLimit.PerSec = getEnvInt("RATE_LIMIT_PER_SEC", cfg.RateLimit.PerSec)

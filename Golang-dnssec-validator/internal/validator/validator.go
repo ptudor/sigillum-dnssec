@@ -3,11 +3,13 @@ package validator
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
 	dnspkg "github.com/ptudor/dnssec-validator/internal/dns"
+	"github.com/ptudor/dnssec-validator/internal/rdap"
 )
 
 // EventCallback is called when validation events occur
@@ -21,6 +23,7 @@ type Validator struct {
 	totalTimeout  time.Duration
 	maxConcurrent int
 	eventCallback EventCallback
+	rdapClient    *rdap.Client
 }
 
 // NewValidator creates a new DNSSEC validator
@@ -32,6 +35,11 @@ func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, a
 		totalTimeout:  totalTimeout,
 		maxConcurrent: maxConcurrent,
 	}
+}
+
+// SetRDAPClient sets the RDAP client for out-of-band DS record verification
+func (v *Validator) SetRDAPClient(client *rdap.Client) {
+	v.rdapClient = client
 }
 
 // SetEventCallback sets the callback for validation events
@@ -691,6 +699,15 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			return result, nil
 		}
 		result.ChainLink = link
+
+		// Query RDAP for out-of-band DS verification (only for registrable domains)
+		if v.rdapClient != nil && IsRegistrableDomain(zone) {
+			rdapResult := v.queryRDAPSecureDNS(ctx, zone, dsRecords)
+			result.RDAPSecureDNS = rdapResult
+			if rdapResult != nil && rdapResult.DSMatch == DSMatchNone {
+				result.Warnings = append(result.Warnings, "RDAP DS records do not match DNS DS records")
+			}
+		}
 	}
 
 	// Check for RFC compliance warnings (informational, don't affect status)
@@ -884,4 +901,86 @@ func compareDNSKEYSets(a, b []dnspkg.DNSKEYRecord) bool {
 	}
 
 	return true
+}
+
+// queryRDAPSecureDNS queries RDAP for secureDNS information and compares with DNS DS records
+func (v *Validator) queryRDAPSecureDNS(ctx context.Context, zone string, dnsDS []dnspkg.DSRecord) *RDAPSecureDNS {
+	if v.rdapClient == nil {
+		return nil
+	}
+
+	result := &RDAPSecureDNS{
+		DSMatch: DSMatchNoRDAP,
+	}
+
+	secureDNS, err := v.rdapClient.GetSecureDNS(ctx, zone)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	// Domain not found in RDAP
+	if secureDNS == nil {
+		result.Error = "domain not found in RDAP"
+		return result
+	}
+
+	result.DelegationSigned = secureDNS.DelegationSigned
+
+	// If RDAP says unsigned
+	if !secureDNS.DelegationSigned || len(secureDNS.DSData) == 0 {
+		result.DSMatch = DSMatchUnsigned
+		// Warning if DNS has DS but RDAP says unsigned
+		if len(dnsDS) > 0 {
+			result.Error = "RDAP reports domain as unsigned but DNS has DS records"
+		}
+		return result
+	}
+
+	// Convert RDAP DS records to our format for comparison
+	rdapDS := make([]dnspkg.DSRecord, 0, len(secureDNS.DSData))
+	for _, ds := range secureDNS.DSData {
+		rdapDS = append(rdapDS, dnspkg.DSRecord{
+			KeyTag:     uint16(ds.KeyTag),
+			Algorithm:  uint8(ds.Algorithm),
+			DigestType: uint8(ds.DigestType),
+			Digest:     strings.ToUpper(ds.Digest),
+		})
+	}
+	result.DSData = rdapDS
+
+	// Compare DS records
+	result.DSMatch = compareDSRecords(dnsDS, rdapDS)
+
+	return result
+}
+
+// compareDSRecords compares DNS and RDAP DS records
+func compareDSRecords(dnsDS, rdapDS []dnspkg.DSRecord) DSMatchResult {
+	if len(dnsDS) == 0 || len(rdapDS) == 0 {
+		return DSMatchNone
+	}
+
+	// Normalize DNS DS digests to uppercase for comparison
+	normalizedDNS := make(map[string]bool)
+	for _, ds := range dnsDS {
+		key := fmt.Sprintf("%d-%d-%d-%s", ds.KeyTag, ds.Algorithm, ds.DigestType, strings.ToUpper(ds.Digest))
+		normalizedDNS[key] = true
+	}
+
+	matchCount := 0
+	for _, ds := range rdapDS {
+		key := fmt.Sprintf("%d-%d-%d-%s", ds.KeyTag, ds.Algorithm, ds.DigestType, strings.ToUpper(ds.Digest))
+		if normalizedDNS[key] {
+			matchCount++
+		}
+	}
+
+	if matchCount == 0 {
+		return DSMatchNone
+	}
+	if matchCount == len(rdapDS) && matchCount == len(dnsDS) {
+		return DSMatchFull
+	}
+	return DSMatchPartial
 }

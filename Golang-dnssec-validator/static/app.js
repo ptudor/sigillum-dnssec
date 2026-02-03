@@ -353,15 +353,57 @@
         if (zoneResult.ds && zoneResult.ds.length > 0) {
             html += '<h4>DS Records (from parent)</h4>';
             zoneResult.ds.forEach(function(ds) {
+                var rdapMatch = checkRDAPMatch(ds, zoneResult.rdap_secure_dns);
                 html += '<div class="record-card">';
                 html += '<div class="record-header">';
                 html += '<span class="record-type">DS</span>';
                 html += '<span class="record-tag">Tag: ' + ds.key_tag + '</span>';
+                if (rdapMatch !== null) {
+                    html += rdapMatch ?
+                        '<span class="rdap-badge match">RDAP \u2713</span>' :
+                        '<span class="rdap-badge mismatch">RDAP \u2717</span>';
+                }
                 html += '</div>';
                 html += '<div class="record-data">' + escapeHtml(ds.digest.substring(0, 50)) + '...</div>';
                 html += '<div class="record-meta">Algorithm: ' + ds.algorithm + ' | Digest Type: ' + ds.digest_type + '</div>';
                 html += '</div>';
             });
+
+            // Show RDAP-only DS records (if any don't appear in DNS)
+            if (zoneResult.rdap_secure_dns && zoneResult.rdap_secure_dns.ds_data) {
+                var rdapOnly = getRDAPOnlyDS(zoneResult.ds, zoneResult.rdap_secure_dns.ds_data);
+                rdapOnly.forEach(function(ds) {
+                    html += '<div class="record-card rdap-only">';
+                    html += '<div class="record-header">';
+                    html += '<span class="record-type">DS</span>';
+                    html += '<span class="record-tag">Tag: ' + ds.key_tag + '</span>';
+                    html += '<span class="rdap-badge warning">RDAP only</span>';
+                    html += '</div>';
+                    html += '<div class="record-data">' + escapeHtml(ds.digest.substring(0, 50)) + '...</div>';
+                    html += '<div class="record-meta">Algorithm: ' + ds.algorithm + ' | Digest Type: ' + ds.digest_type + ' | <em>Not in DNS</em></div>';
+                    html += '</div>';
+                });
+            }
+
+            // Show RDAP status summary
+            if (zoneResult.rdap_secure_dns) {
+                html += '<div class="rdap-summary">';
+                var rdap = zoneResult.rdap_secure_dns;
+                if (rdap.error) {
+                    html += '<span class="rdap-status warning">RDAP: ' + escapeHtml(rdap.error) + '</span>';
+                } else if (rdap.ds_match === 'full') {
+                    html += '<span class="rdap-status success">RDAP: All DS records match registry database</span>';
+                } else if (rdap.ds_match === 'partial') {
+                    html += '<span class="rdap-status warning">RDAP: Partial DS record match with registry</span>';
+                } else if (rdap.ds_match === 'none') {
+                    html += '<span class="rdap-status error">RDAP: DS records do not match registry database</span>';
+                } else if (rdap.ds_match === 'unsigned') {
+                    html += '<span class="rdap-status warning">RDAP: Registry reports domain as unsigned</span>';
+                } else if (rdap.ds_match === 'no_rdap') {
+                    html += '<span class="rdap-status muted">RDAP: Not available for this domain</span>';
+                }
+                html += '</div>';
+            }
         }
 
         // RRSIG records
@@ -521,6 +563,53 @@
         const div = document.createElement('div');
         div.textContent = str;
         return div.innerHTML;
+    }
+
+    // Check if a DNS DS record matches any RDAP DS record
+    // Returns: true (match), false (no match), null (no RDAP data)
+    function checkRDAPMatch(dnsDS, rdapSecureDNS) {
+        if (!rdapSecureDNS || !rdapSecureDNS.ds_data || rdapSecureDNS.ds_data.length === 0) {
+            return null;
+        }
+
+        var dnsDigest = (dnsDS.digest || '').toUpperCase();
+        for (var i = 0; i < rdapSecureDNS.ds_data.length; i++) {
+            var rdapDS = rdapSecureDNS.ds_data[i];
+            var rdapDigest = (rdapDS.digest || '').toUpperCase();
+            if (dnsDS.key_tag === rdapDS.key_tag &&
+                dnsDS.algorithm === rdapDS.algorithm &&
+                dnsDS.digest_type === rdapDS.digest_type &&
+                dnsDigest === rdapDigest) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Get DS records that are only in RDAP (not in DNS)
+    function getRDAPOnlyDS(dnsDS, rdapDS) {
+        if (!rdapDS || rdapDS.length === 0) {
+            return [];
+        }
+        if (!dnsDS || dnsDS.length === 0) {
+            return rdapDS;
+        }
+
+        var dnsSet = {};
+        dnsDS.forEach(function(ds) {
+            var key = ds.key_tag + '-' + ds.algorithm + '-' + ds.digest_type + '-' + (ds.digest || '').toUpperCase();
+            dnsSet[key] = true;
+        });
+
+        var onlyInRDAP = [];
+        rdapDS.forEach(function(ds) {
+            var key = ds.key_tag + '-' + ds.algorithm + '-' + ds.digest_type + '-' + (ds.digest || '').toUpperCase();
+            if (!dnsSet[key]) {
+                onlyInRDAP.push(ds);
+            }
+        });
+
+        return onlyInRDAP;
     }
 
     // Add CNAME indicator to chain visualization

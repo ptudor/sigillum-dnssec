@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ptudor/dnssec-validator/internal/rdap"
 	"github.com/ptudor/dnssec-validator/internal/validator"
 )
 
@@ -14,13 +15,19 @@ import (
 type Handlers struct {
 	anchorsStore *AnchorsStore
 	config       *Config
+	rdapClient   *rdap.Client
 }
 
 // NewHandlers creates new HTTP handlers
 func NewHandlers(anchorsStore *AnchorsStore, config *Config) *Handlers {
+	var rdapClient *rdap.Client
+	if config.RDAPBaseURL != "" {
+		rdapClient = rdap.NewClient(config.RDAPBaseURL, config.QueryTimeout)
+	}
 	return &Handlers{
 		anchorsStore: anchorsStore,
 		config:       config,
+		rdapClient:   rdapClient,
 	}
 }
 
@@ -107,6 +114,11 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		h.config.RecursiveResolver,
 	)
 
+	// Set RDAP client for out-of-band DS verification
+	if h.rdapClient != nil {
+		v.SetRDAPClient(h.rdapClient)
+	}
+
 	// Set up event callback
 	v.SetEventCallback(func(event validator.SSEEvent) {
 		sse.WriteEvent(event.Type, event.Data)
@@ -186,6 +198,11 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		anchors,
 		h.config.RecursiveResolver,
 	)
+
+	// Set RDAP client for out-of-band DS verification
+	if h.rdapClient != nil {
+		v.SetRDAPClient(h.rdapClient)
+	}
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
