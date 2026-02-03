@@ -796,6 +796,16 @@ body {
     color: var(--text-primary);
 }
 
+.about-content a {
+    color: var(--accent-dim);
+    text-decoration: none;
+}
+
+.about-content a:hover {
+    color: var(--accent);
+    text-decoration: underline;
+}
+
 .about-content .code-example {
     margin-top: 1rem;
     padding: 0.75rem 1rem;
