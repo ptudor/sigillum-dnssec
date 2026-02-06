@@ -264,6 +264,7 @@
         var tab = document.createElement('button');
         tab.className = 'zone-tab';
         tab.setAttribute('role', 'tab');
+        tab.setAttribute('aria-selected', 'false');
         tab.textContent = zone === '.' ? 'root' : zone.replace(/\.$/, '');
         tab.dataset.zone = zone;
         tab.addEventListener('click', function() {
@@ -291,7 +292,9 @@
 
         // Update tab selection
         document.querySelectorAll('.zone-tab').forEach(function(tab) {
-            tab.classList.toggle('active', tab.dataset.zone === zone);
+            var isSelected = tab.dataset.zone === zone;
+            tab.classList.toggle('active', isSelected);
+            tab.setAttribute('aria-selected', isSelected ? 'true' : 'false');
         });
 
         // Show zone details
@@ -427,6 +430,94 @@
                 html += '</div>';
                 html += '</div>';
             });
+        }
+
+        // DS Validation (from parent)
+        if (zoneResult.ds_validation) {
+            var dsv = zoneResult.ds_validation;
+            html += '<h4>DS Signature Verification</h4>';
+            html += '<div class="record-card">';
+            html += '<div class="record-data">';
+            if (dsv.rrsig_verified) {
+                html += '<span class="ns-status secure">\u2713</span> DS RRSIG verified by parent ZSK (key tag ' + dsv.parent_signing_key + ')';
+            } else if (dsv.error) {
+                html += '<span class="ns-status error">\u2717</span> ' + escapeHtml(dsv.error);
+            } else {
+                html += '<span class="ns-status warning">\u26A0</span> DS RRSIG not verified';
+            }
+            html += '</div>';
+            html += '<div class="record-meta">Parent: ' + escapeHtml(dsv.parent_zone) + ' | DS count: ' + dsv.ds_count + '</div>';
+            html += '</div>';
+        }
+
+        // Record Validation (actual record RRSIG)
+        if (zoneResult.record_validation) {
+            var rv = zoneResult.record_validation;
+            html += '<h4>Record Signature Verification</h4>';
+            html += '<div class="record-card">';
+            html += '<div class="record-data">';
+            if (rv.rrsig_verified) {
+                html += '<span class="ns-status secure">\u2713</span> ' + escapeHtml(rv.record_type) + ' RRSIG verified (key tag ' + rv.signing_key_tag + ')';
+            } else if (rv.error) {
+                html += '<span class="ns-status error">\u2717</span> ' + escapeHtml(rv.error);
+            } else {
+                html += '<span class="ns-status warning">\u26A0</span> ' + escapeHtml(rv.record_type) + ' RRSIG not verified';
+            }
+            html += '</div>';
+            html += '<div class="record-meta">Records found: ' + rv.record_count + '</div>';
+            html += '</div>';
+        }
+
+        // NSEC records
+        if (zoneResult.nsec && zoneResult.nsec.length > 0) {
+            html += '<h4>NSEC Records</h4>';
+            zoneResult.nsec.forEach(function(nsec) {
+                html += '<div class="record-card">';
+                html += '<div class="record-header">';
+                html += '<span class="record-type">NSEC</span>';
+                html += '</div>';
+                html += '<div class="record-data">' + escapeHtml(nsec.owner) + ' \u2192 ' + escapeHtml(nsec.next_domain) + '</div>';
+                html += '<div class="record-meta">Types: ' + escapeHtml((nsec.type_bitmap || []).join(', ')) + '</div>';
+                html += '</div>';
+            });
+        }
+
+        // NSEC3 records
+        if (zoneResult.nsec3 && zoneResult.nsec3.length > 0) {
+            html += '<h4>NSEC3 Records</h4>';
+            zoneResult.nsec3.forEach(function(nsec3) {
+                var optOut = (nsec3.flags & 0x01) ? ' [opt-out]' : '';
+                html += '<div class="record-card">';
+                html += '<div class="record-header">';
+                html += '<span class="record-type">NSEC3' + escapeHtml(optOut) + '</span>';
+                html += '</div>';
+                html += '<div class="record-data">' + escapeHtml(nsec3.hashed_owner) + ' \u2192 ' + escapeHtml(nsec3.next_hashed) + '</div>';
+                html += '<div class="record-meta">Iterations: ' + nsec3.iterations + ' | Salt: ' + escapeHtml(nsec3.salt || '-') + ' | Types: ' + escapeHtml((nsec3.type_bitmap || []).join(', ')) + '</div>';
+                html += '</div>';
+            });
+        }
+
+        // Denial proof
+        if (zoneResult.denial_proof) {
+            var dp = zoneResult.denial_proof;
+            html += '<h4>Denial of Existence</h4>';
+            html += '<div class="record-card">';
+            html += '<div class="record-header">';
+            html += '<span class="record-type">' + escapeHtml(dp.proof_type) + '</span>';
+            html += '<span class="record-tag">' + escapeHtml(dp.response_type || '') + '</span>';
+            html += '</div>';
+            html += '<div class="record-data">';
+            if (dp.verified) {
+                html += '<span class="ns-status secure">\u2713</span> ';
+            } else if (dp.error) {
+                html += '<span class="ns-status error">\u2717</span> ';
+            }
+            html += escapeHtml(dp.explanation || dp.error || '');
+            html += '</div>';
+            if (dp.covering_nsec) {
+                html += '<div class="record-meta">Covering: ' + escapeHtml(dp.covering_nsec) + '</div>';
+            }
+            html += '</div>';
         }
 
         // Chain link
