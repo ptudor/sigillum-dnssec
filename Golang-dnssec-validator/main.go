@@ -83,6 +83,7 @@ func main() {
 	}()
 
 	// Start periodic anchor refresh (every 24 hours)
+	anchorDone := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
@@ -96,7 +97,7 @@ func main() {
 				}
 				// Update metrics
 				SetRootAnchorsAge(anchorsStore.Age().Seconds())
-			case <-sigChan:
+			case <-anchorDone:
 				return
 			}
 		}
@@ -106,6 +107,9 @@ func main() {
 	select {
 	case sig := <-sigChan:
 		LogShutdown(sig.String())
+
+		// Stop anchor refresh goroutine
+		close(anchorDone)
 
 		// Stop heartbeat background sender (sends "stopping" action)
 		if cancelHeartbeat != nil {
