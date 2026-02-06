@@ -32,27 +32,52 @@
 }
 
 :root {
-    --bg-primary: #0f0f1a;
-    --bg-secondary: #1a1a2e;
-    --bg-tertiary: #252540;
-    --accent: #00d4ff;
-    --accent-dim: #0099bb;
-    --text-primary: #f0f0f0;
-    --text-secondary: #9ca3af;
+    /* Light theme (default) */
+    --bg-primary: #f8f9fa;
+    --bg-secondary: #ffffff;
+    --bg-tertiary: #f0f1f3;
+    --accent: #0077aa;
+    --accent-dim: #005580;
+    --text-primary: #1a1a2e;
+    --text-secondary: #4b5563;
     --text-muted: #6b7280;
-    --success: #10b981;
-    --success-bg: #064e3b;
-    --warning: #f59e0b;
-    --warning-bg: #78350f;
-    --error: #ef4444;
-    --error-bg: #7f1d1d;
-    --dnssec: #8b5cf6;
-    --dnssec-bg: #4c1d95;
-    --insecure: #fbbf24;
-    --insecure-bg: #78350f;
-    --border: #374151;
+    --success: #059669;
+    --success-bg: #d1fae5;
+    --warning: #d97706;
+    --warning-bg: #fef3c7;
+    --error: #dc2626;
+    --error-bg: #fee2e2;
+    --dnssec: #7c3aed;
+    --dnssec-bg: #ede9fe;
+    --insecure: #b45309;
+    --insecure-bg: #fef3c7;
+    --border: #d1d5db;
     --radius: 8px;
     --radius-sm: 4px;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg-primary: #0f0f1a;
+        --bg-secondary: #1a1a2e;
+        --bg-tertiary: #252540;
+        --accent: #00d4ff;
+        --accent-dim: #0099bb;
+        --text-primary: #f0f0f0;
+        --text-secondary: #9ca3af;
+        --text-muted: #6b7280;
+        --success: #10b981;
+        --success-bg: #064e3b;
+        --warning: #f59e0b;
+        --warning-bg: #78350f;
+        --error: #ef4444;
+        --error-bg: #7f1d1d;
+        --dnssec: #8b5cf6;
+        --dnssec-bg: #4c1d95;
+        --insecure: #fbbf24;
+        --insecure-bg: #78350f;
+        --border: #374151;
+    }
 }
 
 body {

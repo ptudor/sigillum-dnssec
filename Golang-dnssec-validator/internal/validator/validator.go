@@ -22,6 +22,7 @@ type Validator struct {
 	queryTimeout  time.Duration
 	totalTimeout  time.Duration
 	maxConcurrent int
+	quickMode     bool // true = query first responding NS only; false = query all
 	eventCallback EventCallback
 	rdapClient    *rdap.Client
 }
@@ -35,6 +36,11 @@ func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, a
 		totalTimeout:  totalTimeout,
 		maxConcurrent: maxConcurrent,
 	}
+}
+
+// SetQuickMode enables quick mode (query first responding NS only)
+func (v *Validator) SetQuickMode(quick bool) {
+	v.quickMode = quick
 }
 
 // SetRDAPClient sets the RDAP client for out-of-band DS record verification
@@ -92,11 +98,15 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 
 	// Emit start event (only for top-level)
 	if depth == 0 {
+		mode := "extended"
+		if v.quickMode {
+			mode = "quick"
+		}
 		v.emitEvent("start", StartEvent{
 			Domain:    result.Domain,
 			QueryType: result.QueryType,
 			Timestamp: start,
-			Mode:      "extended",
+			Mode:      mode,
 		})
 	}
 
@@ -813,9 +823,16 @@ func (v *Validator) queryDSFromParent(ctx context.Context, zone, parentZone stri
 	return ds, err
 }
 
-// ValidateMultipleServers queries all servers in parallel and checks for consensus
+// ValidateMultipleServers queries all servers in parallel and checks for consensus.
+// In quick mode, only the first two servers are queried for speed.
 func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, servers []string) ([]AddressResult, []Disagreement) {
-	results := make([]AddressResult, len(servers))
+	// In quick mode, limit to first 2 servers (primary + one fallback)
+	queryServers := servers
+	if v.quickMode && len(servers) > 2 {
+		queryServers = servers[:2]
+	}
+
+	results := make([]AddressResult, len(queryServers))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	disagreements := make([]Disagreement, 0)
@@ -823,7 +840,7 @@ func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, se
 	// Limit concurrency
 	semaphore := make(chan struct{}, v.maxConcurrent)
 
-	for i, server := range servers {
+	for i, server := range queryServers {
 		wg.Add(1)
 		go func(idx int, srv string) {
 			defer wg.Done()

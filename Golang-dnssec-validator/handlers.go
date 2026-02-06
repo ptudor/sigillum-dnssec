@@ -119,6 +119,11 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		v.SetRDAPClient(h.rdapClient)
 	}
 
+	// Set validation mode (quick = first responding NS, extended = all NS)
+	if mode == "quick" {
+		v.SetQuickMode(true)
+	}
+
 	// Set up event callback
 	v.SetEventCallback(func(event validator.SSEEvent) {
 		sse.WriteEvent(event.Type, event.Data)
@@ -181,6 +186,12 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get mode parameter (quick or extended)
+	mode := r.URL.Query().Get("mode")
+	if mode == "" {
+		mode = "extended"
+	}
+
 	// Get anchors
 	anchors := h.anchorsStore.Get()
 	if anchors == nil || len(anchors.Anchors) == 0 {
@@ -202,6 +213,11 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	// Set RDAP client for out-of-band DS verification
 	if h.rdapClient != nil {
 		v.SetRDAPClient(h.rdapClient)
+	}
+
+	// Set validation mode (quick = first responding NS, extended = all NS)
+	if mode == "quick" {
+		v.SetQuickMode(true)
 	}
 
 	// Create context with timeout
