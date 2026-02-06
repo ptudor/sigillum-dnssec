@@ -103,8 +103,8 @@
             <div class="about-content">
                 <p>Queries authoritative nameservers directly using <a href="https://www.iana.org/dnssec/files" target="_blank" rel="noopener">IANA root trust anchors</a>.</p>
                 <ul>
-                    <li><a href="/dnssec/api/validate?domain=example.com">/dnssec/api/validate?domain=example.com</a> - Validate a domain (JSON response)</li>
-                    <li><a href="/dnssec/api/anchors">/dnssec/api/anchors</a> - View current root trust anchors</li>
+                    <li><a href="api/validate?domain=example.com">api/validate?domain=example.com</a> - Validate a domain (JSON response)</li>
+                    <li><a href="api/anchors">api/anchors</a> - View current root trust anchors</li>
                 </ul>
                 <p class="code-example">
                     <code>curl -s 'https://www.any53.com/dnssec/api/validate?domain=www.any53.com' | jq '.result, .chain[].zone'</code>
