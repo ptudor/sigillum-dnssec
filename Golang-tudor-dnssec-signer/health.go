@@ -24,6 +24,7 @@ func RegisterHealthHandlers(mux *http.ServeMux, state *State, cfg *Config) {
 func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'")
 }
 
 // healthHandler returns detailed health status

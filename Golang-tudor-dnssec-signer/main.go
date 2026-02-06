@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -24,6 +25,9 @@ var (
 	logLevel   string
 	logFormat  string
 	logOutput  string
+
+	// logFile tracks the current log file handle so it can be closed on reload
+	logFile *os.File
 )
 
 func main() {
@@ -225,12 +229,17 @@ func setupLogging() {
 			handler = slog.NewTextHandler(os.Stderr, opts)
 		}
 	default:
-		// Treat as file path
+		// Treat as file path — close previous log file if open
+		if logFile != nil {
+			logFile.Close()
+			logFile = nil
+		}
 		f, err := os.OpenFile(logOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open log file %s: %v, falling back to stderr\n", logOutput, err)
 			handler = slog.NewTextHandler(os.Stderr, opts)
 		} else {
+			logFile = f
 			if logFormat == "json" {
 				handler = slog.NewJSONHandler(f, opts)
 			} else {
@@ -391,14 +400,14 @@ func runResign(cmd *cobra.Command, args []string) error {
 		hookEnv := &HookEnv{
 			Domain:     domain,
 			ZonePath:   zoneCfg.Path,
-			SignedPath: fmt.Sprintf("%s/%s.zone.signed", cfg.OutputDir, domain),
+			SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
 			OutputDir:  cfg.OutputDir,
 		}
 		executeHook(cfg.Hooks.PostSign, hookEnv)
 	}
 
 	fmt.Printf("Zone %s re-signed successfully.\n", domain)
-	fmt.Printf("Signed zone written to: %s/%s.zone.signed\n", cfg.OutputDir, domain)
+	fmt.Printf("Signed zone written to: %s\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
 
 	return nil
 }
@@ -450,6 +459,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 func runAdd(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 	zonePath := args[1]
+
+	if err := ValidateDomainName(domain); err != nil {
+		return fmt.Errorf("invalid domain name: %w", err)
+	}
 
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
@@ -525,7 +538,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\nDomain %s added successfully.\n", domain)
 	fmt.Printf("  Config updated: %s\n", configPath)
-	fmt.Printf("  Signed zone:    %s/%s.zone.signed\n\n", cfg.OutputDir, domain)
+	fmt.Printf("  Signed zone:    %s\n\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
 	fmt.Println("Add the following DS record to your registrar:")
 	dsOutput := FormatDSRecordsFromKey(domain, kskKey)
 	fmt.Println(dsOutput)
@@ -595,15 +608,14 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print new DS
-	zoneState = state.GetZone(domain)
 	fmt.Printf("KSK rollover started for %s.\n\n", domain)
 	fmt.Println("Both keys are now in the zone. Add the NEW DS record at your registrar:")
-	// Find the new KSK
-	dsOutput, err := FormatDSRecords(domain, zoneState.KSK)
+	keyGen := NewKeyGenerator(cfg)
+	kskKey, _, err := keyGen.LoadKeyPair(domain, "ksk")
 	if err != nil {
-		return fmt.Errorf("formatting DS records: %w", err)
+		return fmt.Errorf("loading new KSK for DS: %w", err)
 	}
-	fmt.Println(dsOutput)
+	fmt.Println(FormatDSRecordsFromKey(domain, kskKey))
 	fmt.Printf("\nOnce the new DS is published, run: dnssec-tudor rollover complete %s\n", domain)
 
 	return nil
@@ -825,6 +837,10 @@ func runImport(cmd *cobra.Command, args []string) error {
 	kskPath, _ := cmd.Flags().GetString("ksk")
 	zskPath, _ := cmd.Flags().GetString("zsk")
 
+	if err := ValidateDomainName(domain); err != nil {
+		return fmt.Errorf("invalid domain name: %w", err)
+	}
+
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
 		return err
@@ -931,7 +947,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  KSK: %d (%s)\n", ksk.KeyTag(), AlgorithmName(ksk.Algorithm))
 	fmt.Printf("  ZSK: %d (%s)\n", zsk.KeyTag(), AlgorithmName(zsk.Algorithm))
 	fmt.Printf("  Config updated: %s\n", configPath)
-	fmt.Printf("  Signed zone:    %s/%s.zone.signed\n\n", cfg.OutputDir, domain)
+	fmt.Printf("  Signed zone:    %s\n\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
 	fmt.Println("DS record (verify this matches what's at your registrar):")
 	dsOutput := FormatDSRecordsFromKey(domain, ksk)
 	fmt.Println(dsOutput)

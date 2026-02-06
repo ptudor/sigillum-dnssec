@@ -19,6 +19,7 @@ func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
 		next(w, r)
 	}
 }
@@ -66,12 +67,26 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 
 	status := state.ToStatusOutput()
 
+	// Compute DS records for each zone to display inline
+	dsRecords := make(map[string]string)
+	keyGen := NewKeyGenerator(cfg)
+	for domain, zone := range status.Zones {
+		if zone.KSK != nil {
+			ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+			if err == nil {
+				dsRecords[domain] = FormatDSRecordsFromKey(domain, ksk)
+			}
+		}
+	}
+
 	data := struct {
-		Config *Config
-		Status *StatusOutput
+		Config    *Config
+		Status    *StatusOutput
+		DSRecords map[string]string
 	}{
-		Config: cfg,
-		Status: status,
+		Config:    cfg,
+		Status:    status,
+		DSRecords: dsRecords,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

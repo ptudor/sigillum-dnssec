@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -264,8 +266,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Validate zone paths exist
+	// Validate zone names and paths
 	for domain, zone := range c.Zones {
+		if err := ValidateDomainName(domain); err != nil {
+			return fmt.Errorf("zone %q: %w", domain, err)
+		}
 		if zone.Path == "" {
 			return fmt.Errorf("zone %q has no path specified", domain)
 		}
@@ -311,12 +316,12 @@ func (c *Config) GetZoneAlgorithm(domain string) string {
 
 // KeysDir returns the path to the keys directory
 func (c *Config) KeysDir() string {
-	return c.DataDir + "/keys"
+	return filepath.Join(c.DataDir, "keys")
 }
 
 // StatePath returns the path to the state file
 func (c *Config) StatePath() string {
-	return c.DataDir + "/state.json"
+	return filepath.Join(c.DataDir, "state.json")
 }
 
 // AddZoneToConfigFile appends a new zone entry to the config file
@@ -342,4 +347,25 @@ func AddZoneToConfigFile(configPath, domain, zonePath string) error {
 // Note: This does NOT modify the config file - that would require full rewriting
 func (c *Config) RemoveZoneFromConfig(domain string) {
 	delete(c.Zones, domain)
+}
+
+// ValidateDomainName checks that a domain name is safe for use in file paths.
+// Rejects path traversal attempts and characters that are invalid in DNS names.
+func ValidateDomainName(domain string) error {
+	if domain == "" {
+		return fmt.Errorf("domain name must not be empty")
+	}
+	if strings.Contains(domain, "..") {
+		return fmt.Errorf("domain name must not contain '..'")
+	}
+	if strings.ContainsAny(domain, "/\\") {
+		return fmt.Errorf("domain name must not contain path separators")
+	}
+	// DNS names: letters, digits, hyphens, dots, and underscores (for SRV/DKIM)
+	for _, c := range domain {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_') {
+			return fmt.Errorf("domain name contains invalid character %q", c)
+		}
+	}
+	return nil
 }

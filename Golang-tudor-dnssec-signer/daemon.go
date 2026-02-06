@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -167,7 +168,7 @@ func (d *Daemon) validateStartup() error {
 
 // checkDirWritable verifies a directory is writable
 func (d *Daemon) checkDirWritable(dir, name string) error {
-	testFile := dir + "/.startup_check"
+	testFile := filepath.Join(dir, ".startup_check")
 	f, err := os.Create(testFile)
 	if err != nil {
 		return fmt.Errorf("%s not writable (%s): %w", name, dir, err)
@@ -179,6 +180,11 @@ func (d *Daemon) checkDirWritable(dir, name string) error {
 
 func (d *Daemon) runSigningLoop() {
 	defer d.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[DAEMON] Panic in signing loop", "panic", r)
+		}
+	}()
 
 	ticker := time.NewTicker(d.cfg.PollInterval.Duration)
 	defer ticker.Stop()
@@ -283,7 +289,7 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 		hookEnv := &HookEnv{
 			Domain:     domain,
 			ZonePath:   zoneCfg.Path,
-			SignedPath: fmt.Sprintf("%s/%s.zone.signed", cfg.OutputDir, domain),
+			SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
 			OutputDir:  cfg.OutputDir,
 		}
 		executeHook(cfg.Hooks.PostSign, hookEnv)
@@ -312,6 +318,11 @@ func (d *Daemon) checkZSKRollovers() {
 
 func (d *Daemon) runWebServer() {
 	defer d.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[DAEMON] Panic in web server", "panic", r)
+		}
+	}()
 
 	d.mu.Lock()
 	d.server = NewWebServer(d.cfg, d.state)
@@ -326,6 +337,11 @@ func (d *Daemon) runWebServer() {
 
 func (d *Daemon) runHealthServer() {
 	defer d.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[DAEMON] Panic in health server", "panic", r)
+		}
+	}()
 
 	d.mu.RLock()
 	listenAddr := d.cfg.Health.Listen

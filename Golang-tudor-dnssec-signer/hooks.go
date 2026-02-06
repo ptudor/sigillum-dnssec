@@ -27,6 +27,12 @@ func executeHook(cmd string, env *HookEnv) {
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "command", cmd, "domain", env.Domain)
+			}
+		}()
+
 		startTime := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
