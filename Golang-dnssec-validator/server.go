@@ -93,7 +93,7 @@ func (s *Server) Start() error {
 		Addr:         s.config.ListenAddr,
 		Handler:      s.mux,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second, // Longer for SSE
+		WriteTimeout: 0, // Disabled: SSE connections are long-lived; per-request timeouts via context
 		IdleTimeout:  120 * time.Second,
 	}
 

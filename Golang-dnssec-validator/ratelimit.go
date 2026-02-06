@@ -105,6 +105,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 		if !rl.Allow(ip) {
 			RecordRateLimitHit()
+			w.Header().Set("Retry-After", "1")
 			writeProblemDetails(w, ErrTypeTooManyRequests, "Too Many Requests",
 				http.StatusTooManyRequests, "rate limit exceeded, please try again later", r.URL.Path)
 			return

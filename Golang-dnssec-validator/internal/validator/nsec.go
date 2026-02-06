@@ -52,7 +52,7 @@ func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.
 	}
 
 	// Verify NSEC RRSIG first
-	rrsigRecord := findRRSIGForType(46, rrsigs) // TypeNSEC = 47
+	rrsigRecord := findRRSIGForType(47, rrsigs) // TypeNSEC = 47
 	if rrsigRecord == nil {
 		proof.Error = "no RRSIG for NSEC records"
 		return proof
@@ -527,9 +527,10 @@ func findRRSIGForType(rrtype uint16, rrsigs []dnspkg.RRSIGRecord) *dnspkg.RRSIGR
 	return nil
 }
 
-// verifyRRSIGTimeValid checks if an RRSIG is currently valid time-wise
+// verifyRRSIGTimeValid checks if an RRSIG is currently valid time-wise.
+// Uses VerifyRRSIGValid for consistency with clock skew tolerance per RFC 4035 §5.3.1.
 func verifyRRSIGTimeValid(rrsig dnspkg.RRSIGRecord) bool {
-	return rrsig.IsValid && !rrsig.IsExpired
+	return VerifyRRSIGValid(rrsig)
 }
 
 // findDNSKEYByTag finds a DNSKEY by its key tag

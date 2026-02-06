@@ -231,11 +231,13 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 // HandleAnchors returns the current root trust anchors
 func (h *Handlers) HandleAnchors(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
+	statusCode := "200"
 	defer func() {
-		RecordAPIRequest("/api/anchors", r.Method, "200", time.Since(startTime).Seconds())
+		RecordAPIRequest("/api/anchors", r.Method, statusCode, time.Since(startTime).Seconds())
 	}()
 
 	if r.Method != http.MethodGet {
+		statusCode = "405"
 		writeProblemDetails(w, ErrTypeMethodNotAllowed, "Method Not Allowed",
 			http.StatusMethodNotAllowed, "only GET method is supported", r.URL.Path)
 		return
@@ -243,6 +245,7 @@ func (h *Handlers) HandleAnchors(w http.ResponseWriter, r *http.Request) {
 
 	anchors := h.anchorsStore.Get()
 	if anchors == nil {
+		statusCode = "503"
 		writeProblemDetails(w, ErrTypeServiceUnavailable, "Service Unavailable",
 			http.StatusServiceUnavailable, "root trust anchors not available", r.URL.Path)
 		return

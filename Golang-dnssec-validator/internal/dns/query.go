@@ -47,7 +47,6 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 	}
 
 	// Try UDP first
-	start := time.Now()
 	resp, rtt, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(server, "53"))
 	result.RTT = rtt
 
@@ -55,7 +54,6 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 	if err == nil && resp.Truncated {
 		result.Truncated = true
 		client.Net = "tcp"
-		start = time.Now()
 		resp, rtt, err = client.ExchangeContext(ctx, msg, net.JoinHostPort(server, "53"))
 		result.RTT = rtt
 	}
@@ -64,8 +62,6 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 		result.Error = err.Error()
 		return result, nil // Return result with error, not Go error
 	}
-
-	_ = start // Silence unused variable if needed
 
 	result.RCode = resp.Rcode
 	result.RCodeName = RCodeName(resp.Rcode)
