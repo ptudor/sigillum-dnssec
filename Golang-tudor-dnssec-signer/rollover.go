@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"time"
 )
 
@@ -233,8 +234,8 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 func (rm *RolloverManager) backupKey(domain, keyType string, keyID uint16) error {
 	// Create backup by renaming with key ID suffix
 	keysDir := rm.cfg.KeysDir()
-	baseName := fmt.Sprintf("%s/%s.%s", keysDir, domain, keyType)
-	backupName := fmt.Sprintf("%s/%s.%s.%d", keysDir, domain, keyType, keyID)
+	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
+	backupName := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
 
 	// Copy key file to backup (don't move, in case rollover fails)
 	if err := copyFile(baseName+".key", backupName+".key"); err != nil {

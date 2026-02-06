@@ -878,6 +878,244 @@ www	IN	A	192.0.2.10
 	}
 }
 
+// TestDelegationPointSigning verifies that NS records at delegation points
+// are NOT signed, and glue records are NOT signed, per RFC 4035 §2.2.
+func TestDelegationPointSigning(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	zoneContent := `$ORIGIN example.com.
+$TTL 3600
+@	IN	SOA	ns1.example.com. admin.example.com. 2024011501 3600 1800 604800 86400
+@	IN	NS	ns1.example.com.
+@	IN	NS	ns2.example.com.
+ns1	IN	A	192.0.2.1
+ns2	IN	A	192.0.2.2
+@	IN	A	192.0.2.10
+sub	IN	NS	ns1.sub.example.com.
+sub	IN	NS	ns2.sub.example.com.
+ns1.sub	IN	A	192.0.2.100
+ns2.sub	IN	A	192.0.2.101
+www	IN	A	192.0.2.20
+`
+	zonePath := filepath.Join(dataDir, "example.com.zone")
+	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
+		t.Fatalf("Failed to write zone file: %v", err)
+	}
+
+	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.DNSSEC.NSECVersion = "nsec" // Use NSEC for simpler verification
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+	if err := ensureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("Failed to create output dir: %v", err)
+	}
+
+	state := NewState(cfg.StatePath())
+	keyGen := NewKeyGenerator(cfg)
+	ksk, _ := keyGen.GenerateKSK("example.com")
+	zsk, _ := keyGen.GenerateZSK("example.com")
+	state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone("example.com"); err != nil {
+		t.Fatalf("SignZone failed: %v", err)
+	}
+
+	signedPath := filepath.Join(cfg.OutputDir, "example.com.zone.signed")
+	signedData, _ := os.ReadFile(signedPath)
+	zp := dns.NewZoneParser(strings.NewReader(string(signedData)), "example.com.", signedPath)
+
+	// Collect RRSIG records by name+covered-type
+	type rrsigKey struct {
+		name        string
+		typeCovered uint16
+	}
+	rrsigs := make(map[rrsigKey]bool)
+
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		if sig, ok := rr.(*dns.RRSIG); ok {
+			rrsigs[rrsigKey{strings.ToLower(sig.Header().Name), sig.TypeCovered}] = true
+		}
+	}
+
+	// NS at apex SHOULD be signed
+	if !rrsigs[rrsigKey{"example.com.", dns.TypeNS}] {
+		t.Error("NS records at apex should be signed")
+	}
+
+	// NS at delegation point (sub.example.com) should NOT be signed
+	if rrsigs[rrsigKey{"sub.example.com.", dns.TypeNS}] {
+		t.Error("NS records at delegation point should NOT be signed (RFC 4035 §2.2)")
+	}
+
+	// Glue records (ns1.sub.example.com A) should NOT be signed
+	if rrsigs[rrsigKey{"ns1.sub.example.com.", dns.TypeA}] {
+		t.Error("Glue A records should NOT be signed (RFC 4035 §2.2)")
+	}
+	if rrsigs[rrsigKey{"ns2.sub.example.com.", dns.TypeA}] {
+		t.Error("Glue A records should NOT be signed (RFC 4035 §2.2)")
+	}
+
+	// Regular records SHOULD be signed
+	if !rrsigs[rrsigKey{"example.com.", dns.TypeA}] {
+		t.Error("A record at apex should be signed")
+	}
+	if !rrsigs[rrsigKey{"www.example.com.", dns.TypeA}] {
+		t.Error("www A record should be signed")
+	}
+}
+
+// TestWildcardSigning verifies that wildcard RRSIGs have the correct Labels field
+// per RFC 4035 §5.3.1 (Labels excludes the wildcard label).
+func TestWildcardSigning(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	zoneContent := `$ORIGIN example.com.
+$TTL 3600
+@	IN	SOA	ns1.example.com. admin.example.com. 2024011501 3600 1800 604800 86400
+@	IN	NS	ns1.example.com.
+ns1	IN	A	192.0.2.1
+*	IN	A	192.0.2.99
+`
+	zonePath := filepath.Join(dataDir, "example.com.zone")
+	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
+		t.Fatalf("Failed to write zone file: %v", err)
+	}
+
+	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+	if err := ensureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("Failed to create output dir: %v", err)
+	}
+
+	state := NewState(cfg.StatePath())
+	keyGen := NewKeyGenerator(cfg)
+	ksk, _ := keyGen.GenerateKSK("example.com")
+	zsk, _ := keyGen.GenerateZSK("example.com")
+	state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone("example.com"); err != nil {
+		t.Fatalf("SignZone failed: %v", err)
+	}
+
+	signedPath := filepath.Join(cfg.OutputDir, "example.com.zone.signed")
+	signedData, _ := os.ReadFile(signedPath)
+	zp := dns.NewZoneParser(strings.NewReader(string(signedData)), "example.com.", signedPath)
+
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		if sig, ok := rr.(*dns.RRSIG); ok {
+			if strings.HasPrefix(sig.Header().Name, "*.") && sig.TypeCovered == dns.TypeA {
+				// *.example.com. has 3 labels total, but wildcard RRSIG Labels = 2
+				if sig.Labels != 2 {
+					t.Errorf("Wildcard RRSIG Labels field should be 2 (excluding *), got %d", sig.Labels)
+				}
+				return // Found and verified
+			}
+		}
+	}
+	t.Error("No RRSIG for wildcard A record found")
+}
+
+// TestNeedsSign tests the change detection logic
+func TestNeedsSign(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	zoneContent := `$ORIGIN example.com.
+$TTL 3600
+@	IN	SOA	ns1.example.com. admin.example.com. 2024011501 3600 1800 604800 86400
+@	IN	NS	ns1.example.com.
+ns1	IN	A	192.0.2.1
+`
+	zonePath := filepath.Join(dataDir, "example.com.zone")
+	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
+		t.Fatalf("Failed to write zone file: %v", err)
+	}
+
+	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	signer := NewSigner(cfg, NewState(cfg.StatePath()))
+
+	// New zone (nil state) always needs signing
+	needs, reason := signer.NeedsSign("example.com", zonePath, nil)
+	if !needs || reason != "new zone" {
+		t.Errorf("New zone should need signing, got needs=%v reason=%q", needs, reason)
+	}
+
+	// Zone with recent signing and matching serial should NOT need signing
+	now := time.Now().UTC()
+	zoneState := &ZoneState{
+		Serial:        2024011501,
+		LastSigned:    now,
+		SignaturesExp: now.Add(14 * 24 * time.Hour),
+	}
+	needs, _ = signer.NeedsSign("example.com", zonePath, zoneState)
+	if needs {
+		t.Error("Zone with current signatures should not need signing")
+	}
+
+	// Zone with expired signatures SHOULD need signing
+	zoneState.SignaturesExp = now.Add(-1 * time.Hour)
+	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
+	if !needs || reason != "signatures approaching expiry" {
+		t.Errorf("Zone with expired signatures should need signing, got needs=%v reason=%q", needs, reason)
+	}
+
+	// Zone with active rollover SHOULD need signing
+	zoneState.SignaturesExp = now.Add(14 * 24 * time.Hour)
+	zoneState.Rollover = &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait}
+	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
+	if !needs || reason != "rollover in progress" {
+		t.Errorf("Zone with active rollover should need signing, got needs=%v reason=%q", needs, reason)
+	}
+
+	// Missing zone file should record error
+	zoneState.Rollover = nil
+	needs, _ = signer.NeedsSign("example.com", "/nonexistent/path", zoneState)
+	if needs {
+		t.Error("Missing zone file should not trigger signing")
+	}
+	if len(zoneState.Errors) == 0 {
+		t.Error("Missing zone file should add an error to zone state")
+	}
+}
+
+// TestValidateDomainName tests domain name validation for path safety
+func TestValidateDomainName(t *testing.T) {
+	tests := []struct {
+		domain    string
+		expectErr bool
+	}{
+		{"example.com", false},
+		{"my-domain.co.uk", false},
+		{"_dmarc.example.com", false},
+		{"sub.example.com", false},
+		{"", true},
+		{"../etc/passwd", true},
+		{"example.com/../../etc", true},
+		{"example.com\\..\\etc", true},
+		{"exam ple.com", true},
+		{"exam\x00ple.com", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.domain, func(t *testing.T) {
+			err := ValidateDomainName(tt.domain)
+			if tt.expectErr && err == nil {
+				t.Errorf("Expected error for %q, got nil", tt.domain)
+			}
+			if !tt.expectErr && err != nil {
+				t.Errorf("Unexpected error for %q: %v", tt.domain, err)
+			}
+		})
+	}
+}
+
 // TestMultipleAlgorithms tests signing with different algorithms
 func TestMultipleAlgorithms(t *testing.T) {
 	algorithms := []string{"ED25519", "ECDSAP256SHA256", "ECDSAP384SHA384"}

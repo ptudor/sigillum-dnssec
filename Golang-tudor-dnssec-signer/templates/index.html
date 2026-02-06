@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="60">
     <title>dnssec-tudor Dashboard</title>
     <style>
         :root {
@@ -46,6 +47,7 @@
             border-radius: 8px;
             padding: 1rem;
         }
+        .zone:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
         .zone-header {
             display: flex;
             justify-content: space-between;
@@ -155,7 +157,7 @@
 
     <div class="zones">
         {{range $domain, $zone := .Status.Zones}}
-        <div class="zone" onclick="this.classList.toggle('expanded')">
+        <div class="zone" tabindex="0" role="button" aria-expanded="false" onclick="toggleZone(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleZone(this)}">
             <div class="zone-header">
                 <span class="zone-name">{{$domain}}</span>
                 <span class="badge badge-{{if eq $zone.Status "healthy"}}healthy{{else if eq $zone.Status "warning"}}warning{{else if eq $zone.Status "action_required"}}action{{else}}error{{end}}">
@@ -238,9 +240,13 @@
                 {{end}}
 
                 <div class="section-title">DS Records for Registrar</div>
+                {{with index $.DSRecords $domain}}
+                <div class="code-block"><pre style="margin:0;white-space:pre-wrap;">{{.}}</pre><button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard(this.previousElementSibling.textContent, this)">Copy</button></div>
+                {{else}}
                 <p style="color: var(--text-dim); font-size: 0.875rem;">
                     Run <code>dnssec-tudor ds {{$domain}}</code> to get DS records.
                 </p>
+                {{end}}
 
                 <div class="section-title">Zone Info</div>
                 <div class="detail-row">
@@ -265,6 +271,10 @@
     </footer>
 
     <script>
+        function toggleZone(el) {
+            el.classList.toggle('expanded');
+            el.setAttribute('aria-expanded', el.classList.contains('expanded'));
+        }
         function copyToClipboard(text, btn) {
             navigator.clipboard.writeText(text).then(() => {
                 const orig = btn.textContent;
