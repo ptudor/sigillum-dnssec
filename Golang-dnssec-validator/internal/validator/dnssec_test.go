@@ -325,6 +325,29 @@ func TestVerifyDSMatchesDNSKEY(t *testing.T) {
 	if VerifyDSMatchesDNSKEY(wrongAlgDS, dnskey, "example.com.") {
 		t.Error("VerifyDSMatchesDNSKEY should return false for wrong algorithm")
 	}
+
+	// Unsupported digest type must fail closed
+	unsupportedDigestDS := dns.DSRecord{
+		KeyTag:     12345,
+		Algorithm:  13,
+		DigestType: 99,
+		Digest:     digest,
+	}
+	if VerifyDSMatchesDNSKEY(unsupportedDigestDS, dnskey, "example.com.") {
+		t.Error("VerifyDSMatchesDNSKEY should return false for unsupported digest type")
+	}
+
+	// Invalid DNSKEY public key must fail closed
+	badKey := dns.DNSKEYRecord{
+		KeyTag:    12345,
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: 13,
+		PublicKey: "not-valid-base64!!!",
+	}
+	if VerifyDSMatchesDNSKEY(matchingDS, badKey, "example.com.") {
+		t.Error("VerifyDSMatchesDNSKEY should return false when DNSKEY is malformed")
+	}
 }
 
 func TestReconstructDNSKEY(t *testing.T) {

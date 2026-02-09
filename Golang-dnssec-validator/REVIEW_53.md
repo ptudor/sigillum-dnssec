@@ -1,0 +1,63 @@
+# REVIEW_53 Implementation Plan And Tracking
+
+This document is the execution plan for the three-track review:
+
+- Production-readiness
+- Security hardening
+- UI/UX expert usage
+
+It is also the source of truth for implementation status.
+
+## Status Legend
+
+- `TODO`: not started
+- `IN_PROGRESS`: actively being implemented
+- `DONE`: implemented and verified
+- `BLOCKED`: needs decision or dependency
+
+## Execution Order
+
+1. Close security correctness gaps that can produce false validation results.
+2. Eliminate crash/panic and service-hardening risks.
+3. Improve operational behavior and diagnostics.
+4. Improve expert UX workflow and accessibility.
+
+## Work Items
+
+### A. Security And Correctness
+
+- `R53-001` `DONE` Fail-closed DS digest verification (remove fail-open path on digest computation errors).
+- `R53-002` `TODO` Replace partial DS/A/CNAME "verified" signals with full cryptographic verification or explicit "partial check" semantics.
+- `R53-003` `TODO` Tighten proxy trust model to explicit configured CIDRs only.
+- `R53-004` `DONE` Reduce error-detail leakage to clients while preserving request-id traceability.
+- `R53-005` `TODO` Add metrics endpoint exposure controls guidance and optional guard (auth/IP allowlist/reverse-proxy only).
+
+### B. Production-Readiness
+
+- `R53-101` `DONE` Validate all ticker/time values (`rate_limit.cleanup_seconds`, heartbeat interval) to prevent runtime panics.
+- `R53-102` `IN_PROGRESS` Harden HTTP server timeouts (`ReadHeaderTimeout`, `MaxHeaderBytes`, bounded write policy for non-SSE routes).
+- `R53-103` `TODO` Ensure `/healthz` reflects true readiness policy for missing anchors.
+- `R53-104` `TODO` Implement `base_path` routing support consistently for API, SSE, static UI, and docs examples.
+- `R53-105` `TODO` Stop unnecessary validation work after SSE disconnect/write failures.
+- `R53-106` `TODO` Scope cache headers: long-lived cache for immutable static assets, no-store only for API/SSE.
+
+### C. UI/UX For Expert Usage
+
+- `R53-201` `TODO` Persist/share full query state (`domain` + `mode`) in URL.
+- `R53-202` `TODO` Align client-side domain validation pattern with backend accepted format.
+- `R53-203` `TODO` Fix keyboard/tab semantics for zone navigation and focus styling for current interactive elements.
+- `R53-204` `TODO` Clarify verification labels in UI to avoid overstating cryptographic guarantees.
+
+## Immediate Sprint (Now)
+
+- `R53-001` fail-closed DS digest verification + tests. `DONE`
+- `R53-101` config validation for ticker safety + tests. `DONE`
+- `R53-102` server timeout/header hardening slice 1 (`ReadHeaderTimeout`, `MaxHeaderBytes`). `IN_PROGRESS`
+
+## Change Log
+
+- `2026-02-09`: Created tracking document and started `R53-001`, `R53-101`.
+- `2026-02-09`: Completed `R53-001` with fail-closed behavior and regression tests.
+- `2026-02-09`: Completed `R53-101` with config validation + tests for ticker-safe values.
+- `2026-02-09`: Started `R53-102`; added `ReadHeaderTimeout` and `MaxHeaderBytes` to server config.
+- `2026-02-09`: Completed `R53-004`; API/SSE now return request-id based validation errors and log full internal details server-side.

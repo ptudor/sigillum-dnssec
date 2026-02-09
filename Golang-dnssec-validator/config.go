@@ -20,8 +20,8 @@ var DefaultConfigPaths = []string{
 // Config holds all configuration for the application
 type Config struct {
 	// HTTP Server
-	ListenAddr         string `toml:"listen_addr"`
-	ShutdownTimeoutSec int    `toml:"shutdown_timeout_seconds"`
+	ListenAddr         string        `toml:"listen_addr"`
+	ShutdownTimeoutSec int           `toml:"shutdown_timeout_seconds"`
 	ShutdownTimeout    time.Duration `toml:"-"`
 
 	// Root trust anchors
@@ -298,6 +298,9 @@ func (c *Config) Validate() error {
 	if c.RateLimit.Burst <= 0 {
 		return fmt.Errorf("rate_limit.burst must be positive")
 	}
+	if c.RateLimit.CleanupSec <= 0 {
+		return fmt.Errorf("rate_limit.cleanup_seconds must be positive")
+	}
 
 	// Validate timeouts
 	if c.QueryTimeoutSec <= 0 {
@@ -313,6 +316,11 @@ func (c *Config) Validate() error {
 	// Validate max concurrent
 	if c.MaxConcurrent <= 0 {
 		return fmt.Errorf("max_concurrent must be positive")
+	}
+
+	// Validate heartbeat interval when enabled (time.NewTicker requires > 0)
+	if c.Heartbeat.Enabled && c.Heartbeat.IntervalMinutes <= 0 {
+		return fmt.Errorf("heartbeat.interval_minutes must be positive when heartbeat.enabled is true")
 	}
 
 	return nil

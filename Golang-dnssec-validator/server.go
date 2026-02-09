@@ -90,11 +90,13 @@ func (s *Server) registerRoutes() {
 // Start starts the HTTP server
 func (s *Server) Start() error {
 	s.server = &http.Server{
-		Addr:         s.config.ListenAddr,
-		Handler:      s.mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 0, // Disabled: SSE connections are long-lived; per-request timeouts via context
-		IdleTimeout:  120 * time.Second,
+		Addr:              s.config.ListenAddr,
+		Handler:           s.mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      0, // Disabled: SSE connections are long-lived; per-request timeouts via context
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
 
 	LogInfo("server", "starting HTTP server", "addr", s.config.ListenAddr)
