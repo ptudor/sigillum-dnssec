@@ -50,3 +50,25 @@ func TestConfigValidate_HeartbeatIntervalCanBeZeroWhenDisabled(t *testing.T) {
 		t.Fatalf("Validate() should allow zero heartbeat interval when disabled: %v", err)
 	}
 }
+
+func TestConfigValidate_TrustedProxyCIDRsRejectInvalid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TrustedProxyCIDRs = []string{"127.0.0.0/8", "not-a-cidr"}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() expected error for invalid trusted_proxy_cidrs entry")
+	}
+	if !strings.Contains(err.Error(), "trusted_proxy_cidrs") {
+		t.Fatalf("Validate() error = %q, expected trusted_proxy_cidrs message", err.Error())
+	}
+}
+
+func TestConfigValidate_TrustedProxyCIDRsAllowEmpty(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TrustedProxyCIDRs = []string{}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() should allow empty trusted_proxy_cidrs: %v", err)
+	}
+}

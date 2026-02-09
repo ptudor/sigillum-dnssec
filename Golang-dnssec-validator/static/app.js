@@ -37,7 +37,6 @@
                 var domain = this.getAttribute('data-domain');
                 domainInput.value = domain;
                 startValidation(domain, modeSelect.value);
-                updateURL(domain);
             });
         });
 
@@ -49,6 +48,10 @@
         // Check for domain in URL
         const params = new URLSearchParams(window.location.search);
         const domain = params.get('domain');
+        const mode = params.get('mode');
+        if (mode === 'quick' || mode === 'extended') {
+            modeSelect.value = mode;
+        }
         if (domain) {
             domainInput.value = domain;
             startValidation(domain, modeSelect.value);
@@ -68,9 +71,15 @@
     }
 
     // Update URL without reloading
-    function updateURL(domain) {
+    function updateURL(domain, mode) {
         const url = new URL(window.location);
         url.searchParams.set('domain', domain);
+        if (mode) {
+            url.searchParams.set('mode', mode);
+        }
+        if (url.search === window.location.search) {
+            return;
+        }
         history.pushState({}, '', url);
     }
 
@@ -80,12 +89,13 @@
         const domain = domainInput.value.trim();
         if (!domain) return;
 
-        updateURL(domain);
         startValidation(domain, modeSelect.value);
     }
 
     // Start validation via SSE
     function startValidation(domain, mode) {
+        updateURL(domain, mode);
+
         // Cancel any existing connection
         if (eventSource) {
             eventSource.close();
@@ -251,7 +261,7 @@
         item.addEventListener('click', function() {
             selectZone(zone, zoneResult);
         });
-        item.addEventListener('keypress', function(e) {
+        item.addEventListener('keydown', function(e) {
             if (e.key === 'Enter' || e.key === ' ') {
                 e.preventDefault();
                 selectZone(zone, zoneResult);
@@ -263,13 +273,17 @@
         // Add tab
         var tab = document.createElement('button');
         tab.className = 'zone-tab';
+        tab.id = 'zone-tab-' + zoneTabsEl.children.length;
         tab.setAttribute('role', 'tab');
+        tab.setAttribute('aria-controls', 'zone-content');
         tab.setAttribute('aria-selected', 'false');
+        tab.setAttribute('tabindex', '-1');
         tab.textContent = zone === '.' ? 'root' : zone.replace(/\.$/, '');
         tab.dataset.zone = zone;
         tab.addEventListener('click', function() {
             selectZone(zone, zoneResult);
         });
+        tab.addEventListener('keydown', handleZoneTabKeydown);
         zoneTabsEl.appendChild(tab);
 
         // Auto-select first zone
@@ -295,6 +309,10 @@
             var isSelected = tab.dataset.zone === zone;
             tab.classList.toggle('active', isSelected);
             tab.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+            tab.setAttribute('tabindex', isSelected ? '0' : '-1');
+            if (isSelected) {
+                zoneContentEl.setAttribute('aria-labelledby', tab.id);
+            }
         });
 
         // Show zone details
@@ -588,6 +606,34 @@
     }
 
     // Helper functions
+
+    function handleZoneTabKeydown(e) {
+        var tabs = Array.prototype.slice.call(zoneTabsEl.querySelectorAll('.zone-tab'));
+        var currentIndex = tabs.indexOf(e.currentTarget);
+        if (currentIndex < 0) return;
+
+        var nextIndex = -1;
+        switch (e.key) {
+            case 'ArrowRight':
+                nextIndex = (currentIndex + 1) % tabs.length;
+                break;
+            case 'ArrowLeft':
+                nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+                break;
+            case 'Home':
+                nextIndex = 0;
+                break;
+            case 'End':
+                nextIndex = tabs.length - 1;
+                break;
+            default:
+                return;
+        }
+
+        e.preventDefault();
+        tabs[nextIndex].focus();
+        tabs[nextIndex].click();
+    }
 
     // Safe JSON parsing with error handling
     function safeJSONParse(str, fallback) {

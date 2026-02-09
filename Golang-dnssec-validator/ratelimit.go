@@ -115,26 +115,56 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// trustedProxies contains CIDR ranges of trusted reverse proxies
-// Only requests from these ranges will have X-Forwarded-For headers trusted
-var trustedProxies = []string{
-	"127.0.0.0/8",    // localhost
-	"10.0.0.0/8",     // private class A
-	"172.16.0.0/12",  // private class B
-	"192.168.0.0/16", // private class C
-	"::1/128",        // IPv6 localhost
-	"fc00::/7",       // IPv6 unique local
+var defaultTrustedProxyCIDRs = []string{
+	"127.0.0.0/8", // localhost IPv4
+	"::1/128",     // localhost IPv6
 }
 
-var trustedProxyNets []*net.IPNet
+var (
+	trustedProxyMu    sync.RWMutex
+	trustedProxyNets  []*net.IPNet
+	trustedProxyCIDRs []string
+)
 
 func init() {
-	for _, cidr := range trustedProxies {
-		_, network, err := net.ParseCIDR(cidr)
-		if err == nil {
-			trustedProxyNets = append(trustedProxyNets, network)
+	// Best effort: defaults are valid literals. Keep empty set if something unexpected fails.
+	_ = SetTrustedProxyCIDRs(defaultTrustedProxyCIDRs)
+}
+
+// SetTrustedProxyCIDRs configures which proxy CIDRs are allowed to supply X-Forwarded-For / X-Real-IP.
+// An empty list means proxy headers are never trusted.
+func SetTrustedProxyCIDRs(cidrs []string) error {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	normalized := make([]string, 0, len(cidrs))
+
+	for _, cidr := range cidrs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
 		}
+
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return err
+		}
+
+		nets = append(nets, network)
+		normalized = append(normalized, cidr)
 	}
+
+	trustedProxyMu.Lock()
+	trustedProxyNets = nets
+	trustedProxyCIDRs = normalized
+	trustedProxyMu.Unlock()
+	return nil
+}
+
+func currentTrustedProxyCIDRs() []string {
+	trustedProxyMu.RLock()
+	defer trustedProxyMu.RUnlock()
+	out := make([]string, len(trustedProxyCIDRs))
+	copy(out, trustedProxyCIDRs)
+	return out
 }
 
 // isFromTrustedProxy checks if the remote address is from a trusted proxy
@@ -143,6 +173,8 @@ func isFromTrustedProxy(remoteAddr string) bool {
 	if ip == nil {
 		return false
 	}
+	trustedProxyMu.RLock()
+	defer trustedProxyMu.RUnlock()
 	for _, network := range trustedProxyNets {
 		if network.Contains(ip) {
 			return true
