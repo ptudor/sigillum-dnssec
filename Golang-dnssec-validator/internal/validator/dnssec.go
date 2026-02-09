@@ -30,9 +30,9 @@ func VerifyDSMatchesDNSKEY(ds dnspkg.DSRecord, dnskey dnspkg.DNSKEYRecord, zone 
 	// This is critical for security - we must verify the digest, not just trust key tags
 	computedDigest, err := ComputeDSDigestFromDNSKEY(zone, dnskey, ds.DigestType)
 	if err != nil {
-		// If we can't compute the digest, fall back to key tag match only
-		// This handles unsupported digest types
-		return true
+		// Fail closed: if digest cannot be computed, DS cannot be considered valid.
+		// This avoids accepting a chain link based on key tag/algorithm alone.
+		return false
 	}
 
 	// Compare digests (case-insensitive hex comparison)

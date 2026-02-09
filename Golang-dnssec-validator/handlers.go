@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -137,8 +138,9 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	result, err := v.Validate(ctx, domain)
 	if err != nil && result == nil {
 		statusCode = "500"
+		LogError("handlers", err, "action", "validate_sse", "request_id", requestID, "domain", domain)
 		sse.WriteEvent("error", validator.ErrorEvent{
-			Message: err.Error(),
+			Message: fmt.Sprintf("validation failed (request_id=%s)", requestID),
 			Fatal:   true,
 		})
 		return
@@ -227,8 +229,9 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	// Run validation
 	result, err := v.Validate(ctx, domain)
 	if err != nil && result == nil {
+		LogError("handlers", err, "action", "validate_json", "request_id", requestID, "domain", domain)
 		writeProblemDetails(w, ErrTypeValidationFailed, "Validation Failed",
-			http.StatusInternalServerError, err.Error(), r.URL.Path)
+			http.StatusInternalServerError, fmt.Sprintf("validation failed (request_id=%s)", requestID), r.URL.Path)
 		RecordAPIRequest("/api/validate", r.Method, "500", time.Since(startTime).Seconds())
 		return
 	}
