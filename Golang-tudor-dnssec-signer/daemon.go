@@ -26,21 +26,23 @@ type Daemon struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu     sync.RWMutex
-	server *http.Server
+	mu          sync.RWMutex
+	server      *http.Server
+	tickerReset chan time.Duration // signals the signing loop to reset its ticker
 }
 
 // NewDaemon creates a new daemon instance
 func NewDaemon(cfg *Config, state *State) *Daemon {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Daemon{
-		cfg:       cfg,
-		state:     state,
-		signer:    NewSigner(cfg, state),
-		rollover:  NewRolloverManager(cfg, state),
-		heartbeat: NewHeartbeatClient(&cfg.Heartbeat),
-		ctx:       ctx,
-		cancel:    cancel,
+		cfg:         cfg,
+		state:       state,
+		signer:      NewSigner(cfg, state),
+		rollover:    NewRolloverManager(cfg, state),
+		heartbeat:   NewHeartbeatClient(&cfg.Heartbeat),
+		ctx:         ctx,
+		cancel:      cancel,
+		tickerReset: make(chan time.Duration, 1),
 	}
 }
 
@@ -107,7 +109,7 @@ func (d *Daemon) Shutdown() {
 // Reload updates the daemon's configuration and state
 func (d *Daemon) Reload(cfg *Config, state *State) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	oldCfg := d.cfg
 
 	// Stop old heartbeat client
 	d.heartbeat.Stop()
@@ -120,21 +122,40 @@ func (d *Daemon) Reload(cfg *Config, state *State) {
 
 	// Start new heartbeat client
 	d.heartbeat.Start()
+	d.mu.Unlock()
+
+	// Reset signing loop ticker if poll interval changed
+	if cfg.PollInterval.Duration != oldCfg.PollInterval.Duration {
+		select {
+		case d.tickerReset <- cfg.PollInterval.Duration:
+			slog.Info("[DAEMON] Poll interval updated", "old", oldCfg.PollInterval.String(), "new", cfg.PollInterval.String())
+		default:
+		}
+	}
+
+	// Warn if listen addresses changed (requires restart)
+	if oldCfg.Web.Listen != cfg.Web.Listen || oldCfg.Web.Enabled != cfg.Web.Enabled {
+		slog.Warn("[DAEMON] Web listen address changed; restart required to take effect",
+			"old", oldCfg.Web.Listen, "new", cfg.Web.Listen)
+	}
+	if oldCfg.Health.Listen != cfg.Health.Listen {
+		slog.Warn("[DAEMON] Health listen address changed; restart required to take effect",
+			"old", oldCfg.Health.Listen, "new", cfg.Health.Listen)
+	}
 
 	slog.Info("[DAEMON] Configuration and state reloaded", "zones", len(cfg.Zones))
 }
 
 func (d *Daemon) ensureDirectories() error {
-	dirs := []string{
-		d.cfg.DataDir,
-		d.cfg.KeysDir(),
-		d.cfg.OutputDir,
-	}
-
-	for _, dir := range dirs {
+	// Data and output dirs need standard permissions
+	for _, dir := range []string{d.cfg.DataDir, d.cfg.OutputDir} {
 		if err := ensureDir(dir); err != nil {
 			return err
 		}
+	}
+	// Keys directory holds private keys — restrict to owner-only
+	if err := ensureDirSecure(d.cfg.KeysDir()); err != nil {
+		return err
 	}
 	return nil
 }
@@ -198,50 +219,74 @@ func (d *Daemon) runSigningLoop() {
 			return
 		case <-ticker.C:
 			d.signAllZones()
+		case newInterval := <-d.tickerReset:
+			ticker.Reset(newInterval)
 		}
 	}
 }
 
-func (d *Daemon) signAllZones() {
+// snapshot captures all daemon references under a single lock for a signing cycle.
+// This prevents races where a SIGHUP reload swaps pointers mid-cycle.
+type snapshot struct {
+	cfg      *Config
+	state    *State
+	signer   *Signer
+	rollover *RolloverManager
+}
+
+func (d *Daemon) takeSnapshot() snapshot {
 	d.mu.RLock()
-	cfg := d.cfg
-	d.mu.RUnlock()
+	defer d.mu.RUnlock()
+	return snapshot{
+		cfg:      d.cfg,
+		state:    d.state,
+		signer:   d.signer,
+		rollover: d.rollover,
+	}
+}
+
+func (d *Daemon) signAllZones() {
+	snap := d.takeSnapshot()
 
 	// Reload state from disk to pick up any zones added by CLI commands
-	if err := d.state.ReloadFromDisk(); err != nil {
+	if err := snap.state.ReloadFromDisk(); err != nil {
 		slog.Warn("[DAEMON] Failed to reload state from disk", "error", err)
 	}
 
-	slog.Debug("[DAEMON] Checking zones for signing", "count", len(cfg.Zones))
+	slog.Debug("[DAEMON] Checking zones for signing", "count", len(snap.cfg.Zones))
 
-	for domain := range cfg.Zones {
-		if err := d.checkAndSignZone(domain); err != nil {
+	for domain := range snap.cfg.Zones {
+		if err := d.checkAndSignZone(snap, domain); err != nil {
 			slog.Error("[DAEMON] Failed to sign zone", "domain", domain, "error", err)
 		}
 	}
 
 	// Check for automatic ZSK rollovers
-	d.checkZSKRollovers()
+	for domain := range snap.cfg.Zones {
+		zoneState := snap.state.GetZone(domain)
+		if zoneState == nil || zoneState.ZSK == nil {
+			continue
+		}
+		if err := snap.rollover.CheckZSKRollover(domain); err != nil {
+			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
+		}
+	}
 
 	// Save state
-	if err := d.state.Save(); err != nil {
+	if err := snap.state.Save(); err != nil {
 		slog.Error("[DAEMON] Failed to save state", "error", err)
 	}
 
 	// Update Prometheus metrics
-	UpdateZoneMetrics(d.state)
+	UpdateZoneMetrics(snap.state)
 }
 
-func (d *Daemon) checkAndSignZone(domain string) error {
-	d.mu.RLock()
-	cfg := d.cfg
-	d.mu.RUnlock()
-
-	zoneState := d.state.GetZone(domain)
+func (d *Daemon) checkAndSignZone(snap snapshot, domain string) error {
+	zoneState := snap.state.GetZone(domain)
 
 	// Check if zone needs signing
-	zoneCfg := cfg.Zones[domain]
-	needsSign, reason := d.signer.NeedsSign(domain, zoneCfg.Path, zoneState)
+	zoneCfg := snap.cfg.Zones[domain]
+	needsSign, reason := snap.signer.NeedsSign(domain, zoneCfg.Path, zoneState)
 	if !needsSign {
 		slog.Debug("[DAEMON] Zone does not need signing", "domain", domain, "path", zoneCfg.Path)
 		return nil
@@ -254,7 +299,7 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 
 	// Initialize zone state if new
 	if zoneState == nil {
-		keyGen := NewKeyGenerator(cfg)
+		keyGen := NewKeyGenerator(snap.cfg)
 		ksk, err := keyGen.GenerateKSK(domain)
 		if err != nil {
 			return err
@@ -268,12 +313,12 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 			KSK:  ksk,
 			ZSK:  zsk,
 		}
-		d.state.SetZone(domain, zoneState)
+		snap.state.SetZone(domain, zoneState)
 	}
 
 	// Sign the zone
 	signStart := time.Now()
-	if err := d.signer.SignZone(domain); err != nil {
+	if err := snap.signer.SignZone(domain); err != nil {
 		zoneState.AddError(err.Error())
 		RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
 		d.heartbeat.SigningError(domain)
@@ -285,35 +330,17 @@ func (d *Daemon) checkAndSignZone(domain string) error {
 	d.heartbeat.SigningComplete(domain, zoneState.Serial)
 
 	// Execute post-sign hook
-	if cfg.Hooks.PostSign != "" {
+	if snap.cfg.Hooks.PostSign != "" || len(snap.cfg.Hooks.PostSignCmd) > 0 {
 		hookEnv := &HookEnv{
 			Domain:     domain,
 			ZonePath:   zoneCfg.Path,
-			SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
-			OutputDir:  cfg.OutputDir,
+			SignedPath: filepath.Join(snap.cfg.OutputDir, domain+".zone.signed"),
+			OutputDir:  snap.cfg.OutputDir,
 		}
-		executeHook(cfg.Hooks.PostSign, hookEnv)
+		executeHook(&snap.cfg.Hooks, hookEnv)
 	}
 
 	return nil
-}
-
-func (d *Daemon) checkZSKRollovers() {
-	d.mu.RLock()
-	cfg := d.cfg
-	d.mu.RUnlock()
-
-	for domain := range cfg.Zones {
-		zoneState := d.state.GetZone(domain)
-		if zoneState == nil || zoneState.ZSK == nil {
-			continue
-		}
-
-		// Check if ZSK needs rollover
-		if err := d.rollover.CheckZSKRollover(domain); err != nil {
-			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
-		}
-	}
 }
 
 func (d *Daemon) runWebServer() {
@@ -351,7 +378,10 @@ func (d *Daemon) runHealthServer() {
 	mux := http.NewServeMux()
 	RegisterHealthHandlers(mux, d.state, d.cfg)
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.Handle("/debug/vars", expvar.Handler())
+	if d.cfg.Health.DebugVars {
+		mux.Handle("/debug/vars", expvar.Handler())
+		slog.Debug("[DAEMON] /debug/vars endpoint enabled")
+	}
 
 	server := &http.Server{
 		Addr:              listenAddr,

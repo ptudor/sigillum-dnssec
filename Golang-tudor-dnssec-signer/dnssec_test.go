@@ -601,6 +601,9 @@ func TestConfigValidation(t *testing.T) {
 					NSEC3Iterations:   0,
 					NSEC3Salt:         "",
 				},
+				Health: HealthConfig{
+					Listen: "127.0.0.1:8054",
+				},
 				Zones: make(map[string]ZoneConfig),
 			}
 			tt.modify(cfg)

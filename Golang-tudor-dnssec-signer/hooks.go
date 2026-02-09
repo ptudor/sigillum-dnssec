@@ -20,16 +20,41 @@ type HookEnv struct {
 	OutputDir  string // Output directory for signed zones
 }
 
-// executeHook runs a post-sign hook command asynchronously with environment variables
-func executeHook(cmd string, env *HookEnv) {
-	if cmd == "" {
+// hookCmd returns the command name and arguments for a hook, along with a
+// log-safe identity string. When PostSignCmd is set, it is used directly as
+// exec-style. When PostSign is set and Shell is true, it is wrapped in sh -c.
+// When PostSign is set and Shell is false, it is split on whitespace.
+func hookCmd(hooks *HooksConfig) (name string, args []string, identity string, ok bool) {
+	if len(hooks.PostSignCmd) > 0 {
+		return hooks.PostSignCmd[0], hooks.PostSignCmd[1:], "post_sign", true
+	}
+	if hooks.PostSign == "" {
+		return "", nil, "", false
+	}
+	if hooks.Shell {
+		return "sh", []string{"-c", hooks.PostSign}, "post_sign(shell)", true
+	}
+	// Split on whitespace for simple exec-style
+	parts := strings.Fields(hooks.PostSign)
+	if len(parts) == 0 {
+		return "", nil, "", false
+	}
+	return parts[0], parts[1:], "post_sign", true
+}
+
+// executeHook runs a post-sign hook command asynchronously with environment variables.
+// Log messages contain the hook identity (e.g., "post_sign") and outcome only—
+// raw command strings are never logged.
+func executeHook(hooks *HooksConfig, env *HookEnv) {
+	name, args, identity, ok := hookCmd(hooks)
+	if !ok {
 		return
 	}
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "command", cmd, "domain", env.Domain)
+				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "hook", identity, "domain", env.Domain)
 			}
 		}()
 
@@ -37,9 +62,9 @@ func executeHook(cmd string, env *HookEnv) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		slog.Debug("[HOOK] Executing post-sign hook", "command", cmd, "domain", env.Domain)
+		slog.Debug("[HOOK] Executing hook", "hook", identity, "domain", env.Domain)
 
-		command := exec.CommandContext(ctx, "sh", "-c", cmd)
+		command := exec.CommandContext(ctx, name, args...)
 		command.Stdout = io.Discard
 
 		// Capture stderr for error reporting
@@ -59,33 +84,35 @@ func executeHook(cmd string, env *HookEnv) {
 			RecordHookExecution("post_sign", duration, false)
 			stderr := strings.TrimSpace(stderrBuf.String())
 			if ctx.Err() == context.DeadlineExceeded {
-				slog.Error("[HOOK] Post-sign hook timed out", "command", cmd, "domain", env.Domain)
+				slog.Error("[HOOK] Hook timed out", "hook", identity, "domain", env.Domain)
 			} else if stderr != "" {
-				slog.Error("[HOOK] Post-sign hook failed", "command", cmd, "domain", env.Domain, "error", err, "stderr", stderr)
+				slog.Error("[HOOK] Hook failed", "hook", identity, "domain", env.Domain, "error", err, "stderr", stderr)
 			} else {
-				slog.Error("[HOOK] Post-sign hook failed", "command", cmd, "domain", env.Domain, "error", err)
+				slog.Error("[HOOK] Hook failed", "hook", identity, "domain", env.Domain, "error", err)
 			}
 			return
 		}
 
 		duration := time.Since(startTime).Seconds()
 		RecordHookExecution("post_sign", duration, true)
-		slog.Debug("[HOOK] Post-sign hook completed successfully", "command", cmd, "domain", env.Domain, "duration_ms", int64(duration*1000))
+		slog.Debug("[HOOK] Hook completed successfully", "hook", identity, "domain", env.Domain, "duration_ms", int64(duration*1000))
 	}()
 }
 
-// executeHookSync runs a hook synchronously and returns the error
-func executeHookSync(cmd string) error {
-	if cmd == "" {
+// executeHookSync runs a hook synchronously and returns the error.
+// Used for CLI commands where we want to wait for completion.
+func executeHookSync(hooks *HooksConfig) error {
+	name, args, identity, ok := hookCmd(hooks)
+	if !ok {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	slog.Debug("[HOOK] Executing hook synchronously", "command", cmd)
+	slog.Debug("[HOOK] Executing hook synchronously", "hook", identity)
 
-	command := exec.CommandContext(ctx, "sh", "-c", cmd)
+	command := exec.CommandContext(ctx, name, args...)
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 

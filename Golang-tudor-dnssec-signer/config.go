@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ type HeartbeatConfig struct {
 	StatusURL       string `toml:"status_url"`
 	InstanceID      string `toml:"instance_id"`
 	IntervalMinutes int    `toml:"interval_minutes"`
+	AllowInsecure   bool   `toml:"allow_insecure"` // Allow non-HTTPS heartbeat URL
 }
 
 // DNSSECConfig holds DNSSEC-specific settings
@@ -52,14 +54,17 @@ type DNSSECConfig struct {
 
 // WebConfig holds web UI settings
 type WebConfig struct {
-	Enabled bool   `toml:"enabled"`
-	Listen  string `toml:"listen"`
+	Enabled     bool   `toml:"enabled"`
+	Listen      string `toml:"listen"`
+	AllowRemote bool   `toml:"allow_remote"` // Must be true to bind non-loopback addresses
 }
 
 // HealthConfig holds health server settings
 type HealthConfig struct {
 	Listen          string   `toml:"listen"`
 	ShutdownTimeout Duration `toml:"shutdown_timeout"`
+	AllowRemote     bool     `toml:"allow_remote"` // Must be true to bind non-loopback addresses
+	DebugVars       bool     `toml:"debug_vars"`   // Enable /debug/vars endpoint (default false)
 }
 
 // ZoneConfig holds per-zone settings
@@ -72,7 +77,9 @@ type ZoneConfig struct {
 
 // HooksConfig holds hook settings
 type HooksConfig struct {
-	PostSign string `toml:"post_sign"`
+	PostSign    string   `toml:"post_sign"`     // Shell command (requires shell = true) or simple command
+	PostSignCmd []string `toml:"post_sign_cmd"` // Exec-style command+args (preferred, no shell)
+	Shell       bool     `toml:"shell"`         // Use sh -c for post_sign string (default false)
 }
 
 // Duration wraps time.Duration for TOML parsing
@@ -287,6 +294,52 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("data_dir is required")
 	}
 
+	// Validate heartbeat URL is HTTPS unless allow_insecure is set
+	if c.Heartbeat.Enabled && c.Heartbeat.URL != "" && !c.Heartbeat.AllowInsecure {
+		if !strings.HasPrefix(c.Heartbeat.URL, "https://") {
+			return fmt.Errorf("heartbeat.url must use HTTPS (got %q); set allow_insecure = true to override", c.Heartbeat.URL)
+		}
+	}
+
+	// Validate listen addresses are loopback unless allow_remote is set
+	if c.Web.Enabled && !c.Web.AllowRemote {
+		if err := validateLoopbackAddr(c.Web.Listen, "web.listen"); err != nil {
+			return err
+		}
+	}
+	if !c.Health.AllowRemote {
+		if err := validateLoopbackAddr(c.Health.Listen, "health.listen"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// isLoopbackAddr returns true if the host part of an address is a loopback address.
+// Accepts "host:port", ":port" (all interfaces — NOT loopback), or "host" forms.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr // No port, treat whole string as host
+	}
+	// Empty host means all interfaces (e.g., ":8053") — not loopback
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Could be "localhost"
+		return strings.EqualFold(host, "localhost")
+	}
+	return ip.IsLoopback()
+}
+
+// validateLoopbackAddr returns an error if the listen address is not loopback
+func validateLoopbackAddr(addr, fieldName string) error {
+	if !isLoopbackAddr(addr) {
+		return fmt.Errorf("%s %q binds to a non-loopback address; set allow_remote = true to allow this", fieldName, addr)
+	}
 	return nil
 }
 

@@ -2,19 +2,27 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 )
 
 // RegisterHealthHandlers registers health check endpoints
 func RegisterHealthHandlers(mux *http.ServeMux, state *State, cfg *Config) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		setSecurityHeaders(w)
 		healthHandler(w, r, state, cfg)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		setSecurityHeaders(w)
 		healthzHandler(w, r, state, cfg)
 	})
@@ -25,6 +33,8 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cache-Control", "no-store")
 }
 
 // healthHandler returns detailed health status
@@ -100,14 +110,21 @@ func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *C
 	}
 }
 
-// checkDirWritable verifies a directory exists and is writable
+// checkDirWritable verifies a directory exists and appears writable by
+// checking stat and permission bits. This avoids creating temp files on
+// every health probe, keeping checks non-destructive and fast.
 func checkDirWritable(dir string) error {
-	testFile := filepath.Join(dir, ".health_check")
-	f, err := os.Create(testFile)
+	info, err := os.Stat(dir)
 	if err != nil {
 		return err
 	}
-	f.Close()
-	os.Remove(testFile)
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	// Check owner-write bit as a heuristic — this covers the common case
+	// where the daemon runs as the directory owner.
+	if info.Mode().Perm()&0200 == 0 {
+		return fmt.Errorf("%s is not writable", dir)
+	}
 	return nil
 }

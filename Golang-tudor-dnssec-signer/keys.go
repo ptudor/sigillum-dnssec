@@ -155,7 +155,7 @@ func generateDNSSECKey(domain, algorithm string, flags uint16) (*dns.DNSKEY, []b
 
 func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY, privateKey []byte) error {
 	keysDir := kg.cfg.KeysDir()
-	if err := ensureDir(keysDir); err != nil {
+	if err := ensureDirSecure(keysDir); err != nil {
 		return err
 	}
 
@@ -318,6 +318,33 @@ func AlgorithmFromName(name string) (uint8, error) {
 func ensureDir(path string) error {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return fmt.Errorf("creating directory %s: %w", path, err)
+	}
+	return nil
+}
+
+// ensureDirSecure creates a directory with 0700 permissions if it doesn't exist,
+// and tightens permissions if it already exists with wider access.
+func ensureDirSecure(path string) error {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			return fmt.Errorf("creating directory %s: %w", path, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s exists but is not a directory", path)
+	}
+	// Tighten permissions if too open
+	perm := info.Mode().Perm()
+	if perm&0077 != 0 {
+		slog.Warn("[SECURITY] Tightening directory permissions", "path", path, "old", fmt.Sprintf("%04o", perm), "new", "0700")
+		if err := os.Chmod(path, 0700); err != nil {
+			return fmt.Errorf("chmod %s: %w", path, err)
+		}
 	}
 	return nil
 }
