@@ -68,6 +68,10 @@ type Config struct {
 	// Only requests coming from these CIDRs will have proxy headers trusted.
 	TrustedProxyCIDRs []string `toml:"trusted_proxy_cidrs"`
 
+	// Optional CIDR allowlist for /metrics endpoint.
+	// Empty means no CIDR restriction.
+	MetricsAllowedCIDRs []string `toml:"metrics_allowed_cidrs"`
+
 	// Heartbeat monitoring (AnyStatus)
 	Heartbeat HeartbeatConfig `toml:"heartbeat"`
 
@@ -140,6 +144,7 @@ func DefaultConfig() *Config {
 			"127.0.0.0/8",
 			"::1/128",
 		},
+		MetricsAllowedCIDRs: []string{},
 		// Heartbeat defaults
 		Heartbeat: HeartbeatConfig{
 			Enabled:         false,
@@ -231,6 +236,7 @@ func LoadFromEnv() (*Config, error) {
 	// Base path for reverse proxy
 	cfg.BasePath = getEnv("BASE_PATH", cfg.BasePath)
 	cfg.TrustedProxyCIDRs = getEnvCSV("TRUSTED_PROXY_CIDRS", cfg.TrustedProxyCIDRs)
+	cfg.MetricsAllowedCIDRs = getEnvCSV("METRICS_ALLOWED_CIDRS", cfg.MetricsAllowedCIDRs)
 
 	// Heartbeat monitoring (AnyStatus)
 	cfg.Heartbeat.Enabled = getEnvBool("HEARTBEAT_ENABLED", cfg.Heartbeat.Enabled)
@@ -349,6 +355,17 @@ func (c *Config) Validate() error {
 		}
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("invalid trusted_proxy_cidrs entry %q: %w", cidr, err)
+		}
+	}
+
+	// Validate metrics allowlist CIDRs
+	for _, cidr := range c.MetricsAllowedCIDRs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid metrics_allowed_cidrs entry %q: %w", cidr, err)
 		}
 	}
 

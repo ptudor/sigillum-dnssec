@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	miekgdns "github.com/miekg/dns"
 	dns "github.com/ptudor/dnssec-validator/internal/dns"
 )
 
@@ -556,5 +557,63 @@ func TestDetectWildcardSynthesis(t *testing.T) {
 					tt.ownerName, tt.rrsigLabel, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestVerifyRRsetRRSIGFromResponse_EmptyRaw(t *testing.T) {
+	key := dns.DNSKEYRecord{
+		Flags:     256,
+		Protocol:  3,
+		Algorithm: 13,
+		PublicKey: "dGVzdA==",
+	}
+
+	_, err := VerifyRRsetRRSIGFromResponse(nil, miekgdns.TypeA, key, 12345)
+	if err == nil {
+		t.Fatal("VerifyRRsetRRSIGFromResponse expected error for empty raw response")
+	}
+}
+
+func TestVerifyRRsetRRSIGFromResponse_MalformedRaw(t *testing.T) {
+	key := dns.DNSKEYRecord{
+		Flags:     256,
+		Protocol:  3,
+		Algorithm: 13,
+		PublicKey: "dGVzdA==",
+	}
+
+	_, err := VerifyRRsetRRSIGFromResponse([]byte{0x00, 0x01, 0x02}, miekgdns.TypeA, key, 12345)
+	if err == nil {
+		t.Fatal("VerifyRRsetRRSIGFromResponse expected error for malformed raw response")
+	}
+}
+
+func TestVerifyRRsetRRSIGFromResponse_NoMatchingRRSIG(t *testing.T) {
+	msg := new(miekgdns.Msg)
+	msg.SetQuestion("example.com.", miekgdns.TypeA)
+	msg.Answer = append(msg.Answer, &miekgdns.A{
+		Hdr: miekgdns.RR_Header{
+			Name:   "example.com.",
+			Rrtype: miekgdns.TypeA,
+			Class:  miekgdns.ClassINET,
+			Ttl:    300,
+		},
+		A: []byte{192, 0, 2, 1},
+	})
+	raw, err := msg.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack test DNS message: %v", err)
+	}
+
+	key := dns.DNSKEYRecord{
+		Flags:     256,
+		Protocol:  3,
+		Algorithm: 13,
+		PublicKey: "dGVzdA==",
+	}
+
+	_, err = VerifyRRsetRRSIGFromResponse(raw, miekgdns.TypeA, key, 12345)
+	if err == nil {
+		t.Fatal("VerifyRRsetRRSIGFromResponse expected error when no matching RRSIG exists")
 	}
 }

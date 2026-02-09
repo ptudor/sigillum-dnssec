@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -75,5 +76,57 @@ func TestJoinWithBasePath(t *testing.T) {
 		if got := joinWithBasePath(tc.base, tc.pattern); got != tc.want {
 			t.Fatalf("joinWithBasePath(%q, %q) = %q, want %q", tc.base, tc.pattern, got, tc.want)
 		}
+	}
+}
+
+func TestParseCIDRs(t *testing.T) {
+	nets, err := parseCIDRs([]string{"203.0.113.0/24", "2001:db8::/32"})
+	if err != nil {
+		t.Fatalf("parseCIDRs unexpected error: %v", err)
+	}
+	if len(nets) != 2 {
+		t.Fatalf("parseCIDRs length = %d, want 2", len(nets))
+	}
+
+	if _, err := parseCIDRs([]string{"bad-cidr"}); err == nil {
+		t.Fatal("parseCIDRs expected error for invalid CIDR")
+	}
+}
+
+func TestAllowCIDRs(t *testing.T) {
+	nets, err := parseCIDRs([]string{"203.0.113.0/24"})
+	if err != nil {
+		t.Fatalf("parseCIDRs unexpected error: %v", err)
+	}
+
+	allowedHandler := allowCIDRs(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), nets)
+
+	reqAllowed := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	reqAllowed.RemoteAddr = "203.0.113.7:12345"
+	rrAllowed := httptest.NewRecorder()
+	allowedHandler.ServeHTTP(rrAllowed, reqAllowed)
+	if rrAllowed.Code != http.StatusNoContent {
+		t.Fatalf("allowed request status = %d, want %d", rrAllowed.Code, http.StatusNoContent)
+	}
+
+	reqDenied := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	reqDenied.RemoteAddr = "198.51.100.7:12345"
+	rrDenied := httptest.NewRecorder()
+	allowedHandler.ServeHTTP(rrDenied, reqDenied)
+	if rrDenied.Code != http.StatusForbidden {
+		t.Fatalf("denied request status = %d, want %d", rrDenied.Code, http.StatusForbidden)
+	}
+	if ct := rrDenied.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("denied Content-Type = %q, want application/problem+json", ct)
+	}
+
+	var problem ProblemDetails
+	if err := json.Unmarshal(rrDenied.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("failed to parse problem details: %v", err)
+	}
+	if problem.Type != ErrTypeForbidden {
+		t.Fatalf("problem.Type = %q, want %q", problem.Type, ErrTypeForbidden)
 	}
 }

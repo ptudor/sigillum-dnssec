@@ -100,3 +100,16 @@ func TestConfigValidate_BasePath(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigValidate_MetricsAllowedCIDRsRejectInvalid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MetricsAllowedCIDRs = []string{"10.0.0.0/8", "bad-cidr"}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() expected error for invalid metrics_allowed_cidrs")
+	}
+	if !strings.Contains(err.Error(), "metrics_allowed_cidrs") {
+		t.Fatalf("Validate() error = %q, expected metrics_allowed_cidrs message", err.Error())
+	}
+}
