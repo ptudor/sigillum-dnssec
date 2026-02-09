@@ -94,9 +94,10 @@ func (h *HealthChecker) HealthzHandler() http.HandlerFunc {
 		setSecurityHeaders(w)
 		w.Header().Set("Content-Type", "text/plain")
 
-		if status.Status == "unhealthy" {
+		// /healthz is a readiness probe endpoint. Any non-healthy state is not ready.
+		if status.Status != "healthy" {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("UNHEALTHY"))
+			w.Write([]byte("NOT_READY"))
 			return
 		}
 

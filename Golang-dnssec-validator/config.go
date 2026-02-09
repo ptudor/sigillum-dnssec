@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -62,6 +63,10 @@ type Config struct {
 
 	// Base path (for reverse proxy, e.g., "/dnssec")
 	BasePath string `toml:"base_path"`
+
+	// Trusted proxy CIDRs for honoring X-Forwarded-For / X-Real-IP.
+	// Only requests coming from these CIDRs will have proxy headers trusted.
+	TrustedProxyCIDRs []string `toml:"trusted_proxy_cidrs"`
 
 	// Heartbeat monitoring (AnyStatus)
 	Heartbeat HeartbeatConfig `toml:"heartbeat"`
@@ -131,6 +136,10 @@ func DefaultConfig() *Config {
 		LogFormat: "json",
 		LogLevel:  "info",
 		StaticDir: "./static",
+		TrustedProxyCIDRs: []string{
+			"127.0.0.0/8",
+			"::1/128",
+		},
 		// Heartbeat defaults
 		Heartbeat: HeartbeatConfig{
 			Enabled:         false,
@@ -221,6 +230,7 @@ func LoadFromEnv() (*Config, error) {
 
 	// Base path for reverse proxy
 	cfg.BasePath = getEnv("BASE_PATH", cfg.BasePath)
+	cfg.TrustedProxyCIDRs = getEnvCSV("TRUSTED_PROXY_CIDRS", cfg.TrustedProxyCIDRs)
 
 	// Heartbeat monitoring (AnyStatus)
 	cfg.Heartbeat.Enabled = getEnvBool("HEARTBEAT_ENABLED", cfg.Heartbeat.Enabled)
@@ -318,6 +328,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_concurrent must be positive")
 	}
 
+	// Validate trusted proxy CIDRs
+	for _, cidr := range c.TrustedProxyCIDRs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid trusted_proxy_cidrs entry %q: %w", cidr, err)
+		}
+	}
+
 	// Validate heartbeat interval when enabled (time.NewTicker requires > 0)
 	if c.Heartbeat.Enabled && c.Heartbeat.IntervalMinutes <= 0 {
 		return fmt.Errorf("heartbeat.interval_minutes must be positive when heartbeat.enabled is true")
@@ -354,4 +375,21 @@ func getEnvBool(key string, defaultVal bool) bool {
 		}
 	}
 	return defaultVal
+}
+
+func getEnvCSV(key string, defaultVal []string) []string {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+
+	parts := strings.Split(val, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }

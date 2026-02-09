@@ -931,12 +931,12 @@ select:focus-visible {
     outline-offset: 2px;
 }
 
-/* Zone cards need explicit focus styles since they're clickable */
-.zone-card:focus {
+/* Zone items need explicit focus styles since they're clickable */
+.zone-item:focus {
     outline: none;
 }
 
-.zone-card:focus-visible {
+.zone-item:focus-visible {
     outline: 3px solid var(--accent);
     outline-offset: 2px;
     border-color: var(--accent);
@@ -978,7 +978,7 @@ select:focus-visible {
     button:focus,
     input:focus,
     select:focus,
-    .zone-card:focus,
+    .zone-item:focus,
     .zone-tab:focus,
     .example-btn:focus,
     .copy-btn:focus {

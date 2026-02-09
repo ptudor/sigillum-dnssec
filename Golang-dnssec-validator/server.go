@@ -35,6 +35,11 @@ func NewServer(config *Config, anchorsStore *AnchorsStore) *Server {
 		mux:          http.NewServeMux(),
 	}
 
+	if err := SetTrustedProxyCIDRs(config.TrustedProxyCIDRs); err != nil {
+		LogWarn("server", "invalid trusted_proxy_cidrs, reverting to defaults", "error", err.Error())
+		_ = SetTrustedProxyCIDRs(defaultTrustedProxyCIDRs)
+	}
+
 	// Create components
 	s.healthChecker = NewHealthChecker(anchorsStore)
 	s.rateLimiter = NewRateLimiter(config.RateLimitPerSec, config.RateLimitBurst, config.RateLimitCleanup)
