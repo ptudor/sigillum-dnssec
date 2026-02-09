@@ -35,10 +35,10 @@ It is also the source of truth for implementation status.
 ### B. Production-Readiness
 
 - `R53-101` `DONE` Validate all ticker/time values (`rate_limit.cleanup_seconds`, heartbeat interval) to prevent runtime panics.
-- `R53-102` `IN_PROGRESS` Harden HTTP server timeouts (`ReadHeaderTimeout`, `MaxHeaderBytes`, bounded write policy for non-SSE routes).
+- `R53-102` `DONE` Harden HTTP server timeouts (`ReadHeaderTimeout`, `MaxHeaderBytes`, bounded write policy for non-SSE routes).
 - `R53-103` `TODO` Ensure `/healthz` reflects true readiness policy for missing anchors.
 - `R53-104` `TODO` Implement `base_path` routing support consistently for API, SSE, static UI, and docs examples.
-- `R53-105` `TODO` Stop unnecessary validation work after SSE disconnect/write failures.
+- `R53-105` `DONE` Stop unnecessary validation work after SSE disconnect/write failures.
 - `R53-106` `TODO` Scope cache headers: long-lived cache for immutable static assets, no-store only for API/SSE.
 
 ### C. UI/UX For Expert Usage
@@ -52,7 +52,8 @@ It is also the source of truth for implementation status.
 
 - `R53-001` fail-closed DS digest verification + tests. `DONE`
 - `R53-101` config validation for ticker safety + tests. `DONE`
-- `R53-102` server timeout/header hardening slice 1 (`ReadHeaderTimeout`, `MaxHeaderBytes`). `IN_PROGRESS`
+- `R53-102` server timeout/header hardening (`ReadHeaderTimeout`, `MaxHeaderBytes`, per-route non-SSE write deadlines). `DONE`
+- `R53-105` SSE disconnect/write-failure cancellation to stop wasted validation work. `DONE`
 
 ## Change Log
 
@@ -61,3 +62,5 @@ It is also the source of truth for implementation status.
 - `2026-02-09`: Completed `R53-101` with config validation + tests for ticker-safe values.
 - `2026-02-09`: Started `R53-102`; added `ReadHeaderTimeout` and `MaxHeaderBytes` to server config.
 - `2026-02-09`: Completed `R53-004`; API/SSE now return request-id based validation errors and log full internal details server-side.
+- `2026-02-09`: Completed `R53-102`; applied bounded write deadlines on non-SSE routes while keeping SSE long-lived behavior.
+- `2026-02-09`: Completed `R53-105`; SSE write failures now cancel validation promptly.

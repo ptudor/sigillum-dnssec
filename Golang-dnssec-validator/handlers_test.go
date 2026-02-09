@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,6 +10,22 @@ import (
 
 	"github.com/ptudor/dnssec-validator/internal/dns"
 )
+
+type failingSSEWriter struct {
+	header http.Header
+}
+
+func (w *failingSSEWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *failingSSEWriter) WriteHeader(statusCode int) {}
+
+func (w *failingSSEWriter) Write(p []byte) (int, error) {
+	return 0, errors.New("forced write failure")
+}
+
+func (w *failingSSEWriter) Flush() {}
 
 func TestIsValidDomain(t *testing.T) {
 	tests := []struct {
@@ -285,6 +302,30 @@ func TestHandleValidateSSE_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+// TestHandleValidateSSE_WriteFailureReturnsQuickly verifies that SSE write errors
+// stop handler processing promptly instead of continuing expensive validation work.
+func TestHandleValidateSSE_WriteFailureReturnsQuickly(t *testing.T) {
+	h := newTestHandlers(true)
+	// Keep timeout low to ensure this test can't hang on external DNS work.
+	h.config.TotalTimeout = 1 * time.Second
+
+	req := httptest.NewRequest(http.MethodGet, "/validate?domain=example.com", nil)
+	w := &failingSSEWriter{header: make(http.Header)}
+
+	done := make(chan struct{})
+	go func() {
+		h.HandleValidateSSE(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("HandleValidateSSE did not return promptly after SSE write failure")
+	}
+}
+
 // TestWriteProblemDetails tests RFC 7807 response formatting
 func TestWriteProblemDetails(t *testing.T) {
 	w := httptest.NewRecorder()
@@ -417,8 +458,8 @@ func TestHandleAnchors_SecurityHeaders(t *testing.T) {
 
 	headers := map[string]string{
 		"X-Content-Type-Options": "nosniff",
-		"X-Frame-Options":       "DENY",
-		"Referrer-Policy":       "strict-origin-when-cross-origin",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "strict-origin-when-cross-origin",
 	}
 
 	for name, expected := range headers {

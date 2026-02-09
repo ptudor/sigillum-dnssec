@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"io/fs"
 	"net/http"
 	"time"
@@ -23,6 +24,8 @@ type Server struct {
 	mux           *http.ServeMux
 	server        *http.Server
 }
+
+const nonSSEWriteTimeout = 30 * time.Second
 
 // NewServer creates a new HTTP server
 func NewServer(config *Config, anchorsStore *AnchorsStore) *Server {
@@ -46,16 +49,16 @@ func NewServer(config *Config, anchorsStore *AnchorsStore) *Server {
 // registerRoutes sets up the HTTP routes
 func (s *Server) registerRoutes() {
 	// Health endpoints (no rate limiting)
-	s.mux.HandleFunc("/health", s.healthChecker.HealthHandler())
-	s.mux.HandleFunc("/healthz", s.healthChecker.HealthzHandler())
+	s.mux.Handle("/health", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthHandler())))
+	s.mux.Handle("/healthz", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthzHandler())))
 
 	// Metrics endpoint (no rate limiting)
-	s.mux.Handle("/metrics", promhttp.Handler())
+	s.mux.Handle("/metrics", withWriteDeadline(nonSSEWriteTimeout, promhttp.Handler()))
 
 	// API endpoints (with rate limiting)
 	s.mux.Handle("/validate", s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateSSE)))
-	s.mux.Handle("/api/validate", s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateJSON)))
-	s.mux.Handle("/api/anchors", s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleAnchors)))
+	s.mux.Handle("/api/validate", withWriteDeadline(nonSSEWriteTimeout, s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateJSON))))
+	s.mux.Handle("/api/anchors", withWriteDeadline(nonSSEWriteTimeout, s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleAnchors))))
 
 	// Static files for web UI
 	staticFS, err := fs.Sub(staticFiles, "static")
@@ -69,7 +72,7 @@ func (s *Server) registerRoutes() {
 
 	// Serve static files
 	fileServer := http.FileServer(http.FS(staticFS))
-	s.mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.mux.Handle("/", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set security headers for static files
 		setSecurityHeaders(w)
 
@@ -84,7 +87,26 @@ func (s *Server) registerRoutes() {
 		}
 
 		fileServer.ServeHTTP(w, r)
-	}))
+	})))
+}
+
+// withWriteDeadline applies a bounded response write deadline for non-SSE handlers.
+// SSE routes are intentionally excluded because they are long-lived streams.
+func withWriteDeadline(timeout time.Duration, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if timeout > 0 {
+			rc := http.NewResponseController(w)
+			switch err := rc.SetWriteDeadline(time.Now().Add(timeout)); {
+			case err == nil:
+				defer rc.SetWriteDeadline(time.Time{})
+			case errors.Is(err, http.ErrNotSupported):
+				// Ignore unsupported writers (e.g., some tests/middleware wrappers).
+			default:
+				LogWarn("server", "failed to set write deadline", "path", r.URL.Path, "error", err.Error())
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start starts the HTTP server

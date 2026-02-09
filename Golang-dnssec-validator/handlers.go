@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ptudor/dnssec-validator/internal/rdap"
@@ -92,17 +93,42 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	IncrementActiveSSEConnections()
 	defer DecrementActiveSSEConnections()
 
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
+	defer cancel()
+
+	// Stop validation work immediately if SSE writes fail (e.g., client disconnected).
+	var cancelOnce sync.Once
+	cancelOnWriteError := func(err error, eventType string) {
+		if err == nil {
+			return
+		}
+		cancelOnce.Do(func() {
+			LogWarn("handlers", "sse write failed; canceling validation",
+				"event", eventType,
+				"request_id", requestID,
+				"domain", domain,
+				"error", err.Error(),
+			)
+			cancel()
+		})
+	}
+
 	// Set retry interval
-	sse.WriteRetry(3000)
+	if err := sse.WriteRetry(3000); err != nil {
+		cancelOnWriteError(err, "retry")
+		return
+	}
 
 	// Get anchors
 	anchors := h.anchorsStore.Get()
 	if anchors == nil || len(anchors.Anchors) == 0 {
 		statusCode = "503"
-		sse.WriteEvent("error", validator.ErrorEvent{
+		err := sse.WriteEvent("error", validator.ErrorEvent{
 			Message: "root trust anchors not available",
 			Fatal:   true,
 		})
+		cancelOnWriteError(err, "error")
 		return
 	}
 
@@ -127,22 +153,19 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Set up event callback
 	v.SetEventCallback(func(event validator.SSEEvent) {
-		sse.WriteEvent(event.Type, event.Data)
+		cancelOnWriteError(sse.WriteEvent(event.Type, event.Data), event.Type)
 	})
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
-	defer cancel()
 
 	// Run validation
 	result, err := v.Validate(ctx, domain)
 	if err != nil && result == nil {
 		statusCode = "500"
 		LogError("handlers", err, "action", "validate_sse", "request_id", requestID, "domain", domain)
-		sse.WriteEvent("error", validator.ErrorEvent{
+		writeErr := sse.WriteEvent("error", validator.ErrorEvent{
 			Message: fmt.Sprintf("validation failed (request_id=%s)", requestID),
 			Fatal:   true,
 		})
+		cancelOnWriteError(writeErr, "error")
 		return
 	}
 
