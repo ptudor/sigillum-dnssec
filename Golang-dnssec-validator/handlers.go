@@ -265,6 +265,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 
 	// Write JSON response
 	setSecurityHeaders(w)
+	setNoStore(w)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 	RecordAPIRequest("/api/validate", r.Method, "200", time.Since(startTime).Seconds())
@@ -294,6 +295,7 @@ func (h *Handlers) HandleAnchors(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setSecurityHeaders(w)
+	setNoStore(w)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(anchors)
 }

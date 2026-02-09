@@ -21,3 +21,23 @@ func TestWithWriteDeadlinePassthrough(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusNoContent)
 	}
 }
+
+func TestIsCacheableStaticAsset(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{path: "/app.js", want: true},
+		{path: "/style.css", want: true},
+		{path: "/image.png", want: true},
+		{path: "/index.html", want: false},
+		{path: "/api/validate", want: false},
+	}
+
+	for _, tc := range cases {
+		got := isCacheableStaticAsset(tc.path)
+		if got != tc.want {
+			t.Fatalf("isCacheableStaticAsset(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
