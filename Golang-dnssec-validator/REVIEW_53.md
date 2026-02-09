@@ -46,7 +46,7 @@ It is also the source of truth for implementation status.
 - `R53-201` `DONE` Persist/share full query state (`domain` + `mode`) in URL.
 - `R53-202` `DONE` Align client-side domain validation pattern with backend accepted format.
 - `R53-203` `DONE` Fix keyboard/tab semantics for zone navigation and focus styling for current interactive elements.
-- `R53-204` `TODO` Clarify verification labels in UI to avoid overstating cryptographic guarantees.
+- `R53-204` `DONE` Clarify verification labels in UI to avoid overstating cryptographic guarantees.
 
 ## Immediate Sprint (Now)
 
@@ -71,3 +71,4 @@ It is also the source of truth for implementation status.
 - `2026-02-09`: Completed `R53-203`; added keyboard tab navigation semantics and corrected focus styling to active zone elements.
 - `2026-02-09`: Completed `R53-106`; cache policy is now scoped (API/health/problem/metrics no-store, static assets cacheable).
 - `2026-02-09`: Completed `R53-104`; routes now register under `base_path` for API/SSE/static while preserving root paths for compatibility.
+- `2026-02-09`: Completed `R53-204`; UI now explicitly labels DS/record-level signature checks as partial to avoid overstating cryptographic guarantees.

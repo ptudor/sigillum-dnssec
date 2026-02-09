@@ -90,7 +90,7 @@
                     <li><strong>Zone discovery</strong> - Identifies actual zone cuts (delegation points) in the DNS hierarchy</li>
                     <li><strong>DNSKEY verification</strong> - Fetches and cryptographically verifies DNSKEY records at each zone</li>
                     <li><strong>DS chain validation</strong> - Verifies that each zone's KSK matches the DS record in its parent zone</li>
-                    <li><strong>Signature validation</strong> - Checks RRSIG validity periods and cryptographic signatures</li>
+                    <li><strong>Signature validation</strong> - Cryptographically verifies DNSKEY RRsets; DS/record-level checks currently validate timing/key linkage and clearly mark partial verification</li>
                     <li><strong>RDAP verification</strong> - Compares DS records from DNS against the registry database via RDAP</li>
                     <li><strong>CNAME following</strong> - Automatically validates CNAME target chains</li>
                 </ul>
