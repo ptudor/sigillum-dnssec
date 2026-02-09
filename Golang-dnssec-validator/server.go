@@ -54,17 +54,25 @@ func NewServer(config *Config, anchorsStore *AnchorsStore) *Server {
 
 // registerRoutes sets up the HTTP routes
 func (s *Server) registerRoutes() {
+	basePath := normalizeBasePath(s.config.BasePath)
+	register := func(pattern string, handler http.Handler) {
+		s.mux.Handle(pattern, handler)
+		if basePath != "" {
+			s.mux.Handle(joinWithBasePath(basePath, pattern), handler)
+		}
+	}
+
 	// Health endpoints (no rate limiting)
-	s.mux.Handle("/health", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthHandler())))
-	s.mux.Handle("/healthz", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthzHandler())))
+	register("/health", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthHandler())))
+	register("/healthz", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthzHandler())))
 
 	// Metrics endpoint (no rate limiting)
-	s.mux.Handle("/metrics", withWriteDeadline(nonSSEWriteTimeout, noStoreHandler(promhttp.Handler())))
+	register("/metrics", withWriteDeadline(nonSSEWriteTimeout, noStoreHandler(promhttp.Handler())))
 
 	// API endpoints (with rate limiting)
-	s.mux.Handle("/validate", s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateSSE)))
-	s.mux.Handle("/api/validate", withWriteDeadline(nonSSEWriteTimeout, s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateJSON))))
-	s.mux.Handle("/api/anchors", withWriteDeadline(nonSSEWriteTimeout, s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleAnchors))))
+	register("/validate", s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateSSE)))
+	register("/api/validate", withWriteDeadline(nonSSEWriteTimeout, s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateJSON))))
+	register("/api/anchors", withWriteDeadline(nonSSEWriteTimeout, s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleAnchors))))
 
 	// Static files for web UI
 	staticFS, err := fs.Sub(staticFiles, "static")
@@ -78,7 +86,7 @@ func (s *Server) registerRoutes() {
 
 	// Serve static files
 	fileServer := http.FileServer(http.FS(staticFS))
-	s.mux.Handle("/", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	staticHandler := withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set security headers for static files
 		setSecurityHeaders(w)
 
@@ -102,7 +110,20 @@ func (s *Server) registerRoutes() {
 		}
 
 		fileServer.ServeHTTP(w, r)
-	})))
+	}))
+	s.mux.Handle("/", staticHandler)
+
+	if basePath != "" {
+		stripBase := http.StripPrefix(basePath, staticHandler)
+		s.mux.Handle(basePath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == basePath {
+				staticHandler.ServeHTTP(w, requestWithPath(r, "/"))
+				return
+			}
+			stripBase.ServeHTTP(w, r)
+		}))
+		s.mux.Handle(basePath+"/", stripBase)
+	}
 }
 
 // withWriteDeadline applies a bounded response write deadline for non-SSE handlers.
@@ -129,6 +150,32 @@ func noStoreHandler(next http.Handler) http.Handler {
 		setNoStore(w)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func normalizeBasePath(basePath string) string {
+	basePath = strings.TrimSpace(basePath)
+	if basePath == "" || basePath == "/" {
+		return ""
+	}
+	return strings.TrimSuffix(basePath, "/")
+}
+
+func joinWithBasePath(basePath, pattern string) string {
+	if basePath == "" {
+		return pattern
+	}
+	if pattern == "/" {
+		return basePath + "/"
+	}
+	return basePath + pattern
+}
+
+func requestWithPath(r *http.Request, path string) *http.Request {
+	cloned := r.Clone(r.Context())
+	clonedURL := *r.URL
+	clonedURL.Path = path
+	cloned.URL = &clonedURL
+	return cloned
 }
 
 func isCacheableStaticAsset(path string) bool {

@@ -72,3 +72,31 @@ func TestConfigValidate_TrustedProxyCIDRsAllowEmpty(t *testing.T) {
 		t.Fatalf("Validate() should allow empty trusted_proxy_cidrs: %v", err)
 	}
 }
+
+func TestConfigValidate_BasePath(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "empty allowed", value: "", wantErr: false},
+		{name: "valid prefix", value: "/dnssec", wantErr: false},
+		{name: "must start with slash", value: "dnssec", wantErr: true},
+		{name: "must not be root", value: "/", wantErr: true},
+		{name: "must not end slash", value: "/dnssec/", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.BasePath = tt.value
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatalf("Validate() expected error for base_path=%q", tt.value)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() unexpected error for base_path=%q: %v", tt.value, err)
+			}
+		})
+	}
+}

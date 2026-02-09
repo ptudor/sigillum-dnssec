@@ -37,7 +37,7 @@ It is also the source of truth for implementation status.
 - `R53-101` `DONE` Validate all ticker/time values (`rate_limit.cleanup_seconds`, heartbeat interval) to prevent runtime panics.
 - `R53-102` `DONE` Harden HTTP server timeouts (`ReadHeaderTimeout`, `MaxHeaderBytes`, bounded write policy for non-SSE routes).
 - `R53-103` `DONE` Ensure `/healthz` reflects true readiness policy for missing anchors.
-- `R53-104` `TODO` Implement `base_path` routing support consistently for API, SSE, static UI, and docs examples.
+- `R53-104` `DONE` Implement `base_path` routing support consistently for API, SSE, static UI, and docs examples.
 - `R53-105` `DONE` Stop unnecessary validation work after SSE disconnect/write failures.
 - `R53-106` `DONE` Scope cache headers: long-lived cache for immutable static assets, no-store only for API/SSE.
 
@@ -70,3 +70,4 @@ It is also the source of truth for implementation status.
 - `2026-02-09`: Completed `R53-202`; removed restrictive client-side pattern to match backend domain acceptance rules.
 - `2026-02-09`: Completed `R53-203`; added keyboard tab navigation semantics and corrected focus styling to active zone elements.
 - `2026-02-09`: Completed `R53-106`; cache policy is now scoped (API/health/problem/metrics no-store, static assets cacheable).
+- `2026-02-09`: Completed `R53-104`; routes now register under `base_path` for API/SSE/static while preserving root paths for compatibility.
