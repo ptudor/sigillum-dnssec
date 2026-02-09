@@ -328,6 +328,19 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_concurrent must be positive")
 	}
 
+	// Validate base path
+	if c.BasePath != "" {
+		if c.BasePath == "/" {
+			return fmt.Errorf("base_path must be empty or a path prefix like /dnssec, not /")
+		}
+		if !strings.HasPrefix(c.BasePath, "/") {
+			return fmt.Errorf("base_path must start with '/'")
+		}
+		if strings.HasSuffix(c.BasePath, "/") {
+			return fmt.Errorf("base_path must not have trailing slash")
+		}
+	}
+
 	// Validate trusted proxy CIDRs
 	for _, cidr := range c.TrustedProxyCIDRs {
 		cidr = strings.TrimSpace(cidr)
