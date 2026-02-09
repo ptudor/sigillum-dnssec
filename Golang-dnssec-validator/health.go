@@ -73,6 +73,7 @@ func (h *HealthChecker) HealthHandler() http.HandlerFunc {
 		status := h.Check(ctx)
 
 		setSecurityHeaders(w)
+		setNoStore(w)
 		w.Header().Set("Content-Type", "application/json")
 
 		if status.Status != "healthy" {
@@ -92,6 +93,7 @@ func (h *HealthChecker) HealthzHandler() http.HandlerFunc {
 		status := h.Check(ctx)
 
 		setSecurityHeaders(w)
+		setNoStore(w)
 		w.Header().Set("Content-Type", "text/plain")
 
 		// /healthz is a readiness probe endpoint. Any non-healthy state is not ready.
@@ -112,10 +114,13 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-XSS-Protection", "1; mode=block")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'")
-	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
 	w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
 	// Note: HSTS should be configured at the reverse proxy level (Apache/nginx)
 	// to avoid issues with subdomains that may not support HTTPS
+}
+
+func setNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
 }

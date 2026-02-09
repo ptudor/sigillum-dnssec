@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -58,7 +59,7 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/healthz", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthzHandler())))
 
 	// Metrics endpoint (no rate limiting)
-	s.mux.Handle("/metrics", withWriteDeadline(nonSSEWriteTimeout, promhttp.Handler()))
+	s.mux.Handle("/metrics", withWriteDeadline(nonSSEWriteTimeout, noStoreHandler(promhttp.Handler())))
 
 	// API endpoints (with rate limiting)
 	s.mux.Handle("/validate", s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateSSE)))
@@ -86,9 +87,18 @@ func (s *Server) registerRoutes() {
 
 		// Serve index.html for root path or /index.html (avoid FileServer redirects)
 		if path == "/" || path == "" || path == "/index.html" {
+			setNoStore(w)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Write(indexHTML)
 			return
+		}
+
+		// Static assets can be cached by clients and intermediaries.
+		// Assets are bundled with the binary and refreshed on deployment.
+		if isCacheableStaticAsset(path) {
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=300")
 		}
 
 		fileServer.ServeHTTP(w, r)
@@ -112,6 +122,33 @@ func withWriteDeadline(timeout time.Duration, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func noStoreHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setNoStore(w)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isCacheableStaticAsset(path string) bool {
+	switch {
+	case strings.HasSuffix(path, ".js"),
+		strings.HasSuffix(path, ".css"),
+		strings.HasSuffix(path, ".woff"),
+		strings.HasSuffix(path, ".woff2"),
+		strings.HasSuffix(path, ".ttf"),
+		strings.HasSuffix(path, ".svg"),
+		strings.HasSuffix(path, ".png"),
+		strings.HasSuffix(path, ".jpg"),
+		strings.HasSuffix(path, ".jpeg"),
+		strings.HasSuffix(path, ".gif"),
+		strings.HasSuffix(path, ".webp"),
+		strings.HasSuffix(path, ".ico"):
+		return true
+	default:
+		return false
+	}
 }
 
 // Start starts the HTTP server
