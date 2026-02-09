@@ -17,6 +17,7 @@ type ProblemDetails struct {
 // Error type URIs for RFC 7807 responses
 const (
 	ErrTypeBadRequest          = "https://dnssec-validator.any53.com/errors/bad-request"
+	ErrTypeForbidden           = "https://dnssec-validator.any53.com/errors/forbidden"
 	ErrTypeNotFound            = "https://dnssec-validator.any53.com/errors/not-found"
 	ErrTypeMethodNotAllowed    = "https://dnssec-validator.any53.com/errors/method-not-allowed"
 	ErrTypeTooManyRequests     = "https://dnssec-validator.any53.com/errors/too-many-requests"
@@ -54,6 +55,9 @@ func writeJSONError(w http.ResponseWriter, message string, status int) {
 	case http.StatusBadRequest:
 		errType = ErrTypeBadRequest
 		title = "Bad Request"
+	case http.StatusForbidden:
+		errType = ErrTypeForbidden
+		title = "Forbidden"
 	case http.StatusNotFound:
 		errType = ErrTypeNotFound
 		title = "Not Found"

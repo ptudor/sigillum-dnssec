@@ -285,6 +285,70 @@ func VerifyDNSKEYRRSIG(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecor
 	return nil
 }
 
+// VerifyRRsetRRSIGFromResponse performs full cryptographic verification of an RRset
+// using the raw DNS response bytes and a trusted signing DNSKEY.
+func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signingKeyRecord dnspkg.DNSKEYRecord, keyTag uint16) (int, error) {
+	if len(rawResponse) == 0 {
+		return 0, fmt.Errorf("raw DNS response unavailable")
+	}
+
+	var msg dns.Msg
+	if err := msg.Unpack(rawResponse); err != nil {
+		return 0, fmt.Errorf("failed to unpack DNS response: %w", err)
+	}
+
+	rrsetByOwner := make(map[string][]dns.RR)
+	candidates := make([]*dns.RRSIG, 0)
+	allRRs := append(msg.Answer, msg.Ns...)
+	allRRs = append(allRRs, msg.Extra...)
+
+	for _, rr := range allRRs {
+		switch v := rr.(type) {
+		case *dns.RRSIG:
+			if v.TypeCovered == typeCovered && v.KeyTag == keyTag {
+				candidates = append(candidates, v)
+			}
+		default:
+			if rr.Header().Rrtype == typeCovered {
+				owner := strings.ToLower(rr.Header().Name)
+				rrsetByOwner[owner] = append(rrsetByOwner[owner], rr)
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		return 0, fmt.Errorf("no RRSIG found in response for type %d with key tag %d", typeCovered, keyTag)
+	}
+
+	var lastErr error
+	for _, sig := range candidates {
+		owner := strings.ToLower(sig.Hdr.Name)
+		rrset := rrsetByOwner[owner]
+		if len(rrset) == 0 {
+			lastErr = fmt.Errorf("no RRset found for owner %s and type %d", sig.Hdr.Name, typeCovered)
+			continue
+		}
+
+		signingKey, err := reconstructDNSKEY(sig.SignerName, signingKeyRecord)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to reconstruct signing key: %w", err)
+			continue
+		}
+
+		if err := sig.Verify(signingKey, rrset); err != nil {
+			lastErr = fmt.Errorf("cryptographic RRset verification failed: %w", err)
+			continue
+		}
+
+		return len(rrset), nil
+	}
+
+	if lastErr != nil {
+		return 0, lastErr
+	}
+	return 0, fmt.Errorf("no verifiable RRSIG candidate for type %d", typeCovered)
+}
+
 // reconstructDNSKEY converts our DNSKEYRecord back to a dns.DNSKEY for verification
 func reconstructDNSKEY(zone string, record dnspkg.DNSKEYRecord) (*dns.DNSKEY, error) {
 	// miekg/dns Verify() expects PublicKey as base64 - it decodes internally

@@ -27,10 +27,10 @@ It is also the source of truth for implementation status.
 ### A. Security And Correctness
 
 - `R53-001` `DONE` Fail-closed DS digest verification (remove fail-open path on digest computation errors).
-- `R53-002` `TODO` Replace partial DS/A/CNAME "verified" signals with full cryptographic verification or explicit "partial check" semantics.
+- `R53-002` `DONE` Replace partial DS/A/CNAME "verified" signals with full cryptographic verification or explicit "partial check" semantics.
 - `R53-003` `DONE` Tighten proxy trust model to explicit configured CIDRs only.
 - `R53-004` `DONE` Reduce error-detail leakage to clients while preserving request-id traceability.
-- `R53-005` `TODO` Add metrics endpoint exposure controls guidance and optional guard (auth/IP allowlist/reverse-proxy only).
+- `R53-005` `DONE` Add metrics endpoint exposure controls guidance and optional guard (auth/IP allowlist/reverse-proxy only).
 
 ### B. Production-Readiness
 
@@ -72,3 +72,5 @@ It is also the source of truth for implementation status.
 - `2026-02-09`: Completed `R53-106`; cache policy is now scoped (API/health/problem/metrics no-store, static assets cacheable).
 - `2026-02-09`: Completed `R53-104`; routes now register under `base_path` for API/SSE/static while preserving root paths for compatibility.
 - `2026-02-09`: Completed `R53-204`; UI now explicitly labels DS/record-level signature checks as partial to avoid overstating cryptographic guarantees.
+- `2026-02-09`: Completed `R53-005`; `/metrics` now supports optional CIDR allowlisting with config/env controls and tests.
+- `2026-02-09`: Completed `R53-002`; DS/A/CNAME RRSIG checks now perform full cryptographic RRset verification from raw DNS responses.

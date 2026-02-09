@@ -478,9 +478,14 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 					signingKey = FindDNSKEYByKeyTag(rrsigCNAME.KeyTag, dnskeys)
 				}
 				if signingKey != nil {
-					validation.RRSIGVerified = true
-					validation.SigningKeyTag = signingKey.KeyTag
-					validation.RecordCount = len(queryResult.CNAME)
+					count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, dns.TypeCNAME, *signingKey, rrsigCNAME.KeyTag)
+					if err == nil {
+						validation.RRSIGVerified = true
+						validation.SigningKeyTag = signingKey.KeyTag
+						validation.RecordCount = count
+					} else {
+						validation.Error = fmt.Sprintf("CNAME RRSIG cryptographic verification failed: %v", err)
+					}
 				} else {
 					validation.Error = fmt.Sprintf("CNAME signing key (tag %d) not found", rrsigCNAME.KeyTag)
 				}
@@ -511,13 +516,15 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		return validation
 	}
 
-	// Note: Full cryptographic verification would require reconstructing the A RRset
-	// For now we verify time validity, key existence, and signer matches zone
 	if rrsigA.SignerName == zone || rrsigA.SignerName == dns.Fqdn(zone) {
-		validation.RRSIGVerified = true
-		validation.SigningKeyTag = signingKey.KeyTag
-		// Count A records would require access to raw response, use 1 as placeholder
-		validation.RecordCount = 1
+		count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, dns.TypeA, *signingKey, rrsigA.KeyTag)
+		if err == nil {
+			validation.RRSIGVerified = true
+			validation.SigningKeyTag = signingKey.KeyTag
+			validation.RecordCount = count
+		} else {
+			validation.Error = fmt.Sprintf("A record RRSIG cryptographic verification failed: %v", err)
+		}
 	} else {
 		validation.Error = fmt.Sprintf("RRSIG signer %s does not match zone %s", rrsigA.SignerName, zone)
 	}
@@ -787,10 +794,12 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 					if signingKey != nil {
 						// Verify RRSIG time validity
 						if VerifyRRSIGValid(*dsRRSIG) {
-							// Note: Full cryptographic verification requires reconstructing the DS RRset
-							// which requires the raw DNS response. For now, we verify time + key existence.
-							validation.RRSIGVerified = true
-							validation.ParentSigningKey = signingKey.KeyTag
+							if _, err := VerifyRRsetRRSIGFromResponse(result.RawResponse, dns.TypeDS, *signingKey, dsRRSIG.KeyTag); err == nil {
+								validation.RRSIGVerified = true
+								validation.ParentSigningKey = signingKey.KeyTag
+							} else {
+								validation.Error = fmt.Sprintf("DS RRSIG cryptographic verification failed: %v", err)
+							}
 						} else {
 							if dsRRSIG.IsExpired {
 								validation.Error = fmt.Sprintf("DS RRSIG expired at %s", dsRRSIG.Expiration.Format("2006-01-02T15:04:05Z"))

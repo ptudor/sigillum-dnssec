@@ -67,6 +67,11 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 	result.RCodeName = RCodeName(resp.Rcode)
 	result.Authoritative = resp.Authoritative
 
+	// Preserve raw response for downstream cryptographic RRset verification.
+	if raw, packErr := resp.Pack(); packErr == nil {
+		result.RawResponse = raw
+	}
+
 	// Parse the response
 	q.parseResponse(resp, result)
 

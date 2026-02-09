@@ -5,6 +5,7 @@ import (
 	"embed"
 	"errors"
 	"io/fs"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -67,7 +68,16 @@ func (s *Server) registerRoutes() {
 	register("/healthz", withWriteDeadline(nonSSEWriteTimeout, http.HandlerFunc(s.healthChecker.HealthzHandler())))
 
 	// Metrics endpoint (no rate limiting)
-	register("/metrics", withWriteDeadline(nonSSEWriteTimeout, noStoreHandler(promhttp.Handler())))
+	metricsHandler := noStoreHandler(promhttp.Handler())
+	if len(s.config.MetricsAllowedCIDRs) > 0 {
+		nets, err := parseCIDRs(s.config.MetricsAllowedCIDRs)
+		if err != nil {
+			LogWarn("server", "invalid metrics_allowed_cidrs; metrics access unrestricted", "error", err.Error())
+		} else {
+			metricsHandler = allowCIDRs(metricsHandler, nets)
+		}
+	}
+	register("/metrics", withWriteDeadline(nonSSEWriteTimeout, metricsHandler))
 
 	// API endpoints (with rate limiting)
 	register("/validate", s.rateLimiter.Middleware(http.HandlerFunc(s.handlers.HandleValidateSSE)))
@@ -176,6 +186,43 @@ func requestWithPath(r *http.Request, path string) *http.Request {
 	clonedURL.Path = path
 	cloned.URL = &clonedURL
 	return cloned
+}
+
+func parseCIDRs(cidrs []string) ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, err
+		}
+		nets = append(nets, network)
+	}
+	return nets, nil
+}
+
+func allowCIDRs(next http.Handler, cidrs []*net.IPNet) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientIP := net.ParseIP(extractClientIP(r))
+		if clientIP == nil || !ipAllowed(clientIP, cidrs) {
+			writeProblemDetails(w, ErrTypeForbidden, "Forbidden",
+				http.StatusForbidden, "access to metrics endpoint is restricted", r.URL.Path)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func ipAllowed(ip net.IP, cidrs []*net.IPNet) bool {
+	for _, cidr := range cidrs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func isCacheableStaticAsset(path string) bool {

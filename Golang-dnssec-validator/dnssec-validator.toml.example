@@ -19,6 +19,7 @@ recursive_resolver = "8.8.8.8"  # Recursive resolver for NS lookups
 static_dir = "./static"
 base_path = ""                  # Base path for reverse proxy (e.g., "/dnssec")
 trusted_proxy_cidrs = ["127.0.0.0/8", "::1/128"] # Only these CIDRs may set X-Forwarded-For / X-Real-IP
+metrics_allowed_cidrs = []       # Optional CIDRs allowed to access /metrics (empty = unrestricted)
 
 # Rate limiting
 [rate_limit]
