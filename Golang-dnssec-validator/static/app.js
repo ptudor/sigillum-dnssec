@@ -453,11 +453,11 @@
         // DS Validation (from parent)
         if (zoneResult.ds_validation) {
             var dsv = zoneResult.ds_validation;
-            html += '<h4>DS Signature Verification</h4>';
+            html += '<h4>DS Signature Checks (Partial)</h4>';
             html += '<div class="record-card">';
             html += '<div class="record-data">';
             if (dsv.rrsig_verified) {
-                html += '<span class="ns-status secure">\u2713</span> DS RRSIG verified by parent ZSK (key tag ' + dsv.parent_signing_key + ')';
+                html += '<span class="ns-status secure">\u2713</span> DS RRSIG metadata checks passed (time + parent key tag ' + dsv.parent_signing_key + '), cryptographic verification pending';
             } else if (dsv.error) {
                 html += '<span class="ns-status error">\u2717</span> ' + escapeHtml(dsv.error);
             } else {
@@ -471,11 +471,11 @@
         // Record Validation (actual record RRSIG)
         if (zoneResult.record_validation) {
             var rv = zoneResult.record_validation;
-            html += '<h4>Record Signature Verification</h4>';
+            html += '<h4>Record Signature Checks (Partial)</h4>';
             html += '<div class="record-card">';
             html += '<div class="record-data">';
             if (rv.rrsig_verified) {
-                html += '<span class="ns-status secure">\u2713</span> ' + escapeHtml(rv.record_type) + ' RRSIG verified (key tag ' + rv.signing_key_tag + ')';
+                html += '<span class="ns-status secure">\u2713</span> ' + escapeHtml(rv.record_type) + ' signature metadata checks passed (time + signer + key tag ' + rv.signing_key_tag + '), cryptographic verification pending';
             } else if (rv.error) {
                 html += '<span class="ns-status error">\u2717</span> ' + escapeHtml(rv.error);
             } else {
