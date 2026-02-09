@@ -152,6 +152,7 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 		Args:  cobra.ExactArgs(1),
 		RunE:  runDS,
 	}
+	dsCmd.Flags().Bool("json", false, "Output in JSON format")
 
 	// dnskey command
 	dnskeyCmd := &cobra.Command{
@@ -160,6 +161,7 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 		Args:  cobra.ExactArgs(1),
 		RunE:  runDNSKEY,
 	}
+	dnskeyCmd.Flags().Bool("json", false, "Output in JSON format")
 
 	// import command
 	var importKSK, importZSK string
@@ -395,15 +397,15 @@ func runResign(cmd *cobra.Command, args []string) error {
 	}
 
 	// Execute post-sign hook if configured
-	if cfg.Hooks.PostSign != "" {
-		slog.Info("[CLI] Executing post-sign hook", "command", cfg.Hooks.PostSign)
+	if cfg.Hooks.PostSign != "" || len(cfg.Hooks.PostSignCmd) > 0 {
+		slog.Info("[CLI] Executing post-sign hook")
 		hookEnv := &HookEnv{
 			Domain:     domain,
 			ZonePath:   zoneCfg.Path,
 			SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
 			OutputDir:  cfg.OutputDir,
 		}
-		executeHook(cfg.Hooks.PostSign, hookEnv)
+		executeHook(&cfg.Hooks, hookEnv)
 	}
 
 	fmt.Printf("Zone %s re-signed successfully.\n", domain)
@@ -491,12 +493,6 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	slog.Info("[CLI] Adding domain", "domain", domain, "path", zonePath)
 
-	// Add zone to config file
-	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
-		return fmt.Errorf("adding zone to config file: %w", err)
-	}
-	slog.Info("[CLI] Added zone to config file", "config", configPath)
-
 	// Add to in-memory config so signing works
 	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
 
@@ -522,13 +518,21 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Sign the zone
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
+		// Rollback: remove from state on signing failure
+		state.RemoveZone(domain)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
-	// Save state
+	// Save state first — if this fails, config file is untouched
 	if err := state.Save(); err != nil {
 		return fmt.Errorf("saving state: %w", err)
 	}
+
+	// Config file is written last — state is already consistent
+	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+		return fmt.Errorf("adding zone to config file: %w", err)
+	}
+	slog.Info("[CLI] Added zone to config file", "config", configPath)
 
 	// Print DS records - load actual key for proper DS computation
 	kskKey, _, err := keyGen.LoadKeyPair(domain, "ksk")
@@ -766,6 +770,7 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 // runDS prints DS records for a domain
 func runDS(cmd *cobra.Command, args []string) error {
 	domain := args[0]
+	jsonOutput, _ := cmd.Flags().GetBool("json")
 
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
@@ -788,6 +793,31 @@ func runDS(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading KSK: %w", err)
 	}
 
+	if jsonOutput {
+		ds := ComputeDS(domain, ksk, dns.SHA256)
+		out := struct {
+			Domain     string `json:"domain"`
+			KeyTag     uint16 `json:"key_tag"`
+			Algorithm  uint8  `json:"algorithm"`
+			DigestType uint8  `json:"digest_type"`
+			Digest     string `json:"digest"`
+			Record     string `json:"record"`
+		}{
+			Domain:     domain,
+			KeyTag:     ds.KeyTag,
+			Algorithm:  ds.Algorithm,
+			DigestType: ds.DigestType,
+			Digest:     ds.Digest,
+			Record:     ds.String(),
+		}
+		data, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling DS: %w", err)
+		}
+		fmt.Println(string(data))
+		return nil
+	}
+
 	dsOutput := FormatDSRecordsFromKey(domain, ksk)
 	fmt.Println(dsOutput)
 	return nil
@@ -796,6 +826,7 @@ func runDS(cmd *cobra.Command, args []string) error {
 // runDNSKEY prints DNSKEY records for a domain
 func runDNSKEY(cmd *cobra.Command, args []string) error {
 	domain := args[0]
+	jsonOutput, _ := cmd.Flags().GetBool("json")
 
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
@@ -823,6 +854,44 @@ func runDNSKEY(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			slog.Warn("[CLI] Failed to load ZSK", "error", err)
 		}
+	}
+
+	if jsonOutput {
+		type keyJSON struct {
+			Flags     uint16 `json:"flags"`
+			Protocol  uint8  `json:"protocol"`
+			Algorithm uint8  `json:"algorithm"`
+			PublicKey string `json:"public_key"`
+			KeyTag    uint16 `json:"key_tag"`
+			Record    string `json:"record"`
+		}
+		out := struct {
+			Domain string   `json:"domain"`
+			KSK    *keyJSON `json:"ksk,omitempty"`
+			ZSK    *keyJSON `json:"zsk,omitempty"`
+		}{Domain: domain}
+
+		if ksk != nil {
+			out.KSK = &keyJSON{
+				Flags: ksk.Flags, Protocol: ksk.Protocol,
+				Algorithm: ksk.Algorithm, PublicKey: ksk.PublicKey,
+				KeyTag: ksk.KeyTag(), Record: ksk.String(),
+			}
+		}
+		if zsk != nil {
+			out.ZSK = &keyJSON{
+				Flags: zsk.Flags, Protocol: zsk.Protocol,
+				Algorithm: zsk.Algorithm, PublicKey: zsk.PublicKey,
+				KeyTag: zsk.KeyTag(), Record: zsk.String(),
+			}
+		}
+
+		data, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling DNSKEY: %w", err)
+		}
+		fmt.Println(string(data))
+		return nil
 	}
 
 	dnskeyOutput := FormatDNSKEYRecordsFromKeys(domain, ksk, zsk)
@@ -924,23 +993,24 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 	state.SetZone(domain, zoneState)
 
-	// Add zone to config file
-	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
-		return fmt.Errorf("adding zone to config file: %w", err)
-	}
-
 	// Add to in-memory config
 	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
 
 	// Sign the zone
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
+		state.RemoveZone(domain)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
-	// Save state
+	// Save state first — if this fails, config file is untouched
 	if err := state.Save(); err != nil {
 		return fmt.Errorf("saving state: %w", err)
+	}
+
+	// Config file is written last — state is already consistent
+	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+		return fmt.Errorf("adding zone to config file: %w", err)
 	}
 
 	fmt.Printf("\nDomain %s imported successfully.\n", domain)

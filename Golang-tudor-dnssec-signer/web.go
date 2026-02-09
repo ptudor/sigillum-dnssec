@@ -13,13 +13,31 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
-// securityHeaders wraps a handler to add security headers to all responses
+// dashboardTemplate is parsed once at init and reused for every request.
+var dashboardTemplate *template.Template
+
+func init() {
+	var err error
+	dashboardTemplate, err = template.ParseFS(templateFS, "templates/index.html")
+	if err != nil {
+		// Template is embedded; a parse failure here is a build-time bug.
+		panic("failed to parse embedded dashboard template: " + err.Error())
+	}
+}
+
+// securityHeaders wraps a handler to add security headers and enforce GET-only.
 func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Permissions-Policy", "interest-cohort=()")
+		w.Header().Set("Cache-Control", "no-store")
 		next(w, r)
 	}
 }
@@ -58,13 +76,6 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 		return
 	}
 
-	tmpl, err := template.ParseFS(templateFS, "templates/index.html")
-	if err != nil {
-		slog.Error("[WEB] Failed to parse template", "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
 	status := state.ToStatusOutput()
 
 	// Compute DS records for each zone to display inline
@@ -90,7 +101,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := tmpl.Execute(w, data); err != nil {
+	if err := dashboardTemplate.Execute(w, data); err != nil {
 		slog.Error("[WEB] Failed to execute template", "error", err)
 	}
 }

@@ -144,7 +144,7 @@ func (s *State) Save() error {
 
 	// Write to temp file first, then rename for atomicity
 	tempPath := s.path + ".tmp"
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+	if err := os.WriteFile(tempPath, data, 0600); err != nil {
 		return fmt.Errorf("writing state file: %w", err)
 	}
 
@@ -156,11 +156,25 @@ func (s *State) Save() error {
 	return nil
 }
 
-// GetZone returns the state for a zone, or nil if not found
+// GetZone returns the state for a zone, or nil if not found.
+//
+// Concurrency contract: the returned pointer is safe to mutate from the signing
+// loop goroutine (single writer). Read-only consumers (web handlers, metrics)
+// must use ToStatusOutput which takes a read-lock and deep-copies the data.
 func (s *State) GetZone(domain string) *ZoneState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Zones[domain]
+}
+
+// UpdateZone applies a mutation function to a zone under the state write lock.
+// This is the preferred method when the caller needs atomic read-modify-write.
+func (s *State) UpdateZone(domain string, fn func(*ZoneState)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if zone, ok := s.Zones[domain]; ok {
+		fn(zone)
+	}
 }
 
 // SetZone updates the state for a zone
