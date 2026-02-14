@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -79,7 +80,14 @@ func (c *HeartbeatClient) Send(action string) error {
 		params.Set("instance_id", c.cfg.InstanceID)
 	}
 
-	resp, err := c.httpClient.PostForm(c.cfg.URL, params)
+	req, err := http.NewRequest("POST", c.cfg.URL, strings.NewReader(params.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Tudor "+c.cfg.App+"/1.0 (AnyStatus heartbeat)")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		slog.Debug("[HEARTBEAT] Failed to send", "action", action, "error", err)
 		return err
