@@ -91,7 +91,14 @@ func (c *Client) Send(action string) error {
 		params.Set("instance_id", c.instanceID)
 	}
 
-	resp, err := c.httpClient.PostForm(c.baseURL, params)
+	req, err := http.NewRequest("POST", c.baseURL, strings.NewReader(params.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Tudor "+c.app+"/1.0 (AnyStatus heartbeat)")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		slog.Debug("Heartbeat send failed", "action", action, "error", err)
 		return err
