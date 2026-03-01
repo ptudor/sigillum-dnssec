@@ -214,15 +214,16 @@ type StatusOutput struct {
 
 // ZoneStatusOutput represents per-zone status in the output
 type ZoneStatusOutput struct {
-	Status        string         `json:"status"`
-	Serial        uint32         `json:"serial,omitempty"`
-	LastSigned    time.Time      `json:"last_signed,omitempty"`
-	SignaturesExp time.Time      `json:"signatures_expire,omitempty"`
-	KSK           *KeyState      `json:"ksk,omitempty"`
-	ZSK           *KeyState      `json:"zsk,omitempty"`
-	Rollover      *RolloverState `json:"rollover,omitempty"`
-	Warnings      []string       `json:"warnings,omitempty"`
-	Errors        []string       `json:"errors,omitempty"`
+	Status        string            `json:"status"`
+	Serial        uint32            `json:"serial,omitempty"`
+	LastSigned    time.Time         `json:"last_signed,omitempty"`
+	SignaturesExp time.Time         `json:"signatures_expire,omitempty"`
+	KSK           *KeyState         `json:"ksk,omitempty"`
+	ZSK           *KeyState         `json:"zsk,omitempty"`
+	Rollover      *RolloverState    `json:"rollover,omitempty"`
+	Warnings      []string          `json:"warnings,omitempty"`
+	Errors        []string          `json:"errors,omitempty"`
+	Validation    *ValidationResult `json:"validation,omitempty"`
 }
 
 // StatusSummary provides a summary of all zones

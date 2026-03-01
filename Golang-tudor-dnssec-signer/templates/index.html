@@ -124,7 +124,11 @@
 </head>
 <body>
     <h1>dnssec-tudor</h1>
-    <p class="subtitle">DNSSEC Signing Dashboard</p>
+    <p class="subtitle">DNSSEC Signing Dashboard
+        {{if .Validation}}<a href="/" style="margin-left:1rem;color:var(--text-dim);font-size:0.875rem;">Hide Validation</a>
+        {{else}}<a href="/?validate=true" style="margin-left:1rem;color:var(--accent);font-size:0.875rem;">Validate Now</a>
+        {{end}}
+    </p>
 
     <div class="summary">
         <div class="stat">
@@ -261,6 +265,30 @@
                     <span class="detail-label">Signatures Expire:</span>
                     <span>{{$zone.SignaturesExp.Format "2006-01-02 15:04:05 UTC"}}</span>
                 </div>
+
+                {{with index $.Validation $domain}}
+                <div class="section-title">Internet Validation
+                    <span class="badge badge-{{if eq .Overall "pass"}}healthy{{else if eq .Overall "partial"}}warning{{else if eq .Overall "fail"}}error{{else}}error{{end}}" style="margin-left:0.5rem;">
+                        {{.Overall}}
+                    </span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">DS at Parent:</span>
+                    <span><span class="badge badge-{{if eq .DSCheck.Status "pass"}}healthy{{else if eq .DSCheck.Status "fail"}}error{{else}}warning{{end}}" style="font-size:0.7rem;">{{.DSCheck.Status}}</span> {{.DSCheck.Details}}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">DNSKEY Visible:</span>
+                    <span><span class="badge badge-{{if eq .DNSKEYCheck.Status "pass"}}healthy{{else if eq .DNSKEYCheck.Status "fail"}}error{{else}}warning{{end}}" style="font-size:0.7rem;">{{.DNSKEYCheck.Status}}</span> {{.DNSKEYCheck.Details}}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">RRSIG Present:</span>
+                    <span><span class="badge badge-{{if eq .RRSIGCheck.Status "pass"}}healthy{{else if eq .RRSIGCheck.Status "fail"}}error{{else}}warning{{end}}" style="font-size:0.7rem;">{{.RRSIGCheck.Status}}</span> {{.RRSIGCheck.Details}}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">SOA Serial:</span>
+                    <span><span class="badge badge-{{if eq .SOACheck.Status "pass"}}healthy{{else if eq .SOACheck.Status "fail"}}error{{else}}warning{{end}}" style="font-size:0.7rem;">{{.SOACheck.Status}}</span> {{.SOACheck.Details}}</span>
+                </div>
+                {{end}}
             </div>
         </div>
         {{end}}
