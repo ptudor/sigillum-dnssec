@@ -21,8 +21,15 @@ type Config struct {
 	Web          WebConfig             `toml:"web"`
 	Health       HealthConfig          `toml:"health"`
 	Heartbeat    HeartbeatConfig       `toml:"heartbeat"`
+	Validation   ValidateConfig        `toml:"validate"`
 	Zones        map[string]ZoneConfig `toml:"zones"`
 	Hooks        HooksConfig           `toml:"hooks"`
+}
+
+// ValidateConfig holds settings for internet DNSSEC validation checks
+type ValidateConfig struct {
+	Resolver string   `toml:"resolver"` // e.g. "8.8.8.8:53", default: system resolver
+	Timeout  Duration `toml:"timeout"`  // default: 5s
 }
 
 // HeartbeatConfig holds AnyStatus heartbeat monitoring settings
@@ -189,6 +196,9 @@ func DefaultConfig() *Config {
 			URL:             "https://www.any53.com/any53/anystatus/heartbeat/",
 			App:             "dnssec-tudor",
 			IntervalMinutes: 5,
+		},
+		Validation: ValidateConfig{
+			Timeout: Duration{5 * time.Second},
 		},
 		Zones: make(map[string]ZoneConfig),
 		Hooks: HooksConfig{},

@@ -56,6 +56,12 @@ func NewWebServer(cfg *Config, state *State) *http.Server {
 	mux.HandleFunc("/api/zone/", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
 		apiZoneHandler(w, r, cfg, state)
 	}))
+	mux.HandleFunc("/api/validate", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		apiValidateHandler(w, r, cfg, state)
+	}))
+	mux.HandleFunc("/api/validate/", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		apiValidateZoneHandler(w, r, cfg, state)
+	}))
 
 	// Health endpoints
 	RegisterHealthHandlers(mux, state, cfg)
@@ -90,14 +96,24 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 		}
 	}
 
+	// Run validation if requested via query parameter
+	var validation map[string]*ValidationResult
+	if r.URL.Query().Get("validate") == "true" {
+		v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+		valOutput := v.ValidateAll()
+		validation = valOutput.Zones
+	}
+
 	data := struct {
-		Config    *Config
-		Status    *StatusOutput
-		DSRecords map[string]string
+		Config     *Config
+		Status     *StatusOutput
+		DSRecords  map[string]string
+		Validation map[string]*ValidationResult
 	}{
-		Config:    cfg,
-		Status:    status,
-		DSRecords: dsRecords,
+		Config:     cfg,
+		Status:     status,
+		DSRecords:  dsRecords,
+		Validation: validation,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -159,5 +175,39 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		slog.Debug("[WEB] Failed to encode response", "error", err)
+	}
+}
+
+func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
+	w.Header().Set("Content-Type", "application/json")
+
+	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+	output := v.ValidateAll()
+
+	if err := json.NewEncoder(w).Encode(output); err != nil {
+		slog.Debug("[WEB] Failed to encode validation response", "error", err)
+	}
+}
+
+func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
+	domain := strings.TrimPrefix(r.URL.Path, "/api/validate/")
+	if domain == "" {
+		http.Error(w, "Domain required", http.StatusBadRequest)
+		return
+	}
+
+	zoneState := state.GetZone(domain)
+	if zoneState == nil {
+		http.Error(w, "Zone not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+	result := v.ValidateZone(domain)
+
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		slog.Debug("[WEB] Failed to encode validation response", "error", err)
 	}
 }

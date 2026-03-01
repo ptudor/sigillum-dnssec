@@ -92,6 +92,18 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 		RunE:  runStatus,
 	}
 	statusCmd.Flags().StringVarP(&statusDomain, "domain", "d", "", "Show status for specific domain only")
+	statusCmd.Flags().Bool("validate", false, "Include internet DNSSEC validation in status output")
+
+	// validate command
+	validateCmd := &cobra.Command{
+		Use:   "validate [domain]",
+		Short: "Check DNSSEC visibility on the internet",
+		Long: `Queries the internet to verify DS records at parent, DNSKEY/RRSIG
+visibility at authoritative nameservers, and SOA serial consistency.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runValidate,
+	}
+	validateCmd.Flags().String("resolver", "", "Recursive resolver (default: system resolver)")
 
 	// add command
 	addCmd := &cobra.Command{
@@ -188,7 +200,7 @@ dnssec-tudor's format, and set up the zone for management.`,
 	importCmd.MarkFlagRequired("zsk")
 
 	// Add all commands
-	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, resignCmd, statusCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd, importCmd)
+	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, resignCmd, statusCmd, validateCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd, importCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -421,6 +433,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	doValidate, _ := cmd.Flags().GetBool("validate")
+
 	domain, _ := cmd.Flags().GetString("domain")
 	if domain != "" {
 		// Show status for specific domain
@@ -439,6 +453,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			Warnings:      zoneState.Warnings,
 			Errors:        zoneState.Errors,
 		}
+		if doValidate {
+			v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+			output.Validation = v.ValidateZone(domain)
+		}
 		jsonData, err := json.MarshalIndent(output, "", "  ")
 		if err != nil {
 			return fmt.Errorf("marshaling status: %w", err)
@@ -448,12 +466,59 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	// Show status for all zones
-	jsonData, err := state.ToJSON()
+	output := state.ToStatusOutput()
+	if doValidate {
+		v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+		valOutput := v.ValidateAll()
+		for domain, valResult := range valOutput.Zones {
+			if zone, ok := output.Zones[domain]; ok {
+				zone.Validation = valResult
+			}
+		}
+	}
+	jsonData, err := json.MarshalIndent(output, "", "  ")
 	if err != nil {
 		return fmt.Errorf("generating status: %w", err)
 	}
 	fmt.Println(string(jsonData))
-	_ = cfg // silence unused warning until fully implemented
+	return nil
+}
+
+// runValidate checks DNSSEC visibility on the internet
+func runValidate(cmd *cobra.Command, args []string) error {
+	cfg, state, err := loadConfigAndState()
+	if err != nil {
+		return err
+	}
+
+	resolver, _ := cmd.Flags().GetString("resolver")
+	if resolver == "" {
+		resolver = cfg.Validation.Resolver
+	}
+	timeout := cfg.Validation.Timeout.Duration
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+
+	v := NewValidator(cfg, state, resolver, timeout)
+
+	if len(args) == 1 {
+		domain := args[0]
+		result := v.ValidateZone(domain)
+		jsonData, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling validation result: %w", err)
+		}
+		fmt.Println(string(jsonData))
+		return nil
+	}
+
+	output := v.ValidateAll()
+	jsonData, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling validation output: %w", err)
+	}
+	fmt.Println(string(jsonData))
 	return nil
 }
 
