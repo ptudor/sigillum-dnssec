@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -26,9 +27,11 @@ type Daemon struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu          sync.RWMutex
-	server      *http.Server
-	tickerReset chan time.Duration // signals the signing loop to reset its ticker
+	mu              sync.RWMutex
+	server          *http.Server
+	tickerReset     chan time.Duration // signals the signing loop to reset its ticker
+	signingLoopDead atomic.Bool        // true if signing loop goroutine has exited
+	lastSigningRun  atomic.Int64       // unix timestamp of last signing loop iteration
 }
 
 // NewDaemon creates a new daemon instance
@@ -201,28 +204,35 @@ func (d *Daemon) checkDirWritable(dir, name string) error {
 
 func (d *Daemon) runSigningLoop() {
 	defer d.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("[DAEMON] Panic in signing loop", "panic", r)
-		}
-	}()
+	defer d.signingLoopDead.Store(true)
 
 	ticker := time.NewTicker(d.cfg.PollInterval.Duration)
 	defer ticker.Stop()
 
 	// Initial sign
-	d.signAllZones()
+	d.signAllZonesSafe()
 
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
 		case <-ticker.C:
-			d.signAllZones()
+			d.signAllZonesSafe()
 		case newInterval := <-d.tickerReset:
 			ticker.Reset(newInterval)
 		}
 	}
+}
+
+// signAllZonesSafe wraps signAllZones with panic recovery so the signing loop
+// survives panics and continues on the next tick.
+func (d *Daemon) signAllZonesSafe() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[DAEMON] Panic in signing loop iteration (recovered, will retry next tick)", "panic", r)
+		}
+	}()
+	d.signAllZones()
 }
 
 // snapshot captures all daemon references under a single lock for a signing cycle.
@@ -248,6 +258,9 @@ func (d *Daemon) takeSnapshot() snapshot {
 func (d *Daemon) signAllZones() {
 	snap := d.takeSnapshot()
 
+	// Record that the signing loop is alive
+	d.lastSigningRun.Store(time.Now().Unix())
+
 	// Reload state from disk to pick up any zones added by CLI commands
 	if err := snap.state.ReloadFromDisk(); err != nil {
 		slog.Warn("[DAEMON] Failed to reload state from disk", "error", err)
@@ -256,9 +269,7 @@ func (d *Daemon) signAllZones() {
 	slog.Debug("[DAEMON] Checking zones for signing", "count", len(snap.cfg.Zones))
 
 	for domain := range snap.cfg.Zones {
-		if err := d.checkAndSignZone(snap, domain); err != nil {
-			slog.Error("[DAEMON] Failed to sign zone", "domain", domain, "error", err)
-		}
+		d.checkAndSignZoneSafe(snap, domain)
 	}
 
 	// Check for automatic ZSK rollovers
@@ -279,6 +290,19 @@ func (d *Daemon) signAllZones() {
 
 	// Update Prometheus metrics
 	UpdateZoneMetrics(snap.state)
+}
+
+// checkAndSignZoneSafe wraps checkAndSignZone with per-zone panic recovery
+// so a panic in one zone doesn't prevent other zones from being signed.
+func (d *Daemon) checkAndSignZoneSafe(snap snapshot, domain string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[DAEMON] Panic signing zone (recovered, other zones unaffected)", "domain", domain, "panic", r)
+		}
+	}()
+	if err := d.checkAndSignZone(snap, domain); err != nil {
+		slog.Error("[DAEMON] Failed to sign zone", "domain", domain, "error", err)
+	}
 }
 
 func (d *Daemon) checkAndSignZone(snap snapshot, domain string) error {
@@ -376,7 +400,7 @@ func (d *Daemon) runHealthServer() {
 
 	// Health server runs on internal port for monitoring
 	mux := http.NewServeMux()
-	RegisterHealthHandlers(mux, d.state, d.cfg)
+	RegisterHealthHandlersWithDaemon(mux, d.state, d.cfg, d)
 	mux.Handle("/metrics", promhttp.Handler())
 	if d.cfg.Health.DebugVars {
 		mux.Handle("/debug/vars", expvar.Handler())

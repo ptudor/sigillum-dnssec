@@ -1065,8 +1065,16 @@ ns1	IN	A	192.0.2.1
 	// Zone with expired signatures SHOULD need signing
 	zoneState.SignaturesExp = now.Add(-1 * time.Hour)
 	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
-	if !needs || reason != "signatures approaching expiry" {
+	if !needs || reason != "signatures EXPIRED" {
 		t.Errorf("Zone with expired signatures should need signing, got needs=%v reason=%q", needs, reason)
+	}
+
+	// Zone approaching expiry (within refresh window) SHOULD need signing
+	// Test config uses SignatureRefresh=1s, so set expiry 500ms in future (within 1s refresh window)
+	zoneState.SignaturesExp = now.Add(500 * time.Millisecond)
+	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
+	if !needs || reason != "signatures approaching expiry" {
+		t.Errorf("Zone approaching expiry should need signing, got needs=%v reason=%q", needs, reason)
 	}
 
 	// Zone with active rollover SHOULD need signing

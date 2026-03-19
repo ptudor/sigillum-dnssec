@@ -6,17 +6,23 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 )
 
 // RegisterHealthHandlers registers health check endpoints
 func RegisterHealthHandlers(mux *http.ServeMux, state *State, cfg *Config) {
+	RegisterHealthHandlersWithDaemon(mux, state, cfg, nil)
+}
+
+// RegisterHealthHandlersWithDaemon registers health check endpoints with daemon liveness checks
+func RegisterHealthHandlersWithDaemon(mux *http.ServeMux, state *State, cfg *Config, daemon *Daemon) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		setSecurityHeaders(w)
-		healthHandler(w, r, state, cfg)
+		healthHandler(w, r, state, cfg, daemon)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -24,7 +30,7 @@ func RegisterHealthHandlers(mux *http.ServeMux, state *State, cfg *Config) {
 			return
 		}
 		setSecurityHeaders(w)
-		healthzHandler(w, r, state, cfg)
+		healthzHandler(w, r, state, cfg, daemon)
 	})
 }
 
@@ -38,7 +44,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 }
 
 // healthHandler returns detailed health status
-func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Config) {
+func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Config, daemon *Daemon) {
 	status := state.ToStatusOutput()
 
 	// Check if any zones have errors
@@ -59,19 +65,56 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Co
 		healthy = false
 	}
 
+	// Check signing loop liveness
+	signingLoopAlive := true
+	if daemon != nil {
+		if daemon.signingLoopDead.Load() {
+			depErrors = append(depErrors, "signing_loop: goroutine has exited")
+			healthy = false
+			signingLoopAlive = false
+		}
+		lastRun := daemon.lastSigningRun.Load()
+		if lastRun > 0 {
+			staleness := time.Since(time.Unix(lastRun, 0))
+			// If the signing loop hasn't run in 3x the poll interval, something is wrong
+			if staleness > 3*cfg.PollInterval.Duration {
+				depErrors = append(depErrors, fmt.Sprintf("signing_loop: last ran %s ago (expected every %s)", staleness.Round(time.Second), cfg.PollInterval.String()))
+				healthy = false
+				signingLoopAlive = false
+			}
+		}
+	}
+
+	// Check for expired signatures
+	var expiredZones []string
+	now := time.Now()
+	for domain, zone := range status.Zones {
+		if !zone.SignaturesExp.IsZero() && now.After(zone.SignaturesExp) {
+			expiredZones = append(expiredZones, domain)
+			healthy = false
+		}
+	}
+	if len(expiredZones) > 0 {
+		depErrors = append(depErrors, fmt.Sprintf("expired_signatures: %v", expiredZones))
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if !healthy {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 
 	response := struct {
-		Status    string        `json:"status"`
-		Summary   StatusSummary `json:"summary"`
-		DepErrors []string      `json:"dependency_errors,omitempty"`
+		Status           string        `json:"status"`
+		Summary          StatusSummary `json:"summary"`
+		SigningLoopAlive bool          `json:"signing_loop_alive"`
+		ExpiredZones     []string      `json:"expired_zones,omitempty"`
+		DepErrors        []string      `json:"dependency_errors,omitempty"`
 	}{
-		Status:    "healthy",
-		Summary:   status.Summary,
-		DepErrors: depErrors,
+		Status:           "healthy",
+		Summary:          status.Summary,
+		SigningLoopAlive: signingLoopAlive,
+		ExpiredZones:     expiredZones,
+		DepErrors:        depErrors,
 	}
 
 	if !healthy {
@@ -84,7 +127,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Co
 }
 
 // healthzHandler returns simple OK for kubernetes probes
-func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Config) {
+func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Config, daemon *Daemon) {
 	status := state.ToStatusOutput()
 	healthy := status.Summary.Errors == 0
 
@@ -94,6 +137,26 @@ func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *C
 	}
 	if err := checkDirWritable(cfg.DataDir); err != nil {
 		healthy = false
+	}
+
+	// Check signing loop liveness
+	if daemon != nil {
+		if daemon.signingLoopDead.Load() {
+			healthy = false
+		}
+		lastRun := daemon.lastSigningRun.Load()
+		if lastRun > 0 && time.Since(time.Unix(lastRun, 0)) > 3*cfg.PollInterval.Duration {
+			healthy = false
+		}
+	}
+
+	// Check for expired signatures
+	now := time.Now()
+	for _, zone := range status.Zones {
+		if !zone.SignaturesExp.IsZero() && now.After(zone.SignaturesExp) {
+			healthy = false
+			break
+		}
 	}
 
 	if !healthy {
