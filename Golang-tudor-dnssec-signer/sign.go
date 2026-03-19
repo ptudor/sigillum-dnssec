@@ -257,6 +257,29 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 		return true, "new zone"
 	}
 
+	// Check signature expiry first — this is the most critical check and must
+	// never be skipped, even if the zone file is temporarily inaccessible.
+	now := time.Now()
+	if !zoneState.SignaturesExp.IsZero() {
+		refreshTime := zoneState.SignaturesExp.Add(-s.cfg.DNSSEC.SignatureRefresh.Duration)
+		if now.After(zoneState.SignaturesExp) {
+			return true, "signatures EXPIRED"
+		}
+		if now.After(refreshTime) {
+			return true, "signatures approaching expiry"
+		}
+
+		slog.Debug("[SIGN] Signatures still valid",
+			"domain", domain,
+			"expires", zoneState.SignaturesExp.Format(time.RFC3339),
+			"refresh_at", refreshTime.Format(time.RFC3339))
+	}
+
+	// Check for active rollover
+	if zoneState.Rollover != nil {
+		return true, "rollover in progress"
+	}
+
 	// Check zone file modification time
 	info, err := os.Stat(zonePath)
 	if err != nil {
@@ -278,27 +301,11 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 	_, serial, err := s.parseZoneFile(domain, zonePath)
 	if err != nil {
 		slog.Error("[SIGN] Failed to parse zone file for serial check", "domain", domain, "error", err)
-		// Still check signature expiry even if parse fails
+		// File inaccessible but signatures are valid — skip
 	} else if serial != zoneState.Serial {
 		return true, fmt.Sprintf("serial changed: %d -> %d", zoneState.Serial, serial)
 	} else {
 		slog.Debug("[SIGN] Serial unchanged", "domain", domain, "serial", serial)
-	}
-
-	// Check signature expiry
-	refreshTime := zoneState.SignaturesExp.Add(-s.cfg.DNSSEC.SignatureRefresh.Duration)
-	if time.Now().After(refreshTime) {
-		return true, "signatures approaching expiry"
-	}
-
-	slog.Debug("[SIGN] Signatures still valid",
-		"domain", domain,
-		"expires", zoneState.SignaturesExp.Format(time.RFC3339),
-		"refresh_at", refreshTime.Format(time.RFC3339))
-
-	// Check for active rollover
-	if zoneState.Rollover != nil {
-		return true, "rollover in progress"
 	}
 
 	return false, ""
