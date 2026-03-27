@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNSSEC Validation Status</title>
+<style>
+:root {
+  --pass: #2e7d32;
+  --pass-bg: #e8f5e9;
+  --fail: #c62828;
+  --fail-bg: #ffebee;
+  --partial: #e65100;
+  --partial-bg: #fff3e0;
+  --error: #6a1b9a;
+  --error-bg: #f3e5f5;
+  --border: #ddd;
+  --bg: #f5f5f5;
+  --card-bg: #fff;
+  --text: #212121;
+  --text-secondary: #616161;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, monospace;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  padding: 1rem;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+.meta { color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 1rem; }
+.summary {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+}
+.summary-card {
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+}
+.summary-card .count { font-size: 1.5rem; display: block; }
+.summary-card.pass { border-left: 4px solid var(--pass); }
+.summary-card.fail { border-left: 4px solid var(--fail); }
+.summary-card.partial { border-left: 4px solid var(--partial); }
+.summary-card.error { border-left: 4px solid var(--error); }
+.summary-card.total { border-left: 4px solid #1565c0; }
+
+.zone {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 0.75rem;
+  overflow: hidden;
+}
+.zone-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  cursor: pointer;
+  user-select: none;
+}
+.zone-header:hover { background: #fafafa; }
+.zone-header .arrow {
+  transition: transform 0.15s;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+.zone.open .zone-header .arrow { transform: rotate(90deg); }
+.zone-name { font-weight: 600; font-size: 1rem; flex: 1; }
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.badge.pass { background: var(--pass-bg); color: var(--pass); }
+.badge.fail { background: var(--fail-bg); color: var(--fail); }
+.badge.partial { background: var(--partial-bg); color: var(--partial); }
+.badge.error { background: var(--error-bg); color: var(--error); }
+
+.zone-detail {
+  display: none;
+  padding: 0 1rem 0.75rem;
+  border-top: 1px solid var(--border);
+}
+.zone.open .zone-detail { display: block; }
+
+.checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+.check {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.6rem 0.75rem;
+}
+.check-title {
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.check-detail {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+.check-fields {
+  font-size: 0.8rem;
+  margin-top: 0.3rem;
+}
+.check-fields dt { font-weight: 600; display: inline; }
+.check-fields dt::after { content: ": "; }
+.check-fields dd { display: inline; margin: 0; }
+.check-fields dd::after { content: ""; display: block; }
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.dot.pass { background: var(--pass); }
+.dot.fail { background: var(--fail); }
+.dot.partial { background: var(--partial); }
+.dot.error { background: var(--error); }
+
+.errors-list {
+  margin-top: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--fail-bg);
+  border-radius: 4px;
+  font-size: 0.82rem;
+  color: var(--fail);
+}
+.errors-list li { margin-left: 1rem; }
+
+.ds-records {
+  margin-top: 0.3rem;
+  font-size: 0.75rem;
+  font-family: monospace;
+  background: var(--bg);
+  padding: 0.3rem 0.5rem;
+  border-radius: 3px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+#loading { text-align: center; padding: 3rem; color: var(--text-secondary); }
+#error-msg {
+  text-align: center;
+  padding: 2rem;
+  color: var(--fail);
+  background: var(--fail-bg);
+  border-radius: 6px;
+  display: none;
+}
+</style>
+</head>
+<body>
+
+<h1>DNSSEC Validation Status</h1>
+<div class="meta" id="timestamp"></div>
+
+<div id="loading">Loading validate.json...</div>
+<div id="error-msg"></div>
+<div id="summary" style="display:none"></div>
+<div id="zones"></div>
+
+<script>
+function escapeHtml(s) {
+  var d = document.createElement('div');
+  d.appendChild(document.createTextNode(s));
+  return d.innerHTML;
+}
+
+function badge(status) {
+  return '<span class="badge ' + escapeHtml(status) + '">' + escapeHtml(status) + '</span>';
+}
+
+function dot(status) {
+  return '<span class="dot ' + escapeHtml(status) + '"></span>';
+}
+
+function boolStr(v) {
+  return v ? 'Yes' : 'No';
+}
+
+function renderSummary(summary) {
+  var el = document.getElementById('summary');
+  el.style.display = '';
+  el.className = 'summary';
+  el.innerHTML =
+    '<div class="summary-card total"><span class="count">' + summary.total + '</span>Total</div>' +
+    '<div class="summary-card pass"><span class="count">' + summary.pass + '</span>Pass</div>' +
+    '<div class="summary-card fail"><span class="count">' + summary.fail + '</span>Fail</div>' +
+    '<div class="summary-card partial"><span class="count">' + summary.partial + '</span>Partial</div>' +
+    '<div class="summary-card error"><span class="count">' + summary.error + '</span>Error</div>';
+}
+
+function renderDSRecords(records) {
+  if (!records || records.length === 0) return '';
+  return '<div class="ds-records">' + records.map(escapeHtml).join('\n') + '</div>';
+}
+
+function renderCheck(title, check, extra) {
+  var html = '<div class="check">';
+  html += '<div class="check-title">' + dot(check.status) + ' ' + escapeHtml(title) + '</div>';
+  html += '<div class="check-detail">' + escapeHtml(check.details || '') + '</div>';
+  if (extra) html += extra;
+  html += '</div>';
+  return html;
+}
+
+function renderZone(domain, z) {
+  var dsExtra = '';
+  var dsFields = '<dl class="check-fields">';
+  dsFields += '<dt>Found</dt><dd>' + boolStr(z.ds_check.found) + '</dd>';
+  dsFields += '<dt>Matches KSK</dt><dd>' + boolStr(z.ds_check.matches_ksk) + '</dd>';
+  if (z.ds_check.parent_ns) dsFields += '<dt>Parent NS</dt><dd>' + escapeHtml(z.ds_check.parent_ns) + '</dd>';
+  dsFields += '</dl>';
+  dsExtra = dsFields + renderDSRecords(z.ds_check.ds_records);
+
+  var dnskeyExtra = '<dl class="check-fields">';
+  dnskeyExtra += '<dt>KSK visible</dt><dd>' + boolStr(z.dnskey_check.ksk_found) + '</dd>';
+  dnskeyExtra += '<dt>ZSK visible</dt><dd>' + boolStr(z.dnskey_check.zsk_found) + '</dd>';
+  if (z.dnskey_check.key_tags && z.dnskey_check.key_tags.length)
+    dnskeyExtra += '<dt>Key tags</dt><dd>' + z.dnskey_check.key_tags.join(', ') + '</dd>';
+  if (z.dnskey_check.auth_ns) dnskeyExtra += '<dt>Auth NS</dt><dd>' + escapeHtml(z.dnskey_check.auth_ns) + '</dd>';
+  dnskeyExtra += '</dl>';
+
+  var rrsigExtra = '<dl class="check-fields">';
+  rrsigExtra += '<dt>SOA signed</dt><dd>' + boolStr(z.rrsig_check.soa_signed) + '</dd>';
+  rrsigExtra += '<dt>DNSKEY signed</dt><dd>' + boolStr(z.rrsig_check.dnskey_signed) + '</dd>';
+  rrsigExtra += '</dl>';
+
+  var soaExtra = '<dl class="check-fields">';
+  soaExtra += '<dt>Local serial</dt><dd>' + z.soa_check.local_serial + '</dd>';
+  soaExtra += '<dt>Remote serial</dt><dd>' + z.soa_check.remote_serial + '</dd>';
+  if (z.soa_check.auth_ns) soaExtra += '<dt>Auth NS</dt><dd>' + escapeHtml(z.soa_check.auth_ns) + '</dd>';
+  soaExtra += '</dl>';
+
+  var errorsHtml = '';
+  if (z.errors && z.errors.length) {
+    errorsHtml = '<div class="errors-list"><strong>Errors:</strong><ul>' +
+      z.errors.map(function(e) { return '<li>' + escapeHtml(e) + '</li>'; }).join('') +
+      '</ul></div>';
+  }
+
+  return '<div class="zone" id="zone-' + escapeHtml(domain) + '">' +
+    '<div class="zone-header" onclick="toggleZone(this)">' +
+    '<span class="arrow">&#9654;</span>' +
+    '<span class="zone-name">' + escapeHtml(domain) + '</span>' +
+    badge(z.overall) +
+    '</div>' +
+    '<div class="zone-detail">' +
+    errorsHtml +
+    '<div class="checks">' +
+    renderCheck('DS (Parent)', z.ds_check, dsExtra) +
+    renderCheck('DNSKEY', z.dnskey_check, dnskeyExtra) +
+    renderCheck('RRSIG', z.rrsig_check, rrsigExtra) +
+    renderCheck('SOA Serial', z.soa_check, soaExtra) +
+    '</div>' +
+    '</div>' +
+    '</div>';
+}
+
+function toggleZone(header) {
+  header.parentElement.classList.toggle('open');
+}
+
+function sortDomains(zones) {
+  var order = { error: 0, fail: 1, partial: 2, pass: 3 };
+  return Object.keys(zones).sort(function(a, b) {
+    var oa = order[zones[a].overall] !== undefined ? order[zones[a].overall] : 2;
+    var ob = order[zones[b].overall] !== undefined ? order[zones[b].overall] : 2;
+    if (oa !== ob) return oa - ob;
+    return a.localeCompare(b);
+  });
+}
+
+fetch('validate.json')
+  .then(function(r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  })
+  .then(function(data) {
+    document.getElementById('loading').style.display = 'none';
+
+    var ts = data.timestamp ? new Date(data.timestamp) : null;
+    document.getElementById('timestamp').textContent = ts
+      ? 'Last validated: ' + ts.toLocaleString()
+      : '';
+
+    renderSummary(data.summary);
+
+    var zonesEl = document.getElementById('zones');
+    var sorted = sortDomains(data.zones);
+    zonesEl.innerHTML = sorted.map(function(d) {
+      return renderZone(d, data.zones[d]);
+    }).join('');
+
+    // Auto-expand zones that aren't passing
+    sorted.forEach(function(d) {
+      if (data.zones[d].overall !== 'pass') {
+        var el = document.getElementById('zone-' + d);
+        if (el) el.classList.add('open');
+      }
+    });
+  })
+  .catch(function(err) {
+    document.getElementById('loading').style.display = 'none';
+    var errEl = document.getElementById('error-msg');
+    errEl.style.display = '';
+    errEl.textContent = 'Failed to load validate.json: ' + err.message;
+  });
+</script>
+</body>
+</html>
