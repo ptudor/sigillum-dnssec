@@ -197,6 +197,18 @@ h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
   word-break: break-all;
 }
 
+.dynadot-solution.action-needed {
+  border-color: #ffcc80;
+  background: #fff3e0;
+}
+.dynadot-solution.action-needed .dynadot-solution-title {
+  color: #e65100;
+}
+.dynadot-solution.action-needed .dynadot-table th {
+  border-bottom-color: #ffcc80;
+  color: #e65100;
+}
+
 #loading { text-align: center; padding: 3rem; color: var(--text-secondary); }
 #error-msg {
   text-align: center;
@@ -269,12 +281,25 @@ function parseDSRecord(rec) {
   };
 }
 
-function renderDynadotSolution(records) {
+function renderDynadotSolution(dsCheck) {
+  var records = dsCheck.ds_records;
+  var expected = dsCheck.expected_ds;
+  var isActionNeeded = false;
+  var title = 'DS Record Fields';
+
+  // If no DS at parent but we have expected DS from local KSK, show that instead
+  if ((!records || records.length === 0) && expected && expected.length > 0) {
+    records = expected;
+    isActionNeeded = true;
+    title = 'Publish at Registrar';
+  }
+
   if (!records || records.length === 0) return '';
   var parsed = records.map(parseDSRecord).filter(function(p) { return p; });
   if (parsed.length === 0) return '';
-  var html = '<div class="dynadot-solution">';
-  html += '<div class="dynadot-solution-title">DS Record Fields</div>';
+  var cls = isActionNeeded ? 'dynadot-solution action-needed' : 'dynadot-solution';
+  var html = '<div class="' + cls + '">';
+  html += '<div class="dynadot-solution-title">' + escapeHtml(title) + '</div>';
   html += '<table class="dynadot-table"><tr><th>Tag</th><th>Algorithm</th><th>Digest Type</th><th>Digest</th></tr>';
   parsed.forEach(function(ds) {
     var algoLabel = escapeHtml(ds.algorithm) + (algoNames[ds.algorithm] ? ' (' + escapeHtml(algoNames[ds.algorithm]) + ')' : '');
@@ -348,7 +373,7 @@ function renderZone(domain, z) {
     renderCheck('RRSIG', z.rrsig_check, rrsigExtra) +
     renderCheck('SOA Serial', z.soa_check, soaExtra) +
     '</div>' +
-    renderDynadotSolution(z.ds_check.ds_records) +
+    renderDynadotSolution(z.ds_check) +
     '</div>' +
     '</div>';
 }
