@@ -29,6 +29,7 @@ type DSCheckResult struct {
 	MatchesKSK bool     `json:"matches_ksk"`
 	ParentNS   string   `json:"parent_ns"`
 	DSRecords  []string `json:"ds_records,omitempty"`
+	ExpectedDS []string `json:"expected_ds,omitempty"` // DS computed from local KSK (publish at registrar)
 	Details    string   `json:"details"`
 }
 
@@ -214,6 +215,19 @@ func (v *Validator) checkDSAtParent(domain string, localKSK *dns.DNSKEY) DSCheck
 		}
 	}
 
+	// Compute expected DS from local KSK (useful whether or not parent has DS)
+	var expectedDS *dns.DS
+	if localKSK != nil {
+		expectedDS = localKSK.ToDS(dns.SHA256)
+		if expectedDS != nil {
+			result.ExpectedDS = append(result.ExpectedDS, expectedDS.String())
+			// Also include SHA-384 for registrars that want digest type 4
+			if ds4 := localKSK.ToDS(dns.SHA384); ds4 != nil {
+				result.ExpectedDS = append(result.ExpectedDS, ds4.String())
+			}
+		}
+	}
+
 	if len(dsRecords) == 0 {
 		result.Status = "fail"
 		result.Found = false
@@ -224,13 +238,7 @@ func (v *Validator) checkDSAtParent(domain string, localKSK *dns.DNSKEY) DSCheck
 	result.Found = true
 
 	// Compare with local KSK if available
-	if localKSK != nil {
-		expectedDS := localKSK.ToDS(dns.SHA256)
-		if expectedDS == nil {
-			result.Status = "pass"
-			result.Details = fmt.Sprintf("%d DS record(s) found (could not compute local DS for comparison)", len(dsRecords))
-			return result
-		}
+	if expectedDS != nil {
 		for _, ds := range dsRecords {
 			if ds.KeyTag == expectedDS.KeyTag &&
 				ds.Algorithm == expectedDS.Algorithm &&
@@ -247,6 +255,10 @@ func (v *Validator) checkDSAtParent(domain string, localKSK *dns.DNSKEY) DSCheck
 			result.Status = "fail"
 			result.Details = fmt.Sprintf("DS records found but none match local KSK (tag %d)", expectedDS.KeyTag)
 		}
+	} else if localKSK != nil {
+		// Had a KSK but couldn't compute DS
+		result.Status = "pass"
+		result.Details = fmt.Sprintf("%d DS record(s) found (could not compute local DS for comparison)", len(dsRecords))
 	} else {
 		// Can't compare without local KSK, but DS exists
 		result.Status = "pass"
