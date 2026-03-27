@@ -313,23 +313,9 @@ function parseDSRecord(rec) {
   };
 }
 
-function renderDynadotSolution(dsCheck) {
-  var records = dsCheck.ds_records;
-  var expected = dsCheck.expected_ds;
-  var isActionNeeded = false;
-  var title = 'DS Record Fields';
-
-  // If no DS at parent but we have expected DS from local KSK, show that instead
-  if ((!records || records.length === 0) && expected && expected.length > 0) {
-    records = expected;
-    isActionNeeded = true;
-    title = 'Publish at Registrar';
-  }
-
-  if (!records || records.length === 0) return '';
+function renderDSTable(title, records, cls) {
   var parsed = records.map(parseDSRecord).filter(function(p) { return p; });
   if (parsed.length === 0) return '';
-  var cls = isActionNeeded ? 'dynadot-solution action-needed' : 'dynadot-solution';
   var html = '<div class="' + cls + '">';
   html += '<div class="dynadot-solution-title">' + escapeHtml(title) + '</div>';
   html += '<table class="dynadot-table"><tr><th>Tag</th><th>Algorithm</th><th>Digest Type</th><th>Digest</th></tr>';
@@ -339,6 +325,26 @@ function renderDynadotSolution(dsCheck) {
     html += '<tr><td>' + escapeHtml(ds.tag) + '</td><td>' + algoLabel + '</td><td>' + dtLabel + '</td><td>' + escapeHtml(ds.digest) + '</td></tr>';
   });
   html += '</table></div>';
+  return html;
+}
+
+function renderDynadotSolution(dsCheck) {
+  var records = dsCheck.ds_records;
+  var expected = dsCheck.expected_ds;
+  var hasParent = records && records.length > 0;
+  var hasExpected = expected && expected.length > 0;
+  var html = '';
+
+  if (hasParent) {
+    html += renderDSTable('DS Record Fields', records, 'dynadot-solution');
+  }
+
+  // Show local/expected DS when it differs from parent or parent has none
+  if (hasExpected && (!hasParent || !dsCheck.matches_ksk)) {
+    html += renderDSTable(hasParent ? 'Local Data — Publish at Registrar' : 'Publish at Registrar',
+      expected, 'dynadot-solution action-needed');
+  }
+
   return html;
 }
 
