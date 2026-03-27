@@ -209,6 +209,37 @@ h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
   color: #e65100;
 }
 
+#critical-alert {
+  display: none;
+  background: #b71c1c;
+  color: #fff;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+#critical-alert strong {
+  font-size: 1rem;
+  display: block;
+  margin-bottom: 0.3rem;
+}
+#critical-alert ul {
+  margin: 0.3rem 0 0 1.2rem;
+  padding: 0;
+}
+#critical-alert li {
+  margin-bottom: 0.15rem;
+}
+#critical-alert .critical-domain {
+  font-weight: 700;
+  font-family: monospace;
+}
+#critical-alert .critical-detail {
+  font-weight: 400;
+  font-size: 0.82rem;
+  opacity: 0.85;
+}
+
 #loading { text-align: center; padding: 3rem; color: var(--text-secondary); }
 #error-msg {
   text-align: center;
@@ -225,6 +256,7 @@ h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
 <h1>DNSSEC Validation Status</h1>
 <div class="meta" id="timestamp"></div>
 
+<div id="critical-alert"></div>
 <div id="loading">Loading validate.json...</div>
 <div id="error-msg"></div>
 <div id="summary" style="display:none"></div>
@@ -382,9 +414,44 @@ function toggleZone(header) {
   header.parentElement.classList.toggle('open');
 }
 
+function isServfail(z) {
+  // A zone is SERVFAIL-broken if DNSKEY/RRSIG/SOA all fail to resolve.
+  // This means validating resolvers will return SERVFAIL for the entire zone.
+  var checks = [z.dnskey_check, z.rrsig_check, z.soa_check];
+  return checks.every(function(c) {
+    return c.status === 'error' && /failed to resolve NS|no NS records found/i.test(c.details || '');
+  });
+}
+
+function renderCriticalAlert(zones) {
+  var critical = [];
+  for (var domain in zones) {
+    if (isServfail(zones[domain])) {
+      critical.push(domain);
+    }
+  }
+  if (critical.length === 0) return;
+
+  critical.sort();
+  var el = document.getElementById('critical-alert');
+  el.style.display = '';
+  var html = '<strong>SERVFAIL — NS resolution failure (' + critical.length + ' zone' + (critical.length > 1 ? 's' : '') + ')</strong>';
+  html += '<ul>';
+  critical.forEach(function(d) {
+    var detail = zones[d].dnskey_check.details || zones[d].soa_check.details || '';
+    html += '<li><span class="critical-domain">' + escapeHtml(d) + '</span> <span class="critical-detail">' + escapeHtml(detail) + '</span></li>';
+  });
+  html += '</ul>';
+  el.innerHTML = html;
+}
+
 function sortDomains(zones) {
   var order = { error: 0, fail: 1, partial: 2, pass: 3 };
   return Object.keys(zones).sort(function(a, b) {
+    // SERVFAIL zones always sort first
+    var sa = isServfail(zones[a]) ? -1 : 0;
+    var sb = isServfail(zones[b]) ? -1 : 0;
+    if (sa !== sb) return sa - sb;
     var oa = order[zones[a].overall] !== undefined ? order[zones[a].overall] : 2;
     var ob = order[zones[b].overall] !== undefined ? order[zones[b].overall] : 2;
     if (oa !== ob) return oa - ob;
@@ -405,6 +472,7 @@ fetch('validate.json')
       ? 'Last validated: ' + ts.toLocaleString()
       : '';
 
+    renderCriticalAlert(data.zones);
     renderSummary(data.summary);
 
     var zonesEl = document.getElementById('zones');
