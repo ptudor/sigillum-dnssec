@@ -182,6 +182,15 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 		result.SOACheck.Status,
 	)
 
+	// Override: if the authoritative NS is unreachable, the zone is broken
+	// regardless of whether DS exists at the parent. Validating resolvers
+	// will return SERVFAIL for every query to this zone.
+	if result.DNSKEYCheck.Status == "error" &&
+		result.RRSIGCheck.Status == "error" &&
+		result.SOACheck.Status == "error" {
+		result.Overall = "fail"
+	}
+
 	return result
 }
 
