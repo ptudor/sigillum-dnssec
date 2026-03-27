@@ -122,9 +122,16 @@ func (s *State) ReloadFromDisk() error {
 		return fmt.Errorf("parsing state file: %w", err)
 	}
 
-	// Merge: add any zones from disk that we don't have in memory (CLI additions)
+	// Merge zones from disk:
+	// - Add zones that only exist on disk (CLI additions via "add" command)
+	// - Update zones where disk has a more recent signing (CLI "resign"/"sign"
+	//   ran while daemon was running — adopt the fresher state so the daemon
+	//   doesn't overwrite it with stale in-memory data on next Save)
 	for domain, diskZone := range diskState.Zones {
-		if _, exists := s.Zones[domain]; !exists {
+		memZone, exists := s.Zones[domain]
+		if !exists {
+			s.Zones[domain] = diskZone
+		} else if diskZone.LastSigned.After(memZone.LastSigned) {
 			s.Zones[domain] = diskZone
 		}
 	}

@@ -365,6 +365,14 @@ func runSign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("signing failed: %w", err)
 	}
 
+	// Execute post-sign hook once after all zones are signed
+	if cfg.Hooks.PostSign != "" || len(cfg.Hooks.PostSignCmd) > 0 {
+		slog.Info("[CLI] Executing post-sign hook")
+		if err := executeHookSync(&cfg.Hooks); err != nil {
+			slog.Error("[CLI] Post-sign hook failed", "error", err)
+		}
+	}
+
 	// Output status
 	jsonData, err := state.ToJSON()
 	if err != nil {
