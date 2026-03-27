@@ -164,6 +164,39 @@ h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
   word-break: break-all;
 }
 
+.dynadot-solution {
+  margin-top: 0.5rem;
+  border: 1px solid #bbdefb;
+  background: #e3f2fd;
+  border-radius: 4px;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.8rem;
+}
+.dynadot-solution-title {
+  font-weight: 600;
+  font-size: 0.78rem;
+  margin-bottom: 0.3rem;
+  color: #1565c0;
+}
+.dynadot-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+.dynadot-table th {
+  text-align: left;
+  padding: 0.2rem 0.4rem;
+  border-bottom: 1px solid #90caf9;
+  font-weight: 600;
+  color: #1565c0;
+}
+.dynadot-table td {
+  padding: 0.2rem 0.4rem;
+  border-bottom: 1px solid #e0e0e0;
+  font-family: monospace;
+  word-break: break-all;
+}
+
 #loading { text-align: center; padding: 3rem; color: var(--text-secondary); }
 #error-msg {
   text-align: center;
@@ -216,6 +249,42 @@ function renderSummary(summary) {
     '<div class="summary-card error"><span class="count">' + summary.error + '</span>Error</div>';
 }
 
+var algoNames = {
+  '5': 'RSA/SHA-1', '7': 'RSASHA1-NSEC3-SHA1', '8': 'RSA/SHA-256',
+  '10': 'RSA/SHA-512', '13': 'ECDSA P-256/SHA-256', '14': 'ECDSA P-384/SHA-384',
+  '15': 'ED25519', '16': 'ED448'
+};
+var digestNames = { '1': 'SHA-1', '2': 'SHA-256', '4': 'SHA-384' };
+
+function parseDSRecord(rec) {
+  // Format: "domain. TTL IN DS keytag algorithm digesttype digest"
+  var parts = rec.trim().split(/\s+/);
+  var dsIdx = parts.indexOf('DS');
+  if (dsIdx < 0 || dsIdx + 4 > parts.length) return null;
+  return {
+    tag: parts[dsIdx + 1],
+    algorithm: parts[dsIdx + 2],
+    digestType: parts[dsIdx + 3],
+    digest: parts.slice(dsIdx + 4).join('')
+  };
+}
+
+function renderDynadotSolution(records) {
+  if (!records || records.length === 0) return '';
+  var parsed = records.map(parseDSRecord).filter(function(p) { return p; });
+  if (parsed.length === 0) return '';
+  var html = '<div class="dynadot-solution">';
+  html += '<div class="dynadot-solution-title">Solution: At Dynadot</div>';
+  html += '<table class="dynadot-table"><tr><th>Tag</th><th>Algorithm</th><th>Digest Type</th><th>Digest</th></tr>';
+  parsed.forEach(function(ds) {
+    var algoLabel = escapeHtml(ds.algorithm) + (algoNames[ds.algorithm] ? ' (' + escapeHtml(algoNames[ds.algorithm]) + ')' : '');
+    var dtLabel = escapeHtml(ds.digestType) + (digestNames[ds.digestType] ? ' (' + escapeHtml(digestNames[ds.digestType]) + ')' : '');
+    html += '<tr><td>' + escapeHtml(ds.tag) + '</td><td>' + algoLabel + '</td><td>' + dtLabel + '</td><td>' + escapeHtml(ds.digest) + '</td></tr>';
+  });
+  html += '</table></div>';
+  return html;
+}
+
 function renderDSRecords(records) {
   if (!records || records.length === 0) return '';
   return '<div class="ds-records">' + records.map(escapeHtml).join('\n') + '</div>';
@@ -237,7 +306,7 @@ function renderZone(domain, z) {
   dsFields += '<dt>Matches KSK</dt><dd>' + boolStr(z.ds_check.matches_ksk) + '</dd>';
   if (z.ds_check.parent_ns) dsFields += '<dt>Parent NS</dt><dd>' + escapeHtml(z.ds_check.parent_ns) + '</dd>';
   dsFields += '</dl>';
-  dsExtra = dsFields + renderDSRecords(z.ds_check.ds_records);
+  dsExtra = dsFields + renderDSRecords(z.ds_check.ds_records) + renderDynadotSolution(z.ds_check.ds_records);
 
   var dnskeyExtra = '<dl class="check-fields">';
   dnskeyExtra += '<dt>KSK visible</dt><dd>' + boolStr(z.dnskey_check.ksk_found) + '</dd>';
