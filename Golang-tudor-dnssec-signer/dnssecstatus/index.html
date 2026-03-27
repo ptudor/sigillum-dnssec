@@ -274,7 +274,7 @@ function renderDynadotSolution(records) {
   var parsed = records.map(parseDSRecord).filter(function(p) { return p; });
   if (parsed.length === 0) return '';
   var html = '<div class="dynadot-solution">';
-  html += '<div class="dynadot-solution-title">Solution: At Dynadot</div>';
+  html += '<div class="dynadot-solution-title">DS Record Fields</div>';
   html += '<table class="dynadot-table"><tr><th>Tag</th><th>Algorithm</th><th>Digest Type</th><th>Digest</th></tr>';
   parsed.forEach(function(ds) {
     var algoLabel = escapeHtml(ds.algorithm) + (algoNames[ds.algorithm] ? ' (' + escapeHtml(algoNames[ds.algorithm]) + ')' : '');
@@ -306,7 +306,7 @@ function renderZone(domain, z) {
   dsFields += '<dt>Matches KSK</dt><dd>' + boolStr(z.ds_check.matches_ksk) + '</dd>';
   if (z.ds_check.parent_ns) dsFields += '<dt>Parent NS</dt><dd>' + escapeHtml(z.ds_check.parent_ns) + '</dd>';
   dsFields += '</dl>';
-  dsExtra = dsFields + renderDSRecords(z.ds_check.ds_records) + renderDynadotSolution(z.ds_check.ds_records);
+  dsExtra = dsFields + renderDSRecords(z.ds_check.ds_records);
 
   var dnskeyExtra = '<dl class="check-fields">';
   dnskeyExtra += '<dt>KSK visible</dt><dd>' + boolStr(z.dnskey_check.ksk_found) + '</dd>';
@@ -348,6 +348,7 @@ function renderZone(domain, z) {
     renderCheck('RRSIG', z.rrsig_check, rrsigExtra) +
     renderCheck('SOA Serial', z.soa_check, soaExtra) +
     '</div>' +
+    renderDynadotSolution(z.ds_check.ds_records) +
     '</div>' +
     '</div>';
 }
