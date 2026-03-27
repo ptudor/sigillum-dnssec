@@ -328,7 +328,7 @@ function renderDSTable(title, records, cls) {
   return html;
 }
 
-function renderDynadotSolution(dsCheck) {
+function renderDynadotSolution(dsCheck, overall) {
   var records = dsCheck.ds_records;
   var expected = dsCheck.expected_ds;
   var hasParent = records && records.length > 0;
@@ -339,10 +339,14 @@ function renderDynadotSolution(dsCheck) {
     html += renderDSTable('DS Record Fields', records, 'dynadot-solution');
   }
 
-  // Show local/expected DS when it differs from parent or parent has none
-  if (hasExpected && (!hasParent || !dsCheck.matches_ksk)) {
-    html += renderDSTable(hasParent ? 'Local Data — Publish at Registrar' : 'Publish at Registrar',
-      expected, 'dynadot-solution action-needed');
+  // Show local/expected DS when:
+  // - DS not found at parent (need to publish)
+  // - DS doesn't match local KSK (need to update)
+  // - Zone is failing (need full picture for debugging)
+  if (hasExpected && (!hasParent || !dsCheck.matches_ksk || overall === 'fail')) {
+    var title = !hasParent ? 'Publish at Registrar' : 'Local Data';
+    if (!dsCheck.matches_ksk && hasParent) title = 'Local Data — Publish at Registrar';
+    html += renderDSTable(title, expected, 'dynadot-solution action-needed');
   }
 
   return html;
@@ -411,7 +415,7 @@ function renderZone(domain, z) {
     renderCheck('RRSIG', z.rrsig_check, rrsigExtra) +
     renderCheck('SOA Serial', z.soa_check, soaExtra) +
     '</div>' +
-    renderDynadotSolution(z.ds_check) +
+    renderDynadotSolution(z.ds_check, z.overall) +
     '</div>' +
     '</div>';
 }
