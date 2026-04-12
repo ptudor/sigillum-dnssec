@@ -321,14 +321,13 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) error {
 	// Send heartbeat for signing start
 	d.heartbeat.SigningStart(domain)
 
-	// Initialize zone state if new
+	// Initialize zone state if new — but first try to recover existing key
+	// files from disk. If key files already exist (e.g., state was lost but
+	// keys survive), reuse them to preserve the DS chain of trust. Generating
+	// new keys when a published DS still references the old key causes SERVFAIL.
 	if zoneState == nil {
 		keyGen := NewKeyGenerator(snap.cfg)
-		ksk, err := keyGen.GenerateKSK(domain)
-		if err != nil {
-			return err
-		}
-		zsk, err := keyGen.GenerateZSK(domain)
+		ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 		if err != nil {
 			return err
 		}

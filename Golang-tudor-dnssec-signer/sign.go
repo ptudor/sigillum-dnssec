@@ -35,16 +35,13 @@ func (s *Signer) SignAll() error {
 	for domain, zoneCfg := range s.cfg.Zones {
 		zoneState := s.state.GetZone(domain)
 
-		// Initialize zone if not in state
+		// Initialize zone if not in state — recover existing keys from disk
+		// first to preserve the DS chain of trust.
 		if zoneState == nil {
 			keyGen := NewKeyGenerator(s.cfg)
-			ksk, err := keyGen.GenerateKSK(domain)
+			ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 			if err != nil {
-				return fmt.Errorf("generating KSK for %s: %w", domain, err)
-			}
-			zsk, err := keyGen.GenerateZSK(domain)
-			if err != nil {
-				return fmt.Errorf("generating ZSK for %s: %w", domain, err)
+				return fmt.Errorf("initializing keys for %s: %w", domain, err)
 			}
 			zoneState = &ZoneState{
 				Path: zoneCfg.Path,

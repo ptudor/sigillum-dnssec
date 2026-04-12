@@ -161,6 +161,11 @@ func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
 
+	// Back up existing key files before overwriting to prevent silent key
+	// material loss. If we're about to overwrite a KSK whose key tag matches
+	// a DS record at the registrar, the backup is the only way to recover.
+	kg.backupExistingKeyFiles(domain, keyType, baseName)
+
 	// Write public key file (.key) in BIND format
 	keyFile := baseName + ".key"
 	keyContent := fmt.Sprintf("; Key tag: %d\n; Algorithm: %s\n; Created: %s\n%s\n",
@@ -185,6 +190,59 @@ func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 	return nil
 }
 
+// backupExistingKeyFiles checks for pre-existing key files and backs them up
+// with the key tag in the filename (matching rollover's backup convention)
+// before they are overwritten by new key generation.
+func (kg *KeyGenerator) backupExistingKeyFiles(domain, keyType, baseName string) {
+	keyFile := baseName + ".key"
+	privFile := baseName + ".private"
+
+	// Check if key file exists
+	keyData, err := os.ReadFile(keyFile)
+	if err != nil {
+		return // No existing key file, nothing to back up
+	}
+
+	// Parse existing DNSKEY to get its key tag for the backup filename
+	existingKey, err := parseDNSKEYFromFile(string(keyData))
+	if err != nil {
+		slog.Warn("[KEY] Cannot parse existing key file for backup, renaming with .bak",
+			"domain", domain, "type", keyType, "error", err)
+		// Fall back to .bak suffix
+		os.Rename(keyFile, keyFile+".bak")
+		os.Rename(privFile, privFile+".bak")
+		return
+	}
+
+	existingTag := existingKey.KeyTag()
+	keysDir := kg.cfg.KeysDir()
+	backupBase := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, existingTag))
+
+	// Don't overwrite an existing backup (from a prior rollover)
+	if _, err := os.Stat(backupBase + ".key"); err == nil {
+		slog.Debug("[KEY] Backup already exists, skipping",
+			"domain", domain, "type", keyType, "key_tag", existingTag)
+		return
+	}
+
+	if err := os.Rename(keyFile, backupBase+".key"); err != nil {
+		slog.Warn("[KEY] Failed to back up public key file",
+			"domain", domain, "type", keyType, "error", err)
+		return
+	}
+	if err := os.Rename(privFile, backupBase+".private"); err != nil {
+		slog.Warn("[KEY] Failed to back up private key file",
+			"domain", domain, "type", keyType, "error", err)
+		// Try to restore the public key rename
+		os.Rename(backupBase+".key", keyFile)
+		return
+	}
+
+	slog.Warn("[KEY] Backed up existing key files before overwrite",
+		"domain", domain, "type", keyType, "old_key_tag", existingTag,
+		"backup", backupBase)
+}
+
 // formatPrivateKey formats a private key in BIND-compatible format
 func formatPrivateKey(dnskey *dns.DNSKEY, privateKey []byte) string {
 	return fmt.Sprintf(`Private-key-format: v1.3
@@ -196,6 +254,128 @@ Created: %s
 		AlgorithmName(dnskey.Algorithm),
 		base64.StdEncoding.EncodeToString(privateKey),
 		time.Now().UTC().Format("20060102150405"))
+}
+
+// RecoverKeyState attempts to load an existing key pair from disk and reconstruct
+// a KeyState from it. This is used when a zone has no state entry but key files
+// already exist on disk — recovering the existing keys preserves the DS chain of
+// trust instead of generating new keys that would cause a SERVFAIL.
+//
+// Returns nil (no error) if key files don't exist — the caller should generate
+// new keys in that case. Returns an error only if files exist but are corrupt.
+func (kg *KeyGenerator) RecoverKeyState(domain string, isKSK bool) (*KeyState, error) {
+	var keyType string
+	var lifetime time.Duration
+	if isKSK {
+		keyType = "ksk"
+		lifetime = kg.cfg.GetZoneKSKLifetime(domain)
+	} else {
+		keyType = "zsk"
+		lifetime = kg.cfg.GetZoneZSKLifetime(domain)
+	}
+
+	keysDir := kg.cfg.KeysDir()
+	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
+	keyFile := baseName + ".key"
+	privFile := baseName + ".private"
+
+	// Check if both key files exist
+	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+		return nil, nil // No key files, caller should generate
+	}
+	if _, err := os.Stat(privFile); os.IsNotExist(err) {
+		return nil, nil // Missing private key, caller should generate
+	}
+
+	// Try to load and validate the key pair
+	dnskey, _, err := kg.loadKeyPairFromPath(baseName)
+	if err != nil {
+		return nil, fmt.Errorf("existing %s key files are corrupt: %w", keyType, err)
+	}
+
+	keyTag := dnskey.KeyTag()
+
+	// Parse creation date from key file comments ("; Created: <RFC3339>")
+	created := kg.parseKeyFileCreatedDate(keyFile)
+
+	// Reconstruct KeyState with recovered metadata
+	state := &KeyState{
+		ID:          keyTag,
+		Algorithm:   AlgorithmName(dnskey.Algorithm),
+		Created:     created,
+		Expires:     created.Add(lifetime),
+		RolloverDue: created.Add(time.Duration(float64(lifetime) * 0.75)),
+	}
+
+	slog.Warn("[KEY] Recovered existing key from disk (state was missing)",
+		"domain", domain, "type", keyType, "key_tag", keyTag,
+		"algorithm", state.Algorithm, "created", created.Format(time.RFC3339))
+
+	return state, nil
+}
+
+// parseKeyFileCreatedDate extracts the creation timestamp from a key file's
+// comment header. Returns the file's mtime as fallback if parsing fails.
+func (kg *KeyGenerator) parseKeyFileCreatedDate(keyFile string) time.Time {
+	data, err := os.ReadFile(keyFile)
+	if err != nil {
+		return kg.keyFileMtime(keyFile)
+	}
+
+	for _, line := range splitLines(string(data)) {
+		if strings.HasPrefix(line, "; Created: ") {
+			dateStr := strings.TrimPrefix(line, "; Created: ")
+			if t, err := time.Parse(time.RFC3339, dateStr); err == nil {
+				return t
+			}
+		}
+	}
+
+	return kg.keyFileMtime(keyFile)
+}
+
+// keyFileMtime returns a file's modification time, or time.Now() as last resort.
+func (kg *KeyGenerator) keyFileMtime(path string) time.Time {
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Now().UTC()
+	}
+	return info.ModTime().UTC()
+}
+
+// recoverOrGenerateKeys attempts to recover existing key files from disk before
+// falling back to generating new keys. This prevents DS chain of trust breakage
+// when a zone's state entry is lost but key files still exist on disk.
+func recoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *KeyState, zsk *KeyState, err error) {
+	// Try to recover KSK from disk
+	ksk, err = keyGen.RecoverKeyState(domain, true)
+	if err != nil {
+		slog.Error("[KEY] Existing KSK files are corrupt, generating new KSK",
+			"domain", domain, "error", err)
+		ksk = nil
+	}
+	if ksk == nil {
+		ksk, err = keyGen.GenerateKSK(domain)
+		if err != nil {
+			return nil, nil, fmt.Errorf("generating KSK for %s: %w", domain, err)
+		}
+	}
+
+	// Try to recover ZSK from disk
+	zsk, err = keyGen.RecoverKeyState(domain, false)
+	if err != nil {
+		slog.Error("[KEY] Existing ZSK files are corrupt, generating new ZSK",
+			"domain", domain, "error", err)
+		zsk = nil
+	}
+	if zsk == nil {
+		zsk, err = keyGen.GenerateZSK(domain)
+		if err != nil {
+			return nil, nil, fmt.Errorf("generating ZSK for %s: %w", domain, err)
+		}
+	}
+
+	return ksk, zsk, nil
 }
 
 // LoadKeyPair loads a key pair from disk

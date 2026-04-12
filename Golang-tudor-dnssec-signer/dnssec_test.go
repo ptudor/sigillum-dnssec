@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1197,3 +1198,247 @@ ns1	IN	A	192.0.2.1
 		})
 	}
 }
+
+// TestRecoverKeyState tests that existing key files are recovered instead of
+// regenerated when zone state is missing.
+func TestRecoverKeyState(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+
+	// Generate initial keys
+	origKSK, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateKSK failed: %v", err)
+	}
+	origZSK, err := keyGen.GenerateZSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateZSK failed: %v", err)
+	}
+
+	// Now "lose" the state — recover from disk
+	recoveredKSK, err := keyGen.RecoverKeyState("example.com", true)
+	if err != nil {
+		t.Fatalf("RecoverKeyState(ksk) failed: %v", err)
+	}
+	if recoveredKSK == nil {
+		t.Fatal("RecoverKeyState(ksk) returned nil, expected recovery from existing files")
+	}
+	if recoveredKSK.ID != origKSK.ID {
+		t.Errorf("Recovered KSK key tag mismatch: got %d, want %d", recoveredKSK.ID, origKSK.ID)
+	}
+	if recoveredKSK.Algorithm != origKSK.Algorithm {
+		t.Errorf("Recovered KSK algorithm mismatch: got %s, want %s", recoveredKSK.Algorithm, origKSK.Algorithm)
+	}
+
+	recoveredZSK, err := keyGen.RecoverKeyState("example.com", false)
+	if err != nil {
+		t.Fatalf("RecoverKeyState(zsk) failed: %v", err)
+	}
+	if recoveredZSK == nil {
+		t.Fatal("RecoverKeyState(zsk) returned nil, expected recovery from existing files")
+	}
+	if recoveredZSK.ID != origZSK.ID {
+		t.Errorf("Recovered ZSK key tag mismatch: got %d, want %d", recoveredZSK.ID, origZSK.ID)
+	}
+}
+
+// TestRecoverKeyStateNoFiles tests that RecoverKeyState returns nil when no
+// key files exist, allowing the caller to generate new keys.
+func TestRecoverKeyStateNoFiles(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+
+	// No key files exist — should return nil, nil
+	recovered, err := keyGen.RecoverKeyState("nonexistent.com", true)
+	if err != nil {
+		t.Fatalf("RecoverKeyState should not error for missing files: %v", err)
+	}
+	if recovered != nil {
+		t.Error("RecoverKeyState should return nil for missing files")
+	}
+}
+
+// TestRecoverKeyStateCorruptFiles tests that RecoverKeyState returns an error
+// when key files exist but are corrupt.
+func TestRecoverKeyStateCorruptFiles(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+
+	// Write garbage key files
+	baseName := filepath.Join(cfg.KeysDir(), "corrupt.com.ksk")
+	os.WriteFile(baseName+".key", []byte("not a valid DNSKEY"), 0644)
+	os.WriteFile(baseName+".private", []byte("not a valid private key"), 0600)
+
+	keyGen := NewKeyGenerator(cfg)
+	_, err := keyGen.RecoverKeyState("corrupt.com", true)
+	if err == nil {
+		t.Fatal("RecoverKeyState should return error for corrupt key files")
+	}
+}
+
+// TestRecoverOrGenerateKeysPreservesExisting tests the full recoverOrGenerateKeys
+// flow: when key files exist on disk, they are reused and NOT overwritten.
+func TestRecoverOrGenerateKeysPreservesExisting(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+	if err := ensureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("Failed to create output dir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+
+	// Generate original keys (simulates initial setup)
+	origKSK, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateKSK failed: %v", err)
+	}
+	origZSK, err := keyGen.GenerateZSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateZSK failed: %v", err)
+	}
+
+	// Now call recoverOrGenerateKeys (simulates daemon finding zone with no state)
+	ksk, zsk, err := recoverOrGenerateKeys(keyGen, "example.com")
+	if err != nil {
+		t.Fatalf("recoverOrGenerateKeys failed: %v", err)
+	}
+
+	// Key tags must match originals — NOT be new keys
+	if ksk.ID != origKSK.ID {
+		t.Errorf("recoverOrGenerateKeys generated new KSK (tag %d) instead of recovering existing (tag %d)",
+			ksk.ID, origKSK.ID)
+	}
+	if zsk.ID != origZSK.ID {
+		t.Errorf("recoverOrGenerateKeys generated new ZSK (tag %d) instead of recovering existing (tag %d)",
+			zsk.ID, origZSK.ID)
+	}
+}
+
+// TestRecoverOrGenerateKeysNewDomain tests that recoverOrGenerateKeys generates
+// new keys when no key files exist (truly new domain).
+func TestRecoverOrGenerateKeysNewDomain(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+
+	// No pre-existing keys — should generate fresh ones
+	ksk, zsk, err := recoverOrGenerateKeys(keyGen, "brand-new.com")
+	if err != nil {
+		t.Fatalf("recoverOrGenerateKeys failed: %v", err)
+	}
+	if ksk == nil || zsk == nil {
+		t.Fatal("recoverOrGenerateKeys should return non-nil keys for new domain")
+	}
+	if ksk.ID == 0 {
+		t.Error("Generated KSK should have non-zero key tag")
+	}
+	if zsk.ID == 0 {
+		t.Error("Generated ZSK should have non-zero key tag")
+	}
+}
+
+// TestBackupExistingKeyFiles tests that existing key files are backed up with
+// the key tag in the filename before being overwritten by new key generation.
+func TestBackupExistingKeyFiles(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+
+	// Generate initial KSK
+	origKSK, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateKSK failed: %v", err)
+	}
+	origTag := origKSK.ID
+
+	// Generate a NEW KSK (this should back up the original)
+	newKSK, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("Second GenerateKSK failed: %v", err)
+	}
+
+	// Verify new key is different
+	if newKSK.ID == origTag {
+		// Key tags can theoretically collide; skip check in that rare case
+		t.Log("Key tags happened to match (rare collision), skipping tag comparison")
+	}
+
+	// Verify backup files exist with old key tag
+	backupBase := filepath.Join(cfg.KeysDir(), fmt.Sprintf("example.com.ksk.%d", origTag))
+	if _, err := os.Stat(backupBase + ".key"); os.IsNotExist(err) {
+		t.Errorf("Backup public key file not found: %s.key", backupBase)
+	}
+	if _, err := os.Stat(backupBase + ".private"); os.IsNotExist(err) {
+		t.Errorf("Backup private key file not found: %s.private", backupBase)
+	}
+
+	// Verify the backup contains the original key (load it and check tag)
+	backupKey, _, err := keyGen.loadKeyPairByID("example.com", "ksk", origTag)
+	if err != nil {
+		t.Fatalf("Failed to load backup key: %v", err)
+	}
+	if backupKey.KeyTag() != origTag {
+		t.Errorf("Backup key tag mismatch: got %d, want %d", backupKey.KeyTag(), origTag)
+	}
+}
+
+// TestRecoverKeyStateCreatedDate tests that the creation date is correctly
+// parsed from the key file comment header.
+func TestRecoverKeyStateCreatedDate(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+
+	beforeGenerate := time.Now().UTC().Add(-1 * time.Second)
+	_, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateKSK failed: %v", err)
+	}
+	afterGenerate := time.Now().UTC().Add(1 * time.Second)
+
+	recovered, err := keyGen.RecoverKeyState("example.com", true)
+	if err != nil {
+		t.Fatalf("RecoverKeyState failed: %v", err)
+	}
+
+	if recovered.Created.Before(beforeGenerate) || recovered.Created.After(afterGenerate) {
+		t.Errorf("Recovered created date %v not within expected range [%v, %v]",
+			recovered.Created, beforeGenerate, afterGenerate)
+	}
+}
+
