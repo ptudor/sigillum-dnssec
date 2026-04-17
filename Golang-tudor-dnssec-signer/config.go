@@ -49,7 +49,7 @@ func (r RegistrarConfig) DigestType() uint8 {
 // RegistrarDynadotConfig holds settings for the Dynadot API adapter.
 type RegistrarDynadotConfig struct {
 	Enabled     bool     `toml:"enabled"`
-	APIKey      string   `toml:"api_key"`      // prefer DYNADOT_API_KEY env var
+	APIKey      string   `toml:"api_key"`      // required; keep config file mode 0640 or stricter
 	Sandbox     bool     `toml:"sandbox"`      // true → api-sandbox.dynadot.com
 	Timeout     Duration `toml:"timeout"`      // default 30s
 	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
