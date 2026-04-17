@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -26,21 +25,18 @@ type DynadotClient struct {
 	http     *http.Client
 }
 
-// NewDynadotClient constructs a client from a RegistrarDynadotConfig. It
-// resolves the API key from config or the DYNADOT_API_KEY environment
-// variable and returns an error if neither source produces a value.
+// NewDynadotClient constructs a client from a RegistrarDynadotConfig. The
+// API key must be set in the config file (which is expected to be mode
+// 0640 or stricter); there is no environment-variable fallback.
 func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, fmt.Errorf("dynadot registrar is not enabled")
 	}
 
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("dynadot api_key not set in config")
+	}
 	apiKey := cfg.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("DYNADOT_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("dynadot api_key not set (config or DYNADOT_API_KEY env)")
-	}
 
 	endpoint := "https://api.dynadot.com/api3.json"
 	if cfg.Sandbox {

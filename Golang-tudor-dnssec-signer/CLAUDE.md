@@ -76,8 +76,9 @@ Design constraints:
 - Failures to reach the registrar are logged and surfaced in status output,
   but never cause signing itself to fail. The zone keeps serving the old
   signed output.
-- API keys live in the config file (mode 0600) or the `DYNADOT_API_KEY`
-  environment variable. They are never printed in logs or status output.
+- API keys live in the config file, which must be mode 0640 or stricter
+  (root-owned, group-readable by the daemon user). They are never printed
+  in logs or status output.
 
 ## Command Line Interface
 
@@ -151,7 +152,7 @@ listen = "127.0.0.1:8053"
 # Zones reference a registrar by its key (e.g. `registrar = "dynadot"`).
 [registrar.dynadot]
 enabled = true
-api_key = ""                    # Prefer DYNADOT_API_KEY env var in production
+api_key = ""                    # required; protect with config file mode 0640
 sandbox = false                 # true → api-sandbox.dynadot.com (safe for testing)
 timeout = "30s"
 auto_publish = true             # Push DS automatically on add/rollover events
