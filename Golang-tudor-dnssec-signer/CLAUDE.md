@@ -50,11 +50,34 @@ This tool exists because every DNSSEC solution is either:
 
 ### What It Does NOT Do
 
-- Talk to registrars (you copy-paste DS records yourself)
 - Support NSEC3 opt-out or other complex configurations
 - Manage your primary/secondary topology
 - Support HSMs or PKCS#11
 - Run as anything other than a single daemon on one machine
+
+### What It Optionally Does (Registrar Integration)
+
+Normally, updating the DS record at your registrar is a copy-paste job. For
+registrars with a documented public API, an **opt-in** registrar module can
+push/verify DS records automatically.
+
+Supported registrars:
+
+- **Dynadot** — via the public `api3.json` API (`set_dnssec`, `get_dnssec`,
+  `clear_dnssec`). Requires an API key issued in the Dynadot control panel
+  under *Tools → API*.
+
+Design constraints:
+
+- Registrar integration is **opt-in per zone** — a zone with no
+  `registrar = "..."` line behaves exactly as before (copy-paste DS yourself).
+- The signer never deletes old DS records unprompted. Removal happens only as
+  part of a `rollover complete` that the operator explicitly runs.
+- Failures to reach the registrar are logged and surfaced in status output,
+  but never cause signing itself to fail. The zone keeps serving the old
+  signed output.
+- API keys live in the config file (mode 0600) or the `DYNADOT_API_KEY`
+  environment variable. They are never printed in logs or status output.
 
 ## Command Line Interface
 
@@ -87,6 +110,12 @@ dnssec-tudor rollover complete example.com # Finalize after DS updated
 # Export for registrar
 dnssec-tudor ds example.com                # Print DS records
 dnssec-tudor dnskey example.com            # Print DNSKEY records
+
+# Registrar API (opt-in; requires [registrar.*] config + zone "registrar" field)
+dnssec-tudor registrar get example.com     # Show DS records currently at registrar
+dnssec-tudor registrar push example.com    # Push expected DS records to registrar
+dnssec-tudor registrar verify example.com  # Compare expected vs actual DS records
+dnssec-tudor registrar clear example.com   # Remove all DS records at registrar
 ```
 
 ## Configuration
@@ -118,10 +147,21 @@ enabled = false
 listen = "127.0.0.1:8053"
 # No auth by default — bind to localhost and proxy if you need it
 
+# Optional registrar API integration. Each sub-section configures one registrar.
+# Zones reference a registrar by its key (e.g. `registrar = "dynadot"`).
+[registrar.dynadot]
+enabled = true
+api_key = ""                    # Prefer DYNADOT_API_KEY env var in production
+sandbox = false                 # true → api-sandbox.dynadot.com (safe for testing)
+timeout = "30s"
+auto_publish = true             # Push DS automatically on add/rollover events
+# digest_type = 2               # Digest algorithm for DS: 2 (SHA-256, default) or 4 (SHA-384)
+
 # Zone definitions — explicit paths, can be anywhere
 # Supports hierarchical organization: zones/net/ptudor/zone.db
 [zones.ptudor.net]
 path = "/etc/dnssec-tudor/zones/net/ptudor/zone.db"
+registrar = "dynadot"           # Opt-in: push DS via the registrar above
 
 [zones.ptudor.com]
 path = "/etc/dnssec-tudor/zones/com/ptudor/zone.db"
@@ -129,6 +169,7 @@ ksk_lifetime = "5y"  # Override: I'm extra lazy about this one
 
 [zones.example.org]
 path = "/srv/dns/org/example/zone.db"  # Can live anywhere
+# (no registrar field — DS must be copy-pasted to the registrar manually)
 
 # Hook to run after signing (e.g., reload NSD)
 [hooks]
@@ -244,6 +285,65 @@ Old KSK removed. Rollover complete.
 ```
 
 The daemon will remind you (in status output) if a rollover is pending.
+
+## Registrar API Integration (Optional)
+
+When a zone has `registrar = "dynadot"` and the registrar is configured with
+`auto_publish = true`, the signer automatically manages DS records at the
+registrar during key-state transitions.
+
+### Adapter Contract
+
+Every registrar adapter implements:
+
+```go
+type Registrar interface {
+    Name() string
+    GetDS(ctx context.Context, domain string) ([]*dns.DS, error)
+    // ReplaceDS sets the registrar's DS record set for `domain` to exactly
+    // the records provided. Implementations may clear-then-set if their
+    // upstream API has no atomic "replace" operation; callers must be aware
+    // that a brief (seconds) window with no DS can occur.
+    ReplaceDS(ctx context.Context, domain string, ds []*dns.DS) error
+    // AddDS additively publishes DS records alongside any existing ones.
+    // Used at KSK rollover start so the old DS is never briefly absent.
+    AddDS(ctx context.Context, domain string, ds []*dns.DS) error
+}
+```
+
+### When DS records are touched
+
+| Event                           | Operation at registrar          |
+|---------------------------------|---------------------------------|
+| `add` (new zone)                | `ReplaceDS([new KSK])`          |
+| `import` (existing keys)        | none (verify only, never push)  |
+| `rollover start` (KSK/algo)     | `AddDS([new KSK])`              |
+| `rollover complete` (KSK/algo)  | `ReplaceDS([new KSK])`          |
+| ZSK rollover                    | nothing — ZSK doesn't touch DS  |
+
+`import` is intentionally read-only because the registrar already has the
+correct DS (that's how validation is working); pushing would risk wiping it
+on a transient API error.
+
+### Dynadot adapter specifics
+
+- Endpoint: `https://api.dynadot.com/api3.json` (or `api-sandbox.dynadot.com`)
+- Auth: `key=<API key>` query parameter. **The URL is never logged** — the
+  adapter logs the command name and domain only.
+- `AddDS` calls `set_dnssec` once per DS record.
+- `ReplaceDS` calls `clear_dnssec` then `set_dnssec` for each new DS record.
+  This has a brief window with no DS at the registrar; this is only used at
+  KSK rollover *complete*, where the old DNSKEY is already retired.
+- `GetDS` calls `get_dnssec` and parses the returned DS / DNSKEY list.
+
+### Failure semantics
+
+- Registrar failures are logged with `[REGISTRAR]` prefix and added to the
+  zone's `warnings` array in the status output.
+- A registrar failure **never prevents signing**. A zone that can't reach its
+  registrar just keeps serving the same signed output, same as before.
+- The CLI `registrar push` / `registrar verify` commands report errors
+  directly and exit non-zero, so cron jobs can detect drift.
 
 ## Directory Structure
 
