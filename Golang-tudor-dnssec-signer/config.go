@@ -24,6 +24,35 @@ type Config struct {
 	Validation   ValidateConfig        `toml:"validate"`
 	Zones        map[string]ZoneConfig `toml:"zones"`
 	Hooks        HooksConfig           `toml:"hooks"`
+	Registrar    RegistrarConfig       `toml:"registrar"`
+}
+
+// RegistrarConfig groups all registrar adapter settings. Each sub-struct is
+// opt-in via its own Enabled field; a zone binds to one adapter by name via
+// ZoneConfig.Registrar.
+type RegistrarConfig struct {
+	DigestTypeVal int                     `toml:"digest_type"` // 2 = SHA-256 (default), 4 = SHA-384
+	Dynadot       RegistrarDynadotConfig  `toml:"dynadot"`
+}
+
+// DigestType returns the DS digest algorithm to use when pushing DS records.
+// Defaults to SHA-256 (type 2) when unset or invalid.
+func (r RegistrarConfig) DigestType() uint8 {
+	switch r.DigestTypeVal {
+	case 4:
+		return 4
+	default:
+		return 2
+	}
+}
+
+// RegistrarDynadotConfig holds settings for the Dynadot API adapter.
+type RegistrarDynadotConfig struct {
+	Enabled     bool     `toml:"enabled"`
+	APIKey      string   `toml:"api_key"`      // prefer DYNADOT_API_KEY env var
+	Sandbox     bool     `toml:"sandbox"`      // true → api-sandbox.dynadot.com
+	Timeout     Duration `toml:"timeout"`      // default 30s
+	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
 }
 
 // ValidateConfig holds settings for internet DNSSEC validation checks
@@ -80,6 +109,7 @@ type ZoneConfig struct {
 	KSKLifetime Duration `toml:"ksk_lifetime,omitempty"`
 	ZSKLifetime Duration `toml:"zsk_lifetime,omitempty"`
 	Algorithm   string   `toml:"algorithm,omitempty"` // Per-zone algorithm override for algorithm rollover
+	Registrar   string   `toml:"registrar,omitempty"` // Opt-in registrar adapter name, e.g. "dynadot"
 }
 
 // HooksConfig holds hook settings
@@ -202,6 +232,14 @@ func DefaultConfig() *Config {
 		},
 		Zones: make(map[string]ZoneConfig),
 		Hooks: HooksConfig{},
+		Registrar: RegistrarConfig{
+			DigestTypeVal: 2,
+			Dynadot: RegistrarDynadotConfig{
+				Enabled:     false,
+				Timeout:     Duration{30 * time.Second},
+				AutoPublish: true,
+			},
+		},
 	}
 }
 
@@ -293,6 +331,16 @@ func (c *Config) Validate() error {
 		}
 		if _, err := os.Stat(zone.Path); os.IsNotExist(err) {
 			return fmt.Errorf("zone file for %q does not exist: %s", domain, zone.Path)
+		}
+		if zone.Registrar != "" {
+			switch strings.ToLower(zone.Registrar) {
+			case "dynadot":
+				if !c.Registrar.Dynadot.Enabled {
+					return fmt.Errorf("zone %q references registrar=\"dynadot\" but [registrar.dynadot] is not enabled", domain)
+				}
+			default:
+				return fmt.Errorf("zone %q references unknown registrar %q (supported: dynadot)", domain, zone.Registrar)
+			}
 		}
 	}
 

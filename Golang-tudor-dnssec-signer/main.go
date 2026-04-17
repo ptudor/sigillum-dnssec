@@ -175,6 +175,37 @@ visibility at authoritative nameservers, and SOA serial consistency.`,
 	}
 	dnskeyCmd.Flags().Bool("json", false, "Output in JSON format")
 
+	// registrar command group
+	registrarCmd := &cobra.Command{
+		Use:   "registrar",
+		Short: "Interact with a configured registrar API (opt-in per zone)",
+	}
+	registrarGetCmd := &cobra.Command{
+		Use:   "get <domain>",
+		Short: "Show DS records currently published at the registrar",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runRegistrarGet,
+	}
+	registrarPushCmd := &cobra.Command{
+		Use:   "push <domain>",
+		Short: "Push expected DS records to the registrar (idempotent)",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runRegistrarPush,
+	}
+	registrarVerifyCmd := &cobra.Command{
+		Use:   "verify <domain>",
+		Short: "Compare expected vs published DS records (exit 1 on drift)",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runRegistrarVerify,
+	}
+	registrarClearCmd := &cobra.Command{
+		Use:   "clear <domain>",
+		Short: "Remove all DS records at the registrar",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runRegistrarClear,
+	}
+	registrarCmd.AddCommand(registrarGetCmd, registrarPushCmd, registrarVerifyCmd, registrarClearCmd)
+
 	// import command
 	var importKSK, importZSK string
 	importCmd := &cobra.Command{
@@ -200,7 +231,7 @@ dnssec-tudor's format, and set up the zone for management.`,
 	importCmd.MarkFlagRequired("zsk")
 
 	// Add all commands
-	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, resignCmd, statusCmd, validateCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd, importCmd)
+	rootCmd.AddCommand(versionCmd, serveCmd, signCmd, resignCmd, statusCmd, validateCmd, addCmd, removeCmd, rolloverCmd, dsCmd, dnskeyCmd, importCmd, registrarCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -620,6 +651,10 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	dsOutput := FormatDSRecordsFromKey(domain, kskKey)
 	fmt.Println(dsOutput)
 
+	// If a registrar is configured for this zone and auto-publish is on,
+	// push the DS record automatically. Failures are non-fatal.
+	maybeAutoPublishDS(cfg, state, domain, "add")
+
 	return nil
 }
 
@@ -694,6 +729,8 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println(FormatDSRecordsFromKey(domain, kskKey))
 	fmt.Printf("\nOnce the new DS is published, run: dnssec-tudor rollover complete %s\n", domain)
+
+	maybeAutoPublishDS(cfg, state, domain, "rollover_start")
 
 	return nil
 }
@@ -776,6 +813,8 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
+	maybeAutoPublishDS(cfg, state, domain, "rollover_complete")
+
 	return nil
 }
 
@@ -836,6 +875,8 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 	fmt.Println(ds.String())
 	fmt.Println()
 	fmt.Printf("After the new DS propagates, run: dnssec-tudor rollover complete %s\n", domain)
+
+	maybeAutoPublishDS(cfg, state, domain, "rollover_start")
 
 	return nil
 }
