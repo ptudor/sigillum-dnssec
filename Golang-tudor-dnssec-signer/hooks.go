@@ -99,6 +99,66 @@ func executeHook(hooks *HooksConfig, env *HookEnv) {
 	}()
 }
 
+// executeBatchHook runs a post-sign hook once for a batch of signed
+// domains. Used by the daemon when coalesce_post_sign is enabled so a
+// single cycle that signs N zones produces one hook invocation rather
+// than N. The hook receives `DNSSEC_DOMAINS` (space-separated) instead
+// of the per-zone `DNSSEC_DOMAIN` — consumers like `nsd-control reload`
+// don't need per-zone paths, and a full reload is cheaper than N
+// targeted reloads at scale. A zero-length domains slice is a no-op.
+func executeBatchHook(hooks *HooksConfig, domains []string, outputDir string) {
+	name, args, identity, ok := hookCmd(hooks)
+	if !ok || len(domains) == 0 {
+		return
+	}
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "hook", identity, "batch_size", len(domains))
+			}
+		}()
+
+		startTime := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		slog.Debug("[HOOK] Executing batched hook", "hook", identity, "batch_size", len(domains))
+
+		command := exec.CommandContext(ctx, name, args...)
+		command.Stdout = io.Discard
+		var stderrBuf bytes.Buffer
+		command.Stderr = &stderrBuf
+
+		// DNSSEC_DOMAINS is the batched counterpart of DNSSEC_DOMAIN.
+		// Consumers that used $DNSSEC_DOMAIN in per-zone hooks need to
+		// switch to iterating $DNSSEC_DOMAINS, or just issue a reload-all.
+		command.Env = append(os.Environ(),
+			fmt.Sprintf("DNSSEC_DOMAINS=%s", strings.Join(domains, " ")),
+			fmt.Sprintf("DNSSEC_BATCH_SIZE=%d", len(domains)),
+			fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", outputDir),
+		)
+
+		if err := command.Run(); err != nil {
+			duration := time.Since(startTime).Seconds()
+			RecordHookExecution("post_sign_batch", duration, false)
+			stderr := strings.TrimSpace(stderrBuf.String())
+			if ctx.Err() == context.DeadlineExceeded {
+				slog.Error("[HOOK] Batched hook timed out", "hook", identity, "batch_size", len(domains))
+			} else if stderr != "" {
+				slog.Error("[HOOK] Batched hook failed", "hook", identity, "batch_size", len(domains), "error", err, "stderr", stderr)
+			} else {
+				slog.Error("[HOOK] Batched hook failed", "hook", identity, "batch_size", len(domains), "error", err)
+			}
+			return
+		}
+
+		duration := time.Since(startTime).Seconds()
+		RecordHookExecution("post_sign_batch", duration, true)
+		slog.Debug("[HOOK] Batched hook completed", "hook", identity, "batch_size", len(domains), "duration_ms", int64(duration*1000))
+	}()
+}
+
 // executeHookSync runs a hook synchronously and returns the error.
 // Used for CLI commands where we want to wait for completion.
 func executeHookSync(hooks *HooksConfig) error {
