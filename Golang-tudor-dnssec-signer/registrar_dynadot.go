@@ -35,6 +35,7 @@ type DynadotClient struct {
 	apiSecret string
 	baseURL   string
 	http      *http.Client
+	limiter   *slidingLimiter
 }
 
 // NewDynadotClient validates credentials and constructs a client. The adapter
@@ -67,6 +68,7 @@ func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
 		apiSecret: cfg.APISecret,
 		baseURL:   baseURL,
 		http:      &http.Client{Timeout: timeout},
+		limiter:   newSlidingLimiter(),
 	}, nil
 }
 
@@ -116,6 +118,12 @@ type apiError struct {
 // verbatim so operators can see exact text like "The domain doesn't
 // support DNSSEC." in logs.
 func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
+	// Gate every outgoing request through the sliding-scale limiter so
+	// bursts self-throttle before Dynadot's 60/min cap kicks in with a 429.
+	if c.limiter != nil {
+		c.limiter.gate()
+	}
+
 	var bodyBytes []byte
 	if body != nil {
 		var err error

@@ -120,9 +120,10 @@ type ZoneConfig struct {
 
 // HooksConfig holds hook settings
 type HooksConfig struct {
-	PostSign    string   `toml:"post_sign"`     // Shell command (requires shell = true) or simple command
-	PostSignCmd []string `toml:"post_sign_cmd"` // Exec-style command+args (preferred, no shell)
-	Shell       bool     `toml:"shell"`         // Use sh -c for post_sign string (default false)
+	PostSign         string   `toml:"post_sign"`          // Shell command (requires shell = true) or simple command
+	PostSignCmd      []string `toml:"post_sign_cmd"`      // Exec-style command+args (preferred, no shell)
+	Shell            bool     `toml:"shell"`              // Use sh -c for post_sign string (default false)
+	CoalescePostSign bool     `toml:"coalesce_post_sign"` // Fire hook once per cycle after all zones sign, with DNSSEC_DOMAINS set
 }
 
 // Duration wraps time.Duration for TOML parsing

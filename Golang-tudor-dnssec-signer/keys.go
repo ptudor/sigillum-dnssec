@@ -287,10 +287,14 @@ func (kg *KeyGenerator) RecoverKeyState(domain string, isKSK bool) (*KeyState, e
 		return nil, nil // Missing private key, caller should generate
 	}
 
-	// Try to load and validate the key pair
+	// Try to load and validate the key pair. A read failure here (e.g.
+	// permission denied from a root-owned file) is reported as "cannot
+	// read" rather than "corrupt" — callers decide whether to regenerate
+	// based on the error type, and misclassifying permission issues as
+	// corruption previously led to silent KSK regeneration.
 	dnskey, _, err := kg.loadKeyPairFromPath(baseName)
 	if err != nil {
-		return nil, fmt.Errorf("existing %s key files are corrupt: %w", keyType, err)
+		return nil, fmt.Errorf("cannot read existing %s key files: %w", keyType, err)
 	}
 
 	keyTag := dnskey.KeyTag()

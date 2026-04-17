@@ -177,7 +177,14 @@ path = "/srv/dns/org/example/zone.db"  # Can live anywhere
 
 # Hook to run after signing (e.g., reload NSD)
 [hooks]
-post_sign = "systemctl reload nsd"
+# post_sign     — string form, split on whitespace unless shell=true
+# post_sign_cmd — exec-style array, preferred, no shell
+# coalesce_post_sign — fire once per cycle with DNSSEC_DOMAINS env var
+#                       instead of per-zone DNSSEC_DOMAIN. Recommended
+#                       when managing 100+ zones so a signing pass
+#                       produces one nsd-control reload, not N.
+post_sign = "/usr/local/sbin/nsd-control reload"
+coalesce_post_sign = true
 ```
 
 ## JSON Output Schema
@@ -350,9 +357,12 @@ on a transient API error.
 - `GetDS` parses `data.dnssec_info_list` — note that Dynadot returns
   `algorithm` and `digest_type` as strings, so the adapter converts them
   back to numeric DNS field values.
-- Rate limit: regular accounts are capped at 1 req/sec. The adapter
-  issues requests serially, which stays within the limit for the small
-  (≤3) request counts involved in any DS operation.
+- Rate limit: regular accounts are capped at 60 req/min. The adapter
+  uses a sliding-scale limiter — 100ms gap for the first 20 requests
+  in a burst, 500ms for the next 20, 2s thereafter; the counter resets
+  after 60s of no calls. This stays burst-friendly for normal rollover
+  work (≤3 calls) while self-throttling any bulk push that would
+  otherwise hit Dynadot's 429 ceiling.
 
 ### Failure semantics
 

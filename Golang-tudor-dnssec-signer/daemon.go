@@ -268,8 +268,17 @@ func (d *Daemon) signAllZones() {
 
 	slog.Debug("[DAEMON] Checking zones for signing", "count", len(snap.cfg.Zones))
 
+	// Track successfully-signed zones so we can fire one batched post-sign
+	// hook at the end of the cycle when coalesce_post_sign is enabled.
+	// With N=3000 zones, coalescing turns 3000 nsd-control reload calls
+	// (one per zone) into exactly one, at the cost of losing the per-zone
+	// DNSSEC_DOMAIN env var. Consumers get DNSSEC_DOMAINS (space-list) and
+	// DNSSEC_BATCH_SIZE instead.
+	var signedDomains []string
 	for domain := range snap.cfg.Zones {
-		d.checkAndSignZoneSafe(snap, domain)
+		if d.checkAndSignZoneSafe(snap, domain) {
+			signedDomains = append(signedDomains, domain)
+		}
 	}
 
 	// Check for automatic ZSK rollovers
@@ -288,24 +297,35 @@ func (d *Daemon) signAllZones() {
 		slog.Error("[DAEMON] Failed to save state", "error", err)
 	}
 
+	// Fire the coalesced post-sign hook after state is saved — this way
+	// any consumer that introspects state.json sees the just-signed zones.
+	if snap.cfg.Hooks.CoalescePostSign && len(signedDomains) > 0 {
+		executeBatchHook(&snap.cfg.Hooks, signedDomains, snap.cfg.OutputDir)
+	}
+
 	// Update Prometheus metrics
 	UpdateZoneMetrics(snap.state)
 }
 
 // checkAndSignZoneSafe wraps checkAndSignZone with per-zone panic recovery
 // so a panic in one zone doesn't prevent other zones from being signed.
-func (d *Daemon) checkAndSignZoneSafe(snap snapshot, domain string) {
+// Returns true when the zone was signed this invocation so the caller can
+// include it in a batched post-sign hook.
+func (d *Daemon) checkAndSignZoneSafe(snap snapshot, domain string) (signed bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("[DAEMON] Panic signing zone (recovered, other zones unaffected)", "domain", domain, "panic", r)
+			signed = false
 		}
 	}()
-	if err := d.checkAndSignZone(snap, domain); err != nil {
+	signed, err := d.checkAndSignZone(snap, domain)
+	if err != nil {
 		slog.Error("[DAEMON] Failed to sign zone", "domain", domain, "error", err)
 	}
+	return signed
 }
 
-func (d *Daemon) checkAndSignZone(snap snapshot, domain string) error {
+func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	zoneState := snap.state.GetZone(domain)
 
 	// Check if zone needs signing
@@ -313,7 +333,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) error {
 	needsSign, reason := snap.signer.NeedsSign(domain, zoneCfg.Path, zoneState)
 	if !needsSign {
 		slog.Debug("[DAEMON] Zone does not need signing", "domain", domain, "path", zoneCfg.Path)
-		return nil
+		return false, nil
 	}
 
 	slog.Info("[DAEMON] Signing zone", "domain", domain, "reason", reason)
@@ -329,7 +349,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) error {
 		keyGen := NewKeyGenerator(snap.cfg)
 		ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 		if err != nil {
-			return err
+			return false, err
 		}
 		zoneState = &ZoneState{
 			Path: zoneCfg.Path,
@@ -345,25 +365,28 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) error {
 		zoneState.AddError(err.Error())
 		RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
 		d.heartbeat.SigningError(domain)
-		return err
+		return false, err
 	}
 
 	// Clear errors on success and send completion heartbeat
 	zoneState.ClearErrors()
 	d.heartbeat.SigningComplete(domain, zoneState.Serial)
 
-	// Execute post-sign hook
-	if snap.cfg.Hooks.PostSign != "" || len(snap.cfg.Hooks.PostSignCmd) > 0 {
-		hookEnv := &HookEnv{
-			Domain:     domain,
-			ZonePath:   zoneCfg.Path,
-			SignedPath: filepath.Join(snap.cfg.OutputDir, domain+".zone.signed"),
-			OutputDir:  snap.cfg.OutputDir,
+	// Execute per-zone post-sign hook only when NOT coalescing — the caller
+	// will fire one batched hook at end-of-cycle when coalesce is on.
+	if !snap.cfg.Hooks.CoalescePostSign {
+		if snap.cfg.Hooks.PostSign != "" || len(snap.cfg.Hooks.PostSignCmd) > 0 {
+			hookEnv := &HookEnv{
+				Domain:     domain,
+				ZonePath:   zoneCfg.Path,
+				SignedPath: filepath.Join(snap.cfg.OutputDir, domain+".zone.signed"),
+				OutputDir:  snap.cfg.OutputDir,
+			}
+			executeHook(&snap.cfg.Hooks, hookEnv)
 		}
-		executeHook(&snap.cfg.Hooks, hookEnv)
 	}
 
-	return nil
+	return true, nil
 }
 
 func (d *Daemon) runWebServer() {
