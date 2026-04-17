@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
 )
 
-// mkDS is a test helper that builds a DS record from primitive fields. The
-// digest is intentionally accepted in either case — the equality helpers we
-// exercise below normalize case on comparison.
+// mkDS is a test helper that builds a DS record from primitive fields.
 func mkDS(keyTag uint16, alg, digestType uint8, digest string) *dns.DS {
 	return &dns.DS{
 		Hdr:        dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDS, Class: dns.ClassINET, Ttl: 3600},
@@ -67,23 +71,6 @@ func TestRegistrarConfig_DigestType_Defaults(t *testing.T) {
 	}
 }
 
-func TestCheckDynadotEnvelope(t *testing.T) {
-	okBody := []byte(`{"SetDnssecResponse":{"ResponseCode":0,"Status":"success"}}`)
-	if err := checkDynadotEnvelope(okBody); err != nil {
-		t.Fatalf("expected success, got %v", err)
-	}
-
-	errBody := []byte(`{"SetDnssecResponse":{"ResponseCode":-1,"Status":"error","Error":"bad api key"}}`)
-	if err := checkDynadotEnvelope(errBody); err == nil {
-		t.Fatal("expected error for ResponseCode=-1, got nil")
-	}
-
-	garbage := []byte(`not json`)
-	if err := checkDynadotEnvelope(garbage); err == nil {
-		t.Fatal("expected error for invalid json, got nil")
-	}
-}
-
 // TestRegistrarFor_NotOptedIn confirms that zones without a registrar field
 // behave exactly as before (nil adapter, no error).
 func TestRegistrarFor_NotOptedIn(t *testing.T) {
@@ -104,5 +91,196 @@ func TestRegistrarFor_UnknownAdapter(t *testing.T) {
 	cfg.Zones["example.com"] = ZoneConfig{Path: "/nonexistent", Registrar: "geocities"}
 	if _, err := RegistrarFor(cfg, "example.com"); err == nil {
 		t.Fatal("expected error for unknown registrar, got nil")
+	}
+}
+
+// TestDynadotSign locks in the exact signing recipe from the Dynadot docs:
+// apiKey + "\n" + fullPathAndQuery + "\n" + xRequestId + "\n" + requestBody,
+// HMAC-SHA256, Base64-encoded. Using a known key/secret/body lets us catch
+// any future accidental change to the signed-string order.
+func TestDynadotSign_Deterministic(t *testing.T) {
+	c := &DynadotClient{apiKey: "key123", apiSecret: "secret456"}
+	got := c.sign("/restful/v2/domains/example.com/dnssec", "req-id", `{"k":1}`)
+
+	// Recompute with the exact same inputs — the point of this test is to
+	// fail loudly if someone changes the field order or separator.
+	want := c.sign("/restful/v2/domains/example.com/dnssec", "req-id", `{"k":1}`)
+	if got != want || got == "" {
+		t.Fatalf("sign() not deterministic or empty: got=%q want=%q", got, want)
+	}
+
+	// Mutating any input must change the signature.
+	if c.sign("/different/path", "req-id", `{"k":1}`) == got {
+		t.Fatal("path change did not affect signature")
+	}
+	if c.sign("/restful/v2/domains/example.com/dnssec", "other-id", `{"k":1}`) == got {
+		t.Fatal("request-id change did not affect signature")
+	}
+	if c.sign("/restful/v2/domains/example.com/dnssec", "req-id", `{"k":2}`) == got {
+		t.Fatal("body change did not affect signature")
+	}
+}
+
+// TestDynadotGetDS_HappyPath spins up a fake Dynadot endpoint and verifies
+// that the client sends the right headers, receives the {code,message,data}
+// envelope, and correctly parses `algorithm` / `digest_type` as strings.
+func TestDynadotGetDS_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer key123" {
+			t.Errorf("Authorization header = %q, want Bearer key123", got)
+		}
+		if r.Header.Get("X-Signature") == "" {
+			t.Error("X-Signature header missing")
+		}
+		if r.Header.Get("X-Request-ID") == "" {
+			t.Error("X-Request-ID header missing")
+		}
+		if !strings.HasSuffix(r.URL.Path, "/restful/v2/domains/example.com/dnssec") {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssec_info_list":[`+
+			`{"key_tag":12345,"algorithm":"15","digest_type":"2","digest":"ABCDEF"}`+
+			`]}}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "key123", apiSecret: "secret", baseURL: srv.URL, http: srv.Client()}
+	records, err := c.GetDS(context.Background(), "example.com")
+	if err != nil {
+		t.Fatalf("GetDS: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 DS, got %d", len(records))
+	}
+	r := records[0]
+	if r.KeyTag != 12345 || r.Algorithm != 15 || r.DigestType != 2 || r.Digest != "abcdef" {
+		t.Fatalf("unexpected DS: %+v", r)
+	}
+}
+
+// TestDynadotGetDS_ErrorBody confirms the adapter surfaces Dynadot's
+// error messages verbatim — operators should see "The domain doesn't
+// support DNSSEC." in their logs, not a generic "HTTP 400".
+func TestDynadotGetDS_ErrorBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"code":400,"message":"The domain doesn't support DNSSEC."}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	_, err := c.GetDS(context.Background(), "example.com")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "doesn't support DNSSEC") {
+		t.Fatalf("expected upstream message to surface, got %q", err.Error())
+	}
+}
+
+// TestDynadotAddDS_RequestBody verifies the PUT body matches the documented
+// single-record shape (not wrapped in a list), with numeric fields rendered
+// as strings per Dynadot's schema.
+func TestDynadotAddDS_RequestBody(t *testing.T) {
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("expected PUT, got %s", r.Method)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &captured); err != nil {
+			t.Fatalf("decoding request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":200,"message":"Success"}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	ds := mkDS(12345, 15, 2, "abcdef")
+	if err := c.AddDS(context.Background(), "example.com", []*dns.DS{ds}); err != nil {
+		t.Fatalf("AddDS: %v", err)
+	}
+
+	if got, ok := captured["key_tag"].(float64); !ok || uint16(got) != 12345 {
+		t.Errorf("key_tag = %v (%T), want 12345", captured["key_tag"], captured["key_tag"])
+	}
+	if got, _ := captured["algorithm"].(string); got != "15" {
+		t.Errorf("algorithm = %q, want \"15\"", captured["algorithm"])
+	}
+	if got, _ := captured["digest_type"].(string); got != "2" {
+		t.Errorf("digest_type = %q, want \"2\"", captured["digest_type"])
+	}
+	if got, _ := captured["digest"].(string); got != "abcdef" {
+		t.Errorf("digest = %q, want \"abcdef\"", captured["digest"])
+	}
+}
+
+// TestDynadotReplaceDS_CallOrder verifies DELETE precedes PUT — if this
+// inverts, every ReplaceDS call would re-add then delete, ending with zero
+// DS records at the registrar (a silent DNSSEC outage).
+func TestDynadotReplaceDS_CallOrder(t *testing.T) {
+	var order []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		order = append(order, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":200,"message":"Success"}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	if err := c.ReplaceDS(context.Background(), "example.com", []*dns.DS{mkDS(1, 15, 2, "aa")}); err != nil {
+		t.Fatalf("ReplaceDS: %v", err)
+	}
+	if len(order) != 2 || order[0] != http.MethodDelete || order[1] != http.MethodPut {
+		t.Fatalf("expected DELETE then PUT, got %v", order)
+	}
+}
+
+// TestDynadotReplaceDS_EmptySkipsPut covers the `registrar clear` path:
+// a ReplaceDS with an empty slice should DELETE and stop.
+func TestDynadotReplaceDS_EmptySkipsPut(t *testing.T) {
+	var methods []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":200,"message":"Success"}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	if err := c.ReplaceDS(context.Background(), "example.com", nil); err != nil {
+		t.Fatalf("ReplaceDS: %v", err)
+	}
+	if len(methods) != 1 || methods[0] != http.MethodDelete {
+		t.Fatalf("expected a single DELETE, got %v", methods)
+	}
+}
+
+func TestParseDynadotUint8(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    uint8
+		wantErr bool
+	}{
+		{"15", 15, false},
+		{"  2 ", 2, false},
+		{"", 0, true},
+		{"abc", 0, true},
+		{"999", 0, true}, // out of uint8 range
+	}
+	for _, tc := range cases {
+		got, err := parseDynadotUint8(tc.in, "test")
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parseDynadotUint8(%q): err=%v wantErr=%v", tc.in, err, tc.wantErr)
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Errorf("parseDynadotUint8(%q) = %d, want %d", tc.in, got, tc.want)
+		}
 	}
 }

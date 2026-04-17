@@ -63,9 +63,11 @@ push/verify DS records automatically.
 
 Supported registrars:
 
-- **Dynadot** — via the public `api3.json` API (`set_dnssec`, `get_dnssec`,
-  `clear_dnssec`). Requires an API key issued in the Dynadot control panel
-  under *Tools → API*.
+- **Dynadot** — via the `restful/v2` API (`GET`/`PUT`/`DELETE` on
+  `/restful/v2/domains/{domain}/dnssec`). Requires an **API key** and an
+  **API secret** issued under *Tools → API* in the Dynadot control panel.
+  The key goes in the `Authorization: Bearer ...` header; the secret is
+  the HMAC-SHA256 key for the required `X-Signature` header.
 
 Design constraints:
 
@@ -153,6 +155,7 @@ listen = "127.0.0.1:8053"
 [registrar.dynadot]
 enabled = true
 api_key = ""                    # required; protect with config file mode 0640
+api_secret = ""                 # required; HMAC-SHA256 key for X-Signature
 sandbox = false                 # true → api-sandbox.dynadot.com (safe for testing)
 timeout = "30s"
 auto_publish = true             # Push DS automatically on add/rollover events
@@ -328,14 +331,28 @@ on a transient API error.
 
 ### Dynadot adapter specifics
 
-- Endpoint: `https://api.dynadot.com/api3.json` (or `api-sandbox.dynadot.com`)
-- Auth: `key=<API key>` query parameter. **The URL is never logged** — the
-  adapter logs the command name and domain only.
-- `AddDS` calls `set_dnssec` once per DS record.
-- `ReplaceDS` calls `clear_dnssec` then `set_dnssec` for each new DS record.
-  This has a brief window with no DS at the registrar; this is only used at
-  KSK rollover *complete*, where the old DNSKEY is already retired.
-- `GetDS` calls `get_dnssec` and parses the returned DS / DNSKEY list.
+- Endpoint: `https://api.dynadot.com/restful/v2` (or `api-sandbox.dynadot.com`).
+- Paths:
+  - `GET    /restful/v2/domains/{domain}/dnssec` → returns `data.dnssec_info_list[]`
+  - `PUT    /restful/v2/domains/{domain}/dnssec` → accepts a **single** DS
+    record per request (upsert by `key_tag`)
+  - `DELETE /restful/v2/domains/{domain}/dnssec` → wipes the DS set
+- Auth headers: `Authorization: Bearer <api_key>` plus a mandatory
+  `X-Signature` computed as
+  `base64(HMAC-SHA256(api_secret, api_key + "\n" + fullPathAndQuery + "\n" + xRequestId + "\n" + requestBody))`.
+  Each request also carries a random `X-Request-ID` (UUIDv4) for operator
+  trace correlation. Neither the key nor the secret is ever logged.
+- `AddDS` issues one `PUT` per record (Dynadot's PUT accepts a single
+  record body and upserts by key tag).
+- `ReplaceDS` issues a `DELETE` then one `PUT` per desired record. This
+  has a brief window with no DS at the registrar; used only at rollover
+  *complete*, where the old DNSKEY is already retired.
+- `GetDS` parses `data.dnssec_info_list` — note that Dynadot returns
+  `algorithm` and `digest_type` as strings, so the adapter converts them
+  back to numeric DNS field values.
+- Rate limit: regular accounts are capped at 1 req/sec. The adapter
+  issues requests serially, which stays within the limit for the small
+  (≤3) request counts involved in any DS operation.
 
 ### Failure semantics
 
