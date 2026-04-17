@@ -47,9 +47,15 @@ func (r RegistrarConfig) DigestType() uint8 {
 }
 
 // RegistrarDynadotConfig holds settings for the Dynadot API adapter.
+//
+// The restful/v2 API requires both a key and a secret: the key goes in the
+// Authorization header, the secret is the HMAC-SHA256 key used to compute
+// the X-Signature header. Both are issued under Tools → API in the Dynadot
+// control panel (separate values for sandbox vs production).
 type RegistrarDynadotConfig struct {
 	Enabled     bool     `toml:"enabled"`
 	APIKey      string   `toml:"api_key"`      // required; keep config file mode 0640 or stricter
+	APISecret   string   `toml:"api_secret"`   // required; HMAC key for X-Signature
 	Sandbox     bool     `toml:"sandbox"`      // true → api-sandbox.dynadot.com
 	Timeout     Duration `toml:"timeout"`      // default 30s
 	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
