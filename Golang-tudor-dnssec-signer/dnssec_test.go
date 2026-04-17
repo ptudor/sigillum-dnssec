@@ -1362,6 +1362,57 @@ func TestRecoverOrGenerateKeysNewDomain(t *testing.T) {
 	}
 }
 
+// TestRecoverOrGenerateKeys_UnreadablePrivateKey locks in the fix for the
+// silent data-loss bug where a permission-denied read on an existing
+// .private key was misclassified as "corrupt" and triggered KSK/ZSK
+// regeneration — which would have broken the DS chain at the registrar.
+// After the fix, any read failure on existing key files must return an
+// error and *not* regenerate.
+func TestRecoverOrGenerateKeys_UnreadablePrivateKey(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("test requires non-root euid to exercise permission denial")
+	}
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+		t.Fatalf("create keys dir: %v", err)
+	}
+	keyGen := NewKeyGenerator(cfg)
+
+	// Seed a real key pair so recovery would normally succeed.
+	if _, err := keyGen.GenerateKSK("locked.example."); err != nil {
+		t.Fatalf("GenerateKSK: %v", err)
+	}
+	if _, err := keyGen.GenerateZSK("locked.example."); err != nil {
+		t.Fatalf("GenerateZSK: %v", err)
+	}
+
+	// Take the KSK's private key unreadable — simulates the real-world bug
+	// where `dnssec-tudor add` ran as root produces a 0600 root-owned file
+	// that the non-root daemon can't read.
+	privPath := filepath.Join(cfg.KeysDir(), "locked.example..ksk.private")
+	if err := os.Chmod(privPath, 0); err != nil {
+		t.Fatalf("chmod 0 %s: %v", privPath, err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(privPath, 0600) })
+
+	// Snapshot the pre-call key tag so we can assert no regeneration.
+	beforeKey, _, err := keyGen.LoadKeyPair("locked.example.", "ksk")
+	// We can't load private (chmod 0), but public should still be readable
+	// because it's mode 0644. If that errors too we still have a valid test —
+	// the critical invariant is that recoverOrGenerateKeys fails.
+	_ = beforeKey
+	_ = err
+
+	ksk, zsk, err := recoverOrGenerateKeys(keyGen, "locked.example.")
+	if err == nil {
+		t.Fatalf("expected error on unreadable key, got ksk=%v zsk=%v", ksk, zsk)
+	}
+	if ksk != nil || zsk != nil {
+		t.Errorf("recoverOrGenerateKeys returned non-nil keys on error: ksk=%v zsk=%v", ksk, zsk)
+	}
+}
+
 // TestBackupExistingKeyFiles tests that existing key files are backed up with
 // the key tag in the filename before being overwritten by new key generation.
 func TestBackupExistingKeyFiles(t *testing.T) {

@@ -142,5 +142,11 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	// Mirror the ownership helper so rollover backups written under a
+	// root CLI invocation stay readable by the daemon user.
+	chownToTarget(dst)
+	return nil
 }

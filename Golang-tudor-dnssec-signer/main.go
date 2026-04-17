@@ -309,6 +309,10 @@ func loadConfigAndState() (*Config, *State, error) {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
 
+	// Capture the data_dir owner before any writes so CLI commands run as
+	// root will chown what they create. No-op for non-root invocations.
+	InitOwnershipTarget(cfg.DataDir)
+
 	state, err := LoadState(cfg.StatePath())
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading state: %w", err)
