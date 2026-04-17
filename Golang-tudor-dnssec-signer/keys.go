@@ -174,7 +174,7 @@ func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 		time.Now().UTC().Format(time.RFC3339),
 		dnskey.String())
 
-	if err := os.WriteFile(keyFile, []byte(keyContent), 0644); err != nil {
+	if err := writeFileOwned(keyFile, []byte(keyContent), 0644); err != nil {
 		return fmt.Errorf("writing public key file: %w", err)
 	}
 
@@ -182,7 +182,7 @@ func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 	privFile := baseName + ".private"
 	privContent := formatPrivateKey(dnskey, privateKey)
 
-	if err := os.WriteFile(privFile, []byte(privContent), 0600); err != nil {
+	if err := writeFileOwned(privFile, []byte(privContent), 0600); err != nil {
 		return fmt.Errorf("writing private key file: %w", err)
 	}
 
@@ -346,13 +346,20 @@ func (kg *KeyGenerator) keyFileMtime(path string) time.Time {
 // recoverOrGenerateKeys attempts to recover existing key files from disk before
 // falling back to generating new keys. This prevents DS chain of trust breakage
 // when a zone's state entry is lost but key files still exist on disk.
+//
+// If the key files exist but cannot be read or parsed, this function now
+// returns an error rather than regenerating — silently minting a new KSK
+// over an unreadable existing one breaks the DS chain at the registrar and
+// causes SERVFAIL until the operator notices. Regeneration is reserved for
+// the "no key files present" case only. An operator who truly wants new
+// keys should `dnssec-tudor remove <domain>` + re-add.
 func recoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *KeyState, zsk *KeyState, err error) {
-	// Try to recover KSK from disk
 	ksk, err = keyGen.RecoverKeyState(domain, true)
 	if err != nil {
-		slog.Error("[KEY] Existing KSK files are corrupt, generating new KSK",
-			"domain", domain, "error", err)
-		ksk = nil
+		slog.Error("[KEY] Existing KSK files present but unreadable; refusing to regenerate",
+			"domain", domain, "error", err,
+			"hint", "check file permissions / ownership, or remove the zone and re-add to mint fresh keys")
+		return nil, nil, fmt.Errorf("KSK recovery failed for %s (refusing to regenerate): %w", domain, err)
 	}
 	if ksk == nil {
 		ksk, err = keyGen.GenerateKSK(domain)
@@ -361,12 +368,12 @@ func recoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *KeyState, 
 		}
 	}
 
-	// Try to recover ZSK from disk
 	zsk, err = keyGen.RecoverKeyState(domain, false)
 	if err != nil {
-		slog.Error("[KEY] Existing ZSK files are corrupt, generating new ZSK",
-			"domain", domain, "error", err)
-		zsk = nil
+		slog.Error("[KEY] Existing ZSK files present but unreadable; refusing to regenerate",
+			"domain", domain, "error", err,
+			"hint", "check file permissions / ownership, or remove the zone and re-add to mint fresh keys")
+		return nil, nil, fmt.Errorf("ZSK recovery failed for %s (refusing to regenerate): %w", domain, err)
 	}
 	if zsk == nil {
 		zsk, err = keyGen.GenerateZSK(domain)

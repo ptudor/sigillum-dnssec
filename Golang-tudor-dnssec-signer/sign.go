@@ -36,12 +36,18 @@ func (s *Signer) SignAll() error {
 		zoneState := s.state.GetZone(domain)
 
 		// Initialize zone if not in state — recover existing keys from disk
-		// first to preserve the DS chain of trust.
+		// first to preserve the DS chain of trust. A recovery failure must
+		// not abort the whole SignAll loop: log it, attach it to this zone
+		// as an error, and move on so other zones keep signing.
 		if zoneState == nil {
 			keyGen := NewKeyGenerator(s.cfg)
 			ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 			if err != nil {
-				return fmt.Errorf("initializing keys for %s: %w", domain, err)
+				slog.Error("[SIGN] Cannot initialize zone; skipping", "domain", domain, "error", err)
+				placeholder := &ZoneState{Path: zoneCfg.Path}
+				placeholder.AddError(err.Error())
+				s.state.SetZone(domain, placeholder)
+				continue
 			}
 			zoneState = &ZoneState{
 				Path: zoneCfg.Path,
