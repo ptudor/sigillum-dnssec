@@ -60,6 +60,16 @@ type RegistrarDynadotConfig struct {
 	Timeout     Duration `toml:"timeout"`      // default 30s
 	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
 	UserAgent   string   `toml:"user_agent"`   // override the default dnssec-tudor/<version> UA
+	// SendRequestID defaults to false because Dynadot's "X-Signature
+	// invalid" errors appear to correlate with header-case mismatches:
+	// Go HTTP/2 sends `x-request-id` (lowercase) while their docs
+	// spell `X-Request-ID` (uppercase ID). If their handler is
+	// case-sensitive it treats the header as absent and signs with
+	// empty string, producing the signature mismatch we see. When
+	// this flag is false, the adapter omits the header and signs with
+	// empty requestID, which is what Dynadot expects in the "absent"
+	// case. Set true only if Dynadot confirms they read the header.
+	SendRequestID bool `toml:"send_request_id"`
 }
 
 // ValidateConfig holds settings for internet DNSSEC validation checks
