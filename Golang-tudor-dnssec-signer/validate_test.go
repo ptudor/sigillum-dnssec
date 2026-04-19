@@ -194,7 +194,7 @@ func TestDNSKEYCheck(t *testing.T) {
 				Flags:     257,
 				Protocol:  3,
 				Algorithm: dns.ED25519,
-				PublicKey:  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+				PublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 			})
 		}
 		w.WriteMsg(m)
