@@ -155,7 +155,7 @@ func TestDynadotGetDS_HappyPath(t *testing.T) {
 				}
 				w.Header().Set("Content-Type", "application/json")
 				io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssec_info_list":[`+
-					`{"key_tag":12345,"algorithm":"15","digest_type":"2","digest":"ABCDEF"}`+
+					`{"keyTag":12345,"algorithm":"15","digestType":"2","digest":"ABCDEF"}`+
 					`]}}`)
 			}))
 			defer srv.Close()
@@ -257,13 +257,16 @@ func TestDynadotAddDS_JSONBody(t *testing.T) {
 		t.Errorf("Content-Type = %q, want application/json", gotCT)
 	}
 
-	// The literal body text matters — these fields must be numeric
-	// JSON (no quotes), not strings. Substring-match so we notice if
-	// `"algorithm":"15"` (quoted, the broken shape) ever sneaks back in.
+	// The literal body text matters. Two pitfalls locked down here:
+	//   - Field names must be camelCase (keyTag, digestType), not the
+	//     snake_case shown in Dynadot's docs. Snake_case is silently
+	//     dropped by their Jackson deserializer.
+	//   - digest_type / algorithm must be JSON numbers, not quoted
+	//     strings. Quoted values produced "algorithm is missing" 400s.
 	raw := string(gotRaw)
 	for _, want := range []string{
-		`"key_tag":12345`,
-		`"digest_type":2`,
+		`"keyTag":12345`,
+		`"digestType":2`,
 		`"digest":"abcdef"`,
 		`"algorithm":15`,
 	} {
@@ -272,11 +275,13 @@ func TestDynadotAddDS_JSONBody(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{
-		`"digest_type":"2"`,
+		`"digestType":"2"`,
 		`"algorithm":"15"`,
+		`"key_tag"`,
+		`"digest_type"`,
 	} {
 		if strings.Contains(raw, bad) {
-			t.Errorf("body contains %q — digest_type/algorithm must be JSON numbers, not strings", bad)
+			t.Errorf("body contains %q — must be camelCase with numeric digestType/algorithm", bad)
 		}
 	}
 }
