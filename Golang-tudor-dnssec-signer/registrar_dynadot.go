@@ -309,32 +309,43 @@ func truncate(s string, max int) string {
 	return s[:max] + "…[truncated]"
 }
 
-// dynadotDSRecord matches the shape of a single entry in
-// `data.dnssec_info_list` returned by GET /dnssec. Dynadot declares
-// `algorithm` and `digest_type` as Strings in the docs, so we accept
-// strings and convert to numeric DS fields on our side.
+// dynadotDSRecord matches the shape of a single entry in the list
+// returned by GET /dnssec. Field names are camelCase to match Dynadot's
+// Jackson serializer (same reason as dynadotSetDNSSECBody). We keep
+// algorithm/digestType as strings on inbound because that's what the
+// docs declare and we haven't verified otherwise; parseDynadotUint8
+// handles both string and numeric forms transparently.
 type dynadotDSRecord struct {
-	KeyTag     uint16 `json:"key_tag"`
+	KeyTag     uint16 `json:"keyTag"`
 	Algorithm  string `json:"algorithm"`
-	DigestType string `json:"digest_type"`
+	DigestType string `json:"digestType"`
 	Digest     string `json:"digest"`
 }
 
 // dynadotGetDNSSECData is the `data` portion of a get_dnssec response.
+// The outer list key is the documented snake_case; inner record fields
+// are camelCase (see dynadotDSRecord).
 type dynadotGetDNSSECData struct {
 	DNSSECInfoList []dynadotDSRecord `json:"dnssec_info_list"`
 }
 
-// dynadotSetDNSSECBody is the PUT body for set_dnssec. Dynadot's docs
-// label digest_type and algorithm as "String" but the values are numeric
-// enums (SHA-256=2, ED25519=15, …). Sending them as quoted JSON strings
-// caused their parser to treat the fields as missing ("The required
-// parameter algorithm is missing."); sending them as JSON numbers works.
-// The docs are misleading on the serialization — don't trust the "String"
-// label, trust the actual API behavior confirmed via sandbox.
+// dynadotSetDNSSECBody is the PUT body for set_dnssec. Two docs-vs-reality
+// mismatches to be aware of:
+//
+//  1. The DNSSEC-specific docs show snake_case field names (key_tag,
+//     digest_type, public_key), but their Java/Jackson serializer uses
+//     the camelCase convention shown in every other Dynadot example
+//     (domainName, showPrice, keyTag). Snake_case input is silently
+//     dropped, leaving the record empty, which triggers "algorithm is
+//     missing" (since algorithm is the only required field).
+//  2. Labeled "String" in the docs but the values are numeric enums
+//     (SHA-256=2, ED25519=15, …); the live parser wants JSON numbers.
+//
+// Don't trust the docs' naming or types — trust empirically-verified
+// behavior against the sandbox.
 type dynadotSetDNSSECBody struct {
-	KeyTag     uint16 `json:"key_tag"`
-	DigestType uint8  `json:"digest_type"`
+	KeyTag     uint16 `json:"keyTag"`
+	DigestType uint8  `json:"digestType"`
 	Digest     string `json:"digest"`
 	Algorithm  uint8  `json:"algorithm"`
 }
