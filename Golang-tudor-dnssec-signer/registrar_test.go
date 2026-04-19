@@ -227,20 +227,22 @@ func TestDynadotGetDS_ErrorBody_MessageOnly(t *testing.T) {
 	}
 }
 
-// TestDynadotAddDS_QueryParams verifies set_dnssec puts every DS field in
-// the URL query string (Dynadot's server reads from the query, not the
-// body, despite the docs showing a Request Body section — regression
-// guard against anyone reverting to the body approach and re-creating
-// the "algorithm missing" 400 we hit in practice).
-func TestDynadotAddDS_QueryParams(t *testing.T) {
+// TestDynadotAddDS_FormBody verifies set_dnssec uses form-urlencoded
+// body (Content-Type: application/x-www-form-urlencoded) rather than
+// JSON. A Java/Spring-style handler reading request parameters accepts
+// form bodies the same way as query strings, which reconciles the docs'
+// "Request Body" section with the "parameter" error text.
+func TestDynadotAddDS_FormBody(t *testing.T) {
 	var gotMethod string
-	var gotQuery url.Values
-	var gotBodyLen int
+	var gotCT string
+	var gotFormBody url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
-		gotQuery = r.URL.Query()
-		body, _ := io.ReadAll(r.Body)
-		gotBodyLen = len(body)
+		gotCT = r.Header.Get("Content-Type")
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm: %v", err)
+		}
+		gotFormBody = r.PostForm
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"code":200,"message":"Success"}`)
 	}))
@@ -255,19 +257,19 @@ func TestDynadotAddDS_QueryParams(t *testing.T) {
 	if gotMethod != http.MethodPut {
 		t.Errorf("expected PUT, got %s", gotMethod)
 	}
-	if gotBodyLen != 0 {
-		t.Errorf("expected empty body, got %d bytes", gotBodyLen)
+	if gotCT != "application/x-www-form-urlencoded" {
+		t.Errorf("Content-Type = %q, want application/x-www-form-urlencoded", gotCT)
 	}
-	if got := gotQuery.Get("key_tag"); got != "12345" {
+	if got := gotFormBody.Get("key_tag"); got != "12345" {
 		t.Errorf("key_tag = %q, want \"12345\"", got)
 	}
-	if got := gotQuery.Get("algorithm"); got != "15" {
+	if got := gotFormBody.Get("algorithm"); got != "15" {
 		t.Errorf("algorithm = %q, want \"15\"", got)
 	}
-	if got := gotQuery.Get("digest_type"); got != "2" {
+	if got := gotFormBody.Get("digest_type"); got != "2" {
 		t.Errorf("digest_type = %q, want \"2\"", got)
 	}
-	if got := gotQuery.Get("digest"); got != "abcdef" {
+	if got := gotFormBody.Get("digest"); got != "abcdef" {
 		t.Errorf("digest = %q, want \"abcdef\"", got)
 	}
 }
