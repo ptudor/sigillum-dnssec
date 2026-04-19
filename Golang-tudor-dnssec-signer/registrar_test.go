@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -227,21 +226,21 @@ func TestDynadotGetDS_ErrorBody_MessageOnly(t *testing.T) {
 	}
 }
 
-// TestDynadotAddDS_QueryParamsWithJSONBody locks in the empirically-
-// verified contract: PUT /dnssec takes parameters on the query string,
-// Content-Type must be application/json, and the body is a harmless
-// `{}`. Body field names make no difference — Dynadot's parser ignores
-// the body entirely — but the content-type gate enforces application/json.
-func TestDynadotAddDS_QueryParamsWithJSONBody(t *testing.T) {
+// TestDynadotAddDS_DocsShape verifies set_dnssec follows the docs' JSON
+// body shape verbatim: snake_case field names, key_tag as Integer,
+// everything else as String, AND all six documented fields serialized
+// (including flags and public_key as empty strings for DS-form publishes).
+// Omitting the DNSKEY-form fields produced "algorithm is missing" even
+// with algorithm present, so this test guards against regressing to a
+// partial field set.
+func TestDynadotAddDS_DocsShape(t *testing.T) {
 	var gotMethod string
 	var gotCT string
-	var gotQuery url.Values
-	var gotBody []byte
+	var gotRaw []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotCT = r.Header.Get("Content-Type")
-		gotQuery = r.URL.Query()
-		gotBody, _ = io.ReadAll(r.Body)
+		gotRaw, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"code":200,"message":"Success"}`)
 	}))
@@ -259,20 +258,20 @@ func TestDynadotAddDS_QueryParamsWithJSONBody(t *testing.T) {
 	if gotCT != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", gotCT)
 	}
-	if string(gotBody) != "{}" {
-		t.Errorf("body = %q, want {}", string(gotBody))
-	}
-	if got := gotQuery.Get("key_tag"); got != "12345" {
-		t.Errorf("query key_tag = %q, want \"12345\"", got)
-	}
-	if got := gotQuery.Get("algorithm"); got != "15" {
-		t.Errorf("query algorithm = %q, want \"15\"", got)
-	}
-	if got := gotQuery.Get("digest_type"); got != "2" {
-		t.Errorf("query digest_type = %q, want \"2\"", got)
-	}
-	if got := gotQuery.Get("digest"); got != "abcdef" {
-		t.Errorf("query digest = %q, want \"abcdef\"", got)
+
+	raw := string(gotRaw)
+	// Every documented field must be present, with the type shown in the docs.
+	for _, want := range []string{
+		`"key_tag":12345`,
+		`"digest_type":"2"`,
+		`"digest":"abcdef"`,
+		`"algorithm":"15"`,
+		`"flags":""`,
+		`"public_key":""`,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("body missing %q; got %s", want, raw)
+		}
 	}
 }
 
