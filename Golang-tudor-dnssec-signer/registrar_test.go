@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -155,7 +156,7 @@ func TestDynadotGetDS_HappyPath(t *testing.T) {
 				}
 				w.Header().Set("Content-Type", "application/json")
 				io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssec_info_list":[`+
-					`{"keyTag":12345,"algorithm":"15","digestType":"2","digest":"ABCDEF"}`+
+					`{"key_tag":12345,"algorithm":"15","digest_type":"2","digest":"ABCDEF"}`+
 					`]}}`)
 			}))
 			defer srv.Close()
@@ -226,19 +227,21 @@ func TestDynadotGetDS_ErrorBody_MessageOnly(t *testing.T) {
 	}
 }
 
-// TestDynadotAddDS_JSONBody verifies set_dnssec sends JSON with numeric
-// digest_type and algorithm (not quoted strings). The docs labelled
-// those as "String" but Dynadot's live parser demands JSON numbers
-// for them — regression guard against anyone trusting the docs over
-// the empirically-verified live behavior.
-func TestDynadotAddDS_JSONBody(t *testing.T) {
+// TestDynadotAddDS_QueryParamsWithJSONBody locks in the empirically-
+// verified contract: PUT /dnssec takes parameters on the query string,
+// Content-Type must be application/json, and the body is a harmless
+// `{}`. Body field names make no difference — Dynadot's parser ignores
+// the body entirely — but the content-type gate enforces application/json.
+func TestDynadotAddDS_QueryParamsWithJSONBody(t *testing.T) {
 	var gotMethod string
 	var gotCT string
-	var gotRaw []byte
+	var gotQuery url.Values
+	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotCT = r.Header.Get("Content-Type")
-		gotRaw, _ = io.ReadAll(r.Body)
+		gotQuery = r.URL.Query()
+		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"code":200,"message":"Success"}`)
 	}))
@@ -256,33 +259,20 @@ func TestDynadotAddDS_JSONBody(t *testing.T) {
 	if gotCT != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", gotCT)
 	}
-
-	// The literal body text matters. Two pitfalls locked down here:
-	//   - Field names must be camelCase (keyTag, digestType), not the
-	//     snake_case shown in Dynadot's docs. Snake_case is silently
-	//     dropped by their Jackson deserializer.
-	//   - digest_type / algorithm must be JSON numbers, not quoted
-	//     strings. Quoted values produced "algorithm is missing" 400s.
-	raw := string(gotRaw)
-	for _, want := range []string{
-		`"keyTag":12345`,
-		`"digestType":2`,
-		`"digest":"abcdef"`,
-		`"algorithm":15`,
-	} {
-		if !strings.Contains(raw, want) {
-			t.Errorf("body missing %q; got %s", want, raw)
-		}
+	if string(gotBody) != "{}" {
+		t.Errorf("body = %q, want {}", string(gotBody))
 	}
-	for _, bad := range []string{
-		`"digestType":"2"`,
-		`"algorithm":"15"`,
-		`"key_tag"`,
-		`"digest_type"`,
-	} {
-		if strings.Contains(raw, bad) {
-			t.Errorf("body contains %q — must be camelCase with numeric digestType/algorithm", bad)
-		}
+	if got := gotQuery.Get("key_tag"); got != "12345" {
+		t.Errorf("query key_tag = %q, want \"12345\"", got)
+	}
+	if got := gotQuery.Get("algorithm"); got != "15" {
+		t.Errorf("query algorithm = %q, want \"15\"", got)
+	}
+	if got := gotQuery.Get("digest_type"); got != "2" {
+		t.Errorf("query digest_type = %q, want \"2\"", got)
+	}
+	if got := gotQuery.Get("digest"); got != "abcdef" {
+		t.Errorf("query digest = %q, want \"abcdef\"", got)
 	}
 }
 

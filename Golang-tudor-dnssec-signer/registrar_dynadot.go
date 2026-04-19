@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -299,6 +300,93 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	return env.Data, nil
 }
 
+// doJSONRaw sends a request with a pre-serialized JSON body, signing
+// the exact bytes we put on the wire. This lets AddDS pair a
+// query-string URL with an empty `{}` body without re-marshaling.
+// The Content-Type is always application/json — Dynadot's outer gate
+// requires it even when the body is unused.
+func (c *DynadotClient) doJSONRaw(ctx context.Context, method, path string, bodyBytes []byte) (json.RawMessage, error) {
+	if c.limiter != nil {
+		c.limiter.gate()
+	}
+
+	var requestID string
+	if c.sendRequestID {
+		requestID = newRequestID()
+	}
+	signature := c.sign(path, requestID, string(bodyBytes))
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.sendRequestID {
+		req.Header.Set("X-Request-ID", requestID)
+	}
+	req.Header.Set("X-Signature", signature)
+	if c.userAgent != "" {
+		req.Header.Set("User-Agent", c.userAgent)
+	}
+
+	slog.Debug("[REGISTRAR] dynadot raw request",
+		"method", method, "path", path,
+		"request_id", requestID, "send_request_id_header", c.sendRequestID,
+		"body", string(bodyBytes))
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("dynadot %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("reading dynadot response: %w", err)
+	}
+
+	if len(bytes.TrimSpace(raw)) == 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil, nil
+	}
+
+	if resp.StatusCode >= 400 {
+		slog.Debug("[REGISTRAR] dynadot error response",
+			"method", method, "path", path, "status", resp.StatusCode,
+			"request_id", requestID, "body", truncate(string(raw), 1024))
+	}
+
+	var env apiError
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("dynadot %s %s (HTTP %d): non-JSON body: %q",
+			method, path, resp.StatusCode, truncate(string(raw), 256))
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		msg := env.bestErrorMessage()
+		if msg == "" {
+			msg = truncate(strings.TrimSpace(string(raw)), 256)
+			if msg == "" {
+				msg = http.StatusText(resp.StatusCode)
+			}
+		}
+		return nil, fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
+	}
+	if env.Code != 0 && env.Code != http.StatusOK && env.Code != http.StatusCreated {
+		slog.Debug("[REGISTRAR] dynadot envelope-code error response",
+			"method", method, "path", path, "envelope_code", env.Code,
+			"body", truncate(string(raw), 1024))
+		msg := env.bestErrorMessage()
+		if msg == "" {
+			msg = truncate(strings.TrimSpace(string(raw)), 256)
+		}
+		return nil, fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, msg)
+	}
+
+	return env.Data, nil
+}
+
 // truncate returns s trimmed to at most max runes, with an ellipsis marker
 // appended when truncation occurred. Used for including upstream-body
 // excerpts in error strings without flooding logs on a huge HTML error page.
@@ -310,15 +398,14 @@ func truncate(s string, max int) string {
 }
 
 // dynadotDSRecord matches the shape of a single entry in the list
-// returned by GET /dnssec. Field names are camelCase to match Dynadot's
-// Jackson serializer (same reason as dynadotSetDNSSECBody). We keep
-// algorithm/digestType as strings on inbound because that's what the
-// docs declare and we haven't verified otherwise; parseDynadotUint8
-// handles both string and numeric forms transparently.
+// returned by GET /dnssec. Fields mirror the docs' snake_case here;
+// we haven't yet seen a populated response from the live API, so this
+// is best-effort and may need to flip to camelCase (as set_dnssec did)
+// once a zone with DS comes back non-empty.
 type dynadotDSRecord struct {
-	KeyTag     uint16 `json:"keyTag"`
+	KeyTag     uint16 `json:"key_tag"`
 	Algorithm  string `json:"algorithm"`
-	DigestType string `json:"digestType"`
+	DigestType string `json:"digest_type"`
 	Digest     string `json:"digest"`
 }
 
@@ -329,26 +416,14 @@ type dynadotGetDNSSECData struct {
 	DNSSECInfoList []dynadotDSRecord `json:"dnssec_info_list"`
 }
 
-// dynadotSetDNSSECBody is the PUT body for set_dnssec. Two docs-vs-reality
-// mismatches to be aware of:
-//
-//  1. The DNSSEC-specific docs show snake_case field names (key_tag,
-//     digest_type, public_key), but their Java/Jackson serializer uses
-//     the camelCase convention shown in every other Dynadot example
-//     (domainName, showPrice, keyTag). Snake_case input is silently
-//     dropped, leaving the record empty, which triggers "algorithm is
-//     missing" (since algorithm is the only required field).
-//  2. Labeled "String" in the docs but the values are numeric enums
-//     (SHA-256=2, ED25519=15, …); the live parser wants JSON numbers.
-//
-// Don't trust the docs' naming or types — trust empirically-verified
-// behavior against the sandbox.
-type dynadotSetDNSSECBody struct {
-	KeyTag     uint16 `json:"keyTag"`
-	DigestType uint8  `json:"digestType"`
-	Digest     string `json:"digest"`
-	Algorithm  uint8  `json:"algorithm"`
-}
+// (dynadotSetDNSSECBody removed — set_dnssec reads parameters from the
+// URL query string, not the JSON body, despite the docs showing a
+// "Request Body" section. Empirical evidence: JSON bodies with the docs'
+// literal field names (snake_case), camelCase names, quoted values,
+// unquoted values all produced the same "algorithm is missing" error,
+// which is only possible if the parser was never looking at our body.
+// The content-type gate still requires application/json, but body
+// content is ignored.)
 
 // dnssecPath returns the fully-qualified request path for a zone. The
 // domain is lowercased because Dynadot rejects mixed-case input.
@@ -392,20 +467,24 @@ func (c *DynadotClient) GetDS(ctx context.Context, domain string) ([]*dns.DS, er
 	return out, nil
 }
 
-// AddDS publishes DS records one at a time. set_dnssec requires
-// Content-Type: application/json (confirmed by Dynadot's own error
-// message) and numeric values for digest_type and algorithm — despite
-// the docs labelling those as "String", the live parser rejects quoted
-// numbers as "missing parameter". See dynadotSetDNSSECBody for details.
+// AddDS publishes DS records one at a time. set_dnssec's real contract:
+// parameters go in the URL query string (snake_case, as documented),
+// Content-Type must be application/json (per Dynadot's own error), and
+// the body is a harmless empty object `{}` to satisfy the content-type
+// gate without giving the body parser anything to choke on.
 func (c *DynadotClient) AddDS(ctx context.Context, domain string, records []*dns.DS) error {
 	for _, ds := range records {
-		body := dynadotSetDNSSECBody{
-			KeyTag:     ds.KeyTag,
-			DigestType: ds.DigestType,
-			Digest:     ds.Digest,
-			Algorithm:  ds.Algorithm,
-		}
-		if _, err := c.do(ctx, http.MethodPut, dnssecPath(domain), body); err != nil {
+		q := url.Values{}
+		q.Set("key_tag", strconv.FormatUint(uint64(ds.KeyTag), 10))
+		q.Set("digest_type", strconv.FormatUint(uint64(ds.DigestType), 10))
+		q.Set("digest", ds.Digest)
+		q.Set("algorithm", strconv.FormatUint(uint64(ds.Algorithm), 10))
+		pathWithQuery := dnssecPath(domain) + "?" + q.Encode()
+
+		// Send `{}` so Content-Type: application/json is valid; the
+		// server doesn't look at this body (if it did, earlier JSON
+		// attempts with real fields would have worked).
+		if _, err := c.doJSONRaw(ctx, http.MethodPut, pathWithQuery, []byte("{}")); err != nil {
 			return fmt.Errorf("set_dnssec (key_tag %d): %w", ds.KeyTag, err)
 		}
 		slog.Info("[REGISTRAR] dynadot DS published",
