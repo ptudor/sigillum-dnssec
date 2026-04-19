@@ -283,7 +283,18 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 		return nil, fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
 	}
 	if env.Code != 0 && env.Code != http.StatusOK && env.Code != http.StatusCreated {
-		return nil, fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, env.Message)
+		// Dynadot sometimes returns HTTP 200 with a failure code in the
+		// envelope instead of a real 4xx. Surface error.description the
+		// same way we do for real HTTP errors, and debug-log the raw
+		// body so operators can triage without redeploying.
+		slog.Debug("[REGISTRAR] dynadot envelope-code error response",
+			"method", method, "path", path, "envelope_code", env.Code,
+			"body", truncate(string(raw), 1024))
+		msg := env.bestErrorMessage()
+		if msg == "" {
+			msg = truncate(strings.TrimSpace(string(raw)), 256)
+		}
+		return nil, fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, msg)
 	}
 
 	return env.Data, nil
@@ -365,7 +376,18 @@ func (c *DynadotClient) doForm(ctx context.Context, method, path string, form ur
 		return nil, fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
 	}
 	if env.Code != 0 && env.Code != http.StatusOK && env.Code != http.StatusCreated {
-		return nil, fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, env.Message)
+		// Dynadot sometimes returns HTTP 200 with a failure code in the
+		// envelope instead of a real 4xx. Surface error.description the
+		// same way we do for real HTTP errors, and debug-log the raw
+		// body so operators can triage without redeploying.
+		slog.Debug("[REGISTRAR] dynadot envelope-code error response",
+			"method", method, "path", path, "envelope_code", env.Code,
+			"body", truncate(string(raw), 1024))
+		msg := env.bestErrorMessage()
+		if msg == "" {
+			msg = truncate(strings.TrimSpace(string(raw)), 256)
+		}
+		return nil, fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, msg)
 	}
 
 	return env.Data, nil
