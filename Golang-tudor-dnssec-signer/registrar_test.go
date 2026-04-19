@@ -184,13 +184,15 @@ func TestDynadotGetDS_HappyPath(t *testing.T) {
 }
 
 // TestDynadotGetDS_ErrorBody confirms the adapter surfaces Dynadot's
-// error messages verbatim — operators should see "The domain doesn't
-// support DNSSEC." in their logs, not a generic "HTTP 400".
+// error.description verbatim. The real restful/v2 shape puts the useful
+// text under `error.description`; `message` is just HTTP status text.
+// Regression guard against reverting to "HTTP 400: Bad Request" errors
+// that hide the actual cause from operators.
 func TestDynadotGetDS_ErrorBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `{"code":400,"message":"The domain doesn't support DNSSEC."}`)
+		io.WriteString(w, `{"code":400,"message":"Bad Request","error":{"description":"This TLD isn't supported via the API."}}`)
 	}))
 	defer srv.Close()
 
@@ -199,7 +201,28 @@ func TestDynadotGetDS_ErrorBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "doesn't support DNSSEC") {
+	if !strings.Contains(err.Error(), "This TLD isn't supported") {
+		t.Fatalf("expected error.description to surface, got %q", err.Error())
+	}
+}
+
+// TestDynadotGetDS_ErrorBody_MessageOnly handles the case where Dynadot
+// returns only the top-level message (no error.description) — we should
+// still surface it rather than falling back to stock StatusText.
+func TestDynadotGetDS_ErrorBody_MessageOnly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"code":404,"message":"Can not find the domain_name in the account."}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	_, err := c.GetDS(context.Background(), "example.com")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "Can not find") {
 		t.Fatalf("expected upstream message to surface, got %q", err.Error())
 	}
 }

@@ -151,6 +151,24 @@ type apiError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
+	// Dynadot puts the human-readable error text here on 4xx responses;
+	// `message` is just the HTTP status text ("Bad Request"), not useful
+	// to the operator. Example body:
+	//   {"code":400,"message":"Bad Request","error":{"description":"This TLD isn't supported via the API."}}
+	Error struct {
+		Description string `json:"description"`
+	} `json:"error,omitempty"`
+}
+
+// bestErrorMessage returns the most operator-useful string from an API
+// response: Dynadot's error.description takes precedence over the generic
+// message (which is just HTTP status text). Falls back to message and
+// finally to stock http.StatusText upstream.
+func (e *apiError) bestErrorMessage() string {
+	if e.Error.Description != "" {
+		return e.Error.Description
+	}
+	return e.Message
 }
 
 // do executes a signed request against the given relative path. `body` can
@@ -251,11 +269,11 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	// echo it. A mismatch means Dynadot changed their contract, which we
 	// surface to operators so they notice.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		msg := env.Message
+		msg := env.bestErrorMessage()
 		if msg == "" {
-			// Fall back to a truncated raw body so HTTP 400s without a
-			// structured "message" field still tell the operator what
-			// Dynadot actually said. Stock http.StatusText was useless.
+			// Fall back to a truncated raw body so responses without any
+			// structured error field still tell the operator what
+			// Dynadot actually said.
 			msg = truncate(strings.TrimSpace(string(raw)), 256)
 			if msg == "" {
 				msg = http.StatusText(resp.StatusCode)
