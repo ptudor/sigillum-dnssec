@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -314,15 +315,11 @@ type dynadotGetDNSSECData struct {
 	DNSSECInfoList []dynadotDSRecord `json:"dnssec_info_list"`
 }
 
-// dynadotSetDNSSECBody is the request body for PUT /dnssec. We only ever
-// use the DS-form fields — the DNSKEY-form (flags + public_key) is
-// intentionally unused because we compute DS ourselves from the live key.
-type dynadotSetDNSSECBody struct {
-	KeyTag     uint16 `json:"key_tag"`
-	DigestType string `json:"digest_type"`
-	Digest     string `json:"digest"`
-	Algorithm  string `json:"algorithm"`
-}
+// (dynadotSetDNSSECBody removed — set_dnssec takes parameters as query
+// string, not JSON body, despite the docs' "Request Body" section.
+// Empirical evidence: PUT with a body containing "algorithm":"15"
+// produced "The required parameter algorithm is missing." from the
+// server, i.e. the body was not consulted at all.)
 
 // dnssecPath returns the fully-qualified request path for a zone. The
 // domain is lowercased because Dynadot rejects mixed-case input.
@@ -366,19 +363,22 @@ func (c *DynadotClient) GetDS(ctx context.Context, domain string) ([]*dns.DS, er
 	return out, nil
 }
 
-// AddDS publishes DS records one at a time. Dynadot's PUT accepts a single
-// record per request; we rely on the documented upsert-by-key_tag behavior
-// observed in the legacy api3 endpoint and carried forward here. If a
-// caller needs an atomic replace, they should use ReplaceDS instead.
+// AddDS publishes DS records one at a time. Dynadot's set_dnssec takes
+// parameters as query string, not JSON body — the docs show a "Request
+// Body" section but the live API reads from the URL (confirmed by the
+// server responding "algorithm missing" when we sent algorithm in the
+// body). The signing string's `fullPathAndQuery` must therefore include
+// the exact encoded query string, since that's what Dynadot signs.
 func (c *DynadotClient) AddDS(ctx context.Context, domain string, records []*dns.DS) error {
 	for _, ds := range records {
-		body := dynadotSetDNSSECBody{
-			KeyTag:     ds.KeyTag,
-			DigestType: strconv.FormatUint(uint64(ds.DigestType), 10),
-			Digest:     ds.Digest,
-			Algorithm:  strconv.FormatUint(uint64(ds.Algorithm), 10),
-		}
-		if _, err := c.do(ctx, http.MethodPut, dnssecPath(domain), body); err != nil {
+		q := url.Values{}
+		q.Set("key_tag", strconv.FormatUint(uint64(ds.KeyTag), 10))
+		q.Set("digest_type", strconv.FormatUint(uint64(ds.DigestType), 10))
+		q.Set("digest", ds.Digest)
+		q.Set("algorithm", strconv.FormatUint(uint64(ds.Algorithm), 10))
+		pathWithQuery := dnssecPath(domain) + "?" + q.Encode()
+
+		if _, err := c.do(ctx, http.MethodPut, pathWithQuery, nil); err != nil {
 			return fmt.Errorf("set_dnssec (key_tag %d): %w", ds.KeyTag, err)
 		}
 		slog.Info("[REGISTRAR] dynadot DS published",

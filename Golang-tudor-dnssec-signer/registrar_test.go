@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -227,19 +227,20 @@ func TestDynadotGetDS_ErrorBody_MessageOnly(t *testing.T) {
 	}
 }
 
-// TestDynadotAddDS_RequestBody verifies the PUT body matches the documented
-// single-record shape (not wrapped in a list), with numeric fields rendered
-// as strings per Dynadot's schema.
-func TestDynadotAddDS_RequestBody(t *testing.T) {
-	var captured map[string]any
+// TestDynadotAddDS_QueryParams verifies set_dnssec puts every DS field in
+// the URL query string (Dynadot's server reads from the query, not the
+// body, despite the docs showing a Request Body section — regression
+// guard against anyone reverting to the body approach and re-creating
+// the "algorithm missing" 400 we hit in practice).
+func TestDynadotAddDS_QueryParams(t *testing.T) {
+	var gotMethod string
+	var gotQuery url.Values
+	var gotBodyLen int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			t.Errorf("expected PUT, got %s", r.Method)
-		}
+		gotMethod = r.Method
+		gotQuery = r.URL.Query()
 		body, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(body, &captured); err != nil {
-			t.Fatalf("decoding request body: %v", err)
-		}
+		gotBodyLen = len(body)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"code":200,"message":"Success"}`)
 	}))
@@ -251,17 +252,23 @@ func TestDynadotAddDS_RequestBody(t *testing.T) {
 		t.Fatalf("AddDS: %v", err)
 	}
 
-	if got, ok := captured["key_tag"].(float64); !ok || uint16(got) != 12345 {
-		t.Errorf("key_tag = %v (%T), want 12345", captured["key_tag"], captured["key_tag"])
+	if gotMethod != http.MethodPut {
+		t.Errorf("expected PUT, got %s", gotMethod)
 	}
-	if got, _ := captured["algorithm"].(string); got != "15" {
-		t.Errorf("algorithm = %q, want \"15\"", captured["algorithm"])
+	if gotBodyLen != 0 {
+		t.Errorf("expected empty body, got %d bytes", gotBodyLen)
 	}
-	if got, _ := captured["digest_type"].(string); got != "2" {
-		t.Errorf("digest_type = %q, want \"2\"", captured["digest_type"])
+	if got := gotQuery.Get("key_tag"); got != "12345" {
+		t.Errorf("key_tag = %q, want \"12345\"", got)
 	}
-	if got, _ := captured["digest"].(string); got != "abcdef" {
-		t.Errorf("digest = %q, want \"abcdef\"", captured["digest"])
+	if got := gotQuery.Get("algorithm"); got != "15" {
+		t.Errorf("algorithm = %q, want \"15\"", got)
+	}
+	if got := gotQuery.Get("digest_type"); got != "2" {
+		t.Errorf("digest_type = %q, want \"2\"", got)
+	}
+	if got := gotQuery.Get("digest"); got != "abcdef" {
+		t.Errorf("digest = %q, want \"abcdef\"", got)
 	}
 }
 
