@@ -31,8 +31,8 @@ type Config struct {
 // opt-in via its own Enabled field; a zone binds to one adapter by name via
 // ZoneConfig.Registrar.
 type RegistrarConfig struct {
-	DigestTypeVal int                     `toml:"digest_type"` // 2 = SHA-256 (default), 4 = SHA-384
-	Dynadot       RegistrarDynadotConfig  `toml:"dynadot"`
+	DigestTypeVal int                    `toml:"digest_type"` // 2 = SHA-256 (default), 4 = SHA-384
+	Dynadot       RegistrarDynadotConfig `toml:"dynadot"`
 }
 
 // DigestType returns the DS digest algorithm to use when pushing DS records.
@@ -59,6 +59,7 @@ type RegistrarDynadotConfig struct {
 	Sandbox     bool     `toml:"sandbox"`      // true → api-sandbox.dynadot.com
 	Timeout     Duration `toml:"timeout"`      // default 30s
 	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
+	UserAgent   string   `toml:"user_agent"`   // override the default dnssec-tudor/<version> UA
 }
 
 // ValidateConfig holds settings for internet DNSSEC validation checks

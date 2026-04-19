@@ -34,8 +34,22 @@ type DynadotClient struct {
 	apiKey    string
 	apiSecret string
 	baseURL   string
+	userAgent string
 	http      *http.Client
 	limiter   *slidingLimiter
+}
+
+// defaultUserAgent returns the UA string used for Dynadot (and any future
+// outbound HTTP from the signer) when the operator hasn't overridden it via
+// config. Version is the ldflags-set build identifier; if it's the "dev"
+// default we still emit something sensible so Dynadot's logs can tell us
+// apart from a stock Go client.
+func defaultUserAgent() string {
+	v := Version
+	if v == "" {
+		v = "dev"
+	}
+	return "dnssec-tudor/" + v + " (+https://github.com/ptudor/dnssec-tudor)"
 }
 
 // NewDynadotClient validates credentials and constructs a client. The adapter
@@ -63,10 +77,16 @@ func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
 		timeout = 30 * time.Second
 	}
 
+	ua := cfg.UserAgent
+	if ua == "" {
+		ua = defaultUserAgent()
+	}
+
 	return &DynadotClient{
 		apiKey:    cfg.APIKey,
 		apiSecret: cfg.APISecret,
 		baseURL:   baseURL,
+		userAgent: ua,
 		http:      &http.Client{Timeout: timeout},
 		limiter:   newSlidingLimiter(),
 	}, nil
@@ -136,7 +156,16 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	requestID := newRequestID()
 	signature := c.sign(path, requestID, string(bodyBytes))
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(bodyBytes))
+	// Pass a nil body rather than bytes.NewReader(nil) when there's nothing
+	// to send — the latter causes Go to emit Content-Length: 0 even for
+	// GET/DELETE, which some APIs (including Dynadot, suspected) treat as
+	// a malformed request.
+	var reqBody io.Reader
+	if len(bodyBytes) > 0 {
+		reqBody = bytes.NewReader(bodyBytes)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
@@ -147,6 +176,9 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("X-Request-ID", requestID)
 	req.Header.Set("X-Signature", signature)
+	if c.userAgent != "" {
+		req.Header.Set("User-Agent", c.userAgent)
+	}
 
 	slog.Debug("[REGISTRAR] dynadot request", "method", method, "path", path, "request_id", requestID)
 
@@ -166,9 +198,20 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 		return nil, nil
 	}
 
+	// Always dump the raw response body at debug level on non-2xx — this
+	// is what you want in front of you when triaging a Dynadot 400.
+	if resp.StatusCode >= 400 {
+		slog.Debug("[REGISTRAR] dynadot error response",
+			"method", method, "path", path, "status", resp.StatusCode,
+			"request_id", requestID, "body", truncate(string(raw), 1024))
+	}
+
 	var env apiError
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("dynadot response (HTTP %d): non-JSON body: %w", resp.StatusCode, err)
+		// Surface the first chunk of the body so the operator has
+		// something to grep for — opaque "non-JSON body" was useless.
+		return nil, fmt.Errorf("dynadot %s %s (HTTP %d): non-JSON body: %q",
+			method, path, resp.StatusCode, truncate(string(raw), 256))
 	}
 
 	// The HTTP status code is authoritative; the envelope's `code` should
@@ -177,7 +220,13 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		msg := env.Message
 		if msg == "" {
-			msg = http.StatusText(resp.StatusCode)
+			// Fall back to a truncated raw body so HTTP 400s without a
+			// structured "message" field still tell the operator what
+			// Dynadot actually said. Stock http.StatusText was useless.
+			msg = truncate(strings.TrimSpace(string(raw)), 256)
+			if msg == "" {
+				msg = http.StatusText(resp.StatusCode)
+			}
 		}
 		return nil, fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
 	}
@@ -186,6 +235,16 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	}
 
 	return env.Data, nil
+}
+
+// truncate returns s trimmed to at most max runes, with an ellipsis marker
+// appended when truncation occurred. Used for including upstream-body
+// excerpts in error strings without flooding logs on a huge HTML error page.
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…[truncated]"
 }
 
 // dynadotDSRecord matches the shape of a single entry in
