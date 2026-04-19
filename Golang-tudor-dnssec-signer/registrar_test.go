@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -227,22 +226,19 @@ func TestDynadotGetDS_ErrorBody_MessageOnly(t *testing.T) {
 	}
 }
 
-// TestDynadotAddDS_FormBody verifies set_dnssec uses form-urlencoded
-// body (Content-Type: application/x-www-form-urlencoded) rather than
-// JSON. A Java/Spring-style handler reading request parameters accepts
-// form bodies the same way as query strings, which reconciles the docs'
-// "Request Body" section with the "parameter" error text.
-func TestDynadotAddDS_FormBody(t *testing.T) {
+// TestDynadotAddDS_JSONBody verifies set_dnssec sends JSON with numeric
+// digest_type and algorithm (not quoted strings). The docs labelled
+// those as "String" but Dynadot's live parser demands JSON numbers
+// for them — regression guard against anyone trusting the docs over
+// the empirically-verified live behavior.
+func TestDynadotAddDS_JSONBody(t *testing.T) {
 	var gotMethod string
 	var gotCT string
-	var gotFormBody url.Values
+	var gotRaw []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotCT = r.Header.Get("Content-Type")
-		if err := r.ParseForm(); err != nil {
-			t.Fatalf("ParseForm: %v", err)
-		}
-		gotFormBody = r.PostForm
+		gotRaw, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"code":200,"message":"Success"}`)
 	}))
@@ -257,20 +253,31 @@ func TestDynadotAddDS_FormBody(t *testing.T) {
 	if gotMethod != http.MethodPut {
 		t.Errorf("expected PUT, got %s", gotMethod)
 	}
-	if gotCT != "application/x-www-form-urlencoded" {
-		t.Errorf("Content-Type = %q, want application/x-www-form-urlencoded", gotCT)
+	if gotCT != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", gotCT)
 	}
-	if got := gotFormBody.Get("key_tag"); got != "12345" {
-		t.Errorf("key_tag = %q, want \"12345\"", got)
+
+	// The literal body text matters — these fields must be numeric
+	// JSON (no quotes), not strings. Substring-match so we notice if
+	// `"algorithm":"15"` (quoted, the broken shape) ever sneaks back in.
+	raw := string(gotRaw)
+	for _, want := range []string{
+		`"key_tag":12345`,
+		`"digest_type":2`,
+		`"digest":"abcdef"`,
+		`"algorithm":15`,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("body missing %q; got %s", want, raw)
+		}
 	}
-	if got := gotFormBody.Get("algorithm"); got != "15" {
-		t.Errorf("algorithm = %q, want \"15\"", got)
-	}
-	if got := gotFormBody.Get("digest_type"); got != "2" {
-		t.Errorf("digest_type = %q, want \"2\"", got)
-	}
-	if got := gotFormBody.Get("digest"); got != "abcdef" {
-		t.Errorf("digest = %q, want \"abcdef\"", got)
+	for _, bad := range []string{
+		`"digest_type":"2"`,
+		`"algorithm":"15"`,
+	} {
+		if strings.Contains(raw, bad) {
+			t.Errorf("body contains %q — digest_type/algorithm must be JSON numbers, not strings", bad)
+		}
 	}
 }
 
