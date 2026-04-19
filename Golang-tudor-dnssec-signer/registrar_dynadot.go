@@ -60,10 +60,16 @@ func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, fmt.Errorf("dynadot registrar is not enabled")
 	}
-	if cfg.APIKey == "" {
+	// Trim leading/trailing whitespace. Copy-paste from a web UI commonly
+	// tacks on a newline, which silently breaks HMAC signatures — the
+	// server computes HMAC over bytes-of-secret while ours has one extra
+	// byte. Trimming here prevents that class of mystery 400s.
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	apiSecret := strings.TrimSpace(cfg.APISecret)
+	if apiKey == "" {
 		return nil, fmt.Errorf("dynadot api_key not set in config")
 	}
-	if cfg.APISecret == "" {
+	if apiSecret == "" {
 		return nil, fmt.Errorf("dynadot api_secret not set in config")
 	}
 
@@ -83,8 +89,8 @@ func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
 	}
 
 	return &DynadotClient{
-		apiKey:    cfg.APIKey,
-		apiSecret: cfg.APISecret,
+		apiKey:    apiKey,
+		apiSecret: apiSecret,
 		baseURL:   baseURL,
 		userAgent: ua,
 		http:      &http.Client{Timeout: timeout},
@@ -97,13 +103,26 @@ func (c *DynadotClient) Name() string { return "dynadot" }
 
 // sign computes the Base64-encoded HMAC-SHA256 signature for one request.
 // `path` must be exactly the `fullPathAndQuery` the server sees (including
-// query string when present) — any mismatch produces an HTTP 401 on the
-// server side because the signature won't match.
+// query string when present) — any mismatch produces "X-Signature invalid"
+// (HTTP 400 with Dynadot's specific error body) on the server side.
+//
+// Emits a debug log of the string being signed when DEBUG is enabled so
+// operators can eyeball byte-for-byte what went into the HMAC. The api key
+// is shown in full (it's in the Authorization header anyway); the secret
+// is never logged, only the resulting signature.
 func (c *DynadotClient) sign(path, requestID, body string) string {
 	stringToSign := c.apiKey + "\n" + path + "\n" + requestID + "\n" + body
 	mac := hmac.New(sha256.New, []byte(c.apiSecret))
 	mac.Write([]byte(stringToSign))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	slog.Debug("[REGISTRAR] dynadot signing",
+		"api_key_len", len(c.apiKey),
+		"api_secret_len", len(c.apiSecret),
+		"string_to_sign", stringToSign,
+		"signature", sig)
+
+	return sig
 }
 
 // newRequestID returns a RFC-4122-ish v4 UUID. Used as X-Request-ID so log
