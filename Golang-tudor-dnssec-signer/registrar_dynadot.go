@@ -289,6 +289,88 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	return env.Data, nil
 }
 
+// doForm is a variant of do() that sends an application/x-www-form-
+// urlencoded body. The form's canonical encoding (url.Values.Encode —
+// alphabetical key order) is used verbatim both on the wire and in the
+// signing string; any rearrangement between the two would produce an
+// X-Signature mismatch.
+func (c *DynadotClient) doForm(ctx context.Context, method, path string, form url.Values) (json.RawMessage, error) {
+	if c.limiter != nil {
+		c.limiter.gate()
+	}
+
+	encoded := form.Encode()
+
+	var requestID string
+	if c.sendRequestID {
+		requestID = newRequestID()
+	}
+	signature := c.sign(path, requestID, encoded)
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, strings.NewReader(encoded))
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.sendRequestID {
+		req.Header.Set("X-Request-ID", requestID)
+	}
+	req.Header.Set("X-Signature", signature)
+	if c.userAgent != "" {
+		req.Header.Set("User-Agent", c.userAgent)
+	}
+
+	slog.Debug("[REGISTRAR] dynadot form request",
+		"method", method, "path", path,
+		"request_id", requestID, "send_request_id_header", c.sendRequestID,
+		"form_body", encoded)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("dynadot %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("reading dynadot response: %w", err)
+	}
+
+	if len(bytes.TrimSpace(raw)) == 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil, nil
+	}
+
+	if resp.StatusCode >= 400 {
+		slog.Debug("[REGISTRAR] dynadot error response",
+			"method", method, "path", path, "status", resp.StatusCode,
+			"request_id", requestID, "body", truncate(string(raw), 1024))
+	}
+
+	var env apiError
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("dynadot %s %s (HTTP %d): non-JSON body: %q",
+			method, path, resp.StatusCode, truncate(string(raw), 256))
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		msg := env.bestErrorMessage()
+		if msg == "" {
+			msg = truncate(strings.TrimSpace(string(raw)), 256)
+			if msg == "" {
+				msg = http.StatusText(resp.StatusCode)
+			}
+		}
+		return nil, fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
+	}
+	if env.Code != 0 && env.Code != http.StatusOK && env.Code != http.StatusCreated {
+		return nil, fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, env.Message)
+	}
+
+	return env.Data, nil
+}
+
 // truncate returns s trimmed to at most max runes, with an ellipsis marker
 // appended when truncation occurred. Used for including upstream-body
 // excerpts in error strings without flooding logs on a huge HTML error page.
@@ -363,22 +445,23 @@ func (c *DynadotClient) GetDS(ctx context.Context, domain string) ([]*dns.DS, er
 	return out, nil
 }
 
-// AddDS publishes DS records one at a time. Dynadot's set_dnssec takes
-// parameters as query string, not JSON body — the docs show a "Request
-// Body" section but the live API reads from the URL (confirmed by the
-// server responding "algorithm missing" when we sent algorithm in the
-// body). The signing string's `fullPathAndQuery` must therefore include
-// the exact encoded query string, since that's what Dynadot signs.
+// AddDS publishes DS records one at a time as form-urlencoded body. The
+// docs show a "Request Body" section with fields like key_tag/digest_type/
+// digest/algorithm, but a JSON body with those same fields was rejected
+// with "The required parameter algorithm is missing." That error text
+// ("parameter") plus the presence of a body section reconciles to
+// application/x-www-form-urlencoded — a Java/Spring-style handler
+// reading request parameters treats both query and form body the same
+// way. Signing includes the exact form body as `requestBody` per docs.
 func (c *DynadotClient) AddDS(ctx context.Context, domain string, records []*dns.DS) error {
 	for _, ds := range records {
-		q := url.Values{}
-		q.Set("key_tag", strconv.FormatUint(uint64(ds.KeyTag), 10))
-		q.Set("digest_type", strconv.FormatUint(uint64(ds.DigestType), 10))
-		q.Set("digest", ds.Digest)
-		q.Set("algorithm", strconv.FormatUint(uint64(ds.Algorithm), 10))
-		pathWithQuery := dnssecPath(domain) + "?" + q.Encode()
+		form := url.Values{}
+		form.Set("key_tag", strconv.FormatUint(uint64(ds.KeyTag), 10))
+		form.Set("digest_type", strconv.FormatUint(uint64(ds.DigestType), 10))
+		form.Set("digest", ds.Digest)
+		form.Set("algorithm", strconv.FormatUint(uint64(ds.Algorithm), 10))
 
-		if _, err := c.do(ctx, http.MethodPut, pathWithQuery, nil); err != nil {
+		if _, err := c.doForm(ctx, http.MethodPut, dnssecPath(domain), form); err != nil {
 			return fmt.Errorf("set_dnssec (key_tag %d): %w", ds.KeyTag, err)
 		}
 		slog.Info("[REGISTRAR] dynadot DS published",
