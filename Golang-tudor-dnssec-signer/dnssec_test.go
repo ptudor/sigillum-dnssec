@@ -1492,4 +1492,3 @@ func TestRecoverKeyStateCreatedDate(t *testing.T) {
 			recovered.Created, beforeGenerate, afterGenerate)
 	}
 }
-

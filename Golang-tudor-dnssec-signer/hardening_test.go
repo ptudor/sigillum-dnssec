@@ -24,7 +24,7 @@ func TestIsLoopbackAddr(t *testing.T) {
 		{"[::1]:8053", true},
 		{"localhost:8053", true},
 		{"0.0.0.0:8053", false},
-		{":8053", false},         // all interfaces
+		{":8053", false}, // all interfaces
 		{"192.168.1.1:8053", false},
 		{"10.0.0.1:8053", false},
 		{"[::]:8053", false},
@@ -448,7 +448,7 @@ func TestSecurityHeaders_Present(t *testing.T) {
 
 	expected := map[string]string{
 		"X-Content-Type-Options":  "nosniff",
-		"X-Frame-Options":        "DENY",
+		"X-Frame-Options":         "DENY",
 		"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
 		"Referrer-Policy":         "no-referrer",
 		"Permissions-Policy":      "interest-cohort=()",

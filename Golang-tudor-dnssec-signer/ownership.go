@@ -13,10 +13,10 @@ import (
 // chowned to match the daemon user. Populated once at CLI startup by
 // InitOwnershipTarget and read lock-free thereafter.
 type ownershipTarget struct {
-	uid     int
-	gid     int
-	active  bool // true when we should actually chown (running as root + target is non-root)
-	warned  sync.Once
+	uid    int
+	gid    int
+	active bool // true when we should actually chown (running as root + target is non-root)
+	warned sync.Once
 }
 
 var ownership ownershipTarget

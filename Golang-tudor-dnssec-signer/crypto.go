@@ -56,4 +56,3 @@ func FormatDNSKEYRecordsFromKeys(domain string, ksk, zsk *dns.DNSKEY) string {
 
 	return sb.String()
 }
-
