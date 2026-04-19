@@ -31,12 +31,13 @@ import (
 // xRequestId + "\n" + requestBody`, with xRequestId and body defaulting to
 // empty strings when absent.
 type DynadotClient struct {
-	apiKey    string
-	apiSecret string
-	baseURL   string
-	userAgent string
-	http      *http.Client
-	limiter   *slidingLimiter
+	apiKey        string
+	apiSecret     string
+	baseURL       string
+	userAgent     string
+	sendRequestID bool
+	http          *http.Client
+	limiter       *slidingLimiter
 }
 
 // defaultUserAgent returns the UA string used for Dynadot (and any future
@@ -89,12 +90,13 @@ func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
 	}
 
 	return &DynadotClient{
-		apiKey:    apiKey,
-		apiSecret: apiSecret,
-		baseURL:   baseURL,
-		userAgent: ua,
-		http:      &http.Client{Timeout: timeout},
-		limiter:   newSlidingLimiter(),
+		apiKey:        apiKey,
+		apiSecret:     apiSecret,
+		baseURL:       baseURL,
+		userAgent:     ua,
+		sendRequestID: cfg.SendRequestID,
+		http:          &http.Client{Timeout: timeout},
+		limiter:       newSlidingLimiter(),
 	}, nil
 }
 
@@ -172,7 +174,15 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 		}
 	}
 
-	requestID := newRequestID()
+	// The request ID is used both in the signing string and (optionally)
+	// on the wire as X-Request-ID. When sendRequestID is false, both are
+	// empty — this matches what Dynadot computes when their case-sensitive
+	// handler misses a non-empty header we sent, avoiding a whole class
+	// of "signature invalid" errors.
+	var requestID string
+	if c.sendRequestID {
+		requestID = newRequestID()
+	}
 	signature := c.sign(path, requestID, string(bodyBytes))
 
 	// Pass a nil body rather than bytes.NewReader(nil) when there's nothing
@@ -193,13 +203,17 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("X-Request-ID", requestID)
+	if c.sendRequestID {
+		req.Header.Set("X-Request-ID", requestID)
+	}
 	req.Header.Set("X-Signature", signature)
 	if c.userAgent != "" {
 		req.Header.Set("User-Agent", c.userAgent)
 	}
 
-	slog.Debug("[REGISTRAR] dynadot request", "method", method, "path", path, "request_id", requestID)
+	slog.Debug("[REGISTRAR] dynadot request",
+		"method", method, "path", path,
+		"request_id", requestID, "send_request_id_header", c.sendRequestID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

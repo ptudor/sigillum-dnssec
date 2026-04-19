@@ -124,41 +124,62 @@ func TestDynadotSign_Deterministic(t *testing.T) {
 // TestDynadotGetDS_HappyPath spins up a fake Dynadot endpoint and verifies
 // that the client sends the right headers, receives the {code,message,data}
 // envelope, and correctly parses `algorithm` / `digest_type` as strings.
+// The default adapter config does NOT send X-Request-ID; the with-header
+// variant exercises the opt-in path.
 func TestDynadotGetDS_HappyPath(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("expected GET, got %s", r.Method)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer key123" {
-			t.Errorf("Authorization header = %q, want Bearer key123", got)
-		}
-		if r.Header.Get("X-Signature") == "" {
-			t.Error("X-Signature header missing")
-		}
-		if r.Header.Get("X-Request-ID") == "" {
-			t.Error("X-Request-ID header missing")
-		}
-		if !strings.HasSuffix(r.URL.Path, "/restful/v2/domains/example.com/dnssec") {
-			t.Errorf("unexpected path %q", r.URL.Path)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssec_info_list":[`+
-			`{"key_tag":12345,"algorithm":"15","digest_type":"2","digest":"ABCDEF"}`+
-			`]}}`)
-	}))
-	defer srv.Close()
+	cases := []struct {
+		name           string
+		sendRequestID  bool
+		wantHeaderSeen bool
+	}{
+		{"default_omits_request_id", false, false},
+		{"opt_in_sends_request_id", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("expected GET, got %s", r.Method)
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer key123" {
+					t.Errorf("Authorization header = %q, want Bearer key123", got)
+				}
+				if r.Header.Get("X-Signature") == "" {
+					t.Error("X-Signature header missing")
+				}
+				gotRequestID := r.Header.Get("X-Request-ID") != ""
+				if gotRequestID != tc.wantHeaderSeen {
+					t.Errorf("X-Request-ID present=%v, want %v", gotRequestID, tc.wantHeaderSeen)
+				}
+				if !strings.HasSuffix(r.URL.Path, "/restful/v2/domains/example.com/dnssec") {
+					t.Errorf("unexpected path %q", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssec_info_list":[`+
+					`{"key_tag":12345,"algorithm":"15","digest_type":"2","digest":"ABCDEF"}`+
+					`]}}`)
+			}))
+			defer srv.Close()
 
-	c := &DynadotClient{apiKey: "key123", apiSecret: "secret", baseURL: srv.URL, http: srv.Client()}
-	records, err := c.GetDS(context.Background(), "example.com")
-	if err != nil {
-		t.Fatalf("GetDS: %v", err)
-	}
-	if len(records) != 1 {
-		t.Fatalf("expected 1 DS, got %d", len(records))
-	}
-	r := records[0]
-	if r.KeyTag != 12345 || r.Algorithm != 15 || r.DigestType != 2 || r.Digest != "abcdef" {
-		t.Fatalf("unexpected DS: %+v", r)
+			c := &DynadotClient{
+				apiKey:        "key123",
+				apiSecret:     "secret",
+				baseURL:       srv.URL,
+				sendRequestID: tc.sendRequestID,
+				http:          srv.Client(),
+			}
+			records, err := c.GetDS(context.Background(), "example.com")
+			if err != nil {
+				t.Fatalf("GetDS: %v", err)
+			}
+			if len(records) != 1 {
+				t.Fatalf("expected 1 DS, got %d", len(records))
+			}
+			r := records[0]
+			if r.KeyTag != 12345 || r.Algorithm != 15 || r.DigestType != 2 || r.Digest != "abcdef" {
+				t.Fatalf("unexpected DS: %+v", r)
+			}
+		})
 	}
 }
 
