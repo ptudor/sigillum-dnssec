@@ -321,6 +321,45 @@ func loadConfigAndState() (*Config, *State, error) {
 	return cfg, state, nil
 }
 
+// preflightConfigAppend verifies the config file can be opened for append.
+// Used by `add` to fail fast before generating keys or signing a zone when
+// the daemon user can't write to the config file.
+func preflightConfigAppend(path string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// unwindAdd undoes the on-disk side effects of a partial `add`: removes the
+// zone from in-memory state, persists state.json, and deletes the keys and
+// signed zone file. Best-effort — failures are logged but not returned, so
+// the original error from `add` surfaces unchanged.
+func unwindAdd(cfg *Config, state *State, domain string) {
+	state.RemoveZone(domain)
+	if err := state.Save(); err != nil {
+		slog.Warn("[CLI] Rollback: failed to save state", "domain", domain, "error", err)
+	}
+
+	signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
+	if err := os.Remove(signedPath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("[CLI] Rollback: failed to remove signed zone", "path", signedPath, "error", err)
+	}
+
+	keysDir := cfg.KeysDir()
+	for _, p := range []string{
+		filepath.Join(keysDir, domain+".ksk.key"),
+		filepath.Join(keysDir, domain+".ksk.private"),
+		filepath.Join(keysDir, domain+".zsk.key"),
+		filepath.Join(keysDir, domain+".zsk.private"),
+	} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			slog.Warn("[CLI] Rollback: failed to remove key file", "path", p, "error", err)
+		}
+	}
+}
+
 // runServe runs the daemon
 func runServe(cmd *cobra.Command, args []string) error {
 	cfg, state, err := loadConfigAndState()
@@ -601,17 +640,30 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	slog.Info("[CLI] Adding domain", "domain", domain, "path", zonePath)
 
+	// Pre-flight: confirm the config file is appendable BEFORE doing anything
+	// destructive. The `add` command must update three things on disk — keys,
+	// signed zone, state.json — plus a final append to the config file. If
+	// the config append is going to fail (the common case is a non-writable
+	// config: root-owned, daemon user runs `add`), surface that here so we
+	// don't leave half-added zones on disk.
+	if err := preflightConfigAppend(configPath); err != nil {
+		return fmt.Errorf("config file not writable for zone append: %w", err)
+	}
+
 	// Add to in-memory config so signing works
 	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
 
-	// Generate keys
+	// From here on, any failure must roll back side effects — partial keys,
+	// signed zone, state entry — so a retry of `add` starts from a clean slate.
 	keyGen := NewKeyGenerator(cfg)
 	ksk, err := keyGen.GenerateKSK(domain)
 	if err != nil {
+		unwindAdd(cfg, state, domain)
 		return fmt.Errorf("generating KSK: %w", err)
 	}
 	zsk, err := keyGen.GenerateZSK(domain)
 	if err != nil {
+		unwindAdd(cfg, state, domain)
 		return fmt.Errorf("generating ZSK: %w", err)
 	}
 
@@ -626,18 +678,20 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Sign the zone
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
-		// Rollback: remove from state on signing failure
-		state.RemoveZone(domain)
+		unwindAdd(cfg, state, domain)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
-	// Save state first — if this fails, config file is untouched
 	if err := state.Save(); err != nil {
+		unwindAdd(cfg, state, domain)
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	// Config file is written last — state is already consistent
+	// Config append happens last. The pre-flight makes failure here unlikely,
+	// but if it still fails (race, disk full), unwind everything so state.json
+	// stays consistent with the config file.
 	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+		unwindAdd(cfg, state, domain)
 		return fmt.Errorf("adding zone to config file: %w", err)
 	}
 	slog.Info("[CLI] Added zone to config file", "config", configPath)
