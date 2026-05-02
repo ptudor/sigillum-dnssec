@@ -905,10 +905,17 @@ func (s *Signer) writeSignedZone(domain, path string, records []dns.RR) error {
 
 	// Write to temp file first, then rename for atomicity.
 	// This prevents NSD from picking up a partial zone if the process is killed mid-write.
+	// Mode 0644 so NSD (running as a different user) can read the signed zone;
+	// explicit Chmod defeats a restrictive umask on the daemon process.
 	tempPath := path + ".tmp"
-	f, err := os.Create(tempPath)
+	f, err := os.OpenFile(tempPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
+	}
+	if err = f.Chmod(0644); err != nil {
+		f.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("chmod signed zone: %w", err)
 	}
 	defer func() {
 		f.Close()
