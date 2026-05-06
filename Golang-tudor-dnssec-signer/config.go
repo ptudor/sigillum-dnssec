@@ -220,7 +220,7 @@ func DefaultConfig() *Config {
 		PollInterval: Duration{5 * time.Minute},
 		DNSSEC: DNSSECConfig{
 			Algorithm:          "ED25519",
-			KSKLifetime:        Duration{3 * 365 * 24 * time.Hour}, // 3 years
+			KSKLifetime:        Duration{5 * 365 * 24 * time.Hour}, // 5 years
 			ZSKLifetime:        Duration{90 * 24 * time.Hour},      // 90 days
 			SignatureValidity:  Duration{14 * 24 * time.Hour},      // 14 days
 			SignatureRefresh:   Duration{3 * 24 * time.Hour},       // 3 days

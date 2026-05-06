@@ -249,19 +249,26 @@ func maybeAutoPublishDS(cfg *Config, state *State, domain string, op string) {
 	defer cancel()
 
 	switch op {
-	case "add", "rollover_complete":
-		// Desired end-state is the full set — use ReplaceDS so the registrar
-		// ends up with exactly what we want (no stale DS from prior configs).
-		slog.Info("[REGISTRAR] auto-publishing DS (replace)", "domain", domain, "registrar", reg.Name(), "op", op)
-		if err := reg.ReplaceDS(ctx, domain, want); err != nil {
+	case "add", "rollover_start":
+		// Additive publish. For `add`, this avoids the failure mode where a
+		// destructive ReplaceDS clears valid DS at the registrar before the
+		// PUT lands — leaving a zone with no DS at all, which validators
+		// read as an unsigned delegation (silent DNSSEC outage). Operators
+		// can clear residual DS explicitly via `dnssec-tudor registrar push`
+		// or `... registrar clear` after verifying with `... registrar verify`.
+		// For `rollover_start`, additive is required so the old KSK's DS
+		// stays published throughout the rollover window.
+		slog.Info("[REGISTRAR] auto-publishing DS (additive)", "domain", domain, "registrar", reg.Name(), "op", op)
+		if err := reg.AddDS(ctx, domain, want); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: registrar auto-publish failed: %v\n", err)
 			return
 		}
-	case "rollover_start":
-		// Only add the new KSK's DS — leave any existing DS records alone so
-		// the old KSK's DS stays in place during the rollover window.
-		slog.Info("[REGISTRAR] auto-publishing DS (additive)", "domain", domain, "registrar", reg.Name(), "op", op)
-		if err := reg.AddDS(ctx, domain, want); err != nil {
+	case "rollover_complete":
+		// Rollover finalization: remove the old KSK's DS and leave only the
+		// new one. ReplaceDS is PUT-first internally, so a publish failure
+		// aborts before any destructive DELETE.
+		slog.Info("[REGISTRAR] auto-publishing DS (replace)", "domain", domain, "registrar", reg.Name(), "op", op)
+		if err := reg.ReplaceDS(ctx, domain, want); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: registrar auto-publish failed: %v\n", err)
 			return
 		}
