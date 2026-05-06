@@ -81,7 +81,7 @@ poll_interval = "5m"
 
 [dnssec]
 algorithm = "ED25519"           # or ECDSAP256SHA256, ECDSAP384SHA384
-ksk_lifetime = "3y"             # How long before KSK rollover reminder
+ksk_lifetime = "5y"             # How long before KSK rollover reminder
 zsk_lifetime = "90d"            # ZSK rolls automatically
 signature_validity = "14d"      # How long signatures are valid
 signature_refresh = "3d"        # Re-sign when this much validity remains

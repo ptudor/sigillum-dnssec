@@ -266,9 +266,9 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	}
 
 	// The HTTP status code is authoritative; the envelope's `code` should
-	// echo it. A mismatch means Dynadot changed their contract, which we
-	// surface to operators so they notice.
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+	// echo it. Accept any 2xx — set_dnssec / clear_dnssec can return 204
+	// No Content on success, which earlier code mis-classified as an error.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg := env.bestErrorMessage()
 		if msg == "" {
 			// Fall back to a truncated raw body so responses without any
@@ -410,14 +410,29 @@ func (c *DynadotClient) AddDS(ctx context.Context, domain string, records []*dns
 	return nil
 }
 
-// ReplaceDS wipes the DS set with DELETE then re-populates it. There is a
-// brief (seconds) window with no DS at the parent; callers invoke this
-// only at rollover completion, where the old DNSKEY is already retired
-// from the zone and validators will accept bogus-during-transition.
+// ReplaceDS leaves the registrar with exactly `records`. Sequence:
+//  1. PUT each desired record (additive upsert by key_tag).
+//  2. DELETE the entire DS set.
+//  3. PUT each desired record again, restoring the intended state.
 //
-// Passing an empty `records` slice performs just the DELETE — this is how
-// `registrar clear` ends up on the wire.
+// PUT-first is deliberate: if the PUT format is wrong, the credentials are
+// wrong, or the API is down, step 1 fails and we return *before any
+// destructive op*, leaving whatever the registrar previously held intact.
+// The earlier DELETE-then-PUT order had a failure mode where a broken PUT
+// silently left the zone with zero DS records, which validators interpret
+// as an unsigned delegation — a silent DNSSEC outage. Two PUTs per record
+// is fine: Dynadot's PUT is documented as upsert by key_tag, so the second
+// pass is idempotent over a clean (post-DELETE) registrar.
+//
+// Passing an empty `records` slice is `registrar clear` — performs only
+// the DELETE, no PUTs.
 func (c *DynadotClient) ReplaceDS(ctx context.Context, domain string, records []*dns.DS) error {
+	if len(records) > 0 {
+		if err := c.AddDS(ctx, domain, records); err != nil {
+			return fmt.Errorf("publish before clear: %w", err)
+		}
+	}
+
 	if _, err := c.do(ctx, http.MethodDelete, dnssecPath(domain), nil); err != nil {
 		return fmt.Errorf("clear_dnssec: %w", err)
 	}

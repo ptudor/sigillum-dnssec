@@ -36,7 +36,7 @@ This tool exists because every DNSSEC solution is either:
 ### What It Does
 
 1. **Watches unsigned zone files** in a configured directory
-2. **Generates keys** (KSK + ZSK) on first seeing a zone, with configurable lifetime (default: 3 years)
+2. **Generates keys** (KSK + ZSK) on first seeing a zone, with configurable lifetime (default: 5 years)
 3. **Signs zones** automatically when:
    - Zone file changes (mtime or serial)
    - Signatures approaching expiry (resigns at 75% of signature lifetime)
@@ -138,7 +138,7 @@ poll_interval = "5m"
 # DNSSEC parameters
 [dnssec]
 algorithm = "ED25519"          # Smaller signatures, faster; fall back to ECDSAP256SHA256 if registrar doesn't support alg 15
-ksk_lifetime = "3y"            # 1y, 3y, 5y — how long before rollover reminder
+ksk_lifetime = "5y"            # 1y, 3y, 5y — how long before rollover reminder
 zsk_lifetime = "90d"           # ZSK rolls automatically, no registrar interaction
 signature_validity = "14d"     # How long signatures are valid
 signature_refresh = "3d"       # Re-sign when this much validity remains
@@ -326,11 +326,19 @@ type Registrar interface {
 
 | Event                           | Operation at registrar          |
 |---------------------------------|---------------------------------|
-| `add` (new zone)                | `ReplaceDS([new KSK])`          |
+| `add` (new zone)                | `AddDS([new KSK])`              |
 | `import` (existing keys)        | none (verify only, never push)  |
 | `rollover start` (KSK/algo)     | `AddDS([new KSK])`              |
 | `rollover complete` (KSK/algo)  | `ReplaceDS([new KSK])`          |
 | ZSK rollover                    | nothing — ZSK doesn't touch DS  |
+
+Auto-publish on `add` is deliberately additive, not destructive. If a publish
+attempt fails (e.g., upstream API outage), an `AddDS` leaves whatever the
+registrar previously held intact; a `ReplaceDS` would have already DELETE'd
+before discovering the PUT failure, leaving a zone with zero DS at the
+parent — a silent DNSSEC outage. Operators who need clean-state on add can
+follow up with `dnssec-tudor registrar push` (which uses `ReplaceDS`
+internally, but is now operator-explicit).
 
 `import` is intentionally read-only because the registrar already has the
 correct DS (that's how validation is working); pushing would risk wiping it
@@ -351,9 +359,13 @@ on a transient API error.
   trace correlation. Neither the key nor the secret is ever logged.
 - `AddDS` issues one `PUT` per record (Dynadot's PUT accepts a single
   record body and upserts by key tag).
-- `ReplaceDS` issues a `DELETE` then one `PUT` per desired record. This
-  has a brief window with no DS at the registrar; used only at rollover
-  *complete*, where the old DNSKEY is already retired.
+- `ReplaceDS` issues `PUT` per desired record first, then a single `DELETE`
+  to wipe the set, then `PUT` per desired record again to restore. PUT-first
+  is deliberate: if the publish format/auth is broken, the call aborts
+  before any destructive DELETE, leaving the prior DS state intact. Used
+  only at rollover *complete* (or via the explicit `registrar push` CLI),
+  where the old DNSKEY is already retired in-zone. There is still a brief
+  no-DS window between the DELETE and the second PUT.
 - `GetDS` parses `data.dnssec_info_list` — note that Dynadot returns
   `algorithm` and `digest_type` as strings, so the adapter converts them
   back to numeric DNS field values.

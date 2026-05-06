@@ -275,9 +275,10 @@ func TestDynadotAddDS_DocsShape(t *testing.T) {
 	}
 }
 
-// TestDynadotReplaceDS_CallOrder verifies DELETE precedes PUT — if this
-// inverts, every ReplaceDS call would re-add then delete, ending with zero
-// DS records at the registrar (a silent DNSSEC outage).
+// TestDynadotReplaceDS_CallOrder pins the PUT-first sequence: PUT (publish),
+// DELETE (clear stale), PUT (re-publish). Order matters because the prior
+// DELETE-first implementation could leave a zone with zero DS records when
+// the PUT format was rejected by the API — a silent DNSSEC outage.
 func TestDynadotReplaceDS_CallOrder(t *testing.T) {
 	var order []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -291,8 +292,38 @@ func TestDynadotReplaceDS_CallOrder(t *testing.T) {
 	if err := c.ReplaceDS(context.Background(), "example.com", []*dns.DS{mkDS(1, 15, 2, "aa")}); err != nil {
 		t.Fatalf("ReplaceDS: %v", err)
 	}
-	if len(order) != 2 || order[0] != http.MethodDelete || order[1] != http.MethodPut {
-		t.Fatalf("expected DELETE then PUT, got %v", order)
+	want := []string{http.MethodPut, http.MethodDelete, http.MethodPut}
+	if len(order) != len(want) {
+		t.Fatalf("expected %v, got %v", want, order)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("call %d: expected %s, got %s (full sequence %v)", i, want[i], order[i], order)
+		}
+	}
+}
+
+// TestDynadotReplaceDS_PutFailureAbortsBeforeDelete is the safety property
+// that motivates the PUT-first order: when the API rejects the publish
+// (here simulated as HTTP 400), no DELETE must reach the registrar — the
+// previous DS state must remain intact.
+func TestDynadotReplaceDS_PutFailureAbortsBeforeDelete(t *testing.T) {
+	var order []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		order = append(order, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"code":400,"message":"Bad Request","error":{"description":"simulated"}}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	err := c.ReplaceDS(context.Background(), "example.com", []*dns.DS{mkDS(1, 15, 2, "aa")})
+	if err == nil {
+		t.Fatal("expected error from failing PUT")
+	}
+	if len(order) != 1 || order[0] != http.MethodPut {
+		t.Fatalf("expected exactly one PUT and no DELETE, got %v", order)
 	}
 }
 

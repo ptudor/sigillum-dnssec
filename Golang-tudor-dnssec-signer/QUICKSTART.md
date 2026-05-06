@@ -38,7 +38,7 @@ poll_interval = "5m"
 
 [dnssec]
 algorithm = "ED25519"
-ksk_lifetime = "3y"
+ksk_lifetime = "5y"
 zsk_lifetime = "90d"
 signature_validity = "14d"
 signature_refresh = "3d"
