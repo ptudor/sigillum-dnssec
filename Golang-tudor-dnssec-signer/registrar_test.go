@@ -182,6 +182,35 @@ func TestDynadotGetDS_HappyPath(t *testing.T) {
 	}
 }
 
+// TestDynadotGetDS_LabeledAlgorithm verifies that GET responses using the
+// human-readable "NAME (N)" form for algorithm and digest_type — observed
+// in production against api.dynadot.com despite the docs implying bare
+// numeric strings — round-trip through to correct uint8 values.
+// Regression guard for a real outage where `registrar verify` errored with
+// `strconv.ParseUint: parsing "ED25519 (15)": invalid syntax`.
+func TestDynadotGetDS_LabeledAlgorithm(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssec_info_list":[`+
+			`{"key_tag":42,"algorithm":"ED25519 (15)","digest_type":"SHA-256 (2)","digest":"DEADBEEF"}`+
+			`]}}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	records, err := c.GetDS(context.Background(), "example.com")
+	if err != nil {
+		t.Fatalf("GetDS: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 DS, got %d", len(records))
+	}
+	r := records[0]
+	if r.KeyTag != 42 || r.Algorithm != 15 || r.DigestType != 2 || r.Digest != "deadbeef" {
+		t.Fatalf("unexpected DS: %+v", r)
+	}
+}
+
 // TestDynadotGetDS_ErrorBody confirms the adapter surfaces Dynadot's
 // error.description verbatim. The real restful/v2 shape puts the useful
 // text under `error.description`; `message` is just HTTP status text.
@@ -358,6 +387,15 @@ func TestParseDynadotUint8(t *testing.T) {
 		{"", 0, true},
 		{"abc", 0, true},
 		{"999", 0, true}, // out of uint8 range
+		// Live Dynadot GET responses use labeled form, not bare digits.
+		{"ED25519 (15)", 15, false},
+		{"SHA-256 (2)", 2, false},
+		{"ECDSAP256SHA256 (13)", 13, false},
+		{"  SHA-384 ( 4 ) ", 4, false},
+		{"foo (abc)", 0, true}, // paren content is not numeric
+		{"foo (999)", 0, true}, // paren content out of uint8 range
+		{"foo (", 0, true},     // unclosed paren
+		{"() ", 0, true},       // empty paren content
 	}
 	for _, tc := range cases {
 		got, err := parseDynadotUint8(tc.in, "test")

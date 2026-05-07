@@ -444,18 +444,35 @@ func (c *DynadotClient) ReplaceDS(ctx context.Context, domain string, records []
 	return c.AddDS(ctx, domain, records)
 }
 
-// parseDynadotUint8 parses a Dynadot numeric-as-string field (their docs
-// declare algorithm and digest_type as String) into the uint8 that DNS
-// libraries expect. Accepts unquoted integers too, in case the API starts
-// returning proper numbers later.
+// parseDynadotUint8 parses Dynadot's algorithm / digest_type field into the
+// uint8 the DNS library expects. The live API returns labeled values like
+// "ED25519 (15)" or "SHA-256 (2)" rather than the bare numeric strings the
+// docs implied, so this accepts both shapes:
+//
+//	"15"           → 15
+//	"ED25519 (15)" → 15
+//	"  2 "         → 2
+//	"SHA-256 (2)"  → 2
+//
+// Strategy: try a bare numeric parse first; on failure, extract the integer
+// inside the last "(...)" group. Order matters — bare-numeric is the
+// documented contract, and we want a regression there to surface clearly
+// instead of silently being rescued by paren-extraction.
 func parseDynadotUint8(s, field string) (uint8, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("dynadot %s missing", field)
 	}
-	n, err := strconv.ParseUint(s, 10, 8)
-	if err != nil {
-		return 0, fmt.Errorf("dynadot %s %q: %w", field, s, err)
+	if n, err := strconv.ParseUint(s, 10, 8); err == nil {
+		return uint8(n), nil
 	}
-	return uint8(n), nil
+	if open := strings.LastIndex(s, "("); open >= 0 {
+		if close := strings.Index(s[open:], ")"); close > 0 {
+			inner := strings.TrimSpace(s[open+1 : open+close])
+			if n, err := strconv.ParseUint(inner, 10, 8); err == nil {
+				return uint8(n), nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("dynadot %s %q: not a uint8 (expected bare integer or \"name (N)\" form)", field, s)
 }
