@@ -158,6 +158,37 @@ type signingKeys struct {
 	signingZSKPs [][]byte      // Private keys for signingZSKs
 }
 
+// validateConsistency enforces the load-bearing DNSSEC invariant: every
+// signing key must also be present (by keytag) in the published DNSKEY
+// RRset. A signer whose keytag isn't published produces RRSIGs that
+// validating resolvers can't verify — the zone is bogus and SERVFAILs
+// across every validator. Catching the inconsistency here, before
+// signRecordsWithKeys runs, keeps the previous (working) signed zone in
+// place rather than overwriting it with a broken one.
+//
+// This is a defense-in-depth check: the rollover branches in
+// loadKeysForSigning are supposed to keep this invariant, but a missing
+// "append to dnskeys" line in the ZSK pre-publish branch shipped a
+// silent outage in production. The check pays for itself the first time
+// a future rollover branch forgets the same line.
+func (k *signingKeys) validateConsistency() error {
+	published := make(map[uint16]struct{}, len(k.dnskeys))
+	for _, dk := range k.dnskeys {
+		published[dk.KeyTag()] = struct{}{}
+	}
+	for _, sk := range k.signingKSKs {
+		if _, ok := published[sk.KeyTag()]; !ok {
+			return fmt.Errorf("signing KSK keytag %d is not in the published DNSKEY RRset; signing would emit a bogus zone", sk.KeyTag())
+		}
+	}
+	for _, sk := range k.signingZSKs {
+		if _, ok := published[sk.KeyTag()]; !ok {
+			return fmt.Errorf("signing ZSK keytag %d is not in the published DNSKEY RRset; signing would emit a bogus zone", sk.KeyTag())
+		}
+	}
+	return nil
+}
+
 // loadKeysForSigning loads all keys needed, handling rollover scenarios
 func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneState *ZoneState) (*signingKeys, error) {
 	keys := &signingKeys{}
@@ -198,18 +229,31 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			}
 
 		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == ZSKRolloverStatePrePublish:
-			// ZSK pre-publish: load old ZSK, publish both but sign with old
+			// ZSK pre-publish: publish BOTH old and new ZSK in the DNSKEY
+			// RRset, but continue signing every non-DNSKEY RRset with the OLD
+			// ZSK. The new ZSK is already in keys.dnskeys via the
+			// LoadKeyPair("zsk") call above (saveKeyFiles renamed the old
+			// key file aside when the rollover started, so the *.zsk.key
+			// path now resolves to the new key). Append the OLD ZSK so the
+			// signing key's keytag actually appears in the published RRset
+			// — without this, RRSIGs reference a DNSKEY that isn't there
+			// and every validating resolver returns bogus.
+			//
+			// A load failure here is fatal. Falling back to signing-with-new
+			// would defeat pre-publish (resolvers haven't cached the new key
+			// yet) and emit a structurally-different signed zone than the
+			// one operators are expecting from the rollover state. Returning
+			// an error keeps the previously-emitted signed zone in place.
 			oldZSK, oldZSKPriv, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldKeyID)
 			if err != nil {
-				slog.Warn("[SIGN] Failed to load old ZSK for pre-publish", "error", err)
-			} else {
-				// Replace signing ZSK with old (keep new in dnskeys for publishing)
-				keys.signingZSKs = []*dns.DNSKEY{oldZSK}
-				keys.signingZSKPs = [][]byte{oldZSKPriv}
-				slog.Info("[SIGN] ZSK rollover pre-publish: publishing both, signing with old",
-					"old_key_id", zoneState.Rollover.OldKeyID,
-					"new_key_id", zoneState.Rollover.NewKeyID)
+				return nil, fmt.Errorf("loading old ZSK %d for pre-publish: %w", zoneState.Rollover.OldKeyID, err)
 			}
+			keys.dnskeys = append(keys.dnskeys, oldZSK)
+			keys.signingZSKs = []*dns.DNSKEY{oldZSK}
+			keys.signingZSKPs = [][]byte{oldZSKPriv}
+			slog.Info("[SIGN] ZSK rollover pre-publish: publishing both, signing with old",
+				"old_key_id", zoneState.Rollover.OldKeyID,
+				"new_key_id", zoneState.Rollover.NewKeyID)
 
 		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == ZSKRolloverStateSigning:
 			// ZSK signing phase: load old ZSK for publishing, sign with new
@@ -250,6 +294,9 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 		}
 	}
 
+	if err := keys.validateConsistency(); err != nil {
+		return nil, fmt.Errorf("internal key state for %s: %w", domain, err)
+	}
 	return keys, nil
 }
 

@@ -693,6 +693,195 @@ ns1	IN	A	192.0.2.1
 	}
 }
 
+// TestSignZone_ZSKPrePublish_PublishesBothKeys is a regression test for a
+// production outage where the ZSK pre-publish branch in loadKeysForSigning
+// loaded the old ZSK for signing but never appended it to keys.dnskeys.
+// The signed zone shipped with RRSIGs by the OLD ZSK while the DNSKEY RRset
+// contained only the NEW ZSK — every validating resolver returned bogus.
+//
+// Fix invariant: during ZSK pre-publish, the DNSKEY RRset must contain BOTH
+// the old and new ZSK, and every non-DNSKEY RRSIG must reference the OLD
+// ZSK (which must, by transitive consequence, be in the published RRset).
+func TestSignZone_ZSKPrePublish_PublishesBothKeys(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+
+	zoneContent := `$ORIGIN example.com.
+$TTL 3600
+@	IN	SOA	ns1.example.com. admin.example.com. 2024011501 3600 1800 604800 86400
+@	IN	NS	ns1.example.com.
+ns1	IN	A	192.0.2.1
+@	IN	A	192.0.2.10
+www	IN	A	192.0.2.20
+`
+	zonePath := filepath.Join(dataDir, "example.com.zone")
+	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
+		t.Fatalf("Failed to write zone file: %v", err)
+	}
+	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("ensureDir keys: %v", err)
+	}
+	if err := ensureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("ensureDir output: %v", err)
+	}
+
+	state := NewState(cfg.StatePath())
+	keyGen := NewKeyGenerator(cfg)
+
+	ksk, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateKSK: %v", err)
+	}
+	oldZSK, err := keyGen.GenerateZSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateZSK (old): %v", err)
+	}
+
+	state.SetZone("example.com", &ZoneState{
+		Path: zonePath,
+		KSK:  ksk,
+		ZSK:  oldZSK,
+	})
+
+	// Drive the rollover through the production code path: the rollover
+	// manager generates the new ZSK, renames the old key file to the
+	// keytagged backup name (via saveKeyFiles → backupExistingKeyFiles),
+	// and records the rollover state with the old key id retained.
+	rolloverMgr := NewRolloverManager(cfg, state)
+	zoneState := state.GetZone("example.com")
+	if err := rolloverMgr.startZSKRollover("example.com", zoneState); err != nil {
+		t.Fatalf("startZSKRollover: %v", err)
+	}
+	if zoneState.Rollover == nil || zoneState.Rollover.State != ZSKRolloverStatePrePublish {
+		t.Fatalf("expected pre_publish rollover state, got %+v", zoneState.Rollover)
+	}
+	newZSKID := zoneState.Rollover.NewKeyID
+	if newZSKID == 0 || newZSKID == oldZSK.ID {
+		t.Fatalf("rollover did not pick a distinct new ZSK id (old=%d new=%d)", oldZSK.ID, newZSKID)
+	}
+
+	// Sign the zone. With the bug present, this would emit a bogus zone or
+	// the consistency check would block it; either way the test must hold
+	// the invariants below.
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone("example.com"); err != nil {
+		t.Fatalf("SignZone during pre-publish: %v", err)
+	}
+
+	signedPath := filepath.Join(cfg.OutputDir, "example.com.zone.signed")
+	signedData, err := os.ReadFile(signedPath)
+	if err != nil {
+		t.Fatalf("read signed zone: %v", err)
+	}
+
+	// Parse the signed zone and collect: (1) every keytag in the DNSKEY
+	// RRset, and (2) every signer keytag in non-DNSKEY RRSIGs. The two
+	// invariants we enforce are that both ZSKs are published and that
+	// every non-DNSKEY RRSIG references the OLD ZSK.
+	publishedTags := make(map[uint16]uint16) // keytag → flags
+	nonDNSKEYSigners := make(map[uint16]int) // signer keytag → count
+	dnskeySigners := make(map[uint16]int)    // signer keytag → count
+	zp := dns.NewZoneParser(strings.NewReader(string(signedData)), "example.com.", signedPath)
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		switch r := rr.(type) {
+		case *dns.DNSKEY:
+			publishedTags[r.KeyTag()] = r.Flags
+		case *dns.RRSIG:
+			if r.TypeCovered == dns.TypeDNSKEY {
+				dnskeySigners[r.KeyTag]++
+			} else {
+				nonDNSKEYSigners[r.KeyTag]++
+			}
+		}
+	}
+	if err := zp.Err(); err != nil {
+		t.Fatalf("parse signed zone: %v", err)
+	}
+
+	// Invariant 1: the published DNSKEY RRset contains the KSK and BOTH
+	// ZSKs. Missing the old ZSK was the original bug; missing the new
+	// ZSK would mean pre-publish never started.
+	if _, ok := publishedTags[ksk.ID]; !ok {
+		t.Errorf("KSK keytag %d missing from published DNSKEY RRset (have %v)", ksk.ID, publishedTags)
+	}
+	if _, ok := publishedTags[oldZSK.ID]; !ok {
+		t.Errorf("OLD ZSK keytag %d missing from published DNSKEY RRset (have %v) — this is the original bug",
+			oldZSK.ID, publishedTags)
+	}
+	if _, ok := publishedTags[newZSKID]; !ok {
+		t.Errorf("NEW ZSK keytag %d missing from published DNSKEY RRset (have %v)", newZSKID, publishedTags)
+	}
+
+	// Invariant 2: every non-DNSKEY RRSIG must be signed by the OLD ZSK.
+	// The new ZSK is pre-published only; signing with it would make any
+	// resolver that hadn't seen the new key yet treat the zone as bogus.
+	if len(nonDNSKEYSigners) == 0 {
+		t.Fatal("no non-DNSKEY RRSIGs found in signed zone")
+	}
+	for tag := range nonDNSKEYSigners {
+		if tag != oldZSK.ID {
+			t.Errorf("non-DNSKEY RRSIG signed by keytag %d, expected old ZSK %d", tag, oldZSK.ID)
+		}
+	}
+
+	// Invariant 3: DNSKEY RRSIG must be by the KSK.
+	if dnskeySigners[ksk.ID] == 0 {
+		t.Errorf("DNSKEY RRset is not signed by KSK %d (signers: %v)", ksk.ID, dnskeySigners)
+	}
+}
+
+// TestSigningKeys_ValidateConsistency directly exercises the defense-in-depth
+// helper that blocks any future rollover branch from re-introducing the
+// "signing key not in DNSKEY RRset" bug.
+func TestSigningKeys_ValidateConsistency(t *testing.T) {
+	mkKey := func(flags uint16, pub string) *dns.DNSKEY {
+		return &dns.DNSKEY{
+			Hdr:       dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
+			Flags:     flags,
+			Protocol:  3,
+			Algorithm: dns.ED25519,
+			PublicKey: pub,
+		}
+	}
+	// Two distinct ED25519 keys; their KeyTag values are deterministic.
+	ksk := mkKey(257, "e4JxpxDlYLR2XvKd1aHmNyeIABiD+LOLjJ0P3mC/xVI=")
+	zskA := mkKey(256, "hQV3r2EK6uRHSSvTuHjqF9S0SjDmfmNCIGiYfL9ylzE=")
+	zskB := mkKey(256, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+
+	t.Run("all_signers_published_passes", func(t *testing.T) {
+		k := &signingKeys{
+			dnskeys:     []*dns.DNSKEY{ksk, zskA},
+			signingKSKs: []*dns.DNSKEY{ksk},
+			signingZSKs: []*dns.DNSKEY{zskA},
+		}
+		if err := k.validateConsistency(); err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+	})
+	t.Run("missing_zsk_in_published_set_fails", func(t *testing.T) {
+		k := &signingKeys{
+			dnskeys:     []*dns.DNSKEY{ksk, zskB}, // wrong ZSK published
+			signingKSKs: []*dns.DNSKEY{ksk},
+			signingZSKs: []*dns.DNSKEY{zskA}, // signing with a different ZSK
+		}
+		if err := k.validateConsistency(); err == nil {
+			t.Fatal("expected error when signing ZSK is not published, got nil")
+		}
+	})
+	t.Run("missing_ksk_in_published_set_fails", func(t *testing.T) {
+		altKSK := mkKey(257, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=")
+		k := &signingKeys{
+			dnskeys:     []*dns.DNSKEY{altKSK, zskA},
+			signingKSKs: []*dns.DNSKEY{ksk},
+			signingZSKs: []*dns.DNSKEY{zskA},
+		}
+		if err := k.validateConsistency(); err == nil {
+			t.Fatal("expected error when signing KSK is not published, got nil")
+		}
+	})
+}
+
 // TestCanonicalOrdering tests the canonical DNS name ordering used for NSEC chains
 func TestCanonicalOrdering(t *testing.T) {
 	// Test cases based on RFC 4034 Section 6.1
