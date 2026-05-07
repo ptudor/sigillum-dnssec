@@ -22,10 +22,19 @@
 #   --send-id        Send X-Request-ID header (and sign with it). Default off,
 #                    matching the Go adapter's send_request_id=false default.
 #   --variant=NAME   For put: alternate body shapes for probing.
-#                    snake-empty   default; snake_case, all 6 fields, flags+public_key=""
-#                    snake-omit    snake_case, omit flags + public_key entirely
-#                    camel-empty   camelCase, all 6 fields, flags+publicKey=""
-#                    keytag-string key_tag serialized as string instead of int
+#                    snake-empty    default; snake_case, all 6 fields, flags+public_key=""
+#                    snake-omit     snake_case, omit flags + public_key entirely
+#                    camel-empty    camelCase, all 6 fields, flags+publicKey=""
+#                    keytag-string  key_tag serialized as string instead of int
+#                    labeled        algorithm/digest_type as "NAME (N)" — matches the
+#                                   shape Dynadot's GET returns. Useful to test whether
+#                                   PUT requires the same labeled form.
+#                    numeric        algorithm/digest_type as raw JSON numbers (no quotes)
+#                                   — tests the literal "Integer" reading of the docs.
+#                    minimal        snake_case, only the 4 DS-form fields (no flags,
+#                                   no public_key). Stricter than snake-omit because
+#                                   it shows the call site's intent: this is a DS, not
+#                                   a DNSKEY-form set_dnssec request.
 #
 # Requires: bash, openssl, curl, awk, xxd or python3 (for UUID gen).
 
@@ -88,6 +97,29 @@ build_body_put() {
         "$kt" "$dt" "$dig" "$alg" ;;
     keytag-string)
       printf '{"key_tag":"%s","digest_type":"%s","digest":"%s","algorithm":"%s","flags":"","public_key":""}' \
+        "$kt" "$dt" "$dig" "$alg" ;;
+    labeled)
+      # Mirrors the "NAME (N)" shape Dynadot's GET returns. Map common
+      # algorithm/digest_type numbers back to the labeled form. Falls
+      # back to bare numerics for anything not listed.
+      local alg_label="$alg" dt_label="$dt"
+      case "$alg" in
+        13) alg_label="ECDSAP256SHA256 (13)" ;;
+        14) alg_label="ECDSAP384SHA384 (14)" ;;
+        15) alg_label="ED25519 (15)" ;;
+        16) alg_label="ED448 (16)" ;;
+      esac
+      case "$dt" in
+        2) dt_label="SHA-256 (2)" ;;
+        4) dt_label="SHA-384 (4)" ;;
+      esac
+      printf '{"key_tag":%s,"digest_type":"%s","digest":"%s","algorithm":"%s","flags":"","public_key":""}' \
+        "$kt" "$dt_label" "$dig" "$alg_label" ;;
+    numeric)
+      printf '{"key_tag":%s,"digest_type":%s,"digest":"%s","algorithm":%s}' \
+        "$kt" "$dt" "$dig" "$alg" ;;
+    minimal)
+      printf '{"key_tag":%s,"digest_type":"%s","digest":"%s","algorithm":"%s"}' \
         "$kt" "$dt" "$dig" "$alg" ;;
     *) echo "unknown --variant $VARIANT" >&2; exit 64 ;;
   esac
