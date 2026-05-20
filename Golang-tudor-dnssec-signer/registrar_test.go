@@ -211,6 +211,52 @@ func TestDynadotGetDS_LabeledAlgorithm(t *testing.T) {
 	}
 }
 
+// TestDynadotGetDS_SchemaDrift verifies that GET parsing tolerates the
+// field-name and JSON-type variation Dynadot's beta REST API may return.
+func TestDynadotGetDS_SchemaDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssecInfoList":[`+
+			`{"keyTag":"42","algorithm":15,"digestType":"SHA-256 (2)","digest":"DEADBEEF"}`+
+			`]}}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	records, err := c.GetDS(context.Background(), "example.com")
+	if err != nil {
+		t.Fatalf("GetDS: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 DS, got %d", len(records))
+	}
+	r := records[0]
+	if r.KeyTag != 42 || r.Algorithm != 15 || r.DigestType != 2 || r.Digest != "deadbeef" {
+		t.Fatalf("unexpected DS: %+v", r)
+	}
+}
+
+// TestDynadotGetDS_UnknownDataShapeErrors guards against treating an
+// unrecognized Dynadot beta response as "no DS records".
+func TestDynadotGetDS_UnknownDataShapeErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":200,"message":"Success","data":{"dnssecInfo":[`+
+			`{"key_tag":42,"algorithm":"15","digest_type":"2","digest":"DEADBEEF"}`+
+			`]}}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	_, err := c.GetDS(context.Background(), "example.com")
+	if err == nil {
+		t.Fatal("expected schema error, got nil")
+	}
+	if !strings.Contains(err.Error(), "missing dnssec_info_list") {
+		t.Fatalf("expected missing list error, got %q", err.Error())
+	}
+}
+
 // TestDynadotGetDS_ErrorBody confirms the adapter surfaces Dynadot's
 // error.description verbatim. The real restful/v2 shape puts the useful
 // text under `error.description`; `message` is just HTTP status text.
@@ -301,6 +347,21 @@ func TestDynadotAddDS_DocsShape(t *testing.T) {
 		if !strings.Contains(raw, want) {
 			t.Errorf("body missing %q; got %s", want, raw)
 		}
+	}
+}
+
+// TestDynadotAddDS_AcceptsAcceptedEnvelope confirms any successful 2xx
+// envelope code is accepted, including Dynadot's documented 202 response.
+func TestDynadotAddDS_AcceptsAcceptedEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":202,"message":"Accepted"}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	if err := c.AddDS(context.Background(), "example.com", []*dns.DS{mkDS(12345, 15, 2, "abcdef")}); err != nil {
+		t.Fatalf("AddDS: %v", err)
 	}
 }
 

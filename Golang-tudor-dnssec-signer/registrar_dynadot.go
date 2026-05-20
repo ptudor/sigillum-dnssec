@@ -281,7 +281,7 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 		}
 		return nil, fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
 	}
-	if env.Code != 0 && env.Code != http.StatusOK && env.Code != http.StatusCreated {
+	if env.Code != 0 && (env.Code < 200 || env.Code >= 300) {
 		// Dynadot sometimes returns HTTP 200 with a failure code in the
 		// envelope instead of a real 4xx. Surface error.description the
 		// same way we do for real HTTP errors, and debug-log the raw
@@ -309,11 +309,9 @@ func truncate(s string, max int) string {
 	return s[:max] + "…[truncated]"
 }
 
-// dynadotDSRecord matches the shape of a single entry in the list
-// returned by GET /dnssec. Fields mirror the docs' snake_case here;
-// we haven't yet seen a populated response from the live API, so this
-// is best-effort and may need to flip to camelCase (as set_dnssec did)
-// once a zone with DS comes back non-empty.
+// dynadotDSRecord matches a single entry in GET /dnssec. Dynadot's beta
+// REST API has varied between snake_case/camelCase and string/number JSON
+// values, so UnmarshalJSON accepts both documented and observed shapes.
 type dynadotDSRecord struct {
 	KeyTag     uint16 `json:"key_tag"`
 	Algorithm  string `json:"algorithm"`
@@ -321,11 +319,105 @@ type dynadotDSRecord struct {
 	Digest     string `json:"digest"`
 }
 
+func (r *dynadotDSRecord) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	keyTag, err := dynadotRawUint16(raw, "key_tag", "keyTag")
+	if err != nil {
+		return err
+	}
+	algorithm, err := dynadotRawString(raw, "algorithm")
+	if err != nil {
+		return err
+	}
+	digestType, err := dynadotRawString(raw, "digest_type", "digestType")
+	if err != nil {
+		return err
+	}
+	digest, err := dynadotRawString(raw, "digest")
+	if err != nil {
+		return err
+	}
+
+	r.KeyTag = keyTag
+	r.Algorithm = algorithm
+	r.DigestType = digestType
+	r.Digest = digest
+	return nil
+}
+
 // dynadotGetDNSSECData is the `data` portion of a get_dnssec response.
-// The outer list key is the documented snake_case; inner record fields
-// are camelCase (see dynadotDSRecord).
+// The list key accepts documented snake_case and observed camelCase forms.
 type dynadotGetDNSSECData struct {
 	DNSSECInfoList []dynadotDSRecord `json:"dnssec_info_list"`
+}
+
+func (d *dynadotGetDNSSECData) UnmarshalJSON(data []byte) error {
+	if len(bytes.TrimSpace(data)) == 0 || bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+
+	listRaw, ok := dynadotRawField(raw, "dnssec_info_list", "dnssecInfoList")
+	if !ok {
+		return fmt.Errorf("missing dnssec_info_list in dynadot data object")
+	}
+	if err := json.Unmarshal(listRaw, &d.DNSSECInfoList); err != nil {
+		return fmt.Errorf("parsing dnssec_info_list: %w", err)
+	}
+	return nil
+}
+
+func dynadotRawField(raw map[string]json.RawMessage, names ...string) (json.RawMessage, bool) {
+	for _, name := range names {
+		if v, ok := raw[name]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func dynadotRawString(raw map[string]json.RawMessage, names ...string) (string, error) {
+	v, ok := dynadotRawField(raw, names...)
+	if !ok {
+		return "", fmt.Errorf("missing %s", names[0])
+	}
+
+	var s string
+	if err := json.Unmarshal(v, &s); err == nil {
+		return s, nil
+	}
+
+	var n json.Number
+	dec := json.NewDecoder(bytes.NewReader(v))
+	dec.UseNumber()
+	if err := dec.Decode(&n); err == nil {
+		return n.String(), nil
+	}
+
+	return "", fmt.Errorf("%s must be a string or number", names[0])
+}
+
+func dynadotRawUint16(raw map[string]json.RawMessage, names ...string) (uint16, error) {
+	s, err := dynadotRawString(raw, names...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("%s %q: not a uint16", names[0], s)
+	}
+	return uint16(n), nil
 }
 
 // dynadotSetDNSSECBody mirrors the docs' Request Body shape verbatim:
