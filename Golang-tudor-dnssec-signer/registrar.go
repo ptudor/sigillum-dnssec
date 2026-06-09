@@ -61,7 +61,8 @@ func BuildDSSet(cfg *Config, state *State, domain string) ([]*dns.DS, error) {
 
 	var out []*dns.DS
 	// Active KSK (always present). Key filenames use the primary "ksk" slot.
-	ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+	// Only the public halves are needed to compute DS records.
+	ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
 		return nil, fmt.Errorf("loading active KSK: %w", err)
 	}
@@ -71,7 +72,7 @@ func BuildDSSet(cfg *Config, state *State, domain string) ([]*dns.DS, error) {
 	// until `rollover complete` is run, both DS records must be present at
 	// the parent so resolvers mid-transition can validate either chain.
 	if zoneState.Rollover != nil && (zoneState.Rollover.Type == "ksk" || zoneState.Rollover.Type == "algorithm") {
-		oldKSK, _, err := keyGen.loadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
+		oldKSK, err := keyGen.LoadPublicKeyByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 		if err != nil {
 			slog.Warn("[REGISTRAR] cannot load backed-up old KSK during rollover; DS set will include new KSK only",
 				"domain", domain, "old_key_id", zoneState.Rollover.OldKeyID, "error", err)

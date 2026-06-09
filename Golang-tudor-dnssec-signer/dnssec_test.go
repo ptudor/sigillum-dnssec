@@ -1267,12 +1267,30 @@ ns1	IN	A	192.0.2.1
 		t.Errorf("Zone approaching expiry should need signing, got needs=%v reason=%q", needs, reason)
 	}
 
-	// Zone with active rollover SHOULD need signing
+	// Zone with a rollover transition not yet reflected in the signed
+	// output (ForceResign set) SHOULD need signing
 	zoneState.SignaturesExp = now.Add(14 * 24 * time.Hour)
-	zoneState.Rollover = &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait}
+	zoneState.ForceResign = true
+	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
+	if !needs || reason != "rollover state changed" {
+		t.Errorf("Zone with pending rollover transition should need signing, got needs=%v reason=%q", needs, reason)
+	}
+	zoneState.ForceResign = false
+
+	// Zone with a rollover started after the last signing SHOULD need signing
+	zoneState.Rollover = &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait, Started: now.Add(time.Minute)}
 	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
 	if !needs || reason != "rollover in progress" {
-		t.Errorf("Zone with active rollover should need signing, got needs=%v reason=%q", needs, reason)
+		t.Errorf("Zone with unreflected rollover should need signing, got needs=%v reason=%q", needs, reason)
+	}
+
+	// Zone already signed AFTER the rollover transition should NOT re-sign
+	// every poll cycle — that churned signatures (and nsd reloads) for the
+	// entire days-long ds_add_wait window.
+	zoneState.Rollover.Started = now.Add(-time.Hour)
+	needs, _ = signer.NeedsSign("example.com", zonePath, zoneState)
+	if needs {
+		t.Error("Zone signed after rollover transition should not need signing again")
 	}
 
 	// Missing zone file should record error
@@ -1679,5 +1697,626 @@ func TestRecoverKeyStateCreatedDate(t *testing.T) {
 	if recovered.Created.Before(beforeGenerate) || recovered.Created.After(afterGenerate) {
 		t.Errorf("Recovered created date %v not within expected range [%v, %v]",
 			recovered.Created, beforeGenerate, afterGenerate)
+	}
+}
+
+// signAndParseZone is a helper that writes zoneContent, generates keys, signs
+// the zone, and returns the parsed records of the signed output.
+func signAndParseZone(t *testing.T, cfg *Config, domain, zoneContent string) []dns.RR {
+	t.Helper()
+
+	zonePath := filepath.Join(cfg.DataDir, domain+".zone")
+	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
+		t.Fatalf("Failed to write zone file: %v", err)
+	}
+
+	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("Failed to create keys dir: %v", err)
+	}
+	if err := ensureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("Failed to create output dir: %v", err)
+	}
+
+	state := NewState(cfg.StatePath())
+	keyGen := NewKeyGenerator(cfg)
+	ksk, err := keyGen.GenerateKSK(domain)
+	if err != nil {
+		t.Fatalf("GenerateKSK: %v", err)
+	}
+	zsk, err := keyGen.GenerateZSK(domain)
+	if err != nil {
+		t.Fatalf("GenerateZSK: %v", err)
+	}
+	state.SetZone(domain, &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone(domain); err != nil {
+		t.Fatalf("SignZone failed: %v", err)
+	}
+
+	signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
+	signedData, err := os.ReadFile(signedPath)
+	if err != nil {
+		t.Fatalf("reading signed zone: %v", err)
+	}
+
+	var records []dns.RR
+	zp := dns.NewZoneParser(strings.NewReader(string(signedData)), dns.Fqdn(domain), signedPath)
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		records = append(records, rr)
+	}
+	if err := zp.Err(); err != nil {
+		t.Fatalf("parsing signed zone: %v", err)
+	}
+	return records
+}
+
+// delegationTestZone has an insecure delegation (sub) with glue below the
+// cut and a stray A record at the cut itself, a secure delegation
+// (securesub, has DS), and a record (a.b) that creates an empty non-terminal
+// (b.example.com).
+const delegationTestZone = `$ORIGIN example.com.
+$TTL 3600
+@	IN	SOA	ns1.example.com. admin.example.com. 2024011501 3600 1800 604800 86400
+@	IN	NS	ns1.example.com.
+ns1	IN	A	192.0.2.1
+www	IN	A	192.0.2.20
+a.b	IN	A	192.0.2.30
+sub	IN	NS	ns1.sub.example.com.
+sub	IN	A	192.0.2.50
+ns1.sub	IN	A	192.0.2.100
+securesub	IN	NS	ns.elsewhere.invalid.
+securesub	IN	DS	12345 15 2 ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01234567
+`
+
+func bitmapContains(types []uint16, t uint16) bool {
+	for _, x := range types {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
+// TestNSECChain_DelegationsOccludedAndENTs verifies RFC 4035 §2.3 NSEC chain
+// rules: no NSEC at occluded names or empty non-terminals, and delegation
+// point bitmaps limited to NS, DS (if present), NSEC, RRSIG.
+func TestNSECChain_DelegationsOccludedAndENTs(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	cfg.DNSSEC.NSECVersion = "nsec"
+
+	records := signAndParseZone(t, cfg, "example.com", delegationTestZone)
+
+	nsecs := make(map[string]*dns.NSEC)
+	for _, rr := range records {
+		if nsec, ok := rr.(*dns.NSEC); ok {
+			nsecs[strings.ToLower(nsec.Header().Name)] = nsec
+		}
+	}
+
+	// Occluded glue below the cut must not be in the chain
+	if _, ok := nsecs["ns1.sub.example.com."]; ok {
+		t.Error("occluded glue name must not have an NSEC record (RFC 4035 §2.3)")
+	}
+
+	// Empty non-terminals must not have NSEC records — an NSEC (plus its
+	// RRSIG) must never be the only RRset at a name (RFC 4035 §2.3)
+	if _, ok := nsecs["b.example.com."]; ok {
+		t.Error("empty non-terminal must not have an NSEC record (RFC 4035 §2.3)")
+	}
+
+	// Insecure delegation: bitmap is exactly NS, NSEC, RRSIG — glue A at
+	// the cut stays out
+	sub, ok := nsecs["sub.example.com."]
+	if !ok {
+		t.Fatal("expected NSEC at insecure delegation point")
+	}
+	want := []uint16{dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC}
+	if len(sub.TypeBitMap) != len(want) {
+		t.Errorf("insecure delegation bitmap = %v, want exactly NS/RRSIG/NSEC", sub.TypeBitMap)
+	}
+	for _, w := range want {
+		if !bitmapContains(sub.TypeBitMap, w) {
+			t.Errorf("insecure delegation bitmap missing %s: %v", dns.TypeToString[w], sub.TypeBitMap)
+		}
+	}
+	if bitmapContains(sub.TypeBitMap, dns.TypeA) {
+		t.Errorf("glue A at the cut must not appear in the NSEC bitmap: %v", sub.TypeBitMap)
+	}
+
+	// Secure delegation: NS, DS, NSEC, RRSIG
+	securesub, ok := nsecs["securesub.example.com."]
+	if !ok {
+		t.Fatal("expected NSEC at secure delegation point")
+	}
+	for _, w := range []uint16{dns.TypeNS, dns.TypeDS, dns.TypeNSEC, dns.TypeRRSIG} {
+		if !bitmapContains(securesub.TypeBitMap, w) {
+			t.Errorf("secure delegation bitmap missing %s: %v", dns.TypeToString[w], securesub.TypeBitMap)
+		}
+	}
+
+	// The chain must be closed: every NextDomain points at another owner
+	for name, nsec := range nsecs {
+		next := strings.ToLower(nsec.NextDomain)
+		if _, ok := nsecs[next]; !ok {
+			t.Errorf("NSEC at %s points to %s which has no NSEC", name, next)
+		}
+	}
+
+	// Records at and below the cut stay unsigned; DS at the cut is signed
+	sigs := make(map[string]map[uint16]bool)
+	for _, rr := range records {
+		if sig, ok := rr.(*dns.RRSIG); ok {
+			name := strings.ToLower(sig.Header().Name)
+			if sigs[name] == nil {
+				sigs[name] = make(map[uint16]bool)
+			}
+			sigs[name][sig.TypeCovered] = true
+		}
+	}
+	if sigs["sub.example.com."][dns.TypeA] {
+		t.Error("glue A at the cut must not be signed")
+	}
+	if !sigs["sub.example.com."][dns.TypeNSEC] {
+		t.Error("NSEC at the cut must be signed")
+	}
+	if !sigs["securesub.example.com."][dns.TypeDS] {
+		t.Error("DS at a secure delegation must be signed")
+	}
+	if len(sigs["ns1.sub.example.com."]) != 0 {
+		t.Error("occluded names must not be signed")
+	}
+}
+
+// TestNSEC3Chain_DelegationsOccludedAndApexBitmap verifies RFC 5155 §7.1
+// NSEC3 rules: no NSEC3 for occluded names, ENTs present with empty bitmaps,
+// delegation bitmaps limited to NS (+DS/RRSIG when secure), and NSEC3PARAM
+// listed in the apex bitmap.
+func TestNSEC3Chain_DelegationsOccludedAndApexBitmap(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	cfg.DNSSEC.NSECVersion = "nsec3"
+
+	records := signAndParseZone(t, cfg, "example.com", delegationTestZone)
+
+	hashOf := func(name string) string {
+		return strings.ToLower(dns.HashName(name, dns.SHA1, 0, "") + ".example.com.")
+	}
+
+	nsec3s := make(map[string]*dns.NSEC3)
+	for _, rr := range records {
+		if n3, ok := rr.(*dns.NSEC3); ok {
+			nsec3s[strings.ToLower(n3.Header().Name)] = n3
+		}
+	}
+
+	// Occluded glue below the cut must not be in the chain
+	if _, ok := nsec3s[hashOf("ns1.sub.example.com.")]; ok {
+		t.Error("occluded glue name must not have an NSEC3 record (RFC 5155 §7.1)")
+	}
+
+	// ENT gets an NSEC3 with an empty bitmap
+	ent, ok := nsec3s[hashOf("b.example.com.")]
+	if !ok {
+		t.Fatal("empty non-terminal must have an NSEC3 record (RFC 5155 §7.1)")
+	}
+	if len(ent.TypeBitMap) != 0 {
+		t.Errorf("ENT NSEC3 bitmap must be empty, got %v", ent.TypeBitMap)
+	}
+
+	// Insecure delegation: bitmap is exactly {NS} — no RRSIG (the NSEC3 and
+	// its signature live at the hashed name, not the original)
+	sub, ok := nsec3s[hashOf("sub.example.com.")]
+	if !ok {
+		t.Fatal("expected NSEC3 for insecure delegation point")
+	}
+	if len(sub.TypeBitMap) != 1 || sub.TypeBitMap[0] != dns.TypeNS {
+		t.Errorf("insecure delegation NSEC3 bitmap = %v, want exactly [NS]", sub.TypeBitMap)
+	}
+
+	// Secure delegation: NS, DS, RRSIG
+	securesub, ok := nsec3s[hashOf("securesub.example.com.")]
+	if !ok {
+		t.Fatal("expected NSEC3 for secure delegation point")
+	}
+	for _, w := range []uint16{dns.TypeNS, dns.TypeDS, dns.TypeRRSIG} {
+		if !bitmapContains(securesub.TypeBitMap, w) {
+			t.Errorf("secure delegation NSEC3 bitmap missing %s: %v", dns.TypeToString[w], securesub.TypeBitMap)
+		}
+	}
+
+	// Apex bitmap must include NSEC3PARAM alongside SOA/NS/DNSKEY/RRSIG
+	apex, ok := nsec3s[hashOf("example.com.")]
+	if !ok {
+		t.Fatal("expected NSEC3 for apex")
+	}
+	for _, w := range []uint16{dns.TypeSOA, dns.TypeNS, dns.TypeDNSKEY, dns.TypeNSEC3PARAM, dns.TypeRRSIG} {
+		if !bitmapContains(apex.TypeBitMap, w) {
+			t.Errorf("apex NSEC3 bitmap missing %s: %v", dns.TypeToString[w], apex.TypeBitMap)
+		}
+	}
+}
+
+// TestCheckZSKRollover_StartsWhenAlreadyExpired guards the fix for the stall
+// where a ZSK that had sailed past its expiry (daemon down across the
+// window) never rolled because of a `daysUntilExpiry > 0` guard.
+func TestCheckZSKRollover_StartsWhenAlreadyExpired(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("ensureDir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+	ksk, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateKSK: %v", err)
+	}
+	zsk, err := keyGen.GenerateZSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateZSK: %v", err)
+	}
+
+	// Simulate a ZSK already past expiry
+	zsk.Expires = time.Now().UTC().Add(-24 * time.Hour)
+
+	state := NewState(cfg.StatePath())
+	zoneState := &ZoneState{Path: "unused", KSK: ksk, ZSK: zsk}
+	state.SetZone("example.com", zoneState)
+
+	rm := NewRolloverManager(cfg, state)
+	if err := rm.CheckZSKRollover("example.com"); err != nil {
+		t.Fatalf("CheckZSKRollover: %v", err)
+	}
+
+	if zoneState.Rollover == nil || zoneState.Rollover.Type != "zsk" {
+		t.Fatalf("expected ZSK rollover to start for an expired ZSK, got %+v", zoneState.Rollover)
+	}
+	if zoneState.Rollover.State != ZSKRolloverStatePrePublish {
+		t.Errorf("expected pre_publish state, got %q", zoneState.Rollover.State)
+	}
+	if !zoneState.ForceResign {
+		t.Error("starting a rollover must set ForceResign so the daemon re-signs once")
+	}
+}
+
+// TestForceResignLifecycle verifies that rollover transitions set ForceResign
+// and a successful sign clears it — the mechanism that replaced "re-sign
+// every poll cycle while a rollover is in progress".
+func TestForceResignLifecycle(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+
+	zoneContent := `$ORIGIN example.com.
+$TTL 3600
+@	IN	SOA	ns1.example.com. admin.example.com. 2024011501 3600 1800 604800 86400
+@	IN	NS	ns1.example.com.
+ns1	IN	A	192.0.2.1
+`
+	zonePath := filepath.Join(cfg.DataDir, "example.com.zone")
+	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
+		t.Fatalf("write zone: %v", err)
+	}
+	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("ensureDir: %v", err)
+	}
+	if err := ensureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("ensureDir: %v", err)
+	}
+
+	keyGen := NewKeyGenerator(cfg)
+	ksk, err := keyGen.GenerateKSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateKSK: %v", err)
+	}
+	zsk, err := keyGen.GenerateZSK("example.com")
+	if err != nil {
+		t.Fatalf("GenerateZSK: %v", err)
+	}
+	state := NewState(cfg.StatePath())
+	zoneState := &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk}
+	state.SetZone("example.com", zoneState)
+
+	rm := NewRolloverManager(cfg, state)
+	if err := rm.StartKSKRollover("example.com"); err != nil {
+		t.Fatalf("StartKSKRollover: %v", err)
+	}
+	if !zoneState.ForceResign {
+		t.Fatal("StartKSKRollover must set ForceResign")
+	}
+
+	signer := NewSigner(cfg, state)
+	if err := signer.SignZone("example.com"); err != nil {
+		t.Fatalf("SignZone: %v", err)
+	}
+	if zoneState.ForceResign {
+		t.Fatal("successful SignZone must clear ForceResign")
+	}
+
+	if err := rm.CompleteKSKRollover("example.com"); err != nil {
+		t.Fatalf("CompleteKSKRollover: %v", err)
+	}
+	if !zoneState.ForceResign {
+		t.Fatal("CompleteKSKRollover must set ForceResign so the old KSK is dropped from the next signed zone")
+	}
+}
+
+// TestZoneStateClone verifies the deep copy handed to concurrent readers
+// shares nothing mutable with the live state.
+func TestZoneStateClone(t *testing.T) {
+	orig := &ZoneState{
+		Path:     "/tmp/zone",
+		Serial:   42,
+		KSK:      &KeyState{ID: 1, Algorithm: "ED25519"},
+		ZSK:      &KeyState{ID: 2, Algorithm: "ED25519"},
+		Rollover: &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait},
+		Warnings: []string{"w1"},
+		Errors:   []string{"e1"},
+	}
+
+	c := orig.clone()
+
+	orig.KSK.ID = 99
+	orig.Rollover.State = "mutated"
+	orig.Warnings[0] = "mutated"
+	orig.Errors = append(orig.Errors, "e2")
+
+	if c.KSK.ID != 1 {
+		t.Error("clone shares KSK pointer with original")
+	}
+	if c.Rollover.State != KSKRolloverStateDSAddWait {
+		t.Error("clone shares Rollover pointer with original")
+	}
+	if c.Warnings[0] != "w1" {
+		t.Error("clone shares Warnings slice with original")
+	}
+	if len(c.Errors) != 1 {
+		t.Error("clone shares Errors slice with original")
+	}
+
+	var nilZone *ZoneState
+	if nilZone.clone() != nil {
+		t.Error("clone of nil must be nil")
+	}
+
+	state := NewState("/tmp/state.json")
+	if state.GetZoneCopy("missing") != nil {
+		t.Error("GetZoneCopy of unknown zone must be nil")
+	}
+}
+
+// TestExecuteHookSync_Env verifies the CLI hook path exports the same
+// DNSSEC_* environment the daemon's async hook provides.
+func TestExecuteHookSync_Env(t *testing.T) {
+	outFile := filepath.Join(t.TempDir(), "hook.out")
+	hooks := &HooksConfig{
+		PostSignCmd: []string{"/bin/sh", "-c", "echo \"$DNSSEC_DOMAIN $DNSSEC_SIGNED_PATH\" > " + outFile},
+	}
+	env := &HookEnv{
+		Domain:     "example.com",
+		ZonePath:   "/tmp/zone",
+		SignedPath: "/tmp/signed",
+		OutputDir:  "/tmp",
+	}
+	if err := executeHookSync(hooks, env); err != nil {
+		t.Fatalf("executeHookSync: %v", err)
+	}
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("hook output not written: %v", err)
+	}
+	got := strings.TrimSpace(string(data))
+	if got != "example.com /tmp/signed" {
+		t.Errorf("hook env = %q, want %q", got, "example.com /tmp/signed")
+	}
+}
+
+// TestSerialGt exercises RFC 1982 serial number comparison, including
+// wraparound.
+func TestSerialGt(t *testing.T) {
+	tests := []struct {
+		a, b uint32
+		want bool
+	}{
+		{2, 1, true},
+		{1, 2, false},
+		{1, 1, false},
+		{1765000000, 1764999999, true}, // epoch-scale values
+		{0, 4294967295, true},          // wraparound: 0 is "greater" than max
+		{4294967295, 0, false},
+		{2147483648, 0, false}, // exactly 2^31 apart: not greater per RFC 1982
+	}
+	for _, tt := range tests {
+		if got := serialGt(tt.a, tt.b); got != tt.want {
+			t.Errorf("serialGt(%d, %d) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+// epochSerialZone returns a minimal zone using a unix-epoch SOA serial.
+func epochSerialZone(serial uint32) string {
+	return fmt.Sprintf(`$ORIGIN example.com.
+$TTL 3600
+@	IN	SOA	ns1.example.com. admin.example.com. %d 3600 1800 604800 86400
+@	IN	NS	ns1.example.com.
+ns1	IN	A	192.0.2.1
+`, serial)
+}
+
+// signedSOASerial parses the signed output for a zone and returns its SOA serial.
+func signedSOASerial(t *testing.T, cfg *Config, domain string) uint32 {
+	t.Helper()
+	signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
+	data, err := os.ReadFile(signedPath)
+	if err != nil {
+		t.Fatalf("reading signed zone: %v", err)
+	}
+	zp := dns.NewZoneParser(strings.NewReader(string(data)), dns.Fqdn(domain), signedPath)
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		if soa, ok := rr.(*dns.SOA); ok {
+			return soa.Serial
+		}
+	}
+	t.Fatal("no SOA in signed zone")
+	return 0
+}
+
+// TestSerialPolicy_Epoch verifies the epoch policy publishes a serial that is
+// at least the current time, strictly increases on every signing event, and
+// leaves the unsigned file's serial tracked separately for change detection.
+func TestSerialPolicy_Epoch(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	cfg.DNSSEC.SerialPolicy = "epoch"
+
+	unsigned := uint32(time.Now().Unix() - 3600) // epoch serial set an hour ago
+	records := signAndParseZone(t, cfg, "example.com", epochSerialZone(unsigned))
+	_ = records
+
+	state := NewState(cfg.StatePath())
+	// signAndParseZone uses its own state; re-create the scenario directly
+	// for the double-sign assertion.
+	keyGen := NewKeyGenerator(cfg)
+	ksk, _ := keyGen.GenerateKSK("example.com")
+	zsk, _ := keyGen.GenerateZSK("example.com")
+	zoneState := &ZoneState{Path: cfg.Zones["example.com"].Path, KSK: ksk, ZSK: zsk}
+	state.SetZone("example.com", zoneState)
+	signer := NewSigner(cfg, state)
+
+	if err := signer.SignZone("example.com"); err != nil {
+		t.Fatalf("SignZone: %v", err)
+	}
+	first := zoneState.PublishedSerial
+	now := uint32(time.Now().Unix())
+	if !serialGt(first, unsigned) {
+		t.Errorf("published serial %d must be greater than unsigned %d", first, unsigned)
+	}
+	if first < now-5 || first > now+5 {
+		t.Errorf("published serial %d should be ~now (%d)", first, now)
+	}
+	if got := signedSOASerial(t, cfg, "example.com"); got != first {
+		t.Errorf("signed zone SOA serial = %d, state published_serial = %d", got, first)
+	}
+	if zoneState.Serial != unsigned {
+		t.Errorf("unsigned serial tracking changed: got %d, want %d", zoneState.Serial, unsigned)
+	}
+
+	// Re-sign immediately (same second is fine): serial must strictly increase
+	if err := signer.SignZone("example.com"); err != nil {
+		t.Fatalf("second SignZone: %v", err)
+	}
+	second := zoneState.PublishedSerial
+	if !serialGt(second, first) {
+		t.Errorf("re-sign must bump published serial: first=%d second=%d", first, second)
+	}
+	if got := signedSOASerial(t, cfg, "example.com"); got != second {
+		t.Errorf("signed zone SOA serial = %d, want %d", got, second)
+	}
+}
+
+// TestSerialPolicy_EpochRejectsNonEpochSerials verifies the MUST-USE-epoch
+// contract: date-format (YYYYMMDDnn) and tiny sequential serials fail
+// signing with an instructive error, leaving prior output intact.
+func TestSerialPolicy_EpochRejectsNonEpochSerials(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		serial uint32
+	}{
+		{"date format", 2026060901}, // > now+1d until the year 2034
+		{"sequential", 7},           // < 2000-01-01 epoch floor
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig(t, t.TempDir())
+			cfg.DNSSEC.SerialPolicy = "epoch"
+
+			zonePath := filepath.Join(cfg.DataDir, "example.com.zone")
+			if err := os.WriteFile(zonePath, []byte(epochSerialZone(tt.serial)), 0644); err != nil {
+				t.Fatalf("write zone: %v", err)
+			}
+			cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+			if err := ensureDir(cfg.KeysDir()); err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureDir(cfg.OutputDir); err != nil {
+				t.Fatal(err)
+			}
+
+			state := NewState(cfg.StatePath())
+			keyGen := NewKeyGenerator(cfg)
+			ksk, _ := keyGen.GenerateKSK("example.com")
+			zsk, _ := keyGen.GenerateZSK("example.com")
+			state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+
+			signer := NewSigner(cfg, state)
+			err := signer.SignZone("example.com")
+			if err == nil {
+				t.Fatal("expected SignZone to reject a non-epoch serial under serial_policy = epoch")
+			}
+			if !strings.Contains(err.Error(), "epoch") {
+				t.Errorf("error should explain the epoch requirement, got: %v", err)
+			}
+			if _, statErr := os.Stat(filepath.Join(cfg.OutputDir, "example.com.zone.signed")); statErr == nil {
+				t.Error("no signed output should be written for a rejected zone")
+			}
+		})
+	}
+}
+
+// TestSerialPolicy_KeepPassesThrough verifies the default policy leaves the
+// serial untouched in the signed output.
+func TestSerialPolicy_KeepPassesThrough(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	// testConfig leaves SerialPolicy empty — defaults to "keep"
+
+	signAndParseZone(t, cfg, "example.com", epochSerialZone(1700000000))
+	if got := signedSOASerial(t, cfg, "example.com"); got != 1700000000 {
+		t.Errorf("keep policy must pass the serial through: got %d, want 1700000000", got)
+	}
+}
+
+// TestSerialPolicy_PerZoneOverride verifies a per-zone serial_policy wins
+// over the global default.
+func TestSerialPolicy_PerZoneOverride(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	cfg.DNSSEC.SerialPolicy = "keep"
+	cfg.Zones["example.com"] = ZoneConfig{SerialPolicy: "epoch"}
+	if got := cfg.GetZoneSerialPolicy("example.com"); got != "epoch" {
+		t.Errorf("per-zone override: got %q, want epoch", got)
+	}
+	if got := cfg.GetZoneSerialPolicy("other.com"); got != "keep" {
+		t.Errorf("global default: got %q, want keep", got)
+	}
+}
+
+// TestConfigValidation_SerialPolicy verifies bad values are rejected.
+func TestConfigValidation_SerialPolicy(t *testing.T) {
+	dataDir := t.TempDir()
+	zonePath := filepath.Join(dataDir, "zone.db")
+	if err := os.WriteFile(zonePath, []byte("placeholder"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mkConfig := func() *Config {
+		cfg := DefaultConfig()
+		cfg.OutputDir = dataDir
+		cfg.DataDir = dataDir
+		return cfg
+	}
+
+	cfg := mkConfig()
+	cfg.DNSSEC.SerialPolicy = "increment"
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected validation error for unknown global serial_policy")
+	}
+
+	cfg = mkConfig()
+	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath, SerialPolicy: "unixtime"}
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected validation error for unknown per-zone serial_policy")
+	}
+
+	cfg = mkConfig()
+	cfg.DNSSEC.SerialPolicy = "epoch"
+	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath, SerialPolicy: "keep"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid serial policies should pass validation: %v", err)
 	}
 }

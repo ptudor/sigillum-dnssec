@@ -17,15 +17,51 @@ type State struct {
 
 // ZoneState represents the state of a single zone
 type ZoneState struct {
-	Path          string         `json:"path"`
-	Serial        uint32         `json:"serial"`
-	LastSigned    time.Time      `json:"last_signed"`
-	SignaturesExp time.Time      `json:"signatures_expire"`
-	KSK           *KeyState      `json:"ksk,omitempty"`
-	ZSK           *KeyState      `json:"zsk,omitempty"`
-	Rollover      *RolloverState `json:"rollover,omitempty"`
-	Warnings      []string       `json:"warnings,omitempty"`
-	Errors        []string       `json:"errors,omitempty"`
+	Path   string `json:"path"`
+	Serial uint32 `json:"serial"`
+	// PublishedSerial is the SOA serial actually written to the signed
+	// zone. Equal to Serial under serial_policy = "keep"; under "epoch" it
+	// is bumped on every signing event so secondaries pick up refreshed
+	// signatures. Serial keeps tracking the unsigned file for change
+	// detection.
+	PublishedSerial uint32         `json:"published_serial,omitempty"`
+	LastSigned      time.Time      `json:"last_signed"`
+	SignaturesExp   time.Time      `json:"signatures_expire"`
+	KSK             *KeyState      `json:"ksk,omitempty"`
+	ZSK             *KeyState      `json:"zsk,omitempty"`
+	Rollover        *RolloverState `json:"rollover,omitempty"`
+	Warnings        []string       `json:"warnings,omitempty"`
+	Errors          []string       `json:"errors,omitempty"`
+	// ForceResign is set whenever a rollover transition changes which keys
+	// must be published or used for signing, and cleared on the next
+	// successful sign. It replaces the old "re-sign every cycle while a
+	// rollover is in progress" behavior, which churned signatures (and
+	// fired the post-sign hook) every poll interval for the days a KSK
+	// rollover sits in ds_add_wait.
+	ForceResign bool `json:"force_resign,omitempty"`
+}
+
+// clone returns a deep copy of the zone state. Readers outside the signing
+// goroutine must work on a clone taken under the state lock — handing out
+// the live pointer lets JSON encoders race against in-place mutation.
+func (z *ZoneState) clone() *ZoneState {
+	if z == nil {
+		return nil
+	}
+	c := *z
+	c.KSK = z.KSK.clone()
+	c.ZSK = z.ZSK.clone()
+	if z.Rollover != nil {
+		r := *z.Rollover
+		c.Rollover = &r
+	}
+	if z.Warnings != nil {
+		c.Warnings = append([]string(nil), z.Warnings...)
+	}
+	if z.Errors != nil {
+		c.Errors = append([]string(nil), z.Errors...)
+	}
+	return &c
 }
 
 // KeyState represents the state of a DNSSEC key
@@ -36,6 +72,15 @@ type KeyState struct {
 	Expires     time.Time `json:"expires"`
 	DSPublished bool      `json:"ds_published,omitempty"`
 	RolloverDue time.Time `json:"rollover_due,omitempty"`
+}
+
+// clone returns a copy of the key state (nil-safe).
+func (k *KeyState) clone() *KeyState {
+	if k == nil {
+		return nil
+	}
+	c := *k
+	return &c
 }
 
 // RolloverState represents an in-progress key rollover
@@ -168,13 +213,34 @@ func (s *State) Save() error {
 
 // GetZone returns the state for a zone, or nil if not found.
 //
-// Concurrency contract: the returned pointer is safe to mutate from the signing
-// loop goroutine (single writer). Read-only consumers (web handlers, metrics)
-// must use ToStatusOutput which takes a read-lock and deep-copies the data.
+// Concurrency contract: the returned pointer may only be mutated from the
+// signing goroutine (single writer), and every mutation must be wrapped in
+// Mutate (or UpdateZone) so it happens under the state write lock. Read-only
+// consumers on other goroutines (web handlers, validators) must use
+// GetZoneCopy or ToStatusOutput, which take the read lock and deep-copy.
 func (s *State) GetZone(domain string) *ZoneState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Zones[domain]
+}
+
+// GetZoneCopy returns a deep copy of a zone's state, or nil if not found.
+// Safe to read and serialize from any goroutine.
+func (s *State) GetZoneCopy(domain string) *ZoneState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Zones[domain].clone()
+}
+
+// Mutate runs fn while holding the state write lock. The signing goroutine
+// and the rollover manager mutate ZoneState fields through pointers obtained
+// from GetZone; bracketing those writes here is what makes the deep-copying
+// readers (GetZoneCopy, ToStatusOutput) actually race-free. fn must not call
+// other State methods — that would self-deadlock.
+func (s *State) Mutate(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn()
 }
 
 // UpdateZone applies a mutation function to a zone under the state write lock.
@@ -201,12 +267,17 @@ func (s *State) RemoveZone(domain string) {
 	delete(s.Zones, domain)
 }
 
-// Status returns the overall status for a zone
+// Status returns the overall status for a zone.
+//
+// ZSK rollovers are fully automatic (pre-publish, no registrar interaction),
+// so they do not count as action_required — flagging them paged operators
+// for routine maintenance every 90 days. The rollover details stay visible
+// in the status JSON either way.
 func (z *ZoneState) Status() string {
 	if len(z.Errors) > 0 {
 		return "error"
 	}
-	if z.Rollover != nil && z.Rollover.State != "" {
+	if z.Rollover != nil && z.Rollover.State != "" && z.Rollover.Type != "zsk" {
 		return "action_required"
 	}
 	if len(z.Warnings) > 0 {
@@ -224,16 +295,17 @@ type StatusOutput struct {
 
 // ZoneStatusOutput represents per-zone status in the output
 type ZoneStatusOutput struct {
-	Status        string            `json:"status"`
-	Serial        uint32            `json:"serial,omitempty"`
-	LastSigned    time.Time         `json:"last_signed,omitempty"`
-	SignaturesExp time.Time         `json:"signatures_expire,omitempty"`
-	KSK           *KeyState         `json:"ksk,omitempty"`
-	ZSK           *KeyState         `json:"zsk,omitempty"`
-	Rollover      *RolloverState    `json:"rollover,omitempty"`
-	Warnings      []string          `json:"warnings,omitempty"`
-	Errors        []string          `json:"errors,omitempty"`
-	Validation    *ValidationResult `json:"validation,omitempty"`
+	Status          string            `json:"status"`
+	Serial          uint32            `json:"serial,omitempty"`
+	PublishedSerial uint32            `json:"published_serial,omitempty"`
+	LastSigned      time.Time         `json:"last_signed,omitempty"`
+	SignaturesExp   time.Time         `json:"signatures_expire,omitempty"`
+	KSK             *KeyState         `json:"ksk,omitempty"`
+	ZSK             *KeyState         `json:"zsk,omitempty"`
+	Rollover        *RolloverState    `json:"rollover,omitempty"`
+	Warnings        []string          `json:"warnings,omitempty"`
+	Errors          []string          `json:"errors,omitempty"`
+	Validation      *ValidationResult `json:"validation,omitempty"`
 }
 
 // StatusSummary provides a summary of all zones
@@ -257,16 +329,20 @@ func (s *State) ToStatusOutput() *StatusOutput {
 
 	for domain, zone := range s.Zones {
 		status := zone.Status()
+		// Deep-copy so callers (web handlers, health checks) never hold
+		// references into live state the signing goroutine mutates.
+		zc := zone.clone()
 		output.Zones[domain] = &ZoneStatusOutput{
-			Status:        status,
-			Serial:        zone.Serial,
-			LastSigned:    zone.LastSigned,
-			SignaturesExp: zone.SignaturesExp,
-			KSK:           zone.KSK,
-			ZSK:           zone.ZSK,
-			Rollover:      zone.Rollover,
-			Warnings:      zone.Warnings,
-			Errors:        zone.Errors,
+			Status:          status,
+			Serial:          zc.Serial,
+			PublishedSerial: zc.PublishedSerial,
+			LastSigned:      zc.LastSigned,
+			SignaturesExp:   zc.SignaturesExp,
+			KSK:             zc.KSK,
+			ZSK:             zc.ZSK,
+			Rollover:        zc.Rollover,
+			Warnings:        zc.Warnings,
+			Errors:          zc.Errors,
 		}
 
 		output.Summary.Total++

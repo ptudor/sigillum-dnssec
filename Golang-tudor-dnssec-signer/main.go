@@ -332,11 +332,36 @@ func preflightConfigAppend(path string) error {
 	return f.Close()
 }
 
+// runPostSignHook fires the configured post-sign hook synchronously after a
+// CLI command re-signed a zone. CLI commands must run the hook synchronously
+// — the async daemon variant would be killed when the process exits — and
+// they must run it at all: without this, `rollover complete` would write a
+// new signed zone that NSD doesn't load until the next natural re-sign.
+// Hook failures are logged, never fatal — the signing itself succeeded.
+func runPostSignHook(cfg *Config, domain, zonePath string) {
+	if cfg.Hooks.PostSign == "" && len(cfg.Hooks.PostSignCmd) == 0 {
+		return
+	}
+	slog.Info("[CLI] Executing post-sign hook", "domain", domain)
+	hookEnv := &HookEnv{
+		Domain:     domain,
+		ZonePath:   zonePath,
+		SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
+		OutputDir:  cfg.OutputDir,
+	}
+	if err := executeHookSync(&cfg.Hooks, hookEnv); err != nil {
+		slog.Error("[CLI] Post-sign hook failed", "domain", domain, "error", err)
+	}
+}
+
 // unwindAdd undoes the on-disk side effects of a partial `add`: removes the
-// zone from in-memory state, persists state.json, and deletes the keys and
-// signed zone file. Best-effort — failures are logged but not returned, so
-// the original error from `add` surfaces unchanged.
-func unwindAdd(cfg *Config, state *State, domain string) {
+// zone from in-memory state, persists state.json, and deletes the signed
+// zone file. Key files are deleted only when this `add` generated them —
+// keys recovered from a previous management period must survive the
+// rollback, since a DS at the registrar may still reference them.
+// Best-effort — failures are logged but not returned, so the original error
+// from `add` surfaces unchanged.
+func unwindAdd(cfg *Config, state *State, domain string, removeKSK, removeZSK bool) {
 	state.RemoveZone(domain)
 	if err := state.Save(); err != nil {
 		slog.Warn("[CLI] Rollback: failed to save state", "domain", domain, "error", err)
@@ -348,12 +373,18 @@ func unwindAdd(cfg *Config, state *State, domain string) {
 	}
 
 	keysDir := cfg.KeysDir()
-	for _, p := range []string{
-		filepath.Join(keysDir, domain+".ksk.key"),
-		filepath.Join(keysDir, domain+".ksk.private"),
-		filepath.Join(keysDir, domain+".zsk.key"),
-		filepath.Join(keysDir, domain+".zsk.private"),
-	} {
+	var keyFiles []string
+	if removeKSK {
+		keyFiles = append(keyFiles,
+			filepath.Join(keysDir, domain+".ksk.key"),
+			filepath.Join(keysDir, domain+".ksk.private"))
+	}
+	if removeZSK {
+		keyFiles = append(keyFiles,
+			filepath.Join(keysDir, domain+".zsk.key"),
+			filepath.Join(keysDir, domain+".zsk.private"))
+	}
+	for _, p := range keyFiles {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			slog.Warn("[CLI] Rollback: failed to remove key file", "path", p, "error", err)
 		}
@@ -414,6 +445,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 			case syscall.SIGINT, syscall.SIGTERM:
 				slog.Info("[DAEMON] Received shutdown signal", "signal", sig)
 				daemon.Shutdown()
+				// Wait for Run() to drain — an in-flight signing cycle
+				// finishes (and saves state) before the process exits.
+				if err := <-errCh; err != nil {
+					return fmt.Errorf("daemon error: %w", err)
+				}
 				return nil
 			}
 		case err := <-errCh:
@@ -442,7 +478,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 	// Execute post-sign hook once after all zones are signed
 	if cfg.Hooks.PostSign != "" || len(cfg.Hooks.PostSignCmd) > 0 {
 		slog.Info("[CLI] Executing post-sign hook")
-		if err := executeHookSync(&cfg.Hooks); err != nil {
+		if err := executeHookSync(&cfg.Hooks, &HookEnv{OutputDir: cfg.OutputDir}); err != nil {
 			slog.Error("[CLI] Post-sign hook failed", "error", err)
 		}
 	}
@@ -490,17 +526,7 @@ func runResign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	// Execute post-sign hook if configured
-	if cfg.Hooks.PostSign != "" || len(cfg.Hooks.PostSignCmd) > 0 {
-		slog.Info("[CLI] Executing post-sign hook")
-		hookEnv := &HookEnv{
-			Domain:     domain,
-			ZonePath:   zoneCfg.Path,
-			SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
-			OutputDir:  cfg.OutputDir,
-		}
-		executeHook(&cfg.Hooks, hookEnv)
-	}
+	runPostSignHook(cfg, domain, zoneCfg.Path)
 
 	fmt.Printf("Zone %s re-signed successfully.\n", domain)
 	fmt.Printf("Signed zone written to: %s\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
@@ -525,15 +551,16 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("domain %q not found in state", domain)
 		}
 		output := &ZoneStatusOutput{
-			Status:        zoneState.Status(),
-			Serial:        zoneState.Serial,
-			LastSigned:    zoneState.LastSigned,
-			SignaturesExp: zoneState.SignaturesExp,
-			KSK:           zoneState.KSK,
-			ZSK:           zoneState.ZSK,
-			Rollover:      zoneState.Rollover,
-			Warnings:      zoneState.Warnings,
-			Errors:        zoneState.Errors,
+			Status:          zoneState.Status(),
+			Serial:          zoneState.Serial,
+			PublishedSerial: zoneState.PublishedSerial,
+			LastSigned:      zoneState.LastSigned,
+			SignaturesExp:   zoneState.SignaturesExp,
+			KSK:             zoneState.KSK,
+			ZSK:             zoneState.ZSK,
+			Rollover:        zoneState.Rollover,
+			Warnings:        zoneState.Warnings,
+			Errors:          zoneState.Errors,
 		}
 		if doValidate {
 			v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
@@ -653,18 +680,24 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Add to in-memory config so signing works
 	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
 
+	// Key files may already exist on disk from a previous management period
+	// (zone removed and re-added). Reusing them preserves the DS chain of
+	// trust — generating fresh keys while the registrar's DS still points
+	// at the old KSK would SERVFAIL the zone the moment the new signed
+	// output goes live. recoverOrGenerateKeys only generates when no key
+	// files are present. Capture which slots were empty so a rollback only
+	// deletes keys this command created.
+	keysDir := cfg.KeysDir()
+	kskGenerated := !fileExists(filepath.Join(keysDir, domain+".ksk.key"))
+	zskGenerated := !fileExists(filepath.Join(keysDir, domain+".zsk.key"))
+
 	// From here on, any failure must roll back side effects — partial keys,
 	// signed zone, state entry — so a retry of `add` starts from a clean slate.
 	keyGen := NewKeyGenerator(cfg)
-	ksk, err := keyGen.GenerateKSK(domain)
+	ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 	if err != nil {
-		unwindAdd(cfg, state, domain)
-		return fmt.Errorf("generating KSK: %w", err)
-	}
-	zsk, err := keyGen.GenerateZSK(domain)
-	if err != nil {
-		unwindAdd(cfg, state, domain)
-		return fmt.Errorf("generating ZSK: %w", err)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
+		return fmt.Errorf("preparing keys: %w", err)
 	}
 
 	// Create zone state
@@ -678,12 +711,12 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Sign the zone
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
-		unwindAdd(cfg, state, domain)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
 	if err := state.Save(); err != nil {
-		unwindAdd(cfg, state, domain)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
 		return fmt.Errorf("saving state: %w", err)
 	}
 
@@ -691,13 +724,13 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// but if it still fails (race, disk full), unwind everything so state.json
 	// stays consistent with the config file.
 	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
-		unwindAdd(cfg, state, domain)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
 		return fmt.Errorf("adding zone to config file: %w", err)
 	}
 	slog.Info("[CLI] Added zone to config file", "config", configPath)
 
 	// Print DS records - load actual key for proper DS computation
-	kskKey, _, err := keyGen.LoadKeyPair(domain, "ksk")
+	kskKey, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
 		return fmt.Errorf("loading KSK for DS: %w", err)
 	}
@@ -705,9 +738,16 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\nDomain %s added successfully.\n", domain)
 	fmt.Printf("  Config updated: %s\n", configPath)
 	fmt.Printf("  Signed zone:    %s\n\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
-	fmt.Println("Add the following DS record to your registrar:")
+	if kskGenerated {
+		fmt.Println("Add the following DS record to your registrar:")
+	} else {
+		fmt.Println("Existing keys were reused. Verify this DS record matches your registrar:")
+	}
 	dsOutput := FormatDSRecordsFromKey(domain, kskKey)
 	fmt.Println(dsOutput)
+	fmt.Println("Note: a running daemon picks up the new zone after SIGHUP (config reload).")
+
+	runPostSignHook(cfg, domain, zonePath)
 
 	// If a registrar is configured for this zone and auto-publish is on,
 	// push the DS record automatically. Failures are non-fatal.
@@ -777,11 +817,13 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
+	runPostSignHook(cfg, domain, zoneState.Path)
+
 	// Print new DS
 	fmt.Printf("KSK rollover started for %s.\n\n", domain)
 	fmt.Println("Both keys are now in the zone. Add the NEW DS record at your registrar:")
 	keyGen := NewKeyGenerator(cfg)
-	kskKey, _, err := keyGen.LoadKeyPair(domain, "ksk")
+	kskKey, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
 		return fmt.Errorf("loading new KSK for DS: %w", err)
 	}
@@ -871,6 +913,8 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
+	runPostSignHook(cfg, domain, zoneState.Path)
+
 	maybeAutoPublishDS(cfg, state, domain, "rollover_complete")
 
 	return nil
@@ -916,9 +960,11 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
+	runPostSignHook(cfg, domain, zoneState.Path)
+
 	// Get new DS record
 	keyGen := NewKeyGenerator(cfg)
-	ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+	ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
 		return fmt.Errorf("loading new KSK: %w", err)
 	}
@@ -958,9 +1004,9 @@ func runDS(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no KSK found for %s", domain)
 	}
 
-	// Load the actual key to compute DS
+	// Load the actual key to compute DS (public half is sufficient)
 	keyGen := NewKeyGenerator(cfg)
-	ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+	ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
 		return fmt.Errorf("loading KSK: %w", err)
 	}
@@ -1010,19 +1056,19 @@ func runDNSKEY(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("domain %q is not managed", domain)
 	}
 
-	// Load the actual keys
+	// Load the actual keys (public halves only)
 	keyGen := NewKeyGenerator(cfg)
 	var ksk, zsk *dns.DNSKEY
 
 	if zoneState.KSK != nil {
-		ksk, _, err = keyGen.LoadKeyPair(domain, "ksk")
+		ksk, err = keyGen.LoadPublicKey(domain, "ksk")
 		if err != nil {
 			slog.Warn("[CLI] Failed to load KSK", "error", err)
 		}
 	}
 
 	if zoneState.ZSK != nil {
-		zsk, _, err = keyGen.LoadKeyPair(domain, "zsk")
+		zsk, err = keyGen.LoadPublicKey(domain, "zsk")
 		if err != nil {
 			slog.Warn("[CLI] Failed to load ZSK", "error", err)
 		}
@@ -1193,6 +1239,9 @@ func runImport(cmd *cobra.Command, args []string) error {
 	fmt.Println("DS record (verify this matches what's at your registrar):")
 	dsOutput := FormatDSRecordsFromKey(domain, ksk)
 	fmt.Println(dsOutput)
+	fmt.Println("Note: a running daemon picks up the new zone after SIGHUP (config reload).")
+
+	runPostSignHook(cfg, domain, zonePath)
 
 	return nil
 }

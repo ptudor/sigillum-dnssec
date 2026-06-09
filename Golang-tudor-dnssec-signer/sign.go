@@ -59,9 +59,9 @@ func (s *Signer) SignAll() error {
 
 		if err := s.SignZone(domain); err != nil {
 			slog.Error("[SIGN] Failed to sign zone", "domain", domain, "error", err)
-			zoneState.AddError(err.Error())
+			s.state.Mutate(func() { zoneState.AddError(err.Error()) })
 		} else {
-			zoneState.ClearErrors()
+			s.state.Mutate(zoneState.ClearErrors)
 		}
 	}
 
@@ -83,6 +83,16 @@ func (s *Signer) SignZone(domain string) error {
 	records, serial, err := s.parseZoneFile(domain, zoneState.Path)
 	if err != nil {
 		return fmt.Errorf("parsing zone file: %w", err)
+	}
+
+	// Compute the serial to publish and rewrite the SOA before anything is
+	// signed — the SOA RRset's RRSIG covers the published serial.
+	published, err := s.publishedSerial(domain, serial, zoneState)
+	if err != nil {
+		return err
+	}
+	if published != serial {
+		setSOASerial(records, published)
 	}
 
 	// Extract SOA minimum TTL for NSEC/NSEC3 records (RFC 4035 §2.3)
@@ -131,22 +141,82 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("writing signed zone: %w", err)
 	}
 
-	// Update state
+	// Update state under the write lock so concurrent readers (web UI,
+	// health checks) never observe a half-updated zone.
 	now := time.Now().UTC()
-	zoneState.Serial = serial
-	zoneState.LastSigned = now
-	zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
-	zoneState.ClearWarnings()
+	s.state.Mutate(func() {
+		zoneState.Serial = serial
+		zoneState.PublishedSerial = published
+		zoneState.LastSigned = now
+		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
+		zoneState.ForceResign = false
+		zoneState.ClearWarnings()
 
-	// Check for upcoming rollovers
-	s.checkRolloverWarnings(domain, zoneState)
+		// Check for upcoming rollovers
+		s.checkRolloverWarnings(domain, zoneState)
+	})
 
 	// Record successful signing metrics
 	duration := time.Since(startTime).Seconds()
 	RecordSigningOperation(domain, duration, true)
 
-	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", serial, "output", outputPath, "duration_ms", int64(duration*1000))
+	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", serial, "published_serial", published, "output", outputPath, "duration_ms", int64(duration*1000))
 	return nil
+}
+
+// serialGt reports whether serial a is greater than b in RFC 1982 serial
+// number arithmetic (the comparison DNS secondaries use for SOA serials).
+func serialGt(a, b uint32) bool {
+	return (a > b && a-b < 1<<31) || (a < b && b-a > 1<<31)
+}
+
+// epochSerialFloor is 2000-01-01T00:00:00Z. Serials below this are not
+// plausible unix timestamps; serials above now+1d are date-format
+// (YYYYMMDDnn) or future-clock values — both are rejected under the epoch
+// policy because the published serial is derived from the current time and
+// must never move backwards relative to the unsigned file.
+const epochSerialFloor = 946684800
+
+// publishedSerial returns the SOA serial to write into the signed zone.
+//
+// Policy "keep" (default) publishes the unsigned serial unchanged. Policy
+// "epoch" publishes max(now, serial+1, lastPublished+1): every signing
+// event — including signature refreshes and rollover phases that don't
+// touch the unsigned file — produces a strictly larger serial, so AXFR/IXFR
+// secondaries always transfer the refreshed signatures. Zones under the
+// epoch policy MUST carry a unix epoch serial in the unsigned file (e.g.
+// from `date +%s`); anything else is rejected here, which fails this zone's
+// signing while the previously signed output keeps serving.
+func (s *Signer) publishedSerial(domain string, serial uint32, zoneState *ZoneState) (uint32, error) {
+	if s.cfg.GetZoneSerialPolicy(domain) != "epoch" {
+		return serial, nil
+	}
+
+	now := uint32(time.Now().Unix())
+	if serial < epochSerialFloor || serial > now+86400 {
+		return 0, fmt.Errorf(
+			"zone %s: serial_policy \"epoch\" requires a unix epoch SOA serial in the unsigned zone, got %d (expected %d..%d); set the serial to epoch seconds, e.g. `date +%%s`",
+			domain, serial, epochSerialFloor, now+86400)
+	}
+
+	next := now
+	if !serialGt(next, serial) {
+		next = serial + 1
+	}
+	if prev := zoneState.PublishedSerial; prev != 0 && !serialGt(next, prev) {
+		next = prev + 1
+	}
+	return next, nil
+}
+
+// setSOASerial rewrites the serial on the zone's SOA record in place.
+func setSOASerial(records []dns.RR, serial uint32) {
+	for _, rr := range records {
+		if soa, ok := rr.(*dns.SOA); ok {
+			soa.Serial = serial
+			return
+		}
+	}
 }
 
 // signingKeys holds all keys needed for signing, handling rollover scenarios
@@ -325,8 +395,18 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 			"refresh_at", refreshTime.Format(time.RFC3339))
 	}
 
-	// Check for active rollover
-	if zoneState.Rollover != nil {
+	// Check for rollover transitions. ForceResign is set by the rollover
+	// manager whenever the key set that must be published/signed changes
+	// (start, phase switch, completion) and cleared on successful sign.
+	// The Started fallback covers a rollover begun while the zone had
+	// never been signed with it (e.g. state restored from backup). The old
+	// behavior — re-sign unconditionally while Rollover != nil — re-signed
+	// (and fired the post-sign hook) every poll cycle for the entire days-
+	// long ds_add_wait window of a KSK rollover.
+	if zoneState.ForceResign {
+		return true, "rollover state changed"
+	}
+	if zoneState.Rollover != nil && zoneState.LastSigned.Before(zoneState.Rollover.Started) {
 		return true, "rollover in progress"
 	}
 
@@ -334,7 +414,9 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 	info, err := os.Stat(zonePath)
 	if err != nil {
 		slog.Error("[SIGN] Cannot stat zone file", "domain", domain, "path", zonePath, "error", err)
-		zoneState.AddError(fmt.Sprintf("zone file missing or inaccessible: %v", err))
+		s.state.Mutate(func() {
+			zoneState.AddError(fmt.Sprintf("zone file missing or inaccessible: %v", err))
+		})
 		return false, ""
 	}
 
@@ -478,53 +560,24 @@ func ValidateZoneFile(domain, path string) error {
 	return nil
 }
 
-// delegationInfo holds information about delegation points and glue records
+// delegationInfo holds information about delegation points in a zone
 type delegationInfo struct {
-	delegationPoints map[string]bool // Names with NS records (not at apex)
-	glueRecords      map[string]bool // A/AAAA records for NS targets at/below delegations
+	delegationPoints map[string]bool // lowercase FQDNs with NS records (not at apex)
 }
 
-// findDelegationPoints identifies delegation points and glue records per RFC 4035 §2.2
+// findDelegationPoints identifies delegation points (NS RRsets below the apex)
+// per RFC 4035 §2.2
 func (s *Signer) findDelegationPoints(domain string, records []dns.RR) *delegationInfo {
-	apex := dns.Fqdn(domain)
+	apexLower := strings.ToLower(dns.Fqdn(domain))
 	info := &delegationInfo{
 		delegationPoints: make(map[string]bool),
-		glueRecords:      make(map[string]bool),
 	}
 
-	// First pass: find all NS records and their targets
-	nsTargets := make(map[string]bool) // NS target names
 	for _, rr := range records {
-		if ns, ok := rr.(*dns.NS); ok {
+		if rr.Header().Rrtype == dns.TypeNS {
 			name := strings.ToLower(rr.Header().Name)
-			// Delegation point = NS record not at apex
-			if name != strings.ToLower(apex) {
+			if name != apexLower {
 				info.delegationPoints[name] = true
-			}
-			nsTargets[strings.ToLower(ns.Ns)] = true
-		}
-	}
-
-	// Second pass: identify glue records
-	// Glue = A/AAAA records for NS targets that are at or below a delegation point
-	for _, rr := range records {
-		rrtype := rr.Header().Rrtype
-		if rrtype != dns.TypeA && rrtype != dns.TypeAAAA {
-			continue
-		}
-
-		name := strings.ToLower(rr.Header().Name)
-		// Is this name an NS target?
-		if !nsTargets[name] {
-			continue
-		}
-
-		// Is this name at or below a delegation point?
-		for dp := range info.delegationPoints {
-			if name == dp || strings.HasSuffix(name, "."+dp) {
-				key := fmt.Sprintf("%s:%d", name, rrtype)
-				info.glueRecords[key] = true
-				break
 			}
 		}
 	}
@@ -536,11 +589,22 @@ func (s *Signer) findDelegationPoints(domain string, records []dns.RR) *delegati
 	return info
 }
 
+// isOccluded reports whether a (lowercase, fully-qualified) name sits
+// strictly below a delegation point. Everything at such names — glue address
+// records and any other stray data — is not authoritative in this zone:
+// it is never signed and never appears in the NSEC/NSEC3 chain.
+func (di *delegationInfo) isOccluded(name string) bool {
+	for dp := range di.delegationPoints {
+		if strings.HasSuffix(name, "."+dp) {
+			return true
+		}
+	}
+	return false
+}
+
 // signRecordsWithKeys signs all RRsets using the provided keys, handling rollover scenarios
 func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *signingKeys) ([]dns.RR, error) {
-	apex := dns.Fqdn(domain)
-
-	// Find delegation points and glue records (RFC 4035 §2.2)
+	// Find delegation points (RFC 4035 §2.2)
 	delInfo := s.findDelegationPoints(domain, records)
 
 	// Group records by RRset (name + type)
@@ -557,7 +621,7 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 	signedRecords = append(signedRecords, records...)
 
 	// Sign each RRset
-	for rrsetKey, rrset := range rrsets {
+	for _, rrset := range rrsets {
 		if len(rrset) == 0 {
 			continue
 		}
@@ -565,17 +629,18 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 		name := strings.ToLower(rrset[0].Header().Name)
 		rrtype := rrset[0].Header().Rrtype
 
-		// RFC 4035 §2.2: Don't sign NS at delegation points (only sign at apex)
-		if rrtype == dns.TypeNS && name != strings.ToLower(apex) {
-			if delInfo.delegationPoints[name] {
-				slog.Debug("[SIGN] Skipping NS signature at delegation point", "name", name)
-				continue
-			}
+		// RFC 4035 §2.2: data below a zone cut (glue and anything else
+		// occluded) is not authoritative in this zone — never sign it.
+		if delInfo.isOccluded(name) {
+			slog.Debug("[SIGN] Skipping signature for occluded name", "name", name, "type", dns.TypeToString[rrtype])
+			continue
 		}
 
-		// RFC 4035 §2.2: Don't sign glue records (A/AAAA for NS targets below delegations)
-		if delInfo.glueRecords[rrsetKey] {
-			slog.Debug("[SIGN] Skipping glue record signature", "name", name, "type", dns.TypeToString[rrtype])
+		// RFC 4035 §2.2: at a delegation point the parent is authoritative
+		// only for DS and the NSEC record — the NS RRset and any glue
+		// address records at the cut itself stay unsigned.
+		if delInfo.delegationPoints[name] && rrtype != dns.TypeDS && rrtype != dns.TypeNSEC {
+			slog.Debug("[SIGN] Skipping signature at delegation point", "name", name, "type", dns.TypeToString[rrtype])
 			continue
 		}
 
@@ -683,32 +748,28 @@ func (s *Signer) getSOATTL(records []dns.RR) uint32 {
 }
 
 func (s *Signer) generateNSECChain(domain string, records []dns.RR, soaMinTTL uint32) []dns.RR {
-	// Collect unique owner names
+	delInfo := s.findDelegationPoints(domain, records)
+
+	// Collect unique owner names that hold authoritative data or a
+	// delegation NS RRset. Occluded names (below a zone cut) get no NSEC
+	// (RFC 4035 §2.3), and neither do empty non-terminals: an NSEC (plus
+	// its RRSIG) MUST NOT be the only RRset at any owner name (RFC 4035
+	// §2.3) — ENT nonexistence-of-data is proven by the covering NSEC of
+	// the next existing descendant name.
 	names := make(map[string]bool)
 	typesByName := make(map[string]map[uint16]bool)
 
-	apex := dns.Fqdn(domain)
-	apexLower := strings.ToLower(apex)
-
-	// Track delegation points (NS records not at apex)
-	delegationPoints := make(map[string]bool)
-
 	for _, rr := range records {
 		name := strings.ToLower(rr.Header().Name)
+		if delInfo.isOccluded(name) {
+			continue
+		}
 		names[name] = true
 		if typesByName[name] == nil {
 			typesByName[name] = make(map[uint16]bool)
 		}
 		typesByName[name][rr.Header().Rrtype] = true
-
-		// Track delegation points
-		if rr.Header().Rrtype == dns.TypeNS && name != apexLower {
-			delegationPoints[name] = true
-		}
 	}
-
-	// Add empty non-terminals (RFC 4035)
-	s.addEmptyNonTerminals(names, typesByName, apex)
 
 	// Sort names canonically (RFC 4034 §6.1)
 	var sortedNames []string
@@ -724,34 +785,25 @@ func (s *Signer) generateNSECChain(domain string, records []dns.RR, soaMinTTL ui
 	for i, name := range sortedNames {
 		nextName := sortedNames[(i+1)%len(sortedNames)]
 
-		// Collect types for this name
+		// Collect types for this name. At a delegation point the parent is
+		// authoritative only for NS, DS (if present), NSEC, and the NSEC's
+		// RRSIG — glue address records at the cut stay out of the bitmap
+		// (RFC 4035 §2.3; compare the root zone's insecure delegations:
+		// "NS RRSIG NSEC").
 		var types []uint16
-		for t := range typesByName[name] {
-			types = append(types, t)
-		}
-
-		// NSEC always present
-		types = append(types, dns.TypeNSEC)
-
-		// RRSIG present except for:
-		// - Empty non-terminals with no types (but NSEC gets signed, so RRSIG exists)
-		// - Delegation points with only NS (no DS) - NS doesn't get signed
-		if len(typesByName[name]) > 0 {
-			// Check if this is a delegation point with only NS (no signed types)
-			isDelegation := delegationPoints[name]
-			hasDS := typesByName[name][dns.TypeDS]
-
-			// At delegation points, only DS gets signed. If there's no DS, no RRSIG.
-			if isDelegation && !hasDS {
-				// Pure delegation point - only NS, which doesn't get signed
-				// RRSIG NOT added
-			} else {
-				types = append(types, dns.TypeRRSIG)
+		if delInfo.delegationPoints[name] {
+			types = append(types, dns.TypeNS)
+			if typesByName[name][dns.TypeDS] {
+				types = append(types, dns.TypeDS)
 			}
 		} else {
-			// Empty non-terminal - NSEC exists and gets signed
-			types = append(types, dns.TypeRRSIG)
+			for t := range typesByName[name] {
+				types = append(types, t)
+			}
 		}
+
+		// Every name in the chain owns this NSEC and its RRSIG.
+		types = append(types, dns.TypeNSEC, dns.TypeRRSIG)
 		sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
 
 		nsec := &dns.NSEC{
@@ -833,25 +885,30 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL u
 	apex := dns.Fqdn(domain)
 	apexLower := strings.ToLower(apex)
 
-	// Collect unique owner names and their types
+	delInfo := s.findDelegationPoints(domain, records)
+
+	// Collect unique owner names and their types. Occluded names (below a
+	// zone cut) get no NSEC3 (RFC 5155 §7.1 covers only names with
+	// authoritative data or at delegation points).
 	names := make(map[string]bool)
 	typesByName := make(map[string]map[uint16]bool)
 
-	// Track delegation points (NS records not at apex)
-	delegationPoints := make(map[string]bool)
-
 	for _, rr := range records {
 		name := strings.ToLower(rr.Header().Name)
+		if delInfo.isOccluded(name) {
+			continue
+		}
 		names[name] = true
 		if typesByName[name] == nil {
 			typesByName[name] = make(map[uint16]bool)
 		}
 		typesByName[name][rr.Header().Rrtype] = true
+	}
 
-		// Track delegation points
-		if rr.Header().Rrtype == dns.TypeNS && name != apexLower {
-			delegationPoints[name] = true
-		}
+	// The NSEC3PARAM record (appended below) lives at the apex, so the
+	// apex bitmap must list it (RFC 5155 §7.1).
+	if typesByName[apexLower] != nil {
+		typesByName[apexLower][dns.TypeNSEC3PARAM] = true
 	}
 
 	// Add empty non-terminals (RFC 5155 §7.1)
@@ -897,25 +954,24 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL u
 	for i, hn := range hashedNames {
 		nextHash := hashedNames[(i+1)%len(hashedNames)].hashed
 
-		// Collect types - RFC 5155 §7.1: don't include RRSIG or NSEC3
+		// Collect types present at the *original* owner name (the NSEC3
+		// record and its RRSIG live at the hashed name, so unlike NSEC they
+		// never appear in their own bitmap). At a delegation point the
+		// parent holds only NS and DS (glue stays out); the RRSIG bit is
+		// set only when signed RRsets exist at the original name — i.e.
+		// not at insecure delegations, and not at empty non-terminals,
+		// which keep an empty bitmap (RFC 5155 §7.1).
 		var types []uint16
-		for t := range typesByName[hn.original] {
-			types = append(types, t)
-		}
-		// Only add RRSIG to type bitmap if this name has signed RRsets
-		// Empty non-terminals have empty type bitmaps (RFC 5155 §7.1)
-		// Delegation points with only NS (no DS) have no signed RRsets
-		if len(typesByName[hn.original]) > 0 {
-			isDelegation := delegationPoints[hn.original]
-			hasDS := typesByName[hn.original][dns.TypeDS]
-
-			// At delegation points, only DS gets signed. If there's no DS, no RRSIG.
-			if isDelegation && !hasDS {
-				// Pure delegation point - only NS, which doesn't get signed
-				// RRSIG NOT added
-			} else {
-				types = append(types, dns.TypeRRSIG)
+		if delInfo.delegationPoints[hn.original] {
+			types = append(types, dns.TypeNS)
+			if typesByName[hn.original][dns.TypeDS] {
+				types = append(types, dns.TypeDS, dns.TypeRRSIG)
 			}
+		} else if len(typesByName[hn.original]) > 0 {
+			for t := range typesByName[hn.original] {
+				types = append(types, t)
+			}
+			types = append(types, dns.TypeRRSIG)
 		}
 		sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
 

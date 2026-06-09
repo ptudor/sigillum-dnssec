@@ -84,12 +84,13 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 
 	status := state.ToStatusOutput()
 
-	// Compute DS records for each zone to display inline
+	// Compute DS records for each zone to display inline. Only the public
+	// key halves are read — the dashboard must never touch .private files.
 	dsRecords := make(map[string]string)
 	keyGen := NewKeyGenerator(cfg)
 	for domain, zone := range status.Zones {
 		if zone.KSK != nil {
-			ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+			ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 			if err == nil {
 				dsRecords[domain] = FormatDSRecordsFromKey(domain, ksk)
 			}
@@ -144,7 +145,9 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *
 		return
 	}
 
-	zoneState := state.GetZone(domain)
+	// Deep copy — this handler runs concurrently with the signing loop,
+	// which mutates the live ZoneState in place.
+	zoneState := state.GetZoneCopy(domain)
 	if zoneState == nil {
 		http.Error(w, "Zone not found", http.StatusNotFound)
 		return
@@ -167,7 +170,7 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *
 	// Try to get DS records if KSK exists
 	if zoneState.KSK != nil {
 		keyGen := NewKeyGenerator(cfg)
-		ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+		ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 		if err == nil {
 			response.DSRecords = FormatDSRecordsFromKey(domain, ksk)
 		}
@@ -196,8 +199,7 @@ func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config,
 		return
 	}
 
-	zoneState := state.GetZone(domain)
-	if zoneState == nil {
+	if state.GetZone(domain) == nil {
 		http.Error(w, "Zone not found", http.StatusNotFound)
 		return
 	}

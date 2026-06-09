@@ -187,3 +187,54 @@ All RFC compliance issues have been addressed:
 *Initial Review: 2026-01-19*
 *All Fixes Applied: 2026-01-19*
 *Reviewer: Claude (playing skeptical RFC author)*
+
+---
+
+## Addendum: 2026-06-09 review pass
+
+A second production-readiness review found and fixed four remaining
+authenticated-denial issues. All are covered by regression tests
+(`TestNSECChain_DelegationsOccludedAndENTs`,
+`TestNSEC3Chain_DelegationsOccludedAndApexBitmap`).
+
+### A1. NSEC records at empty non-terminals (RFC 4035 §2.3)
+
+**Status**: ✅ FIXED
+
+**RFC 4035 §2.3**: "An NSEC record (and its associated RRSIG RRset) MUST NOT
+be the only RRset at any particular owner name."
+
+`generateNSECChain()` previously added ENTs to the NSEC chain with a
+`NSEC RRSIG`-only bitmap — an explicit MUST NOT violation. ENTs are now
+excluded from the NSEC chain (NODATA for an ENT is proven by the covering
+NSEC whose next-domain is a descendant). NSEC3 mode keeps its ENT records,
+as RFC 5155 §7.1 requires.
+
+### A2. Occluded names in the NSEC/NSEC3 chain and signatures (RFC 4035 §2.2/§2.3)
+
+**Status**: ✅ FIXED
+
+Names strictly below a zone cut (glue and any stray data) are not
+authoritative in the parent zone. They previously received NSEC/NSEC3
+records, and non-A/AAAA occluded records were even signed. Both chains and
+the signer now exclude all occluded names via `delegationInfo.isOccluded()`.
+With RFC 8198 aggressive NSEC caching, the old chain entries could have fed
+resolvers wrong synthesized answers.
+
+### A3. Type bitmap contents at delegation points
+
+**Status**: ✅ FIXED
+
+NSEC bitmaps at cuts now list exactly NS, DS (when present), NSEC, RRSIG —
+matching the root zone's `NS RRSIG NSEC` shape for insecure delegations
+(the NSEC's own RRSIG lives at the cut name, so the RRSIG bit is always
+set in NSEC mode). NSEC3 bitmaps at cuts list NS (+DS, RRSIG when secure)
+only; glue address records at the cut name itself no longer leak into
+either bitmap. Signing at cuts is now limited to DS and NSEC.
+
+### A4. NSEC3PARAM missing from the apex NSEC3 bitmap (RFC 5155 §7.1)
+
+**Status**: ✅ FIXED
+
+The NSEC3PARAM record is published at the apex, but the apex NSEC3's type
+bitmap didn't list it. It does now (matching BIND/Knot output).

@@ -362,15 +362,17 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// Sign the zone
 	signStart := time.Now()
 	if err := snap.signer.SignZone(domain); err != nil {
-		zoneState.AddError(err.Error())
+		snap.state.Mutate(func() { zoneState.AddError(err.Error()) })
 		RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
 		d.heartbeat.SigningError(domain)
 		return false, err
 	}
 
-	// Clear errors on success and send completion heartbeat
-	zoneState.ClearErrors()
-	d.heartbeat.SigningComplete(domain, zoneState.Serial)
+	// Clear errors on success and send completion heartbeat with the serial
+	// actually served (differs from the unsigned serial under serial_policy
+	// = "epoch")
+	snap.state.Mutate(zoneState.ClearErrors)
+	d.heartbeat.SigningComplete(domain, zoneState.PublishedSerial)
 
 	// Execute per-zone post-sign hook only when NOT coalescing — the caller
 	// will fire one batched hook at end-of-cycle when coalesce is on.

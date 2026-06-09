@@ -160,8 +160,11 @@ func executeBatchHook(hooks *HooksConfig, domains []string, outputDir string) {
 }
 
 // executeHookSync runs a hook synchronously and returns the error.
-// Used for CLI commands where we want to wait for completion.
-func executeHookSync(hooks *HooksConfig) error {
+// Used for CLI commands, which must wait for completion — an async hook
+// spawned from a CLI command would be killed when the process exits.
+// env may be nil; when set, the same DNSSEC_* variables the daemon's
+// per-zone hook receives are exported.
+func executeHookSync(hooks *HooksConfig, env *HookEnv) error {
 	name, args, identity, ok := hookCmd(hooks)
 	if !ok {
 		return nil
@@ -175,6 +178,14 @@ func executeHookSync(hooks *HooksConfig) error {
 	command := exec.CommandContext(ctx, name, args...)
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
+	if env != nil {
+		command.Env = append(os.Environ(),
+			fmt.Sprintf("DNSSEC_DOMAIN=%s", env.Domain),
+			fmt.Sprintf("DNSSEC_ZONE_PATH=%s", env.ZonePath),
+			fmt.Sprintf("DNSSEC_SIGNED_PATH=%s", env.SignedPath),
+			fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", env.OutputDir),
+		)
+	}
 
 	return command.Run()
 }
