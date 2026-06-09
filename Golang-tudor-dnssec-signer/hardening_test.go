@@ -723,6 +723,16 @@ func TestZoneState_StatusTransitions(t *testing.T) {
 			expect: "action_required",
 		},
 		{
+			// ZSK rollovers are fully automatic — no DS update, no operator
+			// action — so they must not page anyone via action_required.
+			name: "automatic zsk rollover stays healthy",
+			zone: ZoneState{
+				Serial:   1,
+				Rollover: &RolloverState{Type: "zsk", State: ZSKRolloverStatePrePublish},
+			},
+			expect: "healthy",
+		},
+		{
 			name: "errors take priority over rollover",
 			zone: ZoneState{
 				Serial:   1,

@@ -143,6 +143,13 @@ zsk_lifetime = "90d"           # ZSK rolls automatically, no registrar interacti
 signature_validity = "14d"     # How long signatures are valid
 signature_refresh = "3d"       # Re-sign when this much validity remains
 nsec_version = "nsec3"         # "nsec" or "nsec3"
+# Serial handling for signed output. "keep" (default) passes the unsigned
+# serial through unchanged. "epoch" publishes max(now, serial+1, last+1) on
+# every signing event so AXFR/IXFR secondaries always pick up refreshed
+# RRSIGs — zones under "epoch" MUST use unix epoch serials (`date +%s`) in
+# the unsigned file; date-format serials (YYYYMMDDnn) are rejected at sign
+# time. Per-zone override: serial_policy on the zone entry.
+serial_policy = "keep"
 
 # Optional web UI
 [web]

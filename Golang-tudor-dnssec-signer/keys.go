@@ -396,6 +396,40 @@ func (kg *KeyGenerator) LoadKeyPair(domain, keyType string) (*dns.DNSKEY, []byte
 	return kg.loadKeyPairFromPath(baseName)
 }
 
+// LoadPublicKey loads only the public half of a key. Callers that just need
+// to display or compute DS/DNSKEY records (CLI output, web UI, registrar
+// pushes, validation) should use this instead of LoadKeyPair so private key
+// files aren't read — and don't need to be readable — on those paths.
+func (kg *KeyGenerator) LoadPublicKey(domain, keyType string) (*dns.DNSKEY, error) {
+	keysDir := kg.cfg.KeysDir()
+	return kg.loadPublicKeyFromPath(filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType)))
+}
+
+// LoadPublicKeyByID loads the public half of a backed-up key by its key tag
+// (the rollover backup naming convention: <domain>.<type>.<tag>.key).
+func (kg *KeyGenerator) LoadPublicKeyByID(domain, keyType string, keyID uint16) (*dns.DNSKEY, error) {
+	keysDir := kg.cfg.KeysDir()
+	return kg.loadPublicKeyFromPath(filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID)))
+}
+
+func (kg *KeyGenerator) loadPublicKeyFromPath(baseName string) (*dns.DNSKEY, error) {
+	keyData, err := os.ReadFile(baseName + ".key")
+	if err != nil {
+		return nil, fmt.Errorf("reading public key: %w", err)
+	}
+	dnskey, err := parseDNSKEYFromFile(string(keyData))
+	if err != nil {
+		return nil, fmt.Errorf("parsing public key: %w", err)
+	}
+	return dnskey, nil
+}
+
+// fileExists reports whether path exists (as any file type).
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // loadKeyPairByID loads a backup key pair by its key ID
 func (kg *KeyGenerator) loadKeyPairByID(domain, keyType string, keyID uint16) (*dns.DNSKEY, []byte, error) {
 	keysDir := kg.cfg.KeysDir()

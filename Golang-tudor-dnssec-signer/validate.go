@@ -134,7 +134,9 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 		Timestamp: time.Now().UTC(),
 	}
 
-	zoneState := v.state.GetZone(domain)
+	// Deep copy — validation runs from web handlers concurrently with the
+	// signing loop mutating the live state.
+	zoneState := v.state.GetZoneCopy(domain)
 	if zoneState == nil {
 		result.Overall = "error"
 		result.Errors = append(result.Errors, "zone not found in state")
@@ -157,7 +159,7 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 	if zoneState.KSK != nil {
 		localKSKTag = zoneState.KSK.ID
 		keyGen := NewKeyGenerator(v.cfg)
-		ksk, _, err := keyGen.LoadKeyPair(domain, "ksk")
+		ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 		if err != nil {
 			slog.Debug("[VALIDATE] Failed to load KSK", "domain", domain, "error", err)
 		} else {
@@ -168,11 +170,16 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 		localZSKTag = zoneState.ZSK.ID
 	}
 
-	// Run checks
+	// Run checks. The serial the world should see is the published one
+	// (differs from the unsigned serial under serial_policy = "epoch").
+	localSerial := zoneState.Serial
+	if zoneState.PublishedSerial != 0 {
+		localSerial = zoneState.PublishedSerial
+	}
 	result.DSCheck = v.checkDSAtParent(domain, localKSK)
 	result.DNSKEYCheck = v.checkDNSKEYVisible(domain, localKSKTag, localZSKTag)
 	result.RRSIGCheck = v.checkRRSIGPresent(domain)
-	result.SOACheck = v.checkSOASerial(domain, zoneState.Serial)
+	result.SOACheck = v.checkSOASerial(domain, localSerial)
 
 	// Compute overall status
 	result.Overall = computeOverall(
@@ -471,27 +478,40 @@ func (v *Validator) resolveNS(zone string) (string, error) {
 		return "", fmt.Errorf("no NS records found for %s", zone)
 	}
 
-	// Try to resolve first NS to an A record
+	// Try to resolve each NS to an address — IPv4 first, then IPv6 so
+	// IPv6-only nameservers can still be validated.
 	for _, nsName := range nsNames {
 		// Check additional section first
 		for _, rr := range r.Extra {
-			if a, ok := rr.(*dns.A); ok && dns.Fqdn(a.Hdr.Name) == dns.Fqdn(nsName) {
-				return net.JoinHostPort(a.A.String(), "53"), nil
+			switch addr := rr.(type) {
+			case *dns.A:
+				if dns.Fqdn(addr.Hdr.Name) == dns.Fqdn(nsName) {
+					return net.JoinHostPort(addr.A.String(), "53"), nil
+				}
+			case *dns.AAAA:
+				if dns.Fqdn(addr.Hdr.Name) == dns.Fqdn(nsName) {
+					return net.JoinHostPort(addr.AAAA.String(), "53"), nil
+				}
 			}
 		}
 
 		// Fall back to resolving the NS hostname
-		am := new(dns.Msg)
-		am.SetQuestion(dns.Fqdn(nsName), dns.TypeA)
-		am.RecursionDesired = true
+		for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+			am := new(dns.Msg)
+			am.SetQuestion(dns.Fqdn(nsName), qtype)
+			am.RecursionDesired = true
 
-		ar, _, err := c.Exchange(am, resolver)
-		if err != nil {
-			continue
-		}
-		for _, rr := range ar.Answer {
-			if a, ok := rr.(*dns.A); ok {
-				return net.JoinHostPort(a.A.String(), "53"), nil
+			ar, _, err := c.Exchange(am, resolver)
+			if err != nil {
+				continue
+			}
+			for _, rr := range ar.Answer {
+				switch addr := rr.(type) {
+				case *dns.A:
+					return net.JoinHostPort(addr.A.String(), "53"), nil
+				case *dns.AAAA:
+					return net.JoinHostPort(addr.AAAA.String(), "53"), nil
+				}
 			}
 		}
 	}

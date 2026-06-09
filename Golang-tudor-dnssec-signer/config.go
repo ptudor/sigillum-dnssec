@@ -103,6 +103,16 @@ type DNSSECConfig struct {
 	DNSKEYTtl          uint32   `toml:"dnskey_ttl"`          // TTL for DNSKEY records (0 = use SOA TTL)
 	RolloverPrepublish Duration `toml:"rollover_prepublish"` // Time before expiry to prepublish new key
 	RolloverSwitch     Duration `toml:"rollover_switch"`     // Time to wait before switching to new key
+	// SerialPolicy controls the SOA serial written to signed zones:
+	//   "keep"  — publish the unsigned zone's serial unchanged (default)
+	//   "epoch" — publish max(now, serial+1, last_published+1) so every
+	//             signing event (including signature refreshes that don't
+	//             touch the unsigned file) is visible to AXFR/IXFR
+	//             secondaries. Zones under this policy MUST use unix epoch
+	//             serials in the unsigned file; date-format serials
+	//             (YYYYMMDDnn) are rejected at signing time because they
+	//             exceed the current epoch and would move serials backwards.
+	SerialPolicy string `toml:"serial_policy"`
 }
 
 // WebConfig holds web UI settings
@@ -122,11 +132,12 @@ type HealthConfig struct {
 
 // ZoneConfig holds per-zone settings
 type ZoneConfig struct {
-	Path        string   `toml:"path"`
-	KSKLifetime Duration `toml:"ksk_lifetime,omitempty"`
-	ZSKLifetime Duration `toml:"zsk_lifetime,omitempty"`
-	Algorithm   string   `toml:"algorithm,omitempty"` // Per-zone algorithm override for algorithm rollover
-	Registrar   string   `toml:"registrar,omitempty"` // Opt-in registrar adapter name, e.g. "dynadot"
+	Path         string   `toml:"path"`
+	KSKLifetime  Duration `toml:"ksk_lifetime,omitempty"`
+	ZSKLifetime  Duration `toml:"zsk_lifetime,omitempty"`
+	Algorithm    string   `toml:"algorithm,omitempty"`     // Per-zone algorithm override for algorithm rollover
+	Registrar    string   `toml:"registrar,omitempty"`     // Opt-in registrar adapter name, e.g. "dynadot"
+	SerialPolicy string   `toml:"serial_policy,omitempty"` // Per-zone override: "keep" or "epoch"
 }
 
 // HooksConfig holds hook settings
@@ -230,6 +241,7 @@ func DefaultConfig() *Config {
 			DNSKEYTtl:          0,                             // 0 = use SOA TTL
 			RolloverPrepublish: Duration{14 * 24 * time.Hour}, // 14 days before expiry
 			RolloverSwitch:     Duration{7 * 24 * time.Hour},  // 7 days to switch signing
+			SerialPolicy:       "keep",
 		},
 		Web: WebConfig{
 			Enabled: false,
@@ -302,6 +314,17 @@ func (c *Config) Validate() error {
 	// Validate NSEC version
 	if c.DNSSEC.NSECVersion != "nsec" && c.DNSSEC.NSECVersion != "nsec3" {
 		return fmt.Errorf("nsec_version must be 'nsec' or 'nsec3', got %q", c.DNSSEC.NSECVersion)
+	}
+
+	// Validate serial policy (global and per-zone)
+	validSerialPolicies := map[string]bool{"": true, "keep": true, "epoch": true}
+	if !validSerialPolicies[c.DNSSEC.SerialPolicy] {
+		return fmt.Errorf("serial_policy must be 'keep' or 'epoch', got %q", c.DNSSEC.SerialPolicy)
+	}
+	for domain, zone := range c.Zones {
+		if !validSerialPolicies[zone.SerialPolicy] {
+			return fmt.Errorf("zone %q: serial_policy must be 'keep' or 'epoch', got %q", domain, zone.SerialPolicy)
+		}
 	}
 
 	// Validate durations are positive
@@ -441,6 +464,18 @@ func (c *Config) GetZoneAlgorithm(domain string) string {
 		return zone.Algorithm
 	}
 	return c.DNSSEC.Algorithm
+}
+
+// GetZoneSerialPolicy returns the serial policy for a zone, using the
+// zone-specific override if set. Defaults to "keep".
+func (c *Config) GetZoneSerialPolicy(domain string) string {
+	if zone, ok := c.Zones[domain]; ok && zone.SerialPolicy != "" {
+		return zone.SerialPolicy
+	}
+	if c.DNSSEC.SerialPolicy != "" {
+		return c.DNSSEC.SerialPolicy
+	}
+	return "keep"
 }
 
 // KeysDir returns the path to the keys directory

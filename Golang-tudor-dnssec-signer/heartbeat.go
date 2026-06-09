@@ -41,18 +41,11 @@ func NewHeartbeatClient(cfg *HeartbeatConfig) *HeartbeatClient {
 	}
 
 	// Create a copy of config with resolved instance_id
-	resolvedCfg := &HeartbeatConfig{
-		Enabled:         cfg.Enabled,
-		URL:             cfg.URL,
-		APIKey:          cfg.APIKey,
-		App:             cfg.App,
-		StatusURL:       cfg.StatusURL,
-		InstanceID:      instanceID,
-		IntervalMinutes: cfg.IntervalMinutes,
-	}
+	resolvedCfg := *cfg
+	resolvedCfg.InstanceID = instanceID
 
 	return &HeartbeatClient{
-		cfg:    resolvedCfg,
+		cfg:    &resolvedCfg,
 		ctx:    ctx,
 		cancel: cancel,
 		httpClient: &http.Client{

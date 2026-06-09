@@ -91,6 +91,7 @@ nsec3_salt = ""                 # Empty salt recommended
 dnskey_ttl = 0                  # 0 = use SOA TTL (recommended)
 rollover_prepublish = "14d"     # Days before expiry to prepublish new key
 rollover_switch = "7d"          # Days to wait before switching to new key
+serial_policy = "keep"          # "keep" or "epoch" — see Serial Management
 
 [web]
 enabled = true
@@ -105,10 +106,45 @@ path = "/etc/nsd/zones/example.com.zone"
 path = "/etc/nsd/zones/example.org.zone"
 ksk_lifetime = "5y"             # Per-zone override
 algorithm = "ECDSAP256SHA256"   # Per-zone algorithm (for algorithm rollover)
+serial_policy = "epoch"         # Per-zone override — zone MUST use epoch serials
 
 [hooks]
 post_sign = "systemctl reload nsd"
 ```
+
+## Serial Management
+
+By default (`serial_policy = "keep"`) the signed zone carries the unsigned
+zone's SOA serial unchanged. That is fine when NSD reads the signed files
+directly on one host, but it has a gap: **signature refreshes don't change
+the serial**, so AXFR/IXFR secondaries never transfer the refreshed RRSIGs
+and will eventually serve expired signatures.
+
+`serial_policy = "epoch"` (global in `[dnssec]`, or per-zone) fixes this.
+On every signing event the published serial becomes:
+
+```
+max( current unix time, unsigned serial + 1, last published serial + 1 )
+```
+
+so each signature refresh, rollover phase, and zone change is visible to
+secondaries as a strictly increasing serial.
+
+**Zones under the epoch policy MUST use unix epoch serials in the unsigned
+file** (e.g. `date +%s` → `1781042000`). The published serial is derived
+from the clock, so the unsigned serial must never be ahead of it:
+
+- Date-format serials (`2026060901`) are **rejected** — they are larger
+  than the current epoch, and publishing time-based serials beneath them
+  would move the zone backwards.
+- Sequential serials (`1`, `2`, …) are **rejected** — bump them once to
+  the current epoch and continue from there.
+
+A zone that fails the epoch check does not get re-signed (the error appears
+in `status` output and the `/health` endpoint); the previously signed output
+keeps serving until you fix the serial. The `status` command and dashboard
+show both values: `serial` is the unsigned file's serial (used for change
+detection), `published_serial` is what the world sees.
 
 ## Commands
 
@@ -226,14 +262,20 @@ The `post_sign` hook reloads NSD after signing. Environment variables are availa
 
 ```toml
 [hooks]
-# Reload only the signed zone (recommended)
-post_sign = "nsd-control reload $DNSSEC_DOMAIN"
-
-# Or reload all zones
+# Reload all zones (simple, recommended)
 post_sign = "nsd-control reload"
 
 # For systemd-based systems
 post_sign = "systemctl reload nsd"
+
+# Reload only the signed zone. NOTE: $VARIABLE expansion requires a shell —
+# by default post_sign is split on whitespace and exec'd directly, so
+# "$DNSSEC_DOMAIN" would be passed literally. Opt in with shell = true:
+shell = true
+post_sign = "nsd-control reload $DNSSEC_DOMAIN"
+
+# Or use exec-style argv (no shell involved; preferred for scripts):
+post_sign_cmd = ["/usr/local/sbin/reload-zone.sh"]
 ```
 
 ### Hook Environment Variables
@@ -246,6 +288,14 @@ The following environment variables are available in hooks:
 | `DNSSEC_ZONE_PATH` | Path to unsigned zone file | `/etc/nsd/zones/example.com.zone` |
 | `DNSSEC_SIGNED_PATH` | Path to signed zone file | `/var/lib/dnssec-tudor/signed/example.com.zone.signed` |
 | `DNSSEC_OUTPUT_DIR` | Output directory | `/var/lib/dnssec-tudor/signed` |
+
+With `coalesce_post_sign = true` the hook fires once per signing cycle instead
+of once per zone, receiving `DNSSEC_DOMAINS` (space-separated list) and
+`DNSSEC_BATCH_SIZE` instead of the per-zone variables.
+
+The hook also runs after CLI commands that write a signed zone (`sign`,
+`resign`, `add`, `import`, `rollover start/complete/algorithm`), synchronously,
+so the nameserver picks up the new output before the command exits.
 
 **Note:** Hooks have a 30-second timeout. If your hook needs longer (e.g., zone transfers to secondaries), consider having the hook trigger an async process instead.
 
@@ -261,7 +311,8 @@ zone "example.com" {
 
 ```toml
 [hooks]
-# Reload only the signed zone
+# Reload only the signed zone ($VARIABLE expansion requires shell = true)
+shell = true
 post_sign = "rndc reload $DNSSEC_DOMAIN"
 ```
 
