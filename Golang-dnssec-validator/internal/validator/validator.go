@@ -259,9 +259,18 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 		recordValidation := v.verifyActualRecord(ctx, domain, leafZone.Zone, leafZone.DNSKEY)
 		if recordValidation != nil {
 			leafZone.RecordValidation = recordValidation
+			// A wildcard-synthesized answer without a verified closest-encloser proof is
+			// not a fully verified denial of a direct match (RFC 4035 §5.3.4); surface it
+			// rather than letting the chain read as fully verified on the record signature.
+			if recordValidation.Wildcard && !recordValidation.WildcardProofVerified {
+				leafZone.Warnings = append(leafZone.Warnings,
+					fmt.Sprintf("wildcard-synthesized answer from %s lacks a verified closest-encloser proof of no direct match",
+						recordValidation.WildcardSource))
+			}
 			// Update the cached result too
 			if cached, ok := validatedZones[leafZone.Zone]; ok {
 				cached.RecordValidation = recordValidation
+				cached.Warnings = leafZone.Warnings
 			}
 		}
 	}
@@ -485,6 +494,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 						validation.RRSIGVerified = true
 						validation.SigningKeyTag = signingKey.KeyTag
 						validation.RecordCount = count
+						v.verifyWildcard(validation, domain, *rrsigCNAME, queryResult, dnskeys)
 					} else {
 						validation.Error = fmt.Sprintf("CNAME RRSIG cryptographic verification failed: %v", err)
 					}
@@ -524,6 +534,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 			validation.RRSIGVerified = true
 			validation.SigningKeyTag = signingKey.KeyTag
 			validation.RecordCount = count
+			v.verifyWildcard(validation, domain, *rrsigA, queryResult, dnskeys)
 		} else {
 			validation.Error = fmt.Sprintf("A record RRSIG cryptographic verification failed: %v", err)
 		}
@@ -532,6 +543,55 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	return validation
+}
+
+// verifyWildcard checks the RFC 4035 §5.3.4 / RFC 5155 §8.8 requirement that a
+// wildcard-synthesized answer is accompanied by an authenticated proof that the queried
+// name has no exact (non-wildcard) match. It records the outcome on validation. A
+// signature-valid answer is only a complete proof of a wildcard expansion when this
+// no-exact-match proof is also present and cryptographically verified, so callers must
+// not represent a wildcard answer as fully verified on the record signature alone.
+func (v *Validator) verifyWildcard(validation *RecordValidation, qname string, rrsig dnspkg.RRSIGRecord, queryResult *dnspkg.QueryResult, dnskeys []dnspkg.DNSKEYRecord) {
+	wildcard := DetectWildcardSynthesis(qname, rrsig)
+	if wildcard == "" {
+		return // not wildcard-synthesized
+	}
+
+	validation.Wildcard = true
+	validation.WildcardSource = wildcard
+
+	proof := VerifyWildcardDenial(qname, rrsig.Labels, queryResult.NSEC, queryResult.NSEC3)
+	validation.WildcardProof = proof
+
+	if !proof.Verified {
+		// The covering NSEC/NSEC3 that proves no direct match is missing.
+		if validation.Error == "" {
+			if proof.Error != "" {
+				validation.Error = fmt.Sprintf("wildcard answer from %s lacks a verified no-exact-match proof: %s", wildcard, proof.Error)
+			} else {
+				validation.Error = fmt.Sprintf("wildcard answer from %s lacks a verified no-exact-match proof", wildcard)
+			}
+		}
+		return
+	}
+
+	// The covering record exists; cryptographically verify its RRSIG(s).
+	var cryptoErr error
+	if len(queryResult.NSEC) > 0 {
+		_, cryptoErr = VerifyDenialRRSIGFromResponse(queryResult.RawResponse, dns.TypeNSEC, dnskeys)
+	} else {
+		_, cryptoErr = VerifyDenialRRSIGFromResponse(queryResult.RawResponse, dns.TypeNSEC3, dnskeys)
+	}
+	if cryptoErr != nil {
+		proof.Verified = false
+		proof.Error = fmt.Sprintf("wildcard denial RRSIG cryptographic verification failed: %v", cryptoErr)
+		if validation.Error == "" {
+			validation.Error = fmt.Sprintf("wildcard answer from %s: %s", wildcard, proof.Error)
+		}
+		return
+	}
+
+	validation.WildcardProofVerified = true
 }
 
 // validateZone validates a single zone
