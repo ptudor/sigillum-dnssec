@@ -391,6 +391,10 @@ func getEnvInt(key string, defaultVal int) int {
 		if i, err := strconv.Atoi(val); err == nil {
 			return i
 		}
+		// A present-but-unparseable value almost always means a misconfiguration
+		// (e.g. "5s" where an integer is expected). Don't fall back silently.
+		LogWarn("config", "ignoring malformed integer environment variable; using default",
+			"var", key, "value", val, "default", defaultVal)
 	}
 	return defaultVal
 }
