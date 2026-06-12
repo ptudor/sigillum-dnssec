@@ -183,37 +183,51 @@ func isFromTrustedProxy(remoteAddr string) bool {
 	return false
 }
 
-// extractClientIP gets the client IP from the request
-// Only trusts X-Forwarded-For when request comes from a trusted proxy
+// extractClientIP gets the client IP from the request.
+//
+// Proxy headers are only honored when the direct peer (r.RemoteAddr) is itself a
+// trusted proxy. Within X-Forwarded-For, the real client is the RIGHTMOST entry that
+// is not one of our own trusted proxies: each proxy in the chain appends the peer it
+// received the request from, so the rightmost untrusted address is the closest hop we
+// did not generate. Taking the leftmost entry (the previous behavior) trusts a value
+// the remote client fully controls, letting anyone spoof their attributed IP — and
+// thereby evade per-IP rate limiting and pollute logs — by sending a forged
+// X-Forwarded-For header.
 func extractClientIP(r *http.Request) string {
-	// Get the direct connection IP
+	// Get the direct connection IP.
 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		remoteIP = r.RemoteAddr
 	}
 
-	// Only trust proxy headers if request is from a trusted proxy
-	if isFromTrustedProxy(remoteIP) {
-		// Check X-Forwarded-For header (first IP in the chain is the client)
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			ips := strings.Split(xff, ",")
-			if len(ips) > 0 {
-				clientIP := strings.TrimSpace(ips[0])
-				// Validate it's a real IP, not garbage
-				if net.ParseIP(clientIP) != nil {
-					return clientIP
-				}
-			}
-		}
+	// Never trust proxy headers from an untrusted direct peer.
+	if !isFromTrustedProxy(remoteIP) {
+		return remoteIP
+	}
 
-		// Check X-Real-IP header
-		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			clientIP := strings.TrimSpace(xri)
-			if net.ParseIP(clientIP) != nil {
-				return clientIP
+	// Walk X-Forwarded-For right-to-left, skipping our own trusted-proxy hops. The
+	// first untrusted, parseable address is the real client.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		for i := len(ips) - 1; i >= 0; i-- {
+			candidate := strings.TrimSpace(ips[i])
+			if net.ParseIP(candidate) == nil {
+				continue // skip empty/garbage entries
 			}
+			if isFromTrustedProxy(candidate) {
+				continue // another known proxy hop; keep walking left
+			}
+			return candidate
 		}
 	}
 
+	// Fall back to X-Real-IP (set by the reverse proxy to the connecting peer).
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		if net.ParseIP(xri) != nil {
+			return xri
+		}
+	}
+
+	// XFF held only trusted-proxy hops (or none): the direct peer is the best answer.
 	return remoteIP
 }
