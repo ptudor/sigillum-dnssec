@@ -494,6 +494,94 @@ func hexDecode(s string) ([]byte, error) {
 	return result, nil
 }
 
+// VerifyWildcardDenial verifies the authenticated-denial half of a wildcard-synthesized
+// answer: that the queried name has no exact (non-wildcard) match, so the wildcard
+// expansion was legitimate. Per RFC 4035 §5.3.4 (NSEC) and RFC 5155 §8.8 (NSEC3).
+//
+// wildcardLabels is the RRSIG Labels field of the synthesized record, which equals the
+// number of labels in the closest encloser. The returned proof has Verified=true only
+// when a covering NSEC (for the NSEC case) or a covering NSEC3 for the next closer name
+// (for the NSEC3 case) is present. The accompanying RRSIG signatures must be verified
+// separately via VerifyDenialRRSIGFromResponse.
+func VerifyWildcardDenial(qname string, wildcardLabels uint8, nsecRecords []dnspkg.NSECRecord, nsec3Records []dnspkg.NSEC3Record) *NSECProof {
+	proof := &NSECProof{
+		ProofType:    "wildcard",
+		ResponseType: "WILDCARD",
+		Records:      make([]string, 0),
+	}
+
+	qname = canonicalizeName(qname)
+
+	if len(nsecRecords) > 0 {
+		proof.ProofType = "NSEC"
+		// The queried name must not exist as an explicit (non-wildcard) name: find an
+		// NSEC whose canonical range covers it.
+		for _, nsec := range nsecRecords {
+			owner := canonicalizeName(nsec.Owner)
+			next := canonicalizeName(nsec.NextDomain)
+			proof.Records = append(proof.Records, fmt.Sprintf("%s → %s", owner, next))
+			if canonicallyBetween(qname, owner, next) {
+				proof.CoveringNSEC = fmt.Sprintf("%s -> %s", owner, next)
+				proof.Explanation = fmt.Sprintf("NSEC proves %s has no exact match (falls between %s and %s); wildcard expansion is valid",
+					qname, owner, next)
+				proof.Verified = true
+				return proof
+			}
+		}
+		proof.Error = fmt.Sprintf("no NSEC proves %s has no exact match for the wildcard expansion", qname)
+		return proof
+	}
+
+	if len(nsec3Records) > 0 {
+		proof.ProofType = "NSEC3"
+		params := nsec3Records[0]
+		if params.Algorithm != NSEC3HashSHA1 {
+			proof.Error = fmt.Sprintf("unsupported NSEC3 hash algorithm: %d (only SHA-1 supported)", params.Algorithm)
+			return proof
+		}
+		salt, err := hexDecode(params.Salt)
+		if err != nil {
+			proof.Error = fmt.Sprintf("invalid NSEC3 salt: %v", err)
+			return proof
+		}
+
+		// Next closer name = one label longer than the closest encloser, toward QNAME.
+		// A covering NSEC3 for it proves no closer match than the wildcard exists.
+		nextCloser := lastNLabels(qname, int(wildcardLabels)+1)
+		hashedNC := computeNSEC3Hash(nextCloser, salt, params.Iterations)
+
+		for _, rec := range nsec3Records {
+			proof.Records = append(proof.Records, fmt.Sprintf("%s → %s", rec.HashedOwner, rec.NextHashed))
+			if hashBetween(hashedNC, rec.HashedOwner, rec.NextHashed) {
+				proof.CoveringNSEC = fmt.Sprintf("NSEC3 %s -> %s", rec.HashedOwner, rec.NextHashed)
+				proof.Explanation = fmt.Sprintf("NSEC3 covers next closer name %s (hash %s); wildcard expansion is valid",
+					nextCloser, hashedNC)
+				proof.Verified = true
+				return proof
+			}
+		}
+		proof.Error = fmt.Sprintf("no NSEC3 covers the next closer name %s for the wildcard expansion", nextCloser)
+		return proof
+	}
+
+	proof.Error = "no NSEC/NSEC3 records accompany the wildcard answer"
+	return proof
+}
+
+// lastNLabels returns the suffix of qname consisting of its rightmost n labels,
+// as an FQDN. n <= 0 yields the root ("."); n >= the label count yields qname itself.
+func lastNLabels(qname string, n int) string {
+	qname = canonicalizeName(qname)
+	if n <= 0 || qname == "." || qname == "" {
+		return "."
+	}
+	labels := strings.Split(strings.TrimSuffix(qname, "."), ".")
+	if n >= len(labels) {
+		return qname
+	}
+	return strings.Join(labels[len(labels)-n:], ".") + "."
+}
+
 // HasTypeInBitmap checks if a type is present in the NSEC/NSEC3 type bitmap.
 func HasTypeInBitmap(typeName string, bitmap []string) bool {
 	for _, t := range bitmap {

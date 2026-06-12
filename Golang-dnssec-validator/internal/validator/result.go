@@ -178,12 +178,16 @@ type Disagreement struct {
 
 // RecordValidation represents validation of an actual record (A, AAAA, MX, etc.)
 type RecordValidation struct {
-	RecordType    string     `json:"record_type"`            // "A", "AAAA", "MX", etc.
-	RecordCount   int        `json:"record_count"`           // Number of records found
-	RRSIGVerified bool       `json:"rrsig_verified"`         // RRSIG cryptographically verified
-	SigningKeyTag uint16     `json:"signing_key_tag"`        // Key tag of ZSK that signed
-	DenialProof   *NSECProof `json:"denial_proof,omitempty"` // NSEC/NSEC3 proof for NXDOMAIN/NODATA answers
-	Error         string     `json:"error,omitempty"`
+	RecordType            string     `json:"record_type"`                       // "A", "AAAA", "MX", etc.
+	RecordCount           int        `json:"record_count"`                      // Number of records found
+	RRSIGVerified         bool       `json:"rrsig_verified"`                    // RRSIG cryptographically verified
+	SigningKeyTag         uint16     `json:"signing_key_tag"`                   // Key tag of ZSK that signed
+	DenialProof           *NSECProof `json:"denial_proof,omitempty"`            // NSEC/NSEC3 proof for NXDOMAIN/NODATA answers
+	Wildcard              bool       `json:"wildcard,omitempty"`                // Answer was synthesized from a wildcard
+	WildcardSource        string     `json:"wildcard_source,omitempty"`         // The wildcard (e.g. "*.example.com.")
+	WildcardProofVerified bool       `json:"wildcard_proof_verified,omitempty"` // No-exact-match NSEC/NSEC3 proof verified
+	WildcardProof         *NSECProof `json:"wildcard_proof,omitempty"`          // RFC 4035 §5.3.4 / RFC 5155 §8.8 proof
+	Error                 string     `json:"error,omitempty"`
 }
 
 // DSValidation represents validation of DS record signature from parent
