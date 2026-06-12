@@ -437,7 +437,8 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		// Check for denial proofs if this is NXDOMAIN or NODATA
 		if len(queryResult.NSEC) > 0 {
 			// Verify NSEC denial proof with full RRSIG verification
-			proof := VerifyNSECDenialWithRRSIG(domain, dns.TypeA, queryResult.NSEC, queryResult.RRSIG, dnskeys, queryResult.RCode)
+			proof := VerifyNSECDenialWithRRSIG(domain, dns.TypeA, queryResult.NSEC, queryResult.RRSIG, dnskeys, queryResult.RawResponse, queryResult.RCode)
+			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
 			} else if proof.Error != "" {
@@ -446,7 +447,8 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 			return validation
 		} else if len(queryResult.NSEC3) > 0 {
 			// Verify NSEC3 denial proof with full RRSIG verification
-			proof := VerifyNSEC3DenialWithRRSIG(domain, dns.TypeA, queryResult.NSEC3, queryResult.RRSIG, dnskeys, zone, queryResult.RCode)
+			proof := VerifyNSEC3DenialWithRRSIG(domain, dns.TypeA, queryResult.NSEC3, queryResult.RRSIG, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
+			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
 			} else if proof.Error != "" {
