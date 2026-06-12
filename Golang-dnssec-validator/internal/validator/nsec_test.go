@@ -415,62 +415,6 @@ func TestHasTypeInBitmap(t *testing.T) {
 	}
 }
 
-func TestProvesDSAbsence(t *testing.T) {
-	tests := []struct {
-		name  string
-		qname string
-		nsec  []dnspkg.NSECRecord
-		nsec3 []dnspkg.NSEC3Record
-		want  bool
-	}{
-		{
-			name:  "NSEC proves no DS",
-			qname: "child.example.com.",
-			nsec: []dnspkg.NSECRecord{
-				{
-					Owner:      "child.example.com.",
-					NextDomain: "foo.example.com.",
-					TypeBitmap: []string{"NS", "RRSIG", "NSEC"}, // No DS
-				},
-			},
-			want: true,
-		},
-		{
-			name:  "NSEC shows DS exists",
-			qname: "child.example.com.",
-			nsec: []dnspkg.NSECRecord{
-				{
-					Owner:      "child.example.com.",
-					NextDomain: "foo.example.com.",
-					TypeBitmap: []string{"NS", "DS", "RRSIG", "NSEC"}, // Has DS
-				},
-			},
-			want: false,
-		},
-		{
-			name:  "NSEC at different name",
-			qname: "child.example.com.",
-			nsec: []dnspkg.NSECRecord{
-				{
-					Owner:      "other.example.com.",
-					NextDomain: "foo.example.com.",
-					TypeBitmap: []string{"A"}, // No DS but wrong name
-				},
-			},
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ProvesDSAbsence(tt.qname, tt.nsec, tt.nsec3)
-			if got != tt.want {
-				t.Errorf("ProvesDSAbsence() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestCompareCanonical(t *testing.T) {
 	tests := []struct {
 		a    []string

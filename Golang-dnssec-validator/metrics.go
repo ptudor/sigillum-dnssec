@@ -25,31 +25,6 @@ var (
 		[]string{"status"},
 	)
 
-	promDNSQueries = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dnssec_validator_dns_queries_total",
-			Help: "Total number of DNS queries",
-		},
-		[]string{"qtype", "status"}, // status: success, timeout, error
-	)
-
-	promDNSQueryDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "dnssec_validator_dns_query_duration_seconds",
-			Help:    "DNS query duration in seconds",
-			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5},
-		},
-		[]string{"qtype"},
-	)
-
-	promZonesValidated = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dnssec_validator_zones_validated_total",
-			Help: "Total number of zones validated",
-		},
-		[]string{"status"}, // secure, insecure, bogus, indeterminate
-	)
-
 	promAPIRequests = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "dnssec_validator_api_requests_total",
@@ -102,7 +77,6 @@ var (
 	expvarValidationsSecure    = expvar.NewInt("dnssec_validator_validations_secure")
 	expvarValidationsInsecure  = expvar.NewInt("dnssec_validator_validations_insecure")
 	expvarValidationsBogus     = expvar.NewInt("dnssec_validator_validations_bogus")
-	expvarDNSQueries           = expvar.NewInt("dnssec_validator_dns_queries_total")
 	expvarRateLimitHits        = expvar.NewInt("dnssec_validator_rate_limit_hits")
 	expvarActiveSSEConnections = expvar.NewInt("dnssec_validator_active_sse_connections")
 )
@@ -111,9 +85,6 @@ func init() {
 	// Register Prometheus metrics
 	prometheus.MustRegister(promValidationsTotal)
 	prometheus.MustRegister(promValidationDuration)
-	prometheus.MustRegister(promDNSQueries)
-	prometheus.MustRegister(promDNSQueryDuration)
-	prometheus.MustRegister(promZonesValidated)
 	prometheus.MustRegister(promAPIRequests)
 	prometheus.MustRegister(promAPIRequestDuration)
 	prometheus.MustRegister(promRateLimitHits)
@@ -138,18 +109,6 @@ func RecordValidation(status string, durationSec float64) {
 	}
 }
 
-// RecordDNSQuery records a DNS query
-func RecordDNSQuery(qtype, status string, durationSec float64) {
-	promDNSQueries.WithLabelValues(qtype, status).Inc()
-	promDNSQueryDuration.WithLabelValues(qtype).Observe(durationSec)
-	expvarDNSQueries.Add(1)
-}
-
-// RecordZoneValidated records a zone validation result
-func RecordZoneValidated(status string) {
-	promZonesValidated.WithLabelValues(status).Inc()
-}
-
 // RecordAPIRequest records an API request
 func RecordAPIRequest(endpoint, method, status string, durationSec float64) {
 	promAPIRequests.WithLabelValues(endpoint, method, status).Inc()
@@ -162,9 +121,14 @@ func RecordRateLimitHit() {
 	expvarRateLimitHits.Add(1)
 }
 
-// SetActiveValidations sets the current active validation count
-func SetActiveValidations(count int) {
-	promActiveValidations.Set(float64(count))
+// IncrementActiveValidations increments the in-flight validation gauge
+func IncrementActiveValidations() {
+	promActiveValidations.Inc()
+}
+
+// DecrementActiveValidations decrements the in-flight validation gauge
+func DecrementActiveValidations() {
+	promActiveValidations.Dec()
 }
 
 // IncrementActiveSSEConnections increments the active SSE connection count

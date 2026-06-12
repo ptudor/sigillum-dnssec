@@ -46,37 +46,3 @@ func writeProblemDetails(w http.ResponseWriter, errType, title string, status in
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(problem)
 }
-
-// writeJSONError writes an RFC 7807 Problem Details error response (convenience wrapper)
-func writeJSONError(w http.ResponseWriter, message string, status int) {
-	// Map status code to error type and title
-	var errType, title string
-	switch status {
-	case http.StatusBadRequest:
-		errType = ErrTypeBadRequest
-		title = "Bad Request"
-	case http.StatusForbidden:
-		errType = ErrTypeForbidden
-		title = "Forbidden"
-	case http.StatusNotFound:
-		errType = ErrTypeNotFound
-		title = "Not Found"
-	case http.StatusMethodNotAllowed:
-		errType = ErrTypeMethodNotAllowed
-		title = "Method Not Allowed"
-	case http.StatusTooManyRequests:
-		errType = ErrTypeTooManyRequests
-		title = "Too Many Requests"
-	case http.StatusInternalServerError:
-		errType = ErrTypeInternalServerError
-		title = "Internal Server Error"
-		message = "internal server error" // Mask internal error details
-	case http.StatusServiceUnavailable:
-		errType = ErrTypeServiceUnavailable
-		title = "Service Unavailable"
-	default:
-		errType = ErrTypeInternalServerError
-		title = "Error"
-	}
-	writeProblemDetails(w, errType, title, status, message, "")
-}

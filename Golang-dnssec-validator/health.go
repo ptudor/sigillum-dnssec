@@ -112,7 +112,10 @@ func (h *HealthChecker) HealthzHandler() http.HandlerFunc {
 func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("X-XSS-Protection", "1; mode=block")
+	// Modern browsers ignore X-XSS-Protection, and the legacy auditor it enabled has
+	// itself been a source of side-channel issues; current OWASP guidance is to send 0
+	// to disable it and rely on the strict CSP above.
+	w.Header().Set("X-XSS-Protection", "0")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=()")

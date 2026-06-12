@@ -592,35 +592,6 @@ func HasTypeInBitmap(typeName string, bitmap []string) bool {
 	return false
 }
 
-// ProvesDSAbsence checks if NSEC/NSEC3 proves DS record doesn't exist.
-// This is used to determine if a delegation is insecure (no DS = unsigned child).
-// Per RFC 5155 Section 8.9.
-func ProvesDSAbsence(qname string, nsecRecords []dnspkg.NSECRecord, nsec3Records []dnspkg.NSEC3Record) bool {
-	qname = canonicalizeName(qname)
-
-	// Check NSEC first
-	for _, nsec := range nsecRecords {
-		owner := canonicalizeName(nsec.Owner)
-		if owner == qname && !HasTypeInBitmap("DS", nsec.TypeBitmap) {
-			// NSEC at delegation point without DS type = insecure delegation
-			return true
-		}
-	}
-
-	// Check NSEC3
-	for _, nsec3 := range nsec3Records {
-		// For NSEC3, we'd need to hash the name and compare
-		// This is a simplified check - full implementation would verify hash
-		if !HasTypeInBitmap("DS", nsec3.TypeBitmap) {
-			// Found NSEC3 without DS - may indicate insecure delegation
-			// Note: proper validation requires hash verification
-			return true
-		}
-	}
-
-	return false
-}
-
 // findRRSIGForType finds an RRSIG covering a specific type
 func findRRSIGForType(rrtype uint16, rrsigs []dnspkg.RRSIGRecord) *dnspkg.RRSIGRecord {
 	for i, rrsig := range rrsigs {
