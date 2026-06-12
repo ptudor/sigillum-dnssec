@@ -12,6 +12,32 @@ func TestConfigValidate_DefaultConfig(t *testing.T) {
 	}
 }
 
+func TestGetEnvInt(t *testing.T) {
+	const key = "DNSSEC_VALIDATOR_TEST_INT"
+
+	t.Run("valid integer is parsed", func(t *testing.T) {
+		t.Setenv(key, "42")
+		if got := getEnvInt(key, 7); got != 42 {
+			t.Fatalf("getEnvInt = %d, want 42", got)
+		}
+	})
+
+	t.Run("malformed value falls back to default", func(t *testing.T) {
+		// A Go-duration string like "5s" is not a valid integer; getEnvInt must
+		// reject it (and log a warning) rather than parse it as a partial number.
+		t.Setenv(key, "5s")
+		if got := getEnvInt(key, 7); got != 7 {
+			t.Fatalf("getEnvInt = %d, want default 7", got)
+		}
+	})
+
+	t.Run("unset value uses default", func(t *testing.T) {
+		if got := getEnvInt("DNSSEC_VALIDATOR_TEST_UNSET", 9); got != 9 {
+			t.Fatalf("getEnvInt = %d, want default 9", got)
+		}
+	})
+}
+
 func TestConfigValidate_RateLimitCleanupMustBePositive(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.RateLimit.CleanupSec = 0

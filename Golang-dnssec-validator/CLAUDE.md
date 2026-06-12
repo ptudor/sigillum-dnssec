@@ -566,18 +566,24 @@ Create a `.env` file or systemd EnvironmentFile based on `.env.example`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LISTEN_ADDR` | `:8080` | HTTP listen address |
+| `LISTEN_ADDR` | `:8791` | HTTP listen address |
 | `ROOT_ANCHORS_PATH` | `/etc/dnssec-validator/root-anchors.json` | Path to trust anchors |
 | `ROOT_ANCHORS_URL` | `https://internet.any53.com/dns/anchors/root-anchors.json` | Fallback URL for anchors |
-| `QUERY_TIMEOUT` | `5s` | Per-server query timeout |
-| `TOTAL_TIMEOUT` | `30s` | Total validation timeout |
+| `QUERY_TIMEOUT_SECONDS` | `5` | Per-server query timeout (seconds) |
+| `TOTAL_TIMEOUT_SECONDS` | `30` | Total validation timeout (seconds) |
 | `MAX_CONCURRENT` | `10` | Max concurrent DNS queries |
 | `RATE_LIMIT_PER_SEC` | `10` | Requests per second per IP |
-| `RATE_BURST_SIZE` | `30` | Max burst size per IP |
+| `RATE_LIMIT_BURST` | `30` | Max burst size per IP |
+| `RATE_LIMIT_CLEANUP_SECONDS` | `300` | Rate-limiter cleanup interval (seconds) |
 | `LOG_FORMAT` | `json` | `json` or `text` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `STATIC_DIR` | `./static` | Path to web UI files |
-| `SHUTDOWN_TIMEOUT_SECONDS` | `30` | Graceful shutdown timeout |
+| `SHUTDOWN_TIMEOUT_SECONDS` | `30` | Graceful shutdown timeout (seconds) |
+| `HEARTBEAT_INTERVAL_MINUTES` | `5` | Background heartbeat interval (minutes) |
+
+**Note:** The DNS/rate-limit timeouts are read as **integers** with `_SECONDS`/`_MINUTES`
+suffixes (parsed by `getEnvInt`), not Go duration strings. A value like `5s` is rejected
+and logged as malformed, then the default is used — use plain integers.
 
 ### Configuration Pattern Reference
 
