@@ -113,37 +113,6 @@ func LoadAnchorsWithFallback(path, url string) (*RootAnchors, error) {
 	return anchors, nil
 }
 
-// VerifyDNSKEYAgainstAnchor checks if a DNSKEY matches a trust anchor
-func VerifyDNSKEYAgainstAnchor(dnskey DNSKEYRecord, anchor Anchor) bool {
-	// Check key tag
-	if int(dnskey.KeyTag) != anchor.KeyTag {
-		return false
-	}
-
-	// Check algorithm
-	if int(dnskey.Algorithm) != anchor.Algorithm {
-		return false
-	}
-
-	// For anchors with public key, verify the key matches
-	if anchor.PublicKey != "" && anchor.PublicKey == dnskey.PublicKey {
-		return true
-	}
-
-	// Key tag and algorithm match
-	return true
-}
-
-// FindMatchingAnchor finds an anchor that matches the given DNSKEY
-func FindMatchingAnchor(dnskey DNSKEYRecord, anchors []Anchor) *Anchor {
-	for i, anchor := range anchors {
-		if VerifyDNSKEYAgainstAnchor(dnskey, anchor) {
-			return &anchors[i]
-		}
-	}
-	return nil
-}
-
 // GetActiveAnchors returns anchors that are currently valid
 func GetActiveAnchors(anchors *RootAnchors) []Anchor {
 	if anchors == nil {

@@ -2,7 +2,6 @@ package dns
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -191,27 +190,4 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 			result.CNAME = append(result.CNAME, cname)
 		}
 	}
-}
-
-// QueryWithRetry performs a DNS query with retries
-func (q *Querier) QueryWithRetry(ctx context.Context, server, qname string, qtype uint16, retries int) (*QueryResult, error) {
-	var lastResult *QueryResult
-	var lastErr error
-
-	for i := 0; i <= retries; i++ {
-		result, err := q.Query(ctx, server, qname, qtype)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if result.Error == "" && result.RCode == 0 {
-			return result, nil
-		}
-		lastResult = result
-	}
-
-	if lastResult != nil {
-		return lastResult, nil
-	}
-	return nil, fmt.Errorf("all retries failed: %v", lastErr)
 }

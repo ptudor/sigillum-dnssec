@@ -92,6 +92,8 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 
 	IncrementActiveSSEConnections()
 	defer DecrementActiveSSEConnections()
+	IncrementActiveValidations()
+	defer DecrementActiveValidations()
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
@@ -248,6 +250,9 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
 	defer cancel()
+
+	IncrementActiveValidations()
+	defer DecrementActiveValidations()
 
 	// Run validation
 	result, err := v.Validate(ctx, domain)
