@@ -33,8 +33,10 @@ const (
 var base32ExtendedHex = base32.HexEncoding.WithPadding(base32.NoPadding)
 
 // VerifyNSECDenialWithRRSIG verifies NSEC records prove non-existence with full RRSIG verification.
-// Per RFC 4035 Section 5.4.
-func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecord, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, rcode int) *NSECProof {
+// Per RFC 4035 Section 5.4. rawResponse is the raw wire-format DNS response containing the NSEC
+// records; it is required so the NSEC RRset signatures can be cryptographically verified before
+// the proof is reported as verified.
+func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecord, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, rawResponse []byte, rcode int) *NSECProof {
 	proof := &NSECProof{
 		ProofType: "NSEC",
 		Records:   make([]string, 0),
@@ -68,10 +70,16 @@ func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.
 		return proof
 	}
 
-	// Find signing key
-	signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys)
-	if signingKey == nil {
+	// Find signing key (fast fail with a clear message before the cryptographic check)
+	if signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys); signingKey == nil {
 		proof.Error = "NSEC signing key not found"
+		return proof
+	}
+
+	// Cryptographically verify every NSEC RRset in the response. This is the security-
+	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
+	if _, err := VerifyDenialRRSIGFromResponse(rawResponse, 47, dnskeys); err != nil {
+		proof.Error = fmt.Sprintf("NSEC RRSIG cryptographic verification failed: %v", err)
 		return proof
 	}
 
@@ -80,7 +88,7 @@ func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.
 		proof.Records = append(proof.Records, fmt.Sprintf("%s → %s [%v]", nsec.Owner, nsec.NextDomain, nsec.TypeBitmap))
 	}
 
-	// Verify the denial proof
+	// Verify the denial proof (ranges/type bitmap)
 	basicProof, err := VerifyNSECDenial(qname, qtype, nsecRecords, rcode)
 	if err != nil {
 		proof.Error = err.Error()
@@ -169,8 +177,10 @@ func verifyNSECNODATA(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 }
 
 // VerifyNSEC3DenialWithRRSIG verifies NSEC3 records prove non-existence with full RRSIG verification.
-// Per RFC 5155 Section 8.
-func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rcode int) *NSECProof {
+// Per RFC 5155 Section 8. rawResponse is the raw wire-format DNS response containing the NSEC3
+// records; it is required so the NSEC3 RRset signatures can be cryptographically verified before
+// the proof is reported as verified.
+func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
 	proof := &NSECProof{
 		ProofType: "NSEC3",
 		Records:   make([]string, 0),
@@ -204,10 +214,16 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 		return proof
 	}
 
-	// Find signing key
-	signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys)
-	if signingKey == nil {
+	// Find signing key (fast fail with a clear message before the cryptographic check)
+	if signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys); signingKey == nil {
 		proof.Error = "NSEC3 signing key not found"
+		return proof
+	}
+
+	// Cryptographically verify every NSEC3 RRset in the response. This is the security-
+	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
+	if _, err := VerifyDenialRRSIGFromResponse(rawResponse, 50, dnskeys); err != nil {
+		proof.Error = fmt.Sprintf("NSEC3 RRSIG cryptographic verification failed: %v", err)
 		return proof
 	}
 
@@ -220,7 +236,7 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 		proof.Records = append(proof.Records, fmt.Sprintf("%s → %s [%v]%s", nsec3.HashedOwner, nsec3.NextHashed, nsec3.TypeBitmap, optOut))
 	}
 
-	// Verify the denial proof
+	// Verify the denial proof (hashes/ranges/type bitmap)
 	basicProof, err := VerifyNSEC3Denial(qname, qtype, nsec3Records, zone, rcode)
 	if err != nil {
 		proof.Error = err.Error()

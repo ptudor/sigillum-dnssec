@@ -349,6 +349,90 @@ func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signin
 	return 0, fmt.Errorf("no verifiable RRSIG candidate for type %d", typeCovered)
 }
 
+// VerifyDenialRRSIGFromResponse performs full cryptographic verification of EVERY
+// RRset of the given type (NSEC = 47, NSEC3 = 50) found in a denial response.
+//
+// Authenticated denial of existence (RFC 4035 §5.4, RFC 5155 §8) is only sound if
+// every NSEC/NSEC3 record contributing to the proof is covered by a valid RRSIG from
+// the zone's keys. Verifying only one RRset would let a forged covering record ride
+// alongside a single genuinely-signed record, so this fails closed: it requires that
+// each distinct RRset owner has at least one RRSIG that both matches a supplied DNSKEY
+// (by key tag) and verifies cryptographically. It returns the number of verified
+// RRsets, or an error naming the first owner whose signature could not be verified.
+func VerifyDenialRRSIGFromResponse(rawResponse []byte, typeCovered uint16, dnskeys []dnspkg.DNSKEYRecord) (int, error) {
+	if len(rawResponse) == 0 {
+		return 0, fmt.Errorf("raw DNS response unavailable")
+	}
+
+	var msg dns.Msg
+	if err := msg.Unpack(rawResponse); err != nil {
+		return 0, fmt.Errorf("failed to unpack DNS response: %w", err)
+	}
+
+	rrsetByOwner := make(map[string][]dns.RR)
+	sigsByOwner := make(map[string][]*dns.RRSIG)
+
+	allRRs := make([]dns.RR, 0, len(msg.Answer)+len(msg.Ns)+len(msg.Extra))
+	allRRs = append(allRRs, msg.Answer...)
+	allRRs = append(allRRs, msg.Ns...)
+	allRRs = append(allRRs, msg.Extra...)
+
+	for _, rr := range allRRs {
+		switch v := rr.(type) {
+		case *dns.RRSIG:
+			if v.TypeCovered == typeCovered {
+				owner := strings.ToLower(v.Hdr.Name)
+				sigsByOwner[owner] = append(sigsByOwner[owner], v)
+			}
+		default:
+			if rr.Header().Rrtype == typeCovered {
+				owner := strings.ToLower(rr.Header().Name)
+				rrsetByOwner[owner] = append(rrsetByOwner[owner], rr)
+			}
+		}
+	}
+
+	if len(rrsetByOwner) == 0 {
+		return 0, fmt.Errorf("no records of type %d found in response", typeCovered)
+	}
+
+	verified := 0
+	for owner, rrset := range rrsetByOwner {
+		sigs := sigsByOwner[owner]
+		if len(sigs) == 0 {
+			return 0, fmt.Errorf("no RRSIG for %s RRset at %s", dnspkg.TypeName(typeCovered), owner)
+		}
+
+		ok := false
+		var lastErr error
+		for _, sig := range sigs {
+			signingKeyRecord := FindDNSKEYByKeyTag(sig.KeyTag, dnskeys)
+			if signingKeyRecord == nil {
+				lastErr = fmt.Errorf("signing key (tag %d) not found in zone DNSKEY", sig.KeyTag)
+				continue
+			}
+			signingKey, err := reconstructDNSKEY(sig.SignerName, *signingKeyRecord)
+			if err != nil {
+				lastErr = fmt.Errorf("failed to reconstruct signing key: %w", err)
+				continue
+			}
+			if err := sig.Verify(signingKey, rrset); err != nil {
+				lastErr = fmt.Errorf("cryptographic verification failed: %w", err)
+				continue
+			}
+			ok = true
+			break
+		}
+
+		if !ok {
+			return 0, fmt.Errorf("%s RRset at %s: %w", dnspkg.TypeName(typeCovered), owner, lastErr)
+		}
+		verified++
+	}
+
+	return verified, nil
+}
+
 // reconstructDNSKEY converts our DNSKEYRecord back to a dns.DNSKEY for verification
 func reconstructDNSKEY(zone string, record dnspkg.DNSKEYRecord) (*dns.DNSKEY, error) {
 	// miekg/dns Verify() expects PublicKey as base64 - it decodes internally
