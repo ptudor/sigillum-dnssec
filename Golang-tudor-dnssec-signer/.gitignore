@@ -1,6 +1,6 @@
 # Build artifacts
 dnssec-tudor
-dnssec-tudor-*
+build/
 
 # Test artifacts
 testdata/keys/

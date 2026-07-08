@@ -1,4 +1,4 @@
 root-anchors.json
 dnssec-validator
-dnssec-validator-*
+build/
 .env
