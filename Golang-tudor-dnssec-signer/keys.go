@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -161,86 +162,128 @@ func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
 
-	// Back up existing key files before overwriting to prevent silent key
-	// material loss. If we're about to overwrite a KSK whose key tag matches
-	// a DS record at the registrar, the backup is the only way to recover.
-	kg.backupExistingKeyFiles(domain, keyType, baseName)
+	// Back up existing key files before overwriting to prevent silent key material loss.
+	// If we're about to overwrite a KSK whose key tag matches a DS record at the
+	// registrar, the backup is the only way to recover — so a backup failure now ABORTS
+	// (R-027), leaving the live pair untouched rather than destroying the only copy.
+	if err := kg.backupExistingKeyFiles(domain, keyType, baseName); err != nil {
+		return fmt.Errorf("backing up existing %s key before overwrite: %w", keyType, err)
+	}
 
-	// Write public key file (.key) in BIND format
 	keyFile := baseName + ".key"
 	keyContent := fmt.Sprintf("; Key tag: %d\n; Algorithm: %s\n; Created: %s\n%s\n",
 		dnskey.KeyTag(),
 		AlgorithmName(dnskey.Algorithm),
 		time.Now().UTC().Format(time.RFC3339),
 		dnskey.String())
-
-	if err := writeFileOwned(keyFile, []byte(keyContent), 0644); err != nil {
-		return fmt.Errorf("writing public key file: %w", err)
-	}
-
-	// Write private key file (.private)
 	privFile := baseName + ".private"
 	privContent := formatPrivateKey(dnskey, privateKey)
 
-	if err := writeFileOwned(privFile, []byte(privContent), 0600); err != nil {
+	// Write each half atomically (temp + fsync + rename) so a crash can never leave a
+	// truncated key file or pair a new .key with an old .private (R-009). Write .private
+	// first: if a crash lands between the two, the correspondence check in
+	// loadKeyPairFromPath rejects the resulting pair and the prior signed zone keeps
+	// serving, rather than a half-written file being read.
+	if err := writeFileAtomicOwned(privFile, []byte(privContent), 0600); err != nil {
 		return fmt.Errorf("writing private key file: %w", err)
+	}
+	if err := writeFileAtomicOwned(keyFile, []byte(keyContent), 0644); err != nil {
+		return fmt.Errorf("writing public key file: %w", err)
 	}
 
 	slog.Debug("[KEY] Saved key files", "domain", domain, "type", keyType, "key_tag", dnskey.KeyTag())
 	return nil
 }
 
-// backupExistingKeyFiles checks for pre-existing key files and backs them up
-// with the key tag in the filename (matching rollover's backup convention)
-// before they are overwritten by new key generation.
-func (kg *KeyGenerator) backupExistingKeyFiles(domain, keyType, baseName string) {
+// backupExistingKeyFiles checks for pre-existing key files and backs them up with the key
+// tag in the filename (matching rollover's backup convention) before they are overwritten
+// by new key generation. It returns an error on any backup failure so the caller can abort
+// the overwrite and leave the live pair intact (R-027) — the backup is the only copy of a
+// KSK whose DS is at the registrar.
+func (kg *KeyGenerator) backupExistingKeyFiles(domain, keyType, baseName string) error {
 	keyFile := baseName + ".key"
 	privFile := baseName + ".private"
 
-	// Check if key file exists
 	keyData, err := os.ReadFile(keyFile)
 	if err != nil {
-		return // No existing key file, nothing to back up
+		if os.IsNotExist(err) {
+			return nil // No existing key file, nothing to back up.
+		}
+		return fmt.Errorf("reading existing key file: %w", err)
 	}
 
-	// Parse existing DNSKEY to get its key tag for the backup filename
+	// Parse existing DNSKEY to get its key tag for the backup filename.
 	existingKey, err := parseDNSKEYFromFile(string(keyData))
 	if err != nil {
-		slog.Warn("[KEY] Cannot parse existing key file for backup, renaming with .bak",
+		// Unparseable existing key: preserve it under a UNIQUE .bak base so a prior
+		// .bak from an earlier failure is never clobbered.
+		slog.Warn("[KEY] Cannot parse existing key file for backup; preserving under a unique .bak",
 			"domain", domain, "type", keyType, "error", err)
-		// Fall back to .bak suffix
-		os.Rename(keyFile, keyFile+".bak")
-		os.Rename(privFile, privFile+".bak")
-		return
+		bakBase, err := uniqueBackupBase(baseName + ".bak")
+		if err != nil {
+			return err
+		}
+		return moveKeyPair(keyFile, privFile, bakBase)
 	}
 
 	existingTag := existingKey.KeyTag()
 	keysDir := kg.cfg.KeysDir()
 	backupBase := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, existingTag))
 
-	// Don't overwrite an existing backup (from a prior rollover)
-	if _, err := os.Stat(backupBase + ".key"); err == nil {
-		slog.Debug("[KEY] Backup already exists, skipping",
+	// A backup at the tag-named slot may already exist (from a prior rollover). Only skip
+	// when it holds the SAME key — a key-tag collision could otherwise let us silently
+	// drop a different key's backup. If it differs, preserve the live key under a unique
+	// name instead of overwriting the existing backup.
+	if fileExists(backupBase + ".key") {
+		if existingBackup, err := kg.loadPublicKeyFromPath(backupBase); err == nil &&
+			existingBackup.PublicKey == existingKey.PublicKey {
+			slog.Debug("[KEY] Backup already exists (same key), skipping",
+				"domain", domain, "type", keyType, "key_tag", existingTag)
+			return nil
+		}
+		slog.Warn("[KEY] Tag-named backup exists but holds a different key; using a unique backup name",
 			"domain", domain, "type", keyType, "key_tag", existingTag)
-		return
+		uniq, err := uniqueBackupBase(backupBase)
+		if err != nil {
+			return err
+		}
+		return moveKeyPair(keyFile, privFile, uniq)
 	}
 
-	if err := os.Rename(keyFile, backupBase+".key"); err != nil {
-		slog.Warn("[KEY] Failed to back up public key file",
-			"domain", domain, "type", keyType, "error", err)
-		return
+	if err := moveKeyPair(keyFile, privFile, backupBase); err != nil {
+		return err
 	}
-	if err := os.Rename(privFile, backupBase+".private"); err != nil {
-		slog.Warn("[KEY] Failed to back up private key file",
-			"domain", domain, "type", keyType, "error", err)
-		// Try to restore the public key rename
-		os.Rename(backupBase+".key", keyFile)
-		return
-	}
-
 	slog.Warn("[KEY] Backed up existing key files before overwrite",
 		"domain", domain, "type", keyType, "old_key_tag", existingTag,
 		"backup", backupBase)
+	return nil
+}
+
+// moveKeyPair renames a .key/.private pair to a new base, restoring the .key rename if the
+// .private rename fails so the live pair is never left split.
+func moveKeyPair(keyFile, privFile, destBase string) error {
+	if err := os.Rename(keyFile, destBase+".key"); err != nil {
+		return fmt.Errorf("backing up public key file: %w", err)
+	}
+	if fileExists(privFile) {
+		if err := os.Rename(privFile, destBase+".private"); err != nil {
+			os.Rename(destBase+".key", keyFile) // undo, keep the live pair together
+			return fmt.Errorf("backing up private key file: %w", err)
+		}
+	}
+	return nil
+}
+
+// uniqueBackupBase returns a base path derived from prefix that has neither a .key nor a
+// .private file yet, so a backup pair can be written without clobbering an existing one.
+func uniqueBackupBase(prefix string) (string, error) {
+	for i := 0; i < 10000; i++ {
+		candidate := fmt.Sprintf("%s.%d", prefix, i)
+		if !fileExists(candidate+".key") && !fileExists(candidate+".private") {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("could not allocate a unique backup path for %s", prefix)
 }
 
 // formatPrivateKey formats a private key in BIND-compatible format
@@ -279,12 +322,27 @@ func (kg *KeyGenerator) RecoverKeyState(domain string, isKSK bool) (*KeyState, e
 	keyFile := baseName + ".key"
 	privFile := baseName + ".private"
 
-	// Check if both key files exist
-	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
-		return nil, nil // No key files, caller should generate
+	// Return "caller should generate" ONLY when both halves are absent (a genuinely new
+	// domain). When exactly one half exists — the artifact of the R-009 crash window or a
+	// botched restore — refuse: regenerating would mint a brand-new KSK while the parent
+	// DS still matches the surviving on-disk .key, silently breaking the chain (R-028).
+	keyExists, err := statExists(keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", keyFile, err)
 	}
-	if _, err := os.Stat(privFile); os.IsNotExist(err) {
-		return nil, nil // Missing private key, caller should generate
+	privExists, err := statExists(privFile)
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", privFile, err)
+	}
+	if !keyExists && !privExists {
+		return nil, nil // No key files, caller should generate.
+	}
+	if keyExists != privExists {
+		present, missing := keyFile, privFile
+		if !keyExists {
+			present, missing = privFile, keyFile
+		}
+		return nil, fmt.Errorf("incomplete %s key pair: %s exists but %s is missing; refusing to regenerate (restore the missing half, or remove the zone and re-add to mint fresh keys)", keyType, present, missing)
 	}
 
 	// Try to load and validate the key pair. A read failure here (e.g.
@@ -464,7 +522,28 @@ func (kg *KeyGenerator) loadKeyPairFromPath(baseName string) (*dns.DNSKEY, []byt
 		return nil, nil, fmt.Errorf("parsing private key: %w", err)
 	}
 
+	// R-009: reject a mismatched pair (e.g. a new .key beside a stale .private left by a
+	// crashed write) before it is used to sign. The ECDSA signing path derives the public
+	// point from the private scalar, so a mismatch would otherwise "sign" and emit RRSIGs
+	// that don't verify against the published DNSKEY — a silent SERVFAIL.
+	if err := verifyKeyPairCorrespondence(dnskey, privateKey); err != nil {
+		return nil, nil, fmt.Errorf("key pair at %s: %w", baseName, err)
+	}
+
 	return dnskey, privateKey, nil
+}
+
+// statExists reports whether path exists, distinguishing a genuine absence (false, nil)
+// from a stat error such as permission denied (false, err).
+func statExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // parseDNSKEYFromFile parses a DNSKEY record from a key file
@@ -482,6 +561,62 @@ func parseDNSKEYFromFile(content string) (*dns.DNSKEY, error) {
 		}
 	}
 	return nil, fmt.Errorf("no DNSKEY record found in file")
+}
+
+// verifyKeyPairCorrespondence checks that the private key material actually corresponds to
+// the public key in the DNSKEY. Two failures this guards against: a crash or restore can
+// pair a freshly written .key with a stale .private of a different key (R-009), and a
+// standard BIND/ldns ED25519 key stores the private half as a 32-byte seed the raw signer
+// would otherwise reject (R-010). It accepts every key form this signer generates or
+// imports: 64-byte or 32-byte-seed ED25519, and 32/48-byte ECDSA P-256/P-384.
+func verifyKeyPairCorrespondence(dnskey *dns.DNSKEY, privateKey []byte) error {
+	pubBytes, err := base64.StdEncoding.DecodeString(dnskey.PublicKey)
+	if err != nil {
+		return fmt.Errorf("decoding DNSKEY public key: %w", err)
+	}
+
+	switch dnskey.Algorithm {
+	case dns.ED25519:
+		var derived ed25519.PublicKey
+		switch len(privateKey) {
+		case ed25519.SeedSize: // 32-byte seed (BIND/ldns/RFC 8080)
+			derived = ed25519.NewKeyFromSeed(privateKey).Public().(ed25519.PublicKey)
+		case ed25519.PrivateKeySize: // 64-byte expanded key
+			derived = ed25519.PrivateKey(privateKey).Public().(ed25519.PublicKey)
+		default:
+			return fmt.Errorf("invalid ED25519 private key length %d (want %d or %d)", len(privateKey), ed25519.SeedSize, ed25519.PrivateKeySize)
+		}
+		if len(pubBytes) != ed25519.PublicKeySize || !bytes.Equal(derived, pubBytes) {
+			return fmt.Errorf("ED25519 private key does not correspond to the DNSKEY public key (key tag %d)", dnskey.KeyTag())
+		}
+		return nil
+	case dns.ECDSAP256SHA256:
+		return verifyECDSACorrespondence(elliptic.P256(), 32, privateKey, pubBytes, dnskey.KeyTag())
+	case dns.ECDSAP384SHA384:
+		return verifyECDSACorrespondence(elliptic.P384(), 48, privateKey, pubBytes, dnskey.KeyTag())
+	default:
+		return fmt.Errorf("unsupported algorithm %d for key-pair verification", dnskey.Algorithm)
+	}
+}
+
+// verifyECDSACorrespondence derives the public point from an ECDSA private scalar and
+// compares it to the DNSKEY's X||Y public key. size is the coordinate/scalar byte length
+// (32 for P-256, 48 for P-384).
+func verifyECDSACorrespondence(curve elliptic.Curve, size int, privateKey, pubBytes []byte, keyTag uint16) error {
+	if len(privateKey) != size {
+		return fmt.Errorf("invalid ECDSA private key length %d (want %d)", len(privateKey), size)
+	}
+	if len(pubBytes) != 2*size {
+		return fmt.Errorf("invalid ECDSA public key length %d (want %d)", len(pubBytes), 2*size)
+	}
+	x, y := curve.ScalarBaseMult(privateKey)
+	derived := make([]byte, 2*size)
+	x.FillBytes(derived[:size])
+	y.FillBytes(derived[size:])
+	if !bytes.Equal(derived, pubBytes) {
+		return fmt.Errorf("ECDSA private key does not correspond to the DNSKEY public key (key tag %d)", keyTag)
+	}
+	return nil
 }
 
 // parsePrivateKeyFromFile parses a private key from BIND format

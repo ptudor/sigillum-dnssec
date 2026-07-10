@@ -43,3 +43,27 @@ Files: `internal/validator/nsec.go`, `internal/validator/nsec_test.go`.
 Verification: updated `TestVerifyNSECNXDOMAIN` (single NSEC → incomplete/fail; covering+wildcard NSEC → proof); new `TestVerifyNSEC3NXDOMAINComplete` (trio → proof, single record → fail), `TestVerifyNODATA_CNAMEBit` (both NSEC/NSEC3), `TestClosestEncloserFromNSEC`. All validator tests green; build/vet/gofmt clean.
 **Partial (documented):** The fix spec's "handle wildcard-NODATA" sub-case is not implemented — the NODATA path proves direct NODATA (name exists, type absent) correctly, and wildcard-NODATA (a wildcard match lacking the queried type) falls through to "no proof" as it did before this change (no regression; it was never accepted). Full wildcard-NODATA proof assembly would reuse the NXDOMAIN closest-encloser/next-closer machinery on the NODATA path; deferred to avoid risking the correct direct-NODATA path, which is the common case. Noted here rather than silently omitted.
 
+---
+
+## Phase 2 — Signer data-integrity & crash safety
+
+**R-010 — Standard 32-byte-seed ED25519 import no longer panics the signer.**
+Changed `signRRSIG` (`sign.go`) to accept both the 32-byte seed (expand via `ed25519.NewKeyFromSeed`) and the 64-byte expanded ED25519 key, and to length-validate the ECDSA branches (32/48) — so a wrong-length key returns an error instead of panicking inside `crypto/ed25519`. Added a pub/priv correspondence check to `loadBindKeyPair` (`main.go`) so `import` validates the pair before writing anything.
+Files: `sign.go`, `main.go`, `keys.go` (helper).
+Verification: new `TestSignRRSIG_ED25519SeedAndFull` (seed + full both sign and verify), `TestSignRRSIG_GarbageLengthErrorsNoPanic`. Green.
+
+**R-009 — Key files written atomically; pub/priv correspondence enforced at load.**
+Added `writeFileAtomicOwned`/`syncDir` (`ownership.go`): unique temp + chmod + fsync + rename + dir-fsync, preserving daemon ownership. `saveKeyFiles` now writes `.private` then `.key` atomically (no truncate-in-place, no half-written pair). Added `verifyKeyPairCorrespondence` (`keys.go`) deriving the public key from the private half; `loadKeyPairFromPath` calls it and errors on mismatch, so a new `.key` beside a stale `.private` fails signing (prior zone keeps serving) instead of the ECDSA path silently "succeeding" with a bogus RRSIG.
+Files: `ownership.go`, `keys.go`.
+Verification: `TestLoadKeyPair_MismatchedPairRejected`, `TestVerifyKeyPairCorrespondence` (ED25519 seed/full/mismatch, ECDSA). All existing key/sign tests still pass. No code path calls `os.WriteFile` on a final key path anymore (key writes go through `writeFileAtomicOwned`).
+
+**R-027 — Key-backup failures are now fatal instead of warn-and-overwrite.**
+`backupExistingKeyFiles` (`keys.go`) returns an error and `saveKeyFiles` aborts (leaving the live pair intact) when a required backup fails. The unparseable-key fallback uses a UNIQUE `.bak` base (`uniqueBackupBase`) so a prior `.bak` is never clobbered; a tag-named backup is skipped only when it holds the SAME public key, otherwise the live key is preserved under a unique name. `backupKey` failures at rollover start (KSK, ZSK, algorithm) are now fatal (`rollover.go`).
+Files: `keys.go`, `rollover.go`.
+Verification: `TestSaveKeyFiles_BackupFailureAborts` (read-only keys dir → generation fails, originals byte-identical), `TestStartKSKRollover_BackupFailureFatal` (Rollover stays nil). Green.
+
+**R-028 — `RecoverKeyState` refuses to regenerate over an orphan key half.**
+`RecoverKeyState` (`keys.go`) now returns `(nil,nil)` only when BOTH halves are absent; when exactly one exists it errors (added `statExists`, which also treats a non-ENOENT stat error as an error, not a "generate"). This stops the daemon/`add` from minting a fresh KSK beside a surviving `.key` whose DS still matches at the parent.
+Files: `keys.go`.
+Verification: `TestRecoverKeyState_OrphanHalf` (delete either half → error, surviving half untouched, `recoverOrGenerateKeys` refuses). Green.
+

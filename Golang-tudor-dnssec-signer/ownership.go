@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 )
@@ -96,6 +97,66 @@ func renameOwned(src, dst string) error {
 	}
 	chownToTarget(dst)
 	return nil
+}
+
+// writeFileAtomicOwned writes data to path atomically and durably: it writes to a unique
+// temp file in the same directory, applies the mode, fsyncs, applies daemon ownership,
+// renames over the destination, then fsyncs the directory. A crash leaves either the old
+// file or the complete new one — never a truncated or half-written file (R-009). The
+// unique temp name also avoids the fixed-".tmp" collision between a concurrent daemon and
+// CLI writing the same path (R-002). On any error the temp file is removed.
+func writeFileAtomicOwned(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+
+	committed := false
+	defer func() {
+		if !committed {
+			tmp.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	// CreateTemp makes the file 0600; set the requested mode explicitly so it survives a
+	// restrictive umask and matches what NSD / the daemon expect.
+	if err := tmp.Chmod(perm); err != nil {
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("syncing temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	chownToTarget(tmpPath)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("renaming temp file over %s: %w", path, err)
+	}
+	committed = true
+	chownToTarget(path)
+	syncDir(dir)
+	return nil
+}
+
+// syncDir fsyncs a directory so a preceding rename is durable across a crash/power loss.
+// Best-effort: a failure is logged, not returned (the rename already succeeded).
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		slog.Debug("[FS] Cannot open directory for fsync", "dir", dir, "error", err)
+		return
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		slog.Debug("[FS] Directory fsync failed", "dir", dir, "error", err)
+	}
 }
 
 // cliRootAdvisory returns a human-readable description of what the CLI is
