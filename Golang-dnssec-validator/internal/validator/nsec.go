@@ -123,24 +123,50 @@ func VerifyNSECDenial(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 }
 
 // verifyNSECNXDOMAIN verifies NSEC proves the queried name doesn't exist.
-// Per RFC 4035 Section 5.4, we need an NSEC whose owner < qname < next_domain.
+// Per RFC 4035 §5.4 a complete NXDOMAIN proof needs TWO things: (1) an NSEC whose range
+// covers qname (owner < qname < next), and (2) an NSEC that covers the wildcard
+// "*.<closest-encloser>", proving no wildcard could have synthesized qname. A single
+// covering NSEC is not sufficient — accepting it would let an incomplete/forged denial
+// pass.
 func verifyNSECNXDOMAIN(qname string, nsecRecords []dnspkg.NSECRecord) (*NSECProof, error) {
-	for _, nsec := range nsecRecords {
-		owner := canonicalizeName(nsec.Owner)
-		next := canonicalizeName(nsec.NextDomain)
-
-		// Check if qname falls in the gap between owner and next
+	// (1) An NSEC must cover qname.
+	var covering *dnspkg.NSECRecord
+	for i := range nsecRecords {
+		owner := canonicalizeName(nsecRecords[i].Owner)
+		next := canonicalizeName(nsecRecords[i].NextDomain)
 		if canonicallyBetween(qname, owner, next) {
-			return &NSECProof{
-				ProofType:    "nxdomain",
-				CoveringNSEC: fmt.Sprintf("%s -> %s", owner, next),
-				Explanation: fmt.Sprintf("NSEC proves %s does not exist (falls between %s and %s in canonical order)",
-					qname, owner, next),
-			}, nil
+			covering = &nsecRecords[i]
+			break
 		}
 	}
+	if covering == nil {
+		return nil, fmt.Errorf("no NSEC record proves %s doesn't exist", qname)
+	}
 
-	return nil, fmt.Errorf("no NSEC record proves %s doesn't exist", qname)
+	// (2) An NSEC must cover the wildcard at the closest encloser (RFC 4035 §5.4).
+	ce := closestEncloserFromNSEC(qname, canonicalizeName(covering.Owner), canonicalizeName(covering.NextDomain))
+	wildcard := wildcardName(ce)
+	var wcOwner, wcNext string
+	wildcardCovered := false
+	for i := range nsecRecords {
+		owner := canonicalizeName(nsecRecords[i].Owner)
+		next := canonicalizeName(nsecRecords[i].NextDomain)
+		if canonicallyBetween(wildcard, owner, next) {
+			wildcardCovered = true
+			wcOwner, wcNext = owner, next
+			break
+		}
+	}
+	if !wildcardCovered {
+		return nil, fmt.Errorf("NXDOMAIN proof incomplete: no NSEC covers the wildcard %s (RFC 4035 §5.4)", wildcard)
+	}
+
+	return &NSECProof{
+		ProofType:    "nxdomain",
+		CoveringNSEC: fmt.Sprintf("%s -> %s", canonicalizeName(covering.Owner), canonicalizeName(covering.NextDomain)),
+		Explanation: fmt.Sprintf("NSEC proves %s does not exist (covered by %s -> %s) and no wildcard %s exists (covered by %s -> %s)",
+			qname, canonicalizeName(covering.Owner), canonicalizeName(covering.NextDomain), wildcard, wcOwner, wcNext),
+	}, nil
 }
 
 // verifyNSECNODATA verifies NSEC proves the queried type doesn't exist for a name.
@@ -153,6 +179,12 @@ func verifyNSECNODATA(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 
 		// If NSEC owner matches the query name
 		if owner == qname {
+			// RFC 6840 §4.3: a NODATA proof is invalid if the NSEC has the CNAME bit set —
+			// a CNAME should have been returned and followed instead of a bare NODATA.
+			if HasTypeInBitmap("CNAME", nsec.TypeBitmap) {
+				return nil, fmt.Errorf("NSEC at %s has the CNAME bit set: a CNAME was expected, not NODATA for %s (RFC 6840 §4.3)", owner, typeName)
+			}
+
 			// Check if the queried type is NOT in the type bitmap
 			typeFound := false
 			for _, t := range nsec.TypeBitmap {
@@ -285,24 +317,52 @@ func VerifyNSEC3Denial(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Re
 }
 
 // verifyNSEC3NXDOMAIN verifies NSEC3 proves the name doesn't exist.
-// Per RFC 5155 Section 8.4-8.5.
+// Per RFC 5155 §8.4 a complete NSEC3 NXDOMAIN proof needs THREE records: (1) an NSEC3 that
+// matches the closest encloser, (2) an NSEC3 that covers the next closer name, and (3) an
+// NSEC3 that covers the wildcard "*.<closest-encloser>". A single covering NSEC3 is not a
+// sufficient proof. hashedQname is unused (closest-encloser hashing is done per ancestor).
 func verifyNSEC3NXDOMAIN(hashedQname, qname string, nsec3Records []dnspkg.NSEC3Record) (*NSECProof, error) {
-	for _, nsec3 := range nsec3Records {
-		owner := nsec3.HashedOwner
-		next := nsec3.NextHashed
+	_ = hashedQname
+	params := nsec3Records[0]
+	salt, err := hexDecode(params.Salt)
+	if err != nil {
+		return nil, fmt.Errorf("invalid NSEC3 salt: %w", err)
+	}
+	iter := params.Iterations
 
-		// Check if the hashed qname falls between owner and next
-		if hashBetween(hashedQname, owner, next) {
-			return &NSECProof{
-				ProofType:    "nxdomain",
-				CoveringNSEC: fmt.Sprintf("NSEC3 %s -> %s", owner, next),
-				Explanation: fmt.Sprintf("NSEC3 proves %s does not exist (hash %s falls between %s and %s)",
-					qname, hashedQname, owner, next),
-			}, nil
+	// (1) Closest encloser: the longest ancestor of qname whose hash matches an NSEC3.
+	qname = canonicalizeName(qname)
+	labels := strings.Split(strings.TrimSuffix(qname, "."), ".")
+	var ce, nextCloser string
+	for drop := 1; drop <= len(labels); drop++ {
+		candidate := lastNLabels(qname, len(labels)-drop)
+		if nsec3Matches(computeNSEC3Hash(candidate, salt, iter), nsec3Records) {
+			ce = candidate
+			nextCloser = lastNLabels(qname, len(labels)-drop+1)
+			break
 		}
 	}
+	if ce == "" {
+		return nil, fmt.Errorf("NSEC3 NXDOMAIN proof incomplete: no closest-encloser match for %s (RFC 5155 §8.4)", qname)
+	}
 
-	return nil, fmt.Errorf("no NSEC3 record proves %s (hash %s) doesn't exist", qname, hashedQname)
+	// (2) The next closer name must be covered.
+	if !nsec3Covers(computeNSEC3Hash(nextCloser, salt, iter), nsec3Records) {
+		return nil, fmt.Errorf("NSEC3 NXDOMAIN proof incomplete: next closer name %s not covered (RFC 5155 §8.4)", nextCloser)
+	}
+
+	// (3) The wildcard at the closest encloser must be covered.
+	wildcard := wildcardName(ce)
+	if !nsec3Covers(computeNSEC3Hash(wildcard, salt, iter), nsec3Records) {
+		return nil, fmt.Errorf("NSEC3 NXDOMAIN proof incomplete: wildcard %s not covered (RFC 5155 §8.4)", wildcard)
+	}
+
+	return &NSECProof{
+		ProofType:    "nxdomain",
+		CoveringNSEC: fmt.Sprintf("NSEC3 closest encloser %s", ce),
+		Explanation: fmt.Sprintf("NSEC3 proves %s does not exist: closest encloser %s matched, next closer %s covered, wildcard %s covered",
+			qname, ce, nextCloser, wildcard),
+	}, nil
 }
 
 // verifyNSEC3NODATA verifies NSEC3 proves the type doesn't exist.
@@ -313,6 +373,11 @@ func verifyNSEC3NODATA(hashedQname, qname string, qtype uint16, nsec3Records []d
 	for _, nsec3 := range nsec3Records {
 		// NSEC3 owner hash should match the queried name's hash
 		if strings.EqualFold(nsec3.HashedOwner, hashedQname) {
+			// RFC 6840 §4.3: a NODATA proof is invalid if the NSEC3 has the CNAME bit set.
+			if HasTypeInBitmap("CNAME", nsec3.TypeBitmap) {
+				return nil, fmt.Errorf("NSEC3 at %s has the CNAME bit set: a CNAME was expected, not NODATA for %s (RFC 6840 §4.3)", nsec3.HashedOwner, typeName)
+			}
+
 			// Check if qtype is NOT in type bitmap
 			typeFound := false
 			for _, t := range nsec3.TypeBitmap {
@@ -580,6 +645,73 @@ func lastNLabels(qname string, n int) string {
 		return qname
 	}
 	return strings.Join(labels[len(labels)-n:], ".") + "."
+}
+
+// commonSuffixLabels returns the longest run of whole trailing labels shared by a and b,
+// as an FQDN (their deepest common ancestor). Labels are compared case-insensitively
+// (splitLabels lowercases). Returns "." when nothing is shared.
+func commonSuffixLabels(a, b string) string {
+	al := splitLabels(a) // right-to-left: al[0] is the rightmost label
+	bl := splitLabels(b)
+	n := len(al)
+	if len(bl) < n {
+		n = len(bl)
+	}
+	i := 0
+	for i < n && al[i] == bl[i] {
+		i++
+	}
+	if i == 0 {
+		return "."
+	}
+	suffix := make([]string, i)
+	copy(suffix, al[:i])
+	for l, r := 0, len(suffix)-1; l < r; l, r = l+1, r-1 {
+		suffix[l], suffix[r] = suffix[r], suffix[l]
+	}
+	return strings.Join(suffix, ".") + "."
+}
+
+// closestEncloserFromNSEC derives the closest encloser of qname from an NSEC that covers
+// it (RFC 7129 §5.3). The covering NSEC's owner and next name both provably exist, so the
+// closest encloser — the deepest existing ancestor of qname — is the deeper of the two
+// longest-common-ancestors of qname with those names.
+func closestEncloserFromNSEC(qname, owner, next string) string {
+	ceOwner := commonSuffixLabels(qname, owner)
+	ceNext := commonSuffixLabels(qname, next)
+	if GetZoneLabels(ceNext) > GetZoneLabels(ceOwner) {
+		return ceNext
+	}
+	return ceOwner
+}
+
+// nsec3Matches reports whether any NSEC3 record's owner hash equals hash (the name exists).
+func nsec3Matches(hash string, records []dnspkg.NSEC3Record) bool {
+	for _, r := range records {
+		if strings.EqualFold(r.HashedOwner, hash) {
+			return true
+		}
+	}
+	return false
+}
+
+// nsec3Covers reports whether any NSEC3 record's hash range covers hash (the name does not
+// exist — it falls strictly between an owner hash and its next hash).
+func nsec3Covers(hash string, records []dnspkg.NSEC3Record) bool {
+	for _, r := range records {
+		if hashBetween(hash, r.HashedOwner, r.NextHashed) {
+			return true
+		}
+	}
+	return false
+}
+
+// wildcardName returns "*.<encloser>" (or "*." for the root encloser).
+func wildcardName(encloser string) string {
+	if encloser == "." || encloser == "" {
+		return "*."
+	}
+	return "*." + encloser
 }
 
 // HasTypeInBitmap checks if a type is present in the NSEC/NSEC3 type bitmap.
