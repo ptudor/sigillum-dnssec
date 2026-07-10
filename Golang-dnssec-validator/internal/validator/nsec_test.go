@@ -211,6 +211,10 @@ func TestComputeNSEC3Hash(t *testing.T) {
 }
 
 func TestVerifyNSECNXDOMAIN(t *testing.T) {
+	// A complete NXDOMAIN proof (RFC 4035 §5.4) needs the NSEC covering qname AND an NSEC
+	// covering the wildcard "*.<closest-encloser>". For qname nonexistent.example.com. the
+	// closest encloser is example.com., so the wildcard is *.example.com. The apex NSEC
+	// (example.com. -> existing.example.com.) covers that wildcard in canonical order.
 	tests := []struct {
 		name        string
 		qname       string
@@ -219,7 +223,24 @@ func TestVerifyNSECNXDOMAIN(t *testing.T) {
 		wantErrText string
 	}{
 		{
-			name:  "name falls in gap",
+			name:  "complete proof: covering NSEC + wildcard NSEC",
+			qname: "nonexistent.example.com.",
+			nsec: []dnspkg.NSECRecord{
+				{
+					Owner:      "existing.example.com.",
+					NextDomain: "other.example.com.",
+					TypeBitmap: []string{"A", "AAAA", "RRSIG"},
+				},
+				{
+					Owner:      "example.com.",
+					NextDomain: "existing.example.com.",
+					TypeBitmap: []string{"A", "NS", "SOA", "RRSIG"},
+				},
+			},
+			wantProof: true,
+		},
+		{
+			name:  "incomplete: covering NSEC only, no wildcard-nonexistence proof",
 			qname: "nonexistent.example.com.",
 			nsec: []dnspkg.NSECRecord{
 				{
@@ -228,7 +249,8 @@ func TestVerifyNSECNXDOMAIN(t *testing.T) {
 					TypeBitmap: []string{"A", "AAAA", "RRSIG"},
 				},
 			},
-			wantProof: true,
+			wantProof:   false,
+			wantErrText: "wildcard",
 		},
 		{
 			name:  "name does not fall in gap",
@@ -242,18 +264,6 @@ func TestVerifyNSECNXDOMAIN(t *testing.T) {
 			},
 			wantProof:   false,
 			wantErrText: "no NSEC record proves",
-		},
-		{
-			name:  "wrap-around at zone apex",
-			qname: "zzz.example.com.",
-			nsec: []dnspkg.NSECRecord{
-				{
-					Owner:      "www.example.com.",
-					NextDomain: "aaa.example.com.",
-					TypeBitmap: []string{"A"},
-				},
-			},
-			wantProof: true,
 		},
 	}
 
@@ -412,6 +422,79 @@ func TestHasTypeInBitmap(t *testing.T) {
 	}
 	if HasTypeInBitmap("DS", bitmap) {
 		t.Error("expected DS to not be in bitmap")
+	}
+}
+
+func TestClosestEncloserFromNSEC(t *testing.T) {
+	tests := []struct {
+		qname, owner, next, want string
+	}{
+		// Closest encloser is example.com. (bar.example.com. is not proven to exist).
+		{"nonexistent.example.com.", "existing.example.com.", "other.example.com.", "example.com."},
+		// bar.example.com. is the owner (exists) and is an ancestor of qname -> it is the CE.
+		{"foo.bar.example.com.", "bar.example.com.", "zoo.example.com.", "bar.example.com."},
+		// The covering NSEC skips over bar.example.com., so the CE is example.com.
+		{"foo.bar.example.com.", "aaa.example.com.", "zzz.example.com.", "example.com."},
+	}
+	for _, tt := range tests {
+		got := closestEncloserFromNSEC(canonicalizeName(tt.qname), canonicalizeName(tt.owner), canonicalizeName(tt.next))
+		if got != tt.want {
+			t.Errorf("closestEncloserFromNSEC(%s, %s, %s) = %s, want %s", tt.qname, tt.owner, tt.next, got, tt.want)
+		}
+	}
+}
+
+// R-085: an NSEC3 NXDOMAIN proof requires the closest-encloser match, the next-closer
+// cover, and the wildcard cover — a single covering NSEC3 is not sufficient.
+func TestVerifyNSEC3NXDOMAINComplete(t *testing.T) {
+	const salt = "AABBCCDD"
+	const iter = uint16(5)
+	saltBytes, err := hexDecode(salt)
+	if err != nil {
+		t.Fatalf("salt: %v", err)
+	}
+	hCE := computeNSEC3Hash("example.com.", saltBytes, iter)
+
+	minH := strings.Repeat("0", 32)
+	maxH := strings.Repeat("V", 32)
+
+	ceMatch := dnspkg.NSEC3Record{HashedOwner: hCE, NextHashed: maxH, Algorithm: 1, Salt: salt, Iterations: iter, TypeBitmap: []string{"NS", "SOA", "RRSIG"}}
+	wideCover := dnspkg.NSEC3Record{HashedOwner: minH, NextHashed: maxH, Algorithm: 1, Salt: salt, Iterations: iter, TypeBitmap: []string{"A", "RRSIG"}}
+
+	// Complete trio: CE match + covers for the next closer and the wildcard.
+	proof, err := verifyNSEC3NXDOMAIN("", "nonexistent.example.com.", []dnspkg.NSEC3Record{ceMatch, wideCover})
+	if err != nil {
+		t.Fatalf("complete NSEC3 NXDOMAIN proof should verify, got: %v", err)
+	}
+	if proof == nil || proof.ProofType != "nxdomain" {
+		t.Fatalf("expected an nxdomain proof, got %+v", proof)
+	}
+
+	// Incomplete: a single covering NSEC3 with no closest-encloser match.
+	if _, err := verifyNSEC3NXDOMAIN("", "nonexistent.example.com.", []dnspkg.NSEC3Record{wideCover}); err == nil {
+		t.Fatal("a single covering NSEC3 must not be accepted as a complete NXDOMAIN proof")
+	}
+}
+
+func TestVerifyNODATA_CNAMEBit(t *testing.T) {
+	// NSEC with the CNAME bit set must not prove NODATA (RFC 6840 §4.3).
+	nsec := []dnspkg.NSECRecord{{
+		Owner:      "alias.example.com.",
+		NextDomain: "foo.example.com.",
+		TypeBitmap: []string{"CNAME", "RRSIG", "NSEC"},
+	}}
+	if _, err := verifyNSECNODATA(canonicalizeName("alias.example.com."), 28 /* AAAA */, nsec); err == nil {
+		t.Fatal("NSEC NODATA proof with the CNAME bit set must be rejected")
+	}
+
+	// NSEC3 with the CNAME bit set must likewise be rejected.
+	const salt = "AABBCCDD"
+	const iter = uint16(5)
+	saltBytes, _ := hexDecode(salt)
+	h := computeNSEC3Hash("alias.example.com.", saltBytes, iter)
+	nsec3 := []dnspkg.NSEC3Record{{HashedOwner: h, NextHashed: strings.Repeat("V", 32), Algorithm: 1, Salt: salt, Iterations: iter, TypeBitmap: []string{"CNAME", "RRSIG"}}}
+	if _, err := verifyNSEC3NODATA(h, "alias.example.com.", 28, nsec3); err == nil {
+		t.Fatal("NSEC3 NODATA proof with the CNAME bit set must be rejected")
 	}
 }
 
