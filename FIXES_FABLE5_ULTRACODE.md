@@ -131,3 +131,37 @@ Verification: `TestSignAllZones_StopsOnShutdown` — cancel ctx, run a cycle ove
 Added `Daemon.hookWG`; `executeHook`/`executeBatchHook` take a `*sync.WaitGroup` (nil from CLI paths, `&d.hookWG` from the daemon) and `Add(1)`/`defer Done()` around the goroutine. After the signing loop drains, `Run` calls `waitForHooks(30s)` so a shutdown right after a cycle doesn't kill the final coalesced `nsd-control reload` before it runs. Hooks stay async relative to per-zone signing; the 30s per-hook timeout, env-var contract, and log redaction are unchanged; `executeHookSync` is untouched.
 Files: `daemon.go`, `hooks.go`, `lifecycle_test.go`.
 Verification: `TestExecuteHook_WaitGroupTracked` and `TestExecuteBatchHook_WaitGroupTracked` — a tracked hook touches a marker; `wg.Wait()` returns only after the marker exists.
+
+---
+
+## Phase 4 — validator hardening (R-086, R-087, R-088, R-089, R-091, R-092)
+
+**R-086 — Global concurrent-validation cap.**
+Added `max_concurrent_validations` config (TOML `max_concurrent_validations` / env `MAX_CONCURRENT_VALIDATIONS`, default 100, validated > 0). `Handlers` gained a buffered-channel semaphore sized to it; `HandleValidateSSE`/`HandleValidateJSON` acquire a slot near the top (before SSE headers / before anchors+DNS work) and reject with 503 + `Retry-After: 5` when full, rather than fanning out into unbounded outbound DNS/goroutines. The in-flight gauge is now bumped/decremented exactly with the slot (via `acquireValidationSlot`/`releaseValidationSlot`), wiring it to the real live count. Per-validation `MaxConcurrent` and the SSE contract are unchanged.
+Files: `config.go`, `handlers.go`.
+Verification: `TestValidationConcurrencyCap_RejectsWhenFull` (N+1th request → 503 + Retry-After + "capacity" body), `TestAcquireValidationSlot_HardCap`, `TestValidate_MaxConcurrentValidationsPositive`.
+
+**R-087 — Trust-anchor HTTPS requirement + known-root-tag sanity floor.**
+`Config.Validate` now rejects a non-`https://` `root_anchors_url` (enforced at config validation, per the fix spec, so the httptest-based function tests keep working; the only production loader path is fed by validated config). `internal/dns/anchors.go` gained `knownRootKSKTags{20326 (KSK-2017), 38696 (KSK-2024)}` and refuses an anchor set whose keys carry none of them (a wholesale-swap floor) in both `LoadAnchors` and `LoadAnchorsFromURL`; an empty set still falls through to the URL fallback. The digest-match-against-live-root check and file→URL order are unchanged.
+Files: `config.go`, `internal/dns/anchors.go`.
+Verification: `TestValidate_RootAnchorsURLRequiresHTTPS` (http:// rejected, https://+empty accepted), `TestLoadAnchors_RejectsUnknownRootTags` (tag-6666-only rejected, tag-20326 accepted). Existing anchor tests (fixtures carry 20326) still pass.
+
+**R-088 — NSEC3 iteration cap (RFC 9276).**
+Added `nsec3IterationsOverCap` (reusing `NSEC3MaxRecommendedIterations = 100`) and call it at the top of every NSEC3-hashing entry point — `VerifyNSEC3Denial`, `VerifyNSEC3DenialWithRRSIG` (before the RRSIG crypto too), and `VerifyWildcardDenial` — refusing the proof before any `computeNSEC3Hash` runs. A hostile zone can no longer force up to 65536 SHA-1 ops/name. Compliant zones (≤100) are unaffected.
+Files: `internal/validator/nsec.go`.
+Verification: `TestNSEC3IterationCap` — iterations=1000 rejected at all three entry points (no hashing); iterations=10 never trips the cap.
+
+**R-089 — Trust-anchor load recovers via backoff, not only the 24h refresh.**
+`main.go` captures the initial `Load()` error; when it failed, the anchor-management goroutine now retries with exponential backoff (30s → 5m ceiling) until anchors load, then enters the existing 24h steady-state refresh. Readiness is already surfaced by `/health`'s `root_anchors` check (degraded/503 until loaded), so a transient boot-time failure recovers within the backoff window instead of causing up to 24h of 503s. Shutdown (`anchorDone`) interrupts the backoff.
+Files: `main.go`.
+Verification: build/vet/test/-race clean; the backoff loop drives `AnchorsStore.Load()` (covered by existing anchor-load tests) and stops on `anchorDone`. Full recovery timing verified by inspection (retry cadence + `/health` readiness gate).
+
+**R-091 — Rate-limiter bucket map is bounded.**
+`RateLimiter` gained `maxBuckets` (default 50000). `Allow` calls `evictLocked` before inserting a new IP once at the cap: it first drops idle buckets (idle > cleanup interval), then — under active churn where all buckets are fresh — sheds ~10% by evicting to a low-water mark so a fresh insert always fits. Evicting a live bucket only resets that IP's tokens to burst (more lenient, never a bypass), so bounding memory is safe. An attacker rotating source addresses within a /64 can no longer grow the map without limit between cleanup ticks.
+Files: `ratelimit.go`.
+Verification: `TestRateLimiter_BoundedByMaxBuckets` — 5000 unique fresh IPs with cap 100 → map stays ≤ 100.
+
+**R-092 — RDAP response body size-limited.**
+`internal/rdap/client.go` wraps `resp.Body` in `io.LimitReader(…, 1<<20)` (mirroring the anchors loader), so a compromised/oversized RDAP endpoint can't exhaust memory.
+Files: `internal/rdap/client.go`.
+Verification: `TestQueryDomain_ResponseSizeLimited` — a valid but >1 MiB JSON object is truncated at the cap and no longer parses (fails without the limit only by buffering the whole body).

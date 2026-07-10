@@ -9,6 +9,28 @@ import (
 	"time"
 )
 
+// knownRootKSKTags are the IANA root-zone KSK key tags this validator
+// recognizes: 20326 (KSK-2017, the currently-active root KSK) and 38696
+// (KSK-2024, the pre-published successor). At least one loaded anchor must
+// carry one of these tags, so a wholesale swap to an attacker-supplied anchor
+// set is refused as a sanity floor. This is defense-in-depth: the primary check
+// remains recomputing the DS from the live root DNSKEY and requiring a digest
+// match. A future root KSK rollover requires adding the new tag here. R-087.
+var knownRootKSKTags = map[int]bool{
+	20326: true,
+	38696: true,
+}
+
+// hasKnownRootTag reports whether any anchor carries a recognized root KSK tag.
+func hasKnownRootTag(anchors []Anchor) bool {
+	for _, a := range anchors {
+		if knownRootKSKTags[a.KeyTag] {
+			return true
+		}
+	}
+	return false
+}
+
 // LoadAnchors loads root trust anchors from a file
 func LoadAnchors(path string) (*RootAnchors, error) {
 	data, err := os.ReadFile(path)
@@ -36,6 +58,12 @@ func LoadAnchors(path string) (*RootAnchors, error) {
 	}
 	anchors.Anchors = validAnchors
 	anchors.LoadedFrom = path
+
+	// Reject an anchor set whose keys are all unrecognized (possible swap); an
+	// empty set falls through to the URL fallback unchanged.
+	if len(validAnchors) > 0 && !hasKnownRootTag(validAnchors) {
+		return nil, fmt.Errorf("anchors from %s carry no known root KSK key tag; refusing possible wholesale anchor swap", path)
+	}
 
 	return &anchors, nil
 }
@@ -92,6 +120,10 @@ func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
 	}
 	anchors.Anchors = validAnchors
 	anchors.LoadedFrom = url
+
+	if len(validAnchors) > 0 && !hasKnownRootTag(validAnchors) {
+		return nil, fmt.Errorf("anchors from %s carry no known root KSK key tag; refusing possible wholesale anchor swap", url)
+	}
 
 	return &anchors, nil
 }

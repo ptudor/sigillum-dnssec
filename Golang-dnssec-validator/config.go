@@ -30,10 +30,11 @@ type Config struct {
 	RootAnchorsURL  string `toml:"root_anchors_url"`
 
 	// DNS query settings
-	QueryTimeoutSec   int    `toml:"query_timeout_seconds"`
-	TotalTimeoutSec   int    `toml:"total_timeout_seconds"`
-	MaxConcurrent     int    `toml:"max_concurrent"`
-	RecursiveResolver string `toml:"recursive_resolver"`
+	QueryTimeoutSec          int    `toml:"query_timeout_seconds"`
+	TotalTimeoutSec          int    `toml:"total_timeout_seconds"`
+	MaxConcurrent            int    `toml:"max_concurrent"`             // max concurrent DNS queries within one validation
+	MaxConcurrentValidations int    `toml:"max_concurrent_validations"` // global cap on in-flight validations (R-086)
+	RecursiveResolver        string `toml:"recursive_resolver"`
 
 	// RDAP settings
 	RDAPBaseURL string `toml:"rdap_base_url"`
@@ -113,18 +114,19 @@ type HeartbeatConfig struct {
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		ListenAddr:         ":8791",
-		ShutdownTimeoutSec: 30,
-		ShutdownTimeout:    30 * time.Second,
-		RootAnchorsPath:    "/etc/dnssec-validator/root-anchors.json",
-		RootAnchorsURL:     "https://internet.any53.com/dns/anchors/root-anchors.json",
-		QueryTimeoutSec:    5,
-		TotalTimeoutSec:    30,
-		QueryTimeout:       5 * time.Second,
-		TotalTimeout:       30 * time.Second,
-		MaxConcurrent:      10,
-		RecursiveResolver:  "127.0.0.1",
-		RDAPBaseURL:        "https://www.any53.com/rdap",
+		ListenAddr:               ":8791",
+		ShutdownTimeoutSec:       30,
+		ShutdownTimeout:          30 * time.Second,
+		RootAnchorsPath:          "/etc/dnssec-validator/root-anchors.json",
+		RootAnchorsURL:           "https://internet.any53.com/dns/anchors/root-anchors.json",
+		QueryTimeoutSec:          5,
+		TotalTimeoutSec:          30,
+		QueryTimeout:             5 * time.Second,
+		TotalTimeout:             30 * time.Second,
+		MaxConcurrent:            10,
+		MaxConcurrentValidations: 100,
+		RecursiveResolver:        "127.0.0.1",
+		RDAPBaseURL:              "https://www.any53.com/rdap",
 		RateLimit: RateLimitConfig{
 			PerSec:     10,
 			Burst:      30,
@@ -215,6 +217,7 @@ func LoadFromEnv() (*Config, error) {
 	cfg.QueryTimeoutSec = getEnvInt("QUERY_TIMEOUT_SECONDS", cfg.QueryTimeoutSec)
 	cfg.TotalTimeoutSec = getEnvInt("TOTAL_TIMEOUT_SECONDS", cfg.TotalTimeoutSec)
 	cfg.MaxConcurrent = getEnvInt("MAX_CONCURRENT", cfg.MaxConcurrent)
+	cfg.MaxConcurrentValidations = getEnvInt("MAX_CONCURRENT_VALIDATIONS", cfg.MaxConcurrentValidations)
 	cfg.RecursiveResolver = getEnv("RECURSIVE_RESOLVER", cfg.RecursiveResolver)
 
 	// RDAP settings
@@ -333,6 +336,9 @@ func (c *Config) Validate() error {
 	if c.MaxConcurrent <= 0 {
 		return fmt.Errorf("max_concurrent must be positive")
 	}
+	if c.MaxConcurrentValidations <= 0 {
+		return fmt.Errorf("max_concurrent_validations must be positive")
+	}
 
 	// Validate base path
 	if c.BasePath != "" {
@@ -372,6 +378,12 @@ func (c *Config) Validate() error {
 	// Validate heartbeat interval when enabled (time.NewTicker requires > 0)
 	if c.Heartbeat.Enabled && c.Heartbeat.IntervalMinutes <= 0 {
 		return fmt.Errorf("heartbeat.interval_minutes must be positive when heartbeat.enabled is true")
+	}
+
+	// The trust-anchor URL, when set, must be HTTPS — anchors fetched over
+	// cleartext are MITM-able (defense-in-depth atop the live-root digest match). R-087.
+	if c.RootAnchorsURL != "" && !strings.HasPrefix(strings.ToLower(c.RootAnchorsURL), "https://") {
+		return fmt.Errorf("root_anchors_url must use https:// (got %q)", c.RootAnchorsURL)
 	}
 
 	return nil

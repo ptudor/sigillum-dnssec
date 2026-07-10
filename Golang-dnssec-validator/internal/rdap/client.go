@@ -12,6 +12,10 @@ import (
 	"github.com/ptudor/dnssec-validator/internal/dns"
 )
 
+// maxRDAPResponseBytes caps the RDAP response body we buffer (1 MiB). RDAP
+// domain objects are small; anything larger is a misbehaving/hostile endpoint.
+const maxRDAPResponseBytes = 1 << 20
+
 // Client is an RDAP client for querying domain secureDNS information.
 type Client struct {
 	baseURL    string
@@ -64,7 +68,9 @@ func (c *Client) QueryDomain(ctx context.Context, domain string) (*RDAPDomainRes
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Bound the response so a compromised/oversized RDAP endpoint can't exhaust
+	// memory (mirrors the 1 MiB LimitReader used for trust anchors). R-092.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRDAPResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

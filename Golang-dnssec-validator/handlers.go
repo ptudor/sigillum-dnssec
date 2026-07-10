@@ -18,6 +18,12 @@ type Handlers struct {
 	anchorsStore *AnchorsStore
 	config       *Config
 	rdapClient   *rdap.Client
+
+	// validationSem globally caps concurrent validations (R-086). Each extended
+	// validation fans out to every authoritative NS of every zone in the chain,
+	// so without a global bound a modest number of concurrent requests becomes a
+	// large volume of outbound DNS (an amplifier) and many goroutines.
+	validationSem chan struct{}
 }
 
 // NewHandlers creates new HTTP handlers
@@ -26,11 +32,35 @@ func NewHandlers(anchorsStore *AnchorsStore, config *Config) *Handlers {
 	if config.RDAPBaseURL != "" {
 		rdapClient = rdap.NewClient(config.RDAPBaseURL, config.QueryTimeout)
 	}
-	return &Handlers{
-		anchorsStore: anchorsStore,
-		config:       config,
-		rdapClient:   rdapClient,
+	max := config.MaxConcurrentValidations
+	if max <= 0 {
+		max = 100 // defensive: Validate() rejects <= 0, but never build a nil/0 semaphore
 	}
+	return &Handlers{
+		anchorsStore:  anchorsStore,
+		config:        config,
+		rdapClient:    rdapClient,
+		validationSem: make(chan struct{}, max),
+	}
+}
+
+// acquireValidationSlot takes a global validation slot without blocking and
+// bumps the in-flight gauge on success, tying the gauge to the real in-flight
+// count. Returns false when at capacity (R-086).
+func (h *Handlers) acquireValidationSlot() bool {
+	select {
+	case h.validationSem <- struct{}{}:
+		IncrementActiveValidations()
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseValidationSlot returns a slot and decrements the in-flight gauge.
+func (h *Handlers) releaseValidationSlot() {
+	<-h.validationSem
+	DecrementActiveValidations()
 }
 
 // HandleValidateSSE handles SSE validation requests
@@ -81,6 +111,17 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		mode = "extended"
 	}
 
+	// Enforce the global concurrency cap before committing to any work or SSE
+	// headers: reject with 503 + Retry-After when at capacity (R-086).
+	if !h.acquireValidationSlot() {
+		statusCode = "503"
+		w.Header().Set("Retry-After", "5")
+		writeProblemDetails(w, ErrTypeServiceUnavailable, "Service Unavailable",
+			http.StatusServiceUnavailable, "server is at validation capacity; please retry shortly", r.URL.Path)
+		return
+	}
+	defer h.releaseValidationSlot()
+
 	// Create SSE writer
 	sse, err := NewSSEWriter(w)
 	if err != nil {
@@ -92,8 +133,6 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 
 	IncrementActiveSSEConnections()
 	defer DecrementActiveSSEConnections()
-	IncrementActiveValidations()
-	defer DecrementActiveValidations()
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
@@ -219,6 +258,16 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		mode = "extended"
 	}
 
+	// Enforce the global concurrency cap before starting work (R-086).
+	if !h.acquireValidationSlot() {
+		w.Header().Set("Retry-After", "5")
+		writeProblemDetails(w, ErrTypeServiceUnavailable, "Service Unavailable",
+			http.StatusServiceUnavailable, "server is at validation capacity; please retry shortly", r.URL.Path)
+		RecordAPIRequest("/api/validate", r.Method, "503", time.Since(startTime).Seconds())
+		return
+	}
+	defer h.releaseValidationSlot()
+
 	// Get anchors
 	anchors := h.anchorsStore.Get()
 	if anchors == nil || len(anchors.Anchors) == 0 {
@@ -250,9 +299,6 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
 	defer cancel()
-
-	IncrementActiveValidations()
-	defer DecrementActiveValidations()
 
 	// Run validation
 	result, err := v.Validate(ctx, domain)

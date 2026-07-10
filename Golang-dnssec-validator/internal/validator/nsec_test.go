@@ -520,3 +520,38 @@ func TestCompareCanonical(t *testing.T) {
 		}
 	}
 }
+
+// R-088: NSEC3 records with iteration counts above the RFC 9276 cap are refused
+// before any hashing, so a hostile zone can't force up to 65536 SHA-1 ops/name.
+func TestNSEC3IterationCap(t *testing.T) {
+	over := []dnspkg.NSEC3Record{{
+		HashedOwner: strings.Repeat("A", 32), NextHashed: strings.Repeat("Z", 32),
+		Algorithm: NSEC3HashSHA1, Salt: "", Iterations: 1000,
+		TypeBitmap: []string{"A", "RRSIG"},
+	}}
+
+	// Direct denial verification rejects with a cap error.
+	if _, err := VerifyNSEC3Denial("nx.example.com.", 1, over, "example.com.", 3); err == nil {
+		t.Fatal("VerifyNSEC3Denial must reject iterations over the RFC 9276 cap")
+	}
+
+	// The RRSIG-gated and wildcard entry points reject as well (before crypto/hashing).
+	proof := VerifyNSEC3DenialWithRRSIG("nx.example.com.", 1, over, nil, nil, "example.com.", nil, 3)
+	if proof == nil || proof.Error == "" || !strings.Contains(proof.Error, "9276") {
+		t.Errorf("VerifyNSEC3DenialWithRRSIG should flag the iteration cap, got %+v", proof)
+	}
+	wc := VerifyWildcardDenial("nx.example.com.", 2, nil, over)
+	if wc == nil || wc.Error == "" || !strings.Contains(wc.Error, "9276") {
+		t.Errorf("VerifyWildcardDenial should flag the iteration cap, got %+v", wc)
+	}
+
+	// A compliant iteration count is not rejected by the cap (it fails later for
+	// other reasons, but never with the cap error).
+	ok := []dnspkg.NSEC3Record{{
+		HashedOwner: strings.Repeat("A", 32), NextHashed: strings.Repeat("Z", 32),
+		Algorithm: NSEC3HashSHA1, Salt: "", Iterations: 10, TypeBitmap: []string{"A"},
+	}}
+	if _, err := VerifyNSEC3Denial("nx.example.com.", 1, ok, "example.com.", 3); err != nil && strings.Contains(err.Error(), "9276") {
+		t.Errorf("iterations=10 must not trip the cap: %v", err)
+	}
+}

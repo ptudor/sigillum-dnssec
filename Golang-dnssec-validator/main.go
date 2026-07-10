@@ -37,8 +37,9 @@ func main() {
 
 	// Create anchors store and load trust anchors
 	anchorsStore := NewAnchorsStore(config.RootAnchorsPath, config.RootAnchorsURL)
-	if err := anchorsStore.Load(); err != nil {
-		LogWarn("main", "failed to load root anchors, will retry", "error", err.Error())
+	initialLoadErr := anchorsStore.Load()
+	if initialLoadErr != nil {
+		LogWarn("main", "failed to load root anchors at startup; will retry with backoff", "error", initialLoadErr.Error())
 	} else {
 		anchors := anchorsStore.Get()
 		LogInfo("main", "loaded root trust anchors",
@@ -82,9 +83,40 @@ func main() {
 		serverErr <- server.Start()
 	}()
 
-	// Start periodic anchor refresh (every 24 hours)
+	// Manage trust anchors in the background: recover from a failed startup load
+	// via bounded backoff, then refresh on the 24h steady-state cadence.
 	anchorDone := make(chan struct{})
 	go func() {
+		// If the initial load failed, retry with backoff until anchors are
+		// available — independent of the 24h refresh — so a transient boot-time
+		// failure doesn't leave every /validate returning 503 for up to a day
+		// (R-089). Readiness is surfaced via /health's root_anchors check.
+		if initialLoadErr != nil {
+			backoff := 30 * time.Second
+			const maxBackoff = 5 * time.Minute
+			for {
+				select {
+				case <-anchorDone:
+					return
+				case <-time.After(backoff):
+				}
+				if err := anchorsStore.Load(); err != nil {
+					LogWarn("main", "retry loading root anchors failed",
+						"error", err.Error(), "next_retry_in", backoff.String())
+					if backoff *= 2; backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					continue
+				}
+				anchors := anchorsStore.Get()
+				LogInfo("main", "loaded root trust anchors after retry",
+					"count", len(anchors.Anchors), "loaded_from", anchors.LoadedFrom)
+				SetRootAnchorsAge(anchorsStore.Age().Seconds())
+				break
+			}
+		}
+
+		// Steady-state refresh every 24 hours.
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
 		for {
