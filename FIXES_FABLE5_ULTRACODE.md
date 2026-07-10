@@ -91,3 +91,13 @@ Added `acquireStateLock`/`release` (`filelock_unix.go` via `syscall.Flock` on `<
 Files: `filelock_unix.go`, `filelock_windows.go`, `main.go`, `daemon.go`, `state.go`.
 Verification: `TestStateLock_MutualExclusion` (second acquire times out while held; succeeds after release), `TestReloadFromDisk_AdoptsRolloverAtEqualLastSigned`, `TestRolloverEqual`. Full suite green. (Pre-existing note: the project already does not build for Windows because `ownership.go` uses `syscall.Stat_t` untagged — unrelated to this change and not a review finding.)
 
+**R-008 — `remove` is now transactional with the config file.**
+Replaced the dead in-memory `RemoveZoneFromConfig` with `RemoveZoneFromConfigFile(configPath, domain)` (`config.go`) — deletes the `[zones."<domain>"]` table (header + all its keys), preserving other content/comments, writing atomically and keeping the file's mode (so a 0640 secrets config isn't loosened). `runRemove` (`main.go`) now: preflights config writability, removes the zone from the config file first (so a running daemon can't re-adopt it), then clears state, unwinding the config entry if the state save fails. Printed note updated to say a running daemon needs SIGHUP; keys are never deleted. Docs updated (`CLAUDE.md`, `README.md`).
+Files: `config.go`, `main.go`, `CLAUDE.md`, `README.md`.
+Verification: `TestRemoveZoneFromConfigFile` — removes the middle of three zones, preserves siblings + comments + 0640 mode, result reparses with exactly the survivors, absent-zone returns the sentinel.
+
+**R-023 — `import` given the same transactional guards as `add`.**
+`runImport` (`main.go`) now calls `preflightConfigAppend(configPath)` before writing any key material, and on an `AddZoneToConfigFile` failure removes the zone from state + re-Saves + deletes the signed output, leaving the converted key files in place with a printed note (never auto-deleting key material). This stops state/config divergence with a blocked "already managed" retry.
+Files: `main.go`.
+Verification: build/vet/gofmt clean; full suite green. (The preflight + unwind mirror `add`'s already-tested pattern.)
+

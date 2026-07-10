@@ -102,7 +102,8 @@ dnssec-tudor status --domain example.com
 # Zone file must already exist at the path
 dnssec-tudor add example.com /etc/dnssec-tudor/zones/com/example/zone.db
 
-# Remove a domain (does NOT delete keys, just stops managing)
+# Remove a domain: deletes it from state.json AND the config file (does NOT delete
+# keys). A running daemon still holds the old config in memory until you SIGHUP it.
 dnssec-tudor remove example.com
 
 # Key rollover commands
