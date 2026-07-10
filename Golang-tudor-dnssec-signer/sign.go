@@ -701,8 +701,23 @@ func (s *Signer) createRRSIG(rrset []dns.RR, signingKey *dns.DNSKEY, domain stri
 func (s *Signer) signRRSIG(rrsig *dns.RRSIG, rrset []dns.RR, key *dns.DNSKEY, privateKey []byte) error {
 	switch key.Algorithm {
 	case dns.ED25519:
-		return rrsig.Sign(ed25519.PrivateKey(privateKey), rrset)
+		// crypto/ed25519.Sign PANICS if the key is not exactly 64 bytes. BIND/ldns and
+		// RFC 8080 store the ED25519 private key as a 32-byte seed, so accept both the
+		// 32-byte seed (expand it) and the 64-byte expanded form (R-010).
+		var edKey ed25519.PrivateKey
+		switch len(privateKey) {
+		case ed25519.SeedSize: // 32-byte seed
+			edKey = ed25519.NewKeyFromSeed(privateKey)
+		case ed25519.PrivateKeySize: // 64-byte expanded key
+			edKey = ed25519.PrivateKey(privateKey)
+		default:
+			return fmt.Errorf("invalid ED25519 private key length %d (want %d or %d)", len(privateKey), ed25519.SeedSize, ed25519.PrivateKeySize)
+		}
+		return rrsig.Sign(edKey, rrset)
 	case dns.ECDSAP256SHA256:
+		if len(privateKey) != 32 {
+			return fmt.Errorf("invalid ECDSA P-256 private key length %d (want 32)", len(privateKey))
+		}
 		// Reconstruct ECDSA P-256 private key
 		ecdsaKey := &ecdsa.PrivateKey{
 			PublicKey: ecdsa.PublicKey{
@@ -713,6 +728,9 @@ func (s *Signer) signRRSIG(rrsig *dns.RRSIG, rrset []dns.RR, key *dns.DNSKEY, pr
 		ecdsaKey.PublicKey.X, ecdsaKey.PublicKey.Y = ecdsaKey.PublicKey.Curve.ScalarBaseMult(privateKey)
 		return rrsig.Sign(ecdsaKey, rrset)
 	case dns.ECDSAP384SHA384:
+		if len(privateKey) != 48 {
+			return fmt.Errorf("invalid ECDSA P-384 private key length %d (want 48)", len(privateKey))
+		}
 		// Reconstruct ECDSA P-384 private key
 		ecdsaKey := &ecdsa.PrivateKey{
 			PublicKey: ecdsa.PublicKey{

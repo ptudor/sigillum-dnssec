@@ -42,9 +42,11 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 	// Generate new KSK
 	keyGen := NewKeyGenerator(rm.cfg)
 
-	// Save old KSK to backup file
+	// Save old KSK to backup file. A backup failure is FATAL (R-027): the rollover-signing
+	// path and DS recovery both depend on the old KSK's backup, so proceeding without it
+	// risks an unrecoverable SERVFAIL. Abort before generating the new key.
 	if err := rm.backupKey(domain, "ksk", oldKSK.ID); err != nil {
-		slog.Warn("[ROLLOVER] Failed to backup old KSK", "error", err)
+		return fmt.Errorf("backing up old KSK before rollover: %w", err)
 	}
 
 	// Generate new KSK
@@ -159,9 +161,11 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState)
 	oldZSK := zoneState.ZSK
 	slog.Info("[ROLLOVER] Starting automatic ZSK rollover", "domain", domain, "old_key_id", oldZSK.ID)
 
-	// Backup old key
+	// Backup old key. Fatal on failure (R-027): the pre-publish/signing phases load the
+	// old ZSK from this backup, and a missing backup would drop it from the published
+	// DNSKEY RRset while resolvers still hold its cached RRSIGs.
 	if err := rm.backupKey(domain, "zsk", oldZSK.ID); err != nil {
-		slog.Warn("[ROLLOVER] Failed to backup old ZSK", "error", err)
+		return fmt.Errorf("backing up old ZSK before rollover: %w", err)
 	}
 
 	// Generate new ZSK
@@ -300,12 +304,14 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 		"old_algorithm", oldAlgorithm,
 		"new_algorithm", targetAlgorithm)
 
-	// Backup old keys
+	// Backup old keys. Fatal on failure (R-027): an algorithm rollover must sign with both
+	// old and new algorithm keys (RFC 6840 §5.11), so losing the old keys' backup would
+	// emit a zone missing signatures for a signaled algorithm.
 	if err := rm.backupKey(domain, "ksk", zoneState.KSK.ID); err != nil {
-		slog.Warn("[ROLLOVER] Failed to backup old KSK", "error", err)
+		return fmt.Errorf("backing up old KSK before algorithm rollover: %w", err)
 	}
 	if err := rm.backupKey(domain, "zsk", zoneState.ZSK.ID); err != nil {
-		slog.Warn("[ROLLOVER] Failed to backup old ZSK", "error", err)
+		return fmt.Errorf("backing up old ZSK before algorithm rollover: %w", err)
 	}
 
 	// Generate new keys with target algorithm (using explicit algorithm to avoid race conditions)

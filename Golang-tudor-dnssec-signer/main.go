@@ -1273,5 +1273,12 @@ func loadBindKeyPair(basePath string) (*dns.DNSKEY, []byte, error) {
 		return nil, nil, fmt.Errorf("parsing %s: %w", privFile, err)
 	}
 
+	// Validate the imported pair before it is ever written or signed with (R-010): a
+	// 32-byte-seed ED25519 key is accepted here, and a mismatched .key/.private pair is
+	// rejected up front rather than panicking or emitting a bogus zone at sign time.
+	if err := verifyKeyPairCorrespondence(dnskey, privateKey); err != nil {
+		return nil, nil, fmt.Errorf("validating key pair at %s: %w", basePath, err)
+	}
+
 	return dnskey, privateKey, nil
 }
