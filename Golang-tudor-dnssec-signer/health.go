@@ -9,19 +9,18 @@ import (
 	"time"
 )
 
-// RegisterHealthHandlers registers health check endpoints
-func RegisterHealthHandlers(mux *http.ServeMux, state *State, cfg *Config) {
-	RegisterHealthHandlersWithDaemon(mux, state, cfg, nil)
-}
-
-// RegisterHealthHandlersWithDaemon registers health check endpoints with daemon liveness checks
-func RegisterHealthHandlersWithDaemon(mux *http.ServeMux, state *State, cfg *Config, daemon *Daemon) {
+// RegisterHealthHandlersWithDaemon registers health check endpoints with daemon
+// liveness checks. The handlers resolve cfg/state per request via daemon.current()
+// so they reflect a SIGHUP reload rather than the pointers captured at startup
+// (R-006). daemon must be non-nil.
+func RegisterHealthHandlersWithDaemon(mux *http.ServeMux, daemon *Daemon) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		setSecurityHeaders(w)
+		cfg, state := daemon.current()
 		healthHandler(w, r, state, cfg, daemon)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -30,6 +29,7 @@ func RegisterHealthHandlersWithDaemon(mux *http.ServeMux, state *State, cfg *Con
 			return
 		}
 		setSecurityHeaders(w)
+		cfg, state := daemon.current()
 		healthzHandler(w, r, state, cfg, daemon)
 	})
 }

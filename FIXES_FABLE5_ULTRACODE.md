@@ -101,3 +101,33 @@ Verification: `TestRemoveZoneFromConfigFile` — removes the middle of three zon
 Files: `main.go`.
 Verification: build/vet/gofmt clean; full suite green. (The preflight + unwind mirror `add`'s already-tested pattern.)
 
+
+**R-018 — Heartbeat data race removed; Reload no longer holds the mutex across heartbeat network I/O.**
+Added `heartbeat` to the `snapshot` struct and `takeSnapshot()`; `checkAndSignZone` now sends via `snap.heartbeat` (captured under `d.mu.RLock`) instead of dereferencing `d.heartbeat` unlocked while `Reload` reassigns it. `Reload` now captures the old client and constructs the new one under the lock, then calls `oldHeartbeat.Stop()` + `newHeartbeat.Start()` AFTER releasing `d.mu` — so a SIGHUP against a blackholed endpoint can no longer stall `takeSnapshot()`/the signing loop for up to ~20s. The two server goroutines copy the cfg fields they need (`Health.DebugVars`, listen addrs) into locals under the lock rather than reading `d.cfg` directly.
+Files: `daemon.go`.
+Verification: `TestDaemon_SignReloadRace` under `go test -race` (concurrent `signAllZonesSafe` loop + `Reload` loop over a real signable zone) — silent. Full suite green under `-race`.
+
+**R-006 — Web UI and health endpoints resolve cfg/state per request, reflecting SIGHUP reloads.**
+Added `Daemon.current()` returning live `cfg,state` under `d.mu.RLock`. `NewWebServer` now takes `*Daemon` and each handler closure calls `d.current()` at the top instead of closing over the startup pointers; health registration is now `RegisterHealthHandlersWithDaemon(mux, d)` (dropped the nil-daemon `RegisterHealthHandlers` variant), with the `/health` and `/healthz` closures resolving cfg/state per request. `runHealthServer`'s unlocked `d.cfg.Health.DebugVars` read is now a lock-copied local. Endpoint paths, JSON schemas, listen addresses ("listen change requires restart"), security headers/method restrictions, and the deep-copy discipline are unchanged. Test call sites updated to pass `NewDaemon(cfg,state)`.
+Files: `daemon.go`, `web.go`, `health.go`, `hardening_test.go`.
+Verification: `TestDaemonReload_HandlersReflectNewState` (`reload_test.go`) — one server handler instance; pre-reload `/api/status` shows the old zone and `/health` is 503 (old zone's sigs expired), then after `Reload` the SAME handler serves the new zone and `/health`+`/healthz` are 200. Fails against the pre-fix frozen-closure code. (Also satisfies R-078's "add a reload test.")
+
+**R-020 — Web server gained a ctx-based shutdown path.**
+`runWebServer` now (1) checks `d.ctx.Done()` non-blocking after storing `d.server` and returns without serving (closing the listener) if shutdown already fired, and (2) runs the same ctx-watcher goroutine the health server uses (`<-d.ctx.Done()` → `srv.Shutdown(timeoutCtx)` with `Health.ShutdownTimeout`). A SIGTERM in the startup window can no longer leave `Serve` running forever with `wg.Wait()` hanging. Double `Shutdown` is safe. Listener binding moved into `Run` (see R-021), so the goroutine uses `srv.Serve(ln)`.
+Files: `daemon.go`.
+Verification: `TestDaemon_ShutdownBeforeRun` — `Shutdown()` then `Run()`; asserts `Run` returns within 10s (hangs forever before the fix).
+
+**R-021 — Initial listener bind failures are fatal (implicit double-start protection).**
+`Run` now `net.Listen`s the health listener (always) and the web listener (when enabled) synchronously BEFORE spawning goroutines; a failure returns a non-nil error from `Run` (process exits non-zero) instead of being logged while the daemon signs headlessly. The health/web goroutines take the pre-bound `net.Listener` and call `Serve(ln)`. A second `serve` with the same config now fails to bind the held health port and exits. Default listen addresses, loopback enforcement, and graceful shutdown are unchanged; later-reload bind changes remain restart-required warnings.
+Files: `daemon.go`.
+Verification: `TestDaemon_HealthBindFatal` and `TestDaemon_WebBindFatal` — occupy a port, point the respective listen at it, assert `Run` returns an error naming that listener.
+
+**R-019 — Graceful shutdown checks ctx between zones and honors repeated signals.**
+`signAllZones` checks `d.ctx.Done()` at the top of both per-zone loops (labeled `break`), stopping promptly on shutdown while still running the final `Save` + coalesced hook for zones already signed this cycle. `runServe`'s SIGINT/SIGTERM handler now runs `daemon.Shutdown()` in a goroutine and keeps consuming `sigCh`: a second shutdown signal logs "forcing exit" and returns a non-zero error even if the graceful drain is wedged (SIGHUP during shutdown is ignored). The save-before-coalesced-hook guarantee for an uninterrupted cycle is unchanged.
+Files: `daemon.go`, `main.go`.
+Verification: `TestSignAllZones_StopsOnShutdown` — cancel ctx, run a cycle over a signable zone, assert `LastSigned` stays zero (loop broke before `SignZone`). The two-signal force-exit path in `runServe` is verified manually (delivering real signals to the test binary would kill the runner).
+
+**R-026 — Async post-sign hook goroutines are tracked and awaited on shutdown.**
+Added `Daemon.hookWG`; `executeHook`/`executeBatchHook` take a `*sync.WaitGroup` (nil from CLI paths, `&d.hookWG` from the daemon) and `Add(1)`/`defer Done()` around the goroutine. After the signing loop drains, `Run` calls `waitForHooks(30s)` so a shutdown right after a cycle doesn't kill the final coalesced `nsd-control reload` before it runs. Hooks stay async relative to per-zone signing; the 30s per-hook timeout, env-var contract, and log redaction are unchanged; `executeHookSync` is untouched.
+Files: `daemon.go`, `hooks.go`, `lifecycle_test.go`.
+Verification: `TestExecuteHook_WaitGroupTracked` and `TestExecuteBatchHook_WaitGroupTracked` — a tracked hook touches a marker; `wg.Wait()` returns only after the marker exists.

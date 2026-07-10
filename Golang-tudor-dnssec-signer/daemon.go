@@ -5,6 +5,7 @@ import (
 	"expvar"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ type Daemon struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	hookWG sync.WaitGroup // tracks async post-sign hook goroutines (R-026)
 
 	mu              sync.RWMutex
 	server          *http.Server
@@ -63,18 +65,42 @@ func (d *Daemon) Run() error {
 		return fmt.Errorf("startup validation failed: %w", err)
 	}
 
-	// Start heartbeat monitoring
+	// Bind the listeners before starting anything else. A failed initial bind is
+	// a startup failure, not a warning: return it from Run() so the process
+	// exits non-zero. This also gives implicit single-instance protection — a
+	// second `serve` cannot bind the already-held health port (R-021).
+	d.mu.RLock()
+	healthAddr := d.cfg.Health.Listen
+	webEnabled := d.cfg.Web.Enabled
+	webAddr := d.cfg.Web.Listen
+	d.mu.RUnlock()
+
+	healthLn, err := net.Listen("tcp", healthAddr)
+	if err != nil {
+		return fmt.Errorf("health listen %s: %w", healthAddr, err)
+	}
+
+	var webLn net.Listener
+	if webEnabled {
+		webLn, err = net.Listen("tcp", webAddr)
+		if err != nil {
+			healthLn.Close()
+			return fmt.Errorf("web listen %s: %w", webAddr, err)
+		}
+	}
+
+	// Start heartbeat monitoring only once the ports are secured.
 	d.heartbeat.Start()
 
 	// Start web server if enabled
-	if d.cfg.Web.Enabled {
+	if webLn != nil {
 		d.wg.Add(1)
-		go d.runWebServer()
+		go d.runWebServer(webLn)
 	}
 
-	// Start health server (always on a separate internal port if needed)
+	// Start health server (always on a separate internal port)
 	d.wg.Add(1)
-	go d.runHealthServer()
+	go d.runHealthServer(healthLn)
 
 	// Main signing loop
 	d.wg.Add(1)
@@ -84,8 +110,29 @@ func (d *Daemon) Run() error {
 	<-d.ctx.Done()
 	d.wg.Wait()
 
+	// Wait (bounded) for any in-flight post-sign hook goroutines to finish, so a
+	// shutdown right after a signing cycle doesn't kill the final coalesced
+	// nsd-control reload before it runs (R-026).
+	d.waitForHooks(30 * time.Second)
+
 	slog.Info("[DAEMON] stopped")
 	return nil
+}
+
+// waitForHooks blocks until all tracked post-sign hook goroutines finish or the
+// timeout elapses, whichever comes first. Called after the signing loop has
+// exited, so no new hooks can be started while we wait.
+func (d *Daemon) waitForHooks(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		d.hookWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("[DAEMON] Timed out waiting for post-sign hooks to finish", "timeout", timeout.String())
+	}
 }
 
 // Shutdown gracefully stops the daemon
@@ -113,19 +160,22 @@ func (d *Daemon) Shutdown() {
 func (d *Daemon) Reload(cfg *Config, state *State) {
 	d.mu.Lock()
 	oldCfg := d.cfg
-
-	// Stop old heartbeat client
-	d.heartbeat.Stop()
+	oldHeartbeat := d.heartbeat
+	newHeartbeat := NewHeartbeatClient(&cfg.Heartbeat)
 
 	d.cfg = cfg
 	d.state = state
 	d.signer = NewSigner(cfg, state)
 	d.rollover = NewRolloverManager(cfg, state)
-	d.heartbeat = NewHeartbeatClient(&cfg.Heartbeat)
-
-	// Start new heartbeat client
-	d.heartbeat.Start()
+	d.heartbeat = newHeartbeat
 	d.mu.Unlock()
+
+	// Stop the old client and start the new one outside the lock. Both Stop()
+	// and Start() send a synchronous heartbeat with up to a 10s HTTP timeout;
+	// holding d.mu across that I/O would stall takeSnapshot() and the signing
+	// loop for up to ~20s on a blackholed endpoint (R-018).
+	oldHeartbeat.Stop()
+	newHeartbeat.Start()
 
 	// Reset signing loop ticker if poll interval changed
 	if cfg.PollInterval.Duration != oldCfg.PollInterval.Duration {
@@ -238,21 +288,32 @@ func (d *Daemon) signAllZonesSafe() {
 // snapshot captures all daemon references under a single lock for a signing cycle.
 // This prevents races where a SIGHUP reload swaps pointers mid-cycle.
 type snapshot struct {
-	cfg      *Config
-	state    *State
-	signer   *Signer
-	rollover *RolloverManager
+	cfg       *Config
+	state     *State
+	signer    *Signer
+	rollover  *RolloverManager
+	heartbeat *HeartbeatClient
 }
 
 func (d *Daemon) takeSnapshot() snapshot {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return snapshot{
-		cfg:      d.cfg,
-		state:    d.state,
-		signer:   d.signer,
-		rollover: d.rollover,
+		cfg:       d.cfg,
+		state:     d.state,
+		signer:    d.signer,
+		rollover:  d.rollover,
+		heartbeat: d.heartbeat,
 	}
+}
+
+// current returns the daemon's live config and state under the read lock. HTTP
+// handlers call this per request so the web UI and health endpoints reflect a
+// SIGHUP reload instead of serving the pointers captured at startup (R-006).
+func (d *Daemon) current() (*Config, *State) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.cfg, d.state
 }
 
 func (d *Daemon) signAllZones() {
@@ -286,14 +347,31 @@ func (d *Daemon) signAllZones() {
 	// DNSSEC_DOMAIN env var. Consumers get DNSSEC_DOMAINS (space-list) and
 	// DNSSEC_BATCH_SIZE instead.
 	var signedDomains []string
+signLoop:
 	for domain := range snap.cfg.Zones {
+		// Stop promptly on shutdown rather than iterating every remaining zone
+		// (each sign + heartbeat can take seconds). We still fall through to the
+		// Save and coalesced hook below so the zones already signed this cycle
+		// are persisted and their reload fires (R-019).
+		select {
+		case <-d.ctx.Done():
+			slog.Info("[DAEMON] Shutdown requested; ending signing cycle early", "signed", len(signedDomains))
+			break signLoop
+		default:
+		}
 		if d.checkAndSignZoneSafe(snap, domain) {
 			signedDomains = append(signedDomains, domain)
 		}
 	}
 
 	// Check for automatic ZSK rollovers
+rolloverLoop:
 	for domain := range snap.cfg.Zones {
+		select {
+		case <-d.ctx.Done():
+			break rolloverLoop
+		default:
+		}
 		zoneState := snap.state.GetZone(domain)
 		if zoneState == nil || zoneState.ZSK == nil {
 			continue
@@ -318,7 +396,7 @@ func (d *Daemon) signAllZones() {
 	// Fire the coalesced post-sign hook after state is saved — this way
 	// any consumer that introspects state.json sees the just-signed zones.
 	if snap.cfg.Hooks.CoalescePostSign && len(signedDomains) > 0 {
-		executeBatchHook(&snap.cfg.Hooks, signedDomains, snap.cfg.OutputDir)
+		executeBatchHook(&snap.cfg.Hooks, signedDomains, snap.cfg.OutputDir, &d.hookWG)
 	}
 
 	// Update Prometheus metrics
@@ -356,8 +434,9 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 
 	slog.Info("[DAEMON] Signing zone", "domain", domain, "reason", reason)
 
-	// Send heartbeat for signing start
-	d.heartbeat.SigningStart(domain)
+	// Send heartbeat for signing start. Use the snapshot's client (captured
+	// under the lock) rather than d.heartbeat, which Reload reassigns (R-018).
+	snap.heartbeat.SigningStart(domain)
 
 	// Initialize zone state if new — but first try to recover existing key
 	// files from disk. If key files already exist (e.g., state was lost but
@@ -382,7 +461,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	if err := snap.signer.SignZone(domain); err != nil {
 		snap.state.Mutate(func() { zoneState.AddError(err.Error()) })
 		RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
-		d.heartbeat.SigningError(domain)
+		snap.heartbeat.SigningError(domain)
 		return false, err
 	}
 
@@ -390,7 +469,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// actually served (differs from the unsigned serial under serial_policy
 	// = "epoch")
 	snap.state.Mutate(zoneState.ClearErrors)
-	d.heartbeat.SigningComplete(domain, zoneState.PublishedSerial)
+	snap.heartbeat.SigningComplete(domain, zoneState.PublishedSerial)
 
 	// Execute per-zone post-sign hook only when NOT coalescing — the caller
 	// will fire one batched hook at end-of-cycle when coalesce is on.
@@ -402,14 +481,14 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 				SignedPath: filepath.Join(snap.cfg.OutputDir, domain+".zone.signed"),
 				OutputDir:  snap.cfg.OutputDir,
 			}
-			executeHook(&snap.cfg.Hooks, hookEnv)
+			executeHook(&snap.cfg.Hooks, hookEnv, &d.hookWG)
 		}
 	}
 
 	return true, nil
 }
 
-func (d *Daemon) runWebServer() {
+func (d *Daemon) runWebServer(ln net.Listener) {
 	defer d.wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
@@ -417,18 +496,46 @@ func (d *Daemon) runWebServer() {
 		}
 	}()
 
+	// Handlers resolve cfg/state per request via the Daemon so a SIGHUP reload
+	// is reflected without a restart (R-006).
+	srv := NewWebServer(d)
+
 	d.mu.Lock()
-	d.server = NewWebServer(d.cfg, d.state)
+	d.server = srv
 	d.mu.Unlock()
 
-	slog.Info("[WEB] Starting server", "listen", d.cfg.Web.Listen)
+	// If shutdown was already signalled before we got here, don't start serving
+	// — Serve would otherwise run on an already-cancelled daemon with nothing to
+	// stop it, and wg.Wait() would hang forever (R-020).
+	select {
+	case <-d.ctx.Done():
+		ln.Close()
+		return
+	default:
+	}
 
-	if err := d.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	// Shut the server down when the daemon context is cancelled. This mirrors
+	// the health server's watcher and covers the window where Shutdown() ran
+	// before d.server was stored. Calling Shutdown twice is safe (R-020).
+	go func() {
+		<-d.ctx.Done()
+		d.mu.RLock()
+		timeout := d.cfg.Health.ShutdownTimeout.Duration
+		d.mu.RUnlock()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			slog.Debug("[WEB] Error during web server shutdown", "error", err)
+		}
+	}()
+
+	slog.Info("[WEB] Starting server", "listen", srv.Addr)
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		slog.Error("[WEB] Server error", "error", err)
 	}
 }
 
-func (d *Daemon) runHealthServer() {
+func (d *Daemon) runHealthServer(ln net.Listener) {
 	defer d.wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
@@ -436,21 +543,23 @@ func (d *Daemon) runHealthServer() {
 		}
 	}()
 
+	// Copy cfg fields into locals under the lock (R-018) — the goroutine must
+	// not read d.cfg directly, which Reload reassigns.
 	d.mu.RLock()
-	listenAddr := d.cfg.Health.Listen
+	debugVars := d.cfg.Health.DebugVars
 	d.mu.RUnlock()
 
-	// Health server runs on internal port for monitoring
+	// Health server runs on an internal port for monitoring. Handlers resolve
+	// cfg/state per request via the Daemon so a reload is reflected (R-006).
 	mux := http.NewServeMux()
-	RegisterHealthHandlersWithDaemon(mux, d.state, d.cfg, d)
+	RegisterHealthHandlersWithDaemon(mux, d)
 	mux.Handle("/metrics", promhttp.Handler())
-	if d.cfg.Health.DebugVars {
+	if debugVars {
 		mux.Handle("/debug/vars", expvar.Handler())
 		slog.Debug("[DAEMON] /debug/vars endpoint enabled")
 	}
 
 	server := &http.Server{
-		Addr:              listenAddr,
 		Handler:           mux,
 		ReadTimeout:       5 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,
@@ -467,8 +576,8 @@ func (d *Daemon) runHealthServer() {
 		}
 	}()
 
-	slog.Debug("[WEB] Starting health server", "listen", server.Addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	slog.Debug("[WEB] Starting health server", "listen", ln.Addr().String())
+	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		slog.Error("[WEB] Health server error", "error", err)
 	}
 }

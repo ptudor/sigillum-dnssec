@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,14 +45,22 @@ func hookCmd(hooks *HooksConfig) (name string, args []string, identity string, o
 
 // executeHook runs a post-sign hook command asynchronously with environment variables.
 // Log messages contain the hook identity (e.g., "post_sign") and outcome only—
-// raw command strings are never logged.
-func executeHook(hooks *HooksConfig, env *HookEnv) {
+// raw command strings are never logged. When wg is non-nil (the daemon path) the
+// goroutine is tracked on it so shutdown can wait for the hook to finish before
+// the process exits (R-026); CLI callers pass nil.
+func executeHook(hooks *HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
 	name, args, identity, ok := hookCmd(hooks)
 	if !ok {
 		return
 	}
 
+	if wg != nil {
+		wg.Add(1)
+	}
 	go func() {
+		if wg != nil {
+			defer wg.Done()
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "hook", identity, "domain", env.Domain)
@@ -106,13 +115,19 @@ func executeHook(hooks *HooksConfig, env *HookEnv) {
 // of the per-zone `DNSSEC_DOMAIN` — consumers like `nsd-control reload`
 // don't need per-zone paths, and a full reload is cheaper than N
 // targeted reloads at scale. A zero-length domains slice is a no-op.
-func executeBatchHook(hooks *HooksConfig, domains []string, outputDir string) {
+func executeBatchHook(hooks *HooksConfig, domains []string, outputDir string, wg *sync.WaitGroup) {
 	name, args, identity, ok := hookCmd(hooks)
 	if !ok || len(domains) == 0 {
 		return
 	}
 
+	if wg != nil {
+		wg.Add(1)
+	}
 	go func() {
+		if wg != nil {
+			defer wg.Done()
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "hook", identity, "batch_size", len(domains))

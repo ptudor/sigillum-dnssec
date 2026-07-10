@@ -471,13 +471,27 @@ func runServe(cmd *cobra.Command, args []string) error {
 				daemon.Reload(newCfg, newState)
 			case syscall.SIGINT, syscall.SIGTERM:
 				slog.Info("[DAEMON] Received shutdown signal", "signal", sig)
-				daemon.Shutdown()
-				// Wait for Run() to drain — an in-flight signing cycle
-				// finishes (and saves state) before the process exits.
-				if err := <-errCh; err != nil {
-					return fmt.Errorf("daemon error: %w", err)
+				// Run Shutdown in the background so we keep reading sigCh: a
+				// second SIGINT/SIGTERM forces exit even if the graceful drain
+				// is wedged on a hung hook or blackholed heartbeat (R-019).
+				go daemon.Shutdown()
+				for {
+					select {
+					case err := <-errCh:
+						// Run() drained — an in-flight signing cycle finished
+						// (and saved state) before the process exits.
+						if err != nil {
+							return fmt.Errorf("daemon error: %w", err)
+						}
+						return nil
+					case sig2 := <-sigCh:
+						if sig2 == syscall.SIGHUP {
+							continue // ignore reloads once shutting down
+						}
+						slog.Warn("[DAEMON] Second shutdown signal; forcing exit", "signal", sig2)
+						return fmt.Errorf("forced exit on repeated signal %v", sig2)
+					}
 				}
-				return nil
 			}
 		case err := <-errCh:
 			if err != nil {
