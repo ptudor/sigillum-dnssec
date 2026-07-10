@@ -440,8 +440,181 @@ The following are maintainability, minor-correctness, doc, and test-gap items. E
 
 # Part 2 — `Golang-dnssec-validator`
 
-_(in progress — direct review underway; findings continue at R-079)_
+The three headline findings (R-079, R-080, R-081) are soundness breaks in the chain-of-trust enforcement: the tool computes the right cryptographic checks but does not *require* them to pass for a `secure` verdict. Because the validator bootstraps all NS records, glue, and zone-cut structure from an untrusted recursive resolver (default in config: `127.0.0.1`; library default `8.8.8.8`) and only the authoritative-side crypto is meant to provide integrity, these enforcement gaps make the tool spoofable by a network attacker.
 
-## Summary
+## Critical
 
-_(pending — completed after the validator review)_
+### R-079 — DS RRSIG verification failure is only a warning: the parent→child chain link is not cryptographically enforced, so a forged DS/DNSKEY/answer is reported `secure`
+- **Severity:** Critical
+- **Category:** security / correctness
+- **Location:** `internal/validator/validator.go:750-790` (validateZone), specifically `:758-763` (DS RRSIG result → warning only) and `:808` (`result.Status = StatusSecure` regardless); `internal/validator/validator.go:815-889` (queryDSFromParentWithValidation sets `RRSIGVerified` but it is never consumed).
+- **Problem:** For every non-root zone, the DS RRset at the parent must be signed by the parent's keys (the inductive step of DNSSEC — RFC 4035 §5.2). `queryDSFromParentWithValidation` *does* verify the DS RRSIG against the parent's DNSKEY and records the result in `dsValidation.RRSIGVerified`/`dsValidation.Error`, but `validateZone` only turns a DS-RRSIG error into a **warning** (`result.Warnings = append(..., "DS RRSIG: %s", dsValidation.Error)`) and then unconditionally sets `StatusSecure` after `ValidateChainLink` (which only checks the DS *digest* matches a served DNSKEY). Grep confirms `RRSIGVerified` is never read to influence status, and no `StatusBogus` path derives from the DS RRSIG. So an on-path attacker (or a malicious authoritative server for the parent, or a compromised recursive resolver supplying attacker NS addresses per R-084) can present a forged DS pointing at an attacker-generated DNSKEY, a self-signed DNSKEY RRset, and a signed forged answer — all mutually consistent — and the tool reports `secure` even though the DS is not signed by the parent. This defeats the entire purpose of the validator (its own code comments call this "FULL cryptographic verification").
+- **Evidence:** `validator.go:760-762`:
+  ```go
+  if dsValidation.Error != "" {
+      result.Warnings = append(result.Warnings, fmt.Sprintf("DS RRSIG: %s", dsValidation.Error))
+  }
+  ```
+  followed by `validator.go:774` `ValidateChainLink(...)` (digest-only) and `validator.go:808` `result.Status = StatusSecure`. `RRSIGVerified` is set at `validator.go:860` and read nowhere.
+- **Fix specification:** In `validateZone`, when the zone has a DS (secure delegation) the DS RRset RRSIG MUST verify against the parent's (already-authenticated) DNSKEY for the zone to be `secure`. Concretely: require `dsValidation != nil && dsValidation.RRSIGVerified == true`; if the DS RRSIG is missing or fails to verify, set `result.Status = StatusBogus` with the DS-RRSIG error, not a warning. Edge cases: (a) the parent zone must itself be `secure` (its DNSKEY authenticated) before its DS signature can be trusted — thread the parent's *verified* DNSKEY, and if the parent is insecure the child is under an insecure delegation (handled by the no-DS path); (b) a DS answer with no RRSIG at all is bogus, not secure; (c) keep the existing digest-match (`ValidateChainLink`) and DNSKEY-self-signature checks. **Must not change:** the `secure`/`insecure`/`bogus`/`indeterminate` vocabulary, the JSON result schema (`DSValidation` already carries the fields), the root-anchor path.
+- **Verification:** Add a test that serves a valid DNSKEY/DS digest match but a DS RRSIG that fails to verify (wrong signature bytes, or signed by a key not in the parent) → assert the zone result is `bogus`, not `secure` with a warning. A live test against `dnssec-failed.org` must report `bogus`; a healthy domain `secure`.
+
+### R-080 — The DNSKEY RRset is not required to be signed by the DS-authenticated key: a rogue self-signed KSK added to the RRset validates as secure
+- **Severity:** Critical
+- **Category:** security / correctness
+- **Location:** `internal/validator/dnssec.go:234-286` (VerifyDNSKEYRRSIG picks the signing key by the RRSIG's own keytag), `internal/validator/validator.go:721` (called with all DNSKEYs) vs `validator.go:774`/`dnssec.go:170-230` (ValidateChainLink independently finds the DS-matched key). No linkage between the two.
+- **Problem:** RFC 4035 §5.2 requires authenticating the DNSKEY RRset *using the DS* — i.e. the DNSKEY RRset must be signed by (a key authenticated by) the parent's DS. `VerifyDNSKEYRRSIG` finds the signing key via `FindKSKByKeyTag(rrsigRecord.KeyTag, dnskeys)` (falling back to any key by tag) — the key named by the RRSIG itself, which the attacker controls — and never checks that this key is the one `ValidateChainLink` matched to a DS. An attacker serving the zone's DNSKEY RRset can include the genuine KSK-A (whose DS is at the parent, public information) alongside a rogue KSK-B and rogue ZSK-C, sign the DNSKEY RRset with KSK-B and the answer with ZSK-C. Then `ValidateChainLink` matches the real DS to KSK-A ✓, `VerifyDNSKEYRRSIG` verifies the RRSIG by KSK-B ✓, the leaf answer verifies by ZSK-C ✓ — `secure`, even though the private key of the DS-authenticated KSK-A was never used. This is a full chain break independent of R-079 (it does not even need the DS RRSIG to be unverified).
+- **Evidence:** `dnssec.go:250-256` selects the key by `rrsigRecord.KeyTag`; the DS-matched `firstValidKSK` from `ValidateChainLink` (`dnssec.go:204-208`) is never passed to or cross-checked in `VerifyDNSKEYRRSIG`.
+- **Fix specification:** Bind the two steps: the DNSKEY RRset must be verified by a KSK that is authenticated by a verified DS at the parent. Concretely — after `ValidateChainLink` yields the set of DS-matched DNSKEYs, require that the RRSIG over the DNSKEY RRset is made by one of *those* keys (match on keytag *and* that the key is a DS-matched KSK), and verify it. For the root, the equivalent binding already exists via `VerifyRootTrustAnchor` (digest match) — additionally require the DNSKEY RRSIG be by an anchor-matched key. Reorder so DS authentication happens before/with DNSKEY-RRSIG verification and they share the key identity. **Must not change:** the digest-based DS match, RFC 6840 §5.11 all-algorithms logic, the result schema.
+- **Verification:** Test serving a DNSKEY RRset containing the genuine (DS-matched) KSK plus a rogue KSK, with the DNSKEY RRSIG made by the rogue KSK → assert `bogus`. The genuine case (RRSIG by the DS-matched KSK) stays `secure`.
+
+## High
+
+### R-081 — Insecure delegation is declared on an empty DS answer with no authenticated NSEC/NSEC3 proof of DS absence (downgrade attack)
+- **Severity:** High
+- **Category:** security / correctness
+- **Location:** `internal/validator/validator.go:699-712` (no-DNSKEY → query DS → insecure), `internal/validator/validator.go:765-768` (`len(dsRecords)==0 → StatusInsecure`).
+- **Problem:** When the parent returns no DS records, the validator declares the delegation `insecure` and stops validating — without requiring an authenticated denial (NSEC/NSEC3 from the parent proving the DS RRset genuinely does not exist, RFC 4035 §5.2/§4.3, RFC 5155). An on-path attacker (or malicious parent server) can simply strip the DS RRset from the response, and the tool downgrades a genuinely-secure zone to `insecure`, then treats the (attacker-supplied) child data as unvalidated. For a diagnostic tool this both misreports a secure zone and removes the protection the user is relying on.
+- **Evidence:** `validator.go:704-707` returns `StatusInsecure` on `err != nil || len(dsResult) == 0` with no NSEC handling; `validator.go:765-768` likewise. `queryDSFromParentWithValidation` returns `nil` DS on an empty answer with no proof-of-absence check.
+- **Fix specification:** Before declaring `insecure`, require an authenticated proof that the DS RRset is absent: an NSEC/NSEC3 record from the parent covering/matching the child name that does *not* have the DS bit set (and, for NSEC3, honoring opt-out only where RFC 5155 §6 allows). Verify that NSEC/NSEC3's RRSIG against the parent's DNSKEY (reuse `VerifyDenialRRSIGFromResponse`). If no such authenticated proof exists, the result is `indeterminate`/`bogus`, not `insecure`. **Must not change:** genuine opt-out insecure delegations must still resolve to `insecure` when the proof is present; the status vocabulary.
+- **Verification:** Test — parent answer with zero DS and no NSEC → result is not `insecure` (indeterminate/bogus); parent answer with a valid signed NSEC/NSEC3 proving no DS → `insecure`. Live: a signed zone with DS stripped by a mock parent must not read `insecure`.
+
+### R-082 — The leaf answer's RRSIG never affects the overall verdict: a secure chain with a bogus/forged answer reports `secure`
+- **Severity:** High
+- **Category:** correctness
+- **Location:** `internal/validator/validator.go:256-276` (verifyActualRecord result stored on `leafZone.RecordValidation`), `internal/validator/validator.go:303` (`result.Result = lastStatus`, computed only from zone statuses).
+- **Problem:** `verifyActualRecord` cryptographically verifies the queried record's RRSIG and records `RRSIGVerified`/`Error` on `RecordValidation`, but the top-level `result.Result` is set from `lastStatus`, which only ever changes on *zone* Bogus/Insecure/Indeterminate. The actual answer's signature outcome is never folded in. So a zone whose chain is secure but whose A/AAAA/CNAME answer has an expired, missing, or forged RRSIG (or a `RecordValidation.Error`) is still reported `secure` overall. The record error is surfaced only in the per-zone detail, not the verdict a caller/`/api/validate` consumer reads.
+- **Evidence:** `verifyActualRecord` sets `validation.Error`/`validation.RRSIGVerified` (validator.go:507/512/534/539); grep confirms neither is read to change `result.Result`. `validator.go:303` `result.Result = lastStatus`.
+- **Fix specification:** Fold the leaf `RecordValidation` into the verdict: if the chain is secure but the requested record's RRSIG is missing/expired/fails verification (and it is not a validated denial), downgrade `result.Result` to `bogus` (for a signature failure) or `indeterminate` (for an unqueryable answer), with the record error in `result.Errors`. Keep validated NXDOMAIN/NODATA/denial as their appropriate status. **Must not change:** the per-zone `RecordValidation` detail, the denial-proof handling, the status vocabulary.
+- **Verification:** Test a secure chain serving an A answer with a forged/expired RRSIG → overall `bogus`; a correctly-signed answer → `secure`.
+
+## Medium
+
+### R-083 — Only type A is ever validated; the documented `type` parameter is ignored
+- **Severity:** Medium
+- **Category:** correctness / docs
+- **Location:** `internal/validator/validator.go:90` (`QueryType: "A"` hardcoded), `validator.go:426` (`QueryRecordAuthoritative(..., dns.TypeA)`), `validator.go:350` (CNAME check queries A), `handlers.go` (never reads `type`).
+- **Problem:** The API documents a `type` parameter (A, AAAA, MX, …), but the handler never reads it and the validator hardcodes `dns.TypeA` everywhere the leaf record is fetched/verified. A user validating `MX` or `AAAA` actually gets the A record validated; the reported `RecordValidation` is for the wrong type, and NODATA/denial reasoning uses `dns.TypeA`.
+- **Fix specification:** Plumb the `type` query parameter through the handler → `Validate` → `verifyActualRecord`/`checkAndFollowCNAME` (default A), set `result.QueryType` accordingly, and use it in the denial `qtype`. Validate the type string against a supported set. **Must not change:** default behavior when `type` is omitted (A), the result schema field names.
+- **Verification:** `GET /api/validate?domain=…&type=MX` validates the MX RRset (its RRSIG/denial), and `result.type` reflects MX.
+
+### R-084 — NS records, glue addresses, and zone-cut structure come from an untrusted recursive resolver with no validation
+- **Severity:** Medium (elevated in combination with R-079)
+- **Category:** security
+- **Location:** `internal/dns/resolver.go:30-125` (ResolveNS/ResolveAddresses/ResolveNSWithAddresses via `r.recursive`), `resolver.go:172-246` (CheckZoneCut/DiscoverZoneCuts via the recursive resolver).
+- **Problem:** Every nameserver name, its A/AAAA addresses, and the set of zone cuts in the chain are obtained from a single recursive resolver (RD=1, DO unset, no DNSSEC checking) and trusted verbatim. The security of the tool therefore rests entirely on the authoritative-side crypto — which R-079/R-080/R-081 show is not enforced. Even once those are fixed, an attacker controlling the resolver can steer the validator to attacker nameservers and manipulate the zone-cut list (e.g. hide a zone cut, or via `CheckZoneCut` treating SERVFAIL/errors as "is a zone", `resolver.go:192-194`/`235-236`, inject spurious cuts). Root is safely bootstrapped from hardcoded root IPs (`GetRootServers`), which limits the damage to below the root once DS RRSIGs are enforced.
+- **Fix specification:** Document and constrain the trust model: (a) after R-079, the DS-RRSIG chain makes resolver-supplied *addresses* non-load-bearing for the secure verdict — ensure a manipulated NS set can only yield `indeterminate`/`bogus`, never a false `secure`; (b) do not treat resolver errors/SERVFAIL as "confirmed zone cut" in a way that changes the verdict — mark such zones `indeterminate`; (c) consider validating the delegation NS/DS chain from the authoritative side rather than the recursive resolver. **Must not change:** the hardcoded root bootstrap.
+- **Verification:** With a mock recursive resolver returning attacker NS addresses for a signed zone, the result is never `secure` (it is `bogus`/`indeterminate`) once R-079 is fixed.
+
+### R-085 — NXDOMAIN/NODATA denial proofs are incomplete (single covering record; no wildcard-nonexistence; NSEC3 lacks the closest-encloser/next-closer/wildcard trio)
+- **Severity:** Medium
+- **Category:** correctness / rfc-compliance
+- **Location:** `internal/validator/nsec.go:127-144` (verifyNSECNXDOMAIN), `:148-177` (verifyNSECNODATA), `:289-306` (verifyNSEC3NXDOMAIN), `:310-337` (verifyNSEC3NODATA).
+- **Problem:** RFC 4035 §5.4 requires an NXDOMAIN proof to include *both* an NSEC covering the qname *and* an NSEC proving no wildcard could synthesize it; `verifyNSECNXDOMAIN` accepts a single covering NSEC. RFC 5155 §8.4 requires an NSEC3 NXDOMAIN proof to present the closest-encloser match, the next-closer cover, *and* the wildcard cover (three records); `verifyNSEC3NXDOMAIN` accepts a single covering NSEC3. The denial RRSIGs themselves are cryptographically verified (good, the 4ec8209 fix), but the *proof structure* is under-checked, so an incomplete denial is reported `verified`. (Blast radius is limited because denial results feed `RecordValidation`, which per R-082 doesn't currently drive the verdict — fixing R-082 raises this finding's importance.)
+- **Fix specification:** Implement the full RFC 4035 §5.4 / RFC 5155 §8.4-8.9 proofs: NXDOMAIN requires the covering record *and* the wildcard-nonexistence record; NSEC3 NXDOMAIN requires closest-encloser + next-closer + wildcard; NODATA must also check the CNAME bit (RFC 6840 §4.3) and handle wildcard-NODATA. Only set `Verified=true` when the complete proof is present and every contributing RRSIG verifies. **Must not change:** the RRSIG cryptographic verification, the `NSECProof` schema.
+- **Verification:** Tests with a single covering NSEC/NSEC3 for an NXDOMAIN → `Verified=false` (incomplete); with the full record set → `Verified=true`.
+
+### R-086 — No enforced cap on concurrent validations: `active_validations` is a gauge only, enabling amplification/resource DoS
+- **Severity:** Medium
+- **Category:** performance / security
+- **Location:** `handlers.go:95-96`/`254-255` (`IncrementActiveValidations`/`Decrement` are metrics only), `metrics.go:125-133`.
+- **Problem:** `MaxConcurrent` bounds concurrent DNS queries *within* one validation, but nothing bounds the number of concurrent validations across requests — `IncrementActiveValidations` only moves a Prometheus gauge. Each validation in extended mode queries every authoritative NS of every zone in the chain, so a modest number of concurrent requests fans out into a large volume of outbound DNS to third parties (a DNS amplifier) and many goroutines. Per-IP rate limiting is the only guard and is bypassable behind a shared proxy or via distributed clients.
+- **Fix specification:** Add a global concurrency limiter (buffered semaphore sized to a config value, e.g. `MAX_CONCURRENT_VALIDATIONS`) acquired at the top of `HandleValidateSSE`/`HandleValidateJSON`; when full, return 503/429 with `Retry-After` rather than starting work. Wire the gauge to the real in-flight count. **Must not change:** the per-validation `MaxConcurrent` semantics, the SSE contract.
+- **Verification:** Fire N+1 concurrent validations with the cap at N → the extra request is rejected promptly; the gauge matches the live count.
+
+### R-087 — Root trust anchor loaded with no signature verification; `LoadAnchorsFromURL` accepts `http://`
+- **Severity:** Medium
+- **Category:** security
+- **Location:** `internal/dns/anchors.go:13-41` (LoadAnchors), `:47-97` (LoadAnchorsFromURL — HTTPS not required), no PKCS7/DNSSEC verification anywhere.
+- **Problem:** The trust root is loaded from a JSON file or URL and trusted verbatim; there is no verification against IANA's signed `root-anchors.xml`/`.p7s`. `LoadAnchorsFromURL` does not require the URL to be HTTPS, so an operator (or the default being overridden) could fetch anchors over cleartext HTTP, MITM-able. This is partly mitigated because `VerifyRootTrustAnchor` recomputes the DS from the *real* root DNSKEY (served by hardcoded root IPs) and requires a digest match — so a tampered anchor alone fails closed unless the attacker also MITMs the root servers — but it is defense-in-depth worth closing.
+- **Fix specification:** Require HTTPS for `ROOT_ANCHORS_URL` (reject `http://` at config validation). Optionally verify the IANA detached signature, or pin the well-known root KSK key tags (20326, 38696) as a sanity floor so a wholesale anchor swap is rejected. Set a size limit (already present, 1 MiB). **Must not change:** the file/URL fallback order, the digest-match verification.
+- **Verification:** `ROOT_ANCHORS_URL=http://…` is rejected at startup; a pinned-tag check rejects an anchor file with no known root tag.
+
+### R-088 — NSEC3 iteration count is not capped (RFC 9276): a hostile zone forces up to 65536 SHA-1 hashes per name
+- **Severity:** Medium
+- **Category:** performance / security
+- **Location:** `internal/validator/nsec.go:342-362` (computeNSEC3Hash loops `iterations` times), callers at `:276`, `:551`; `warnings.go:66` only *warns*.
+- **Problem:** `iterations` is a uint16 read from the (attacker-controlled) zone's NSEC3 records, up to 65535. `computeNSEC3Hash` performs `iterations+1` SHA-1 operations per name, and is called for the qname, the next-closer name, and per NSEC3 record. RFC 9276 recommends treating iterations > 100 as insecure and validators capping/refusing them. Here there is no cap — a hostile domain submitted to the public validator forces maximal hashing per request (a CPU amplifier), bounded only by the rate limiter.
+- **Fix specification:** Enforce an iteration cap per RFC 9276: reject (treat the proof as insecure/failed) NSEC3 records with iterations > a small bound (e.g. 100), before computing hashes. Keep the existing warning for 1–100. **Must not change:** the SHA-1 hash computation for compliant zones.
+- **Verification:** An NSEC3 record with iterations=1000 → the denial is rejected/flagged, and no 1000-iteration hashing is performed.
+
+### R-089 — A failed initial trust-anchor load is only retried after 24 hours, causing up to 24h of 503s
+- **Severity:** Medium
+- **Category:** error-handling / availability
+- **Location:** `main.go:39-49` (startup load, warn-and-continue), `main.go:86-104` (only refresh is the 24h ticker).
+- **Problem:** If `anchorsStore.Load()` fails at startup (mirror briefly down, file missing), the server starts anyway and every `/validate`/`/api/validate` returns 503 "root trust anchors not available"; the log says "will retry" but the only retry is the 24-hour ticker. A transient boot-time failure disables the service for up to a day.
+- **Fix specification:** On initial load failure, retry with backoff (e.g. every 30s–5m up to some ceiling) until anchors load, independent of the 24h steady-state refresh; expose readiness via `/health`. **Must not change:** the 24h steady refresh, the fallback file→URL order.
+- **Verification:** Start with the anchor file/URL unavailable, then make it available → the service recovers within the backoff window, not 24h.
+
+## Low
+
+- **R-090 (Low) — SSE auto-reconnect re-runs the full server-side validation.** `handlers.go:37-177` — if the SSE stream drops without a terminal `complete`/fatal `error` event, the browser's `EventSource` auto-reconnects and the server starts a brand-new validation (`app.js:171-175` only re-enables the button on `CLOSED`). Amplifies R-086. *Fix:* always send a terminal event and set `Last-Event-ID`/a done marker so the client stops; consider refusing a reconnect that carries a completed id. *Verify:* drop the connection mid-stream → the server does not silently re-run.
+- **R-091 (Low) — rate-limiter map eviction only every cleanup interval → IPv6 churn memory DoS.** `ratelimit.go:75-94` — buckets are evicted only when the cleanup ticker (default 5m) fires; an attacker rotating source addresses within a /64 can create millions of buckets within one window. *Fix:* cap the map size (LRU) or evict opportunistically on insert past a threshold. *Verify:* churn many unique IPs within one interval → memory stays bounded.
+- **R-092 (Low) — RDAP client reads the response body with no size limit.** `internal/rdap/client.go:67` uses `io.ReadAll(resp.Body)` (contrast the 1 MiB `LimitReader` in `anchors.go:70`). A compromised/oversized RDAP response exhausts memory. *Fix:* wrap in `io.LimitReader` (e.g. 1 MiB). *Verify:* a large RDAP body is truncated, not fully buffered.
+- **R-093 (Low) — go-toml/v2 without `DisallowUnknownFields` (silent typo'd config keys).** `config.go:170` — same class as signer R-015; a mistyped validator TOML key is silently ignored. *Fix:* strict decoding as in R-015. *Verify:* a typo'd key errors at load.
+- **R-094 (Low, docs) — validator CLAUDE.md documents env-only `.env` config, but the code prefers TOML and `.env` is house-banned.** `CLAUDE.md:561-587` ("All configuration is via environment variables (not TOML)", "Create a `.env` file … based on `.env.example`") contradicts `config.go` (TOML file paths checked before env) and the user's global "never `.env`" policy. *Fix:* rewrite the config section to document TOML-first (matching `dnssec-validator.toml.example`) with env as fallback; drop `.env` references. *Verify:* docs match `Load()` behavior.
+- **R-095 (Low) — `IsKSK`/`IsZSK` use strict flag equality (257/256), misclassifying REVOKE-bit and non-standard-flag keys.** `internal/dns/query.go:115-116` — a revoked key (RFC 5011, REVOKE bit set) or a key with extra flags is neither KSK nor ZSK, so `FindKSK/ZSKByKeyTag` miss it (though `FindDNSKEYByKeyTag` by tag still finds it). *Fix:* classify by the Zone-Key bit (bit 7) for signing capability and the SEP bit (bit 0) for KSK, rather than exact equality; handle REVOKE explicitly. *Verify:* a key with flags 257+REVOKE is still handled.
+- **R-096 (Low) — CNAME RRSIG verification lacks the signer-name==zone check the A path has.** `internal/validator/validator.go:476-505` verifies a CNAME RRSIG by keytag but, unlike the A path (`validator.go:531`), never checks `rrsig.SignerName == zone`. Cryptographic verification still requires the signature to be by that key, so impact is low, but the defense-in-depth check is missing. *Fix:* add the signer-name check to the CNAME branch. *Verify:* a CNAME RRSIG with a foreign signer is rejected.
+- **R-097 (Low) — NODATA NSEC proof doesn't check the CNAME/DNAME bit (RFC 6840 §4.3).** `internal/validator/nsec.go:148-177` — an NSEC NODATA proof should confirm the CNAME bit is not set (else a CNAME should have been returned). *Fix:* reject NODATA when the matching NSEC has the CNAME (or DNAME above) bit. *Verify:* a NODATA NSEC with the CNAME bit is not accepted.
+- **R-098 (Low) — `/metrics` is unrestricted by default.** `server.go:71-80` — `MetricsAllowedCIDRs` defaults empty, so Prometheus metrics (including request/validation internals) are world-readable unless the operator sets a CIDR. *Fix:* default to loopback-only, or document prominently; the systemd unit should set the allowlist. *Verify:* default config restricts `/metrics` to loopback.
+- **R-099 (Low, maintainability) — heartbeat code is duplicated between the two projects.** `Golang-tudor-dnssec-signer/heartbeat.go` and `Golang-dnssec-validator/internal/heartbeat/heartbeat.go` are near-duplicate AnyStatus clients that have already diverged (async vs sync sends, different lifecycle). *Fix:* extract a shared `libs/` heartbeat package (per the `~/Git` layout conventions) consumed by both. *Verify:* one implementation, both projects import it.
+- **R-100 (Low) — the "query every NS, flag inconsistencies" headline feature is only partial for the leaf record.** `verifyActualRecord`/`checkAndFollowCNAME` (`validator.go:424-431`, `:348-355`) query authoritative servers only until the *first* success, so a per-server disagreement on the actual answer (the exact scenario the tool advertises) is not surfaced for the leaf record — only the DNSKEY step (`ValidateMultipleServers`) compares across servers, and even there disagreements are warning-only. *Fix:* query all servers for the leaf record and report per-server disagreement, consistent with the DNSKEY step and the documented feature. *Verify:* a zone where one NS returns a different/expired answer is flagged.
+
+---
+
+# Summary
+
+**Coverage note:** The signer (`Golang-tudor-dnssec-signer`) was reviewed by a fleet of area reviewers plus a full manual verification pass of every High/Medium finding against source. The validator (`Golang-dnssec-validator`) was reviewed entirely by direct read (the review fleet was cut off by an account spend limit before it reached the validator), covering every `.go` file, the frontend, and config/build artifacts. Both projects' `go build`/`go vet`/`gofmt`/`go test` are clean — every finding here is invisible to that toolchain.
+
+## Findings by severity
+
+| Severity | Count | IDs |
+|---|---|---|
+| **Critical** | 2 | R-079, R-080 |
+| **High** | 14 | R-001, R-002, R-003, R-004, R-005, R-006, R-007, R-008, R-009, R-010, R-011, R-012, R-081, R-082 |
+| **Medium** | 40 | R-013…R-044 (signer: 32), R-045…R-048 (validate.go, listed under signer Low but Medium severity: 4), R-083, R-084, R-085, R-086, R-087, R-088, R-089 (validator: 7) |
+| **Low** | 44 | R-049…R-078 (signer: 30), R-090…R-100 (validator: 11), plus R-055/R-094 doc items |
+
+(Counts approximate where a few IDs carry a severity that differs from their listing group — notably R-045…R-048 are Medium-severity `validate.go` findings grouped under the signer Low block for locality, and R-052/R-054 are Medium-leaning. Treat the per-finding **Severity** line as authoritative.)
+
+## The two things to fix first
+
+1. **Validator chain enforcement (R-079 + R-080 + R-081 + R-082).** The validator currently reports forged/bogus zones as `secure` and secure zones as `insecure`. These four together are the difference between a working DNSSEC validator and one that provides false assurance. They are independent of each other and each must be closed. Fix as one coordinated change to `validateZone`/`VerifyDNSKEYRRSIG`, with the leaf-verdict fold-in (R-082) and DS-absence proof (R-081). Add adversarial tests (forged DS, rogue KSK, stripped DS, forged answer) that must all yield `bogus`/`indeterminate`.
+2. **Signer bogus-zone and outage risks (R-003, R-002, R-009, R-010, R-001, R-006, R-007, R-008).** The signer can silently ship a bogus zone (rollover warn-and-continue, non-atomic keys, no post-sign verify), corrupt its output under concurrency, panic on a standard ED25519 import, and mismanage the CLI/daemon state split (remove/rollover lost updates, SIGHUP staleness).
+
+## Suggested fix order (accounting for dependencies)
+
+**Phase 1 — validator soundness (do together, ship behind tests):**
+- R-079, R-080, R-081, R-082 — chain-of-trust enforcement. R-084 (resolver trust) becomes non-exploitable once these land; verify that.
+- R-085 (complete denial proofs) — do alongside R-082 since fixing R-082 makes denial correctness verdict-affecting.
+
+**Phase 2 — signer data-integrity and crash safety (mostly independent, high value):**
+- R-010 (ED25519 import panic) — small, self-contained, crash fix.
+- R-009 (atomic key writes + pub/priv cross-check) and R-027 (backup-failure fatal) and R-028 (orphan-half refusal) — same subsystem, do together.
+- R-002 (unique temp names for signed zone + state.json) — prerequisite mindset for R-007.
+- R-001 (post-sign verify gate) — independent safety net; catches regressions in R-003 and NSEC bugs.
+- R-003 (rollover warn-and-continue → fatal) — depends conceptually on R-027 (backup reliability); do R-027 first.
+
+**Phase 3 — signer CLI/daemon coordination (interrelated; R-007 is the anchor):**
+- R-007 (state.json inter-process lock) — foundational; R-008, R-021, R-038, and the daemon side of R-018 build on it.
+- R-008 (remove transactional) and R-023 (import transactional) — after R-007.
+- R-006 (SIGHUP reload staleness) and R-018 (heartbeat/cfg race) — daemon lifecycle; R-018's snapshot change is small.
+- R-019, R-020, R-021, R-026 (shutdown/lifecycle) — after R-006/R-018.
+
+**Phase 4 — validator hardening and signer config validation:**
+- R-086 (concurrent-validation cap), R-088 (NSEC3 iteration cap), R-087 (anchor HTTPS/verify), R-089 (anchor retry), R-091/R-092 (resource limits).
+- R-013, R-014, R-015 (config validation + strict TOML) — signer; R-054/R-016 depend on R-015.
+- R-005 (serve --web loopback re-check) — small, security-relevant, do early if the web UI is deployed.
+
+**Phase 5 — correctness edges, RFC completeness, and the validator diagnostic verdicts:**
+- R-045…R-048 (validate.go diagnostic accuracy), R-012 (expired-sig false pass) — the signer's `validate` command.
+- R-011 (ZSK phase gating), R-037/R-038/R-039/R-041 (rollover correctness), R-034/R-035 (input hygiene), R-083 (validator record type), R-100 (leaf multi-server).
+
+**Phase 6 — docs, dead code, tests, and maintainability:**
+- R-054/R-055/R-094 (doc drift: quoted zone tables, BurntSushi vs go-toml, `.env` vs TOML), R-016/R-032 (registrar docs/contract), R-042/R-069 (metrics), R-070/R-062/R-074 (dead code), R-099 (shared heartbeat lib), R-076/R-077/R-078 (test gaps).
+
+## Cross-cutting notes
+
+- **Build/git hygiene:** `git ls-files` shows the compiled binaries `Golang-tudor-dnssec-signer/dnssec-tudor` and `Golang-dnssec-validator/dnssec-validator` are present on disk but the `.gitignore` (widened in commit `4d80794`/`990f6c5`) excludes them; confirm they are untracked before release. Both projects build/vet/test clean on go1.26.4.
+- **Doc/reality inversions (both projects):** the root and `daemons/dnssec` `CLAUDE.md` claim the signer uses `BurntSushi/toml` "the only project on BurntSushi rather than go-toml" — both projects actually use `pelletier/go-toml/v2` (R-055). The signer's documented unquoted `[zones.ptudor.net]` config silently registers zero zones (R-054). The validator's CLAUDE.md documents env/`.env` config while the code prefers TOML (R-094). These matter because they misdirect fixes and can produce a non-functional deployment from copy-pasted docs.
+- **What is genuinely solid (not findings, for reviewer confidence):** signer NSEC/NSEC3 chain generation's occlusion/ENT handling; validator DO-bit + TCP-fallback transport; validator denial-proof *RRSIG* cryptographic verification (the 4ec8209 fix); validator XFF rightmost-untrusted client-IP extraction (the 95a3976 fix); validator frontend XSS escaping; both projects' graceful-shutdown skeletons and structured logging. The signer's `hooks` are not command-injectable (operator-config commands, env-var data).
