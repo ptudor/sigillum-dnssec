@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -240,5 +241,24 @@ func TestGetSecureDNS_NotFound(t *testing.T) {
 
 	if secureDNS != nil {
 		t.Errorf("GetSecureDNS() = %v, want nil for 404 domain", secureDNS)
+	}
+}
+
+// R-092: the RDAP response body is bounded by a LimitReader. A syntactically
+// valid but oversized (>1 MiB) JSON object is truncated at the limit, so it no
+// longer parses — proving the read was capped rather than buffered whole.
+func TestQueryDomain_ResponseSizeLimited(t *testing.T) {
+	// Build a valid JSON object larger than the 1 MiB cap by padding a field.
+	huge := `{"objectClassName":"domain","ldhName":"` + strings.Repeat("a", 2<<20) + `"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/rdap+json")
+		w.Write([]byte(huge))
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, 5*time.Second)
+	_, err := c.QueryDomain(context.Background(), "example.com")
+	if err == nil {
+		t.Fatal("expected a parse error from the truncated (size-limited) body; got nil (body not capped?)")
 	}
 }

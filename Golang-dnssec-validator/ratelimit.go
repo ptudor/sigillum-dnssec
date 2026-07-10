@@ -8,14 +8,20 @@ import (
 	"time"
 )
 
+// defaultMaxBuckets bounds the per-IP bucket map. Without a hard cap, an
+// attacker rotating source addresses (trivial within an IPv6 /64) can create
+// millions of buckets between cleanup ticks — a memory DoS. R-091.
+const defaultMaxBuckets = 50000
+
 // RateLimiter implements per-IP token bucket rate limiting
 type RateLimiter struct {
-	mu       sync.Mutex
-	limiters map[string]*tokenBucket
-	rate     int           // tokens per second
-	burst    int           // maximum burst size
-	cleanup  time.Duration // cleanup interval
-	stopCh   chan struct{}
+	mu         sync.Mutex
+	limiters   map[string]*tokenBucket
+	rate       int           // tokens per second
+	burst      int           // maximum burst size
+	cleanup    time.Duration // cleanup interval
+	maxBuckets int           // hard cap on live buckets (R-091)
+	stopCh     chan struct{}
 }
 
 type tokenBucket struct {
@@ -26,11 +32,12 @@ type tokenBucket struct {
 // NewRateLimiter creates a new rate limiter
 func NewRateLimiter(rate, burst int, cleanup time.Duration) *RateLimiter {
 	rl := &RateLimiter{
-		limiters: make(map[string]*tokenBucket),
-		rate:     rate,
-		burst:    burst,
-		cleanup:  cleanup,
-		stopCh:   make(chan struct{}),
+		limiters:   make(map[string]*tokenBucket),
+		rate:       rate,
+		burst:      burst,
+		cleanup:    cleanup,
+		maxBuckets: defaultMaxBuckets,
+		stopCh:     make(chan struct{}),
 	}
 
 	// Start cleanup goroutine
@@ -48,6 +55,11 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	now := time.Now()
 
 	if !exists {
+		// Bound the map before inserting a new IP so churn can't grow it without
+		// limit between cleanup ticks (R-091).
+		if len(rl.limiters) >= rl.maxBuckets {
+			rl.evictLocked(now)
+		}
 		bucket = &tokenBucket{
 			tokens:    float64(rl.burst),
 			lastCheck: now,
@@ -69,6 +81,34 @@ func (rl *RateLimiter) Allow(ip string) bool {
 		return true
 	}
 	return false
+}
+
+// evictLocked bounds the bucket map when it hits the cap. It first drops idle
+// buckets (idle longer than the cleanup interval); if the map is still full —
+// the active-churn case, where every bucket is fresh — it evicts down to a
+// low-water mark so a fresh insert always fits. Evicting a live bucket only
+// resets that IP's tokens to burst (more lenient, never a bypass), so bounding
+// memory here is safe. Caller holds rl.mu. R-091.
+func (rl *RateLimiter) evictLocked(now time.Time) {
+	for ip, bucket := range rl.limiters {
+		if now.Sub(bucket.lastCheck) > rl.cleanup {
+			delete(rl.limiters, ip)
+		}
+	}
+	if len(rl.limiters) < rl.maxBuckets {
+		return
+	}
+	// Still full: shed ~10% so this doesn't run on every subsequent insert.
+	target := rl.maxBuckets - rl.maxBuckets/10
+	if target < 1 {
+		target = 1
+	}
+	for ip := range rl.limiters {
+		if len(rl.limiters) <= target {
+			break
+		}
+		delete(rl.limiters, ip)
+	}
 }
 
 // cleanupLoop periodically removes stale entries

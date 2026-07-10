@@ -273,3 +273,39 @@ func TestGetRootServers(t *testing.T) {
 		t.Errorf("last root server = %q, want 202.12.27.33", servers[12])
 	}
 }
+
+// R-087: an anchor set whose keys carry no recognized root KSK tag is refused
+// (a wholesale-swap sanity floor). A set that includes a known tag loads fine.
+func TestLoadAnchors_RejectsUnknownRootTags(t *testing.T) {
+	swapped := &RootAnchors{
+		Zone: ".",
+		Anchors: []Anchor{{
+			ID: "attacker", KeyTag: 6666, Algorithm: 8, DigestType: 2,
+			Digest: "DEAD", ValidFrom: "2017-02-02T00:00:00Z",
+		}},
+	}
+	data, _ := json.Marshal(swapped)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "swapped.json")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAnchors(path); err == nil {
+		t.Fatal("LoadAnchors must reject an anchor set with no known root KSK tag")
+	}
+
+	// A set that includes the current root KSK tag (20326) is accepted.
+	good := &RootAnchors{Zone: ".", Anchors: []Anchor{{
+		ID: "KSK-2017", KeyTag: 20326, Algorithm: 8, DigestType: 2,
+		Digest:    "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+		ValidFrom: "2017-02-02T00:00:00Z",
+	}}}
+	data, _ = json.Marshal(good)
+	goodPath := filepath.Join(dir, "good.json")
+	if err := os.WriteFile(goodPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAnchors(goodPath); err != nil {
+		t.Errorf("LoadAnchors should accept a set carrying tag 20326: %v", err)
+	}
+}

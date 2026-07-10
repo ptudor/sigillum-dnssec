@@ -229,6 +229,13 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 		return proof
 	}
 
+	// RFC 9276: refuse excessive iteration counts before any hashing or the
+	// (bounded, but still wasteful) RRSIG crypto below (R-088).
+	if iters, over := nsec3IterationsOverCap(nsec3Records); over {
+		proof.Error = fmt.Sprintf("NSEC3 iterations=%d exceeds RFC 9276 cap of %d; refusing (CPU-amplification DoS vector)", iters, NSEC3MaxRecommendedIterations)
+		return proof
+	}
+
 	// Verify NSEC3 RRSIG first
 	rrsigRecord := findRRSIGForType(50, rrsigs) // TypeNSEC3 = 50
 	if rrsigRecord == nil {
@@ -288,6 +295,11 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 func VerifyNSEC3Denial(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, zone string, rcode int) (*NSECProof, error) {
 	if len(nsec3Records) == 0 {
 		return nil, nil // No NSEC3 records, no proof
+	}
+
+	// RFC 9276: refuse excessive iteration counts before hashing (R-088).
+	if iters, over := nsec3IterationsOverCap(nsec3Records); over {
+		return nil, fmt.Errorf("NSEC3 iterations=%d exceeds RFC 9276 cap of %d; refusing (CPU-amplification DoS vector)", iters, NSEC3MaxRecommendedIterations)
 	}
 
 	qname = canonicalizeName(qname)
@@ -399,6 +411,19 @@ func verifyNSEC3NODATA(hashedQname, qname string, qtype uint16, nsec3Records []d
 	}
 
 	return nil, fmt.Errorf("no NSEC3 record proves type %s doesn't exist for %s", typeName, qname)
+}
+
+// nsec3IterationsOverCap returns the first NSEC3 iteration count exceeding the
+// RFC 9276 cap (NSEC3MaxRecommendedIterations). Iterations beyond the cap give
+// no security benefit and force up to 65536 SHA-1 hashes per name — a CPU
+// amplifier — so callers refuse the proof before any hashing is performed. R-088.
+func nsec3IterationsOverCap(records []dnspkg.NSEC3Record) (uint16, bool) {
+	for _, r := range records {
+		if int(r.Iterations) > NSEC3MaxRecommendedIterations {
+			return r.Iterations, true
+		}
+	}
+	return 0, false
 }
 
 // computeNSEC3Hash computes the NSEC3 hash of a name per RFC 5155 Section 5.
@@ -600,6 +625,11 @@ func VerifyWildcardDenial(qname string, wildcardLabels uint8, nsecRecords []dnsp
 	if len(nsec3Records) > 0 {
 		proof.ProofType = "NSEC3"
 		params := nsec3Records[0]
+		// RFC 9276: refuse excessive iteration counts before hashing (R-088).
+		if iters, over := nsec3IterationsOverCap(nsec3Records); over {
+			proof.Error = fmt.Sprintf("NSEC3 iterations=%d exceeds RFC 9276 cap of %d; refusing (CPU-amplification DoS vector)", iters, NSEC3MaxRecommendedIterations)
+			return proof
+		}
 		if params.Algorithm != NSEC3HashSHA1 {
 			proof.Error = fmt.Sprintf("unsupported NSEC3 hash algorithm: %d (only SHA-1 supported)", params.Algorithm)
 			return proof
