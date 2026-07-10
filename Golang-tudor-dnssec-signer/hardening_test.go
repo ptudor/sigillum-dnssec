@@ -477,7 +477,7 @@ func TestHealthEndpoints_MethodRestriction(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	RegisterHealthHandlers(mux, state, cfg)
+	RegisterHealthHandlersWithDaemon(mux, NewDaemon(cfg, state))
 
 	for _, path := range []string{"/health", "/healthz"} {
 		t.Run("POST"+path, func(t *testing.T) {
@@ -510,7 +510,7 @@ func TestHealthEndpoints_SecurityHeaders(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	RegisterHealthHandlers(mux, state, cfg)
+	RegisterHealthHandlersWithDaemon(mux, NewDaemon(cfg, state))
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -600,7 +600,7 @@ func TestWebServer_NoDebugVarsPath(t *testing.T) {
 		Zones:     make(map[string]ZoneConfig),
 	}
 	state := NewState("")
-	srv := NewWebServer(cfg, state)
+	srv := NewWebServer(NewDaemon(cfg, state))
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/debug/vars", nil)
@@ -624,7 +624,7 @@ func TestDashboardHandler_PathRouting(t *testing.T) {
 		Zones:     make(map[string]ZoneConfig),
 	}
 	state := NewState("")
-	srv := NewWebServer(cfg, state)
+	srv := NewWebServer(NewDaemon(cfg, state))
 
 	t.Run("root path returns 200", func(t *testing.T) {
 		rr := httptest.NewRecorder()
@@ -658,7 +658,7 @@ func TestAPIEndpoints_MethodAndContentType(t *testing.T) {
 		Zones:     make(map[string]ZoneConfig),
 	}
 	state := NewState("")
-	srv := NewWebServer(cfg, state)
+	srv := NewWebServer(NewDaemon(cfg, state))
 
 	t.Run("POST /api/status rejected", func(t *testing.T) {
 		rr := httptest.NewRecorder()
@@ -766,7 +766,7 @@ func TestHealthz_ReturnsOK(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	RegisterHealthHandlers(mux, state, cfg)
+	RegisterHealthHandlersWithDaemon(mux, NewDaemon(cfg, state))
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)

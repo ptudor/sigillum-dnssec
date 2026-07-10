@@ -42,30 +42,41 @@ func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// NewWebServer creates a new HTTP server for the web UI
-func NewWebServer(cfg *Config, state *State) *http.Server {
+// NewWebServer creates a new HTTP server for the web UI. Handlers resolve the
+// daemon's live cfg/state per request (d.current()) rather than closing over the
+// pointers captured at startup, so the dashboard and health endpoints reflect a
+// SIGHUP reload instead of serving frozen pre-reload state (R-006).
+func NewWebServer(d *Daemon) *http.Server {
 	mux := http.NewServeMux()
 
 	// Register handlers with security headers
 	mux.HandleFunc("/", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		cfg, state := d.current()
 		dashboardHandler(w, r, cfg, state)
 	}))
 	mux.HandleFunc("/api/status", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		_, state := d.current()
 		apiStatusHandler(w, r, state)
 	}))
 	mux.HandleFunc("/api/zone/", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		cfg, state := d.current()
 		apiZoneHandler(w, r, cfg, state)
 	}))
 	mux.HandleFunc("/api/validate", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		cfg, state := d.current()
 		apiValidateHandler(w, r, cfg, state)
 	}))
 	mux.HandleFunc("/api/validate/", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		cfg, state := d.current()
 		apiValidateZoneHandler(w, r, cfg, state)
 	}))
 
 	// Health endpoints
-	RegisterHealthHandlers(mux, state, cfg)
+	RegisterHealthHandlersWithDaemon(mux, d)
 
+	// Addr is read once at construction — changing web.listen still requires a
+	// restart (the listener is bound in Run before this server is created).
+	cfg, _ := d.current()
 	return &http.Server{
 		Addr:              cfg.Web.Listen,
 		Handler:           mux,
