@@ -135,6 +135,14 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("signing records: %w", err)
 	}
 
+	// R-001: self-verify the produced records before publishing. If signing produced
+	// something internally inconsistent (an RRSIG that doesn't verify, an unsigned
+	// authoritative RRset, a broken NSEC/NSEC3 chain), fail here so the previous signed
+	// output keeps serving instead of shipping a zone that SERVFAILs at every resolver.
+	if err := s.verifySignedZone(domain, signedRecords, keys); err != nil {
+		return fmt.Errorf("post-sign verification failed (previous signed zone kept): %w", err)
+	}
+
 	// Write signed zone
 	outputPath := filepath.Join(s.cfg.OutputDir, fmt.Sprintf("%s.zone.signed", domain))
 	if err := s.writeSignedZone(domain, outputPath, signedRecords); err != nil {
@@ -285,18 +293,20 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 	if zoneState.Rollover != nil {
 		switch {
 		case zoneState.Rollover.Type == "ksk" && zoneState.Rollover.State == KSKRolloverStateDSAddWait:
-			// KSK rollover: load old KSK too, sign with both
+			// KSK rollover: load old KSK too, sign with both. FATAL on failure (R-003):
+			// during ds_add_wait the parent DS still references the old KSK, so publishing
+			// a DNSKEY RRset without it makes every resolver validating via the old DS go
+			// bogus. Failing keeps the previous good signed zone in place.
 			oldKSK, oldKSKPriv, err := keyGen.loadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 			if err != nil {
-				slog.Warn("[SIGN] Failed to load old KSK for rollover signing", "error", err)
-			} else {
-				keys.dnskeys = append(keys.dnskeys, oldKSK)
-				keys.signingKSKs = append(keys.signingKSKs, oldKSK)
-				keys.signingKSKPs = append(keys.signingKSKPs, oldKSKPriv)
-				slog.Info("[SIGN] KSK rollover: signing with both old and new KSK",
-					"old_key_id", zoneState.Rollover.OldKeyID,
-					"new_key_id", zoneState.Rollover.NewKeyID)
+				return nil, fmt.Errorf("loading old KSK %d for rollover signing (if the rollover is complete and the old key is gone, run `dnssec-tudor rollover complete %s`): %w", zoneState.Rollover.OldKeyID, domain, err)
 			}
+			keys.dnskeys = append(keys.dnskeys, oldKSK)
+			keys.signingKSKs = append(keys.signingKSKs, oldKSK)
+			keys.signingKSKPs = append(keys.signingKSKPs, oldKSKPriv)
+			slog.Info("[SIGN] KSK rollover: signing with both old and new KSK",
+				"old_key_id", zoneState.Rollover.OldKeyID,
+				"new_key_id", zoneState.Rollover.NewKeyID)
 
 		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == ZSKRolloverStatePrePublish:
 			// ZSK pre-publish: publish BOTH old and new ZSK in the DNSKEY
@@ -326,37 +336,38 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 				"new_key_id", zoneState.Rollover.NewKeyID)
 
 		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == ZSKRolloverStateSigning:
-			// ZSK signing phase: load old ZSK for publishing, sign with new
-			oldZSK, _, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldKeyID)
+			// ZSK signing phase: publish the old ZSK (only the public half is needed) while
+			// signing with the new one. FATAL on failure (R-003): dropping the old ZSK from
+			// the published RRset while resolvers still hold its cached RRSIGs is bogus.
+			oldZSK, err := keyGen.LoadPublicKeyByID(domain, "zsk", zoneState.Rollover.OldKeyID)
 			if err != nil {
-				slog.Warn("[SIGN] Failed to load old ZSK for publish", "error", err)
-			} else {
-				keys.dnskeys = append(keys.dnskeys, oldZSK)
-				slog.Info("[SIGN] ZSK rollover signing: publishing both, signing with new",
-					"old_key_id", zoneState.Rollover.OldKeyID,
-					"new_key_id", zoneState.Rollover.NewKeyID)
+				return nil, fmt.Errorf("loading old ZSK %d for publish during rollover (if the rollover is complete and the old key is gone, run `dnssec-tudor rollover complete %s`): %w", zoneState.Rollover.OldKeyID, domain, err)
 			}
+			keys.dnskeys = append(keys.dnskeys, oldZSK)
+			slog.Info("[SIGN] ZSK rollover signing: publishing both, signing with new",
+				"old_key_id", zoneState.Rollover.OldKeyID,
+				"new_key_id", zoneState.Rollover.NewKeyID)
 
 		case zoneState.Rollover.Type == "algorithm" && zoneState.Rollover.State == AlgoRolloverStateDSAddWait:
-			// Algorithm rollover: load old algorithm keys, publish and sign with both algorithms
+			// Algorithm rollover: publish and sign with BOTH algorithms' keys. FATAL on
+			// failure (R-003): dropping an old-algorithm key mid-rollover leaves RRsets
+			// unsigned for a signaled algorithm, violating RFC 4035 §2.2 / RFC 6840 §5.11.
 			oldKSK, oldKSKPriv, err := keyGen.loadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 			if err != nil {
-				slog.Warn("[SIGN] Failed to load old KSK for algorithm rollover", "error", err)
-			} else {
-				keys.dnskeys = append(keys.dnskeys, oldKSK)
-				keys.signingKSKs = append(keys.signingKSKs, oldKSK)
-				keys.signingKSKPs = append(keys.signingKSKPs, oldKSKPriv)
+				return nil, fmt.Errorf("loading old-algorithm KSK %d for rollover (if the rollover is complete and the old key is gone, run `dnssec-tudor rollover complete %s`): %w", zoneState.Rollover.OldKeyID, domain, err)
 			}
+			keys.dnskeys = append(keys.dnskeys, oldKSK)
+			keys.signingKSKs = append(keys.signingKSKs, oldKSK)
+			keys.signingKSKPs = append(keys.signingKSKPs, oldKSKPriv)
 
 			// Load old ZSK using stored ID
 			oldZSK, oldZSKPriv, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldZSKID)
 			if err != nil {
-				slog.Warn("[SIGN] Failed to load old ZSK for algorithm rollover", "error", err)
-			} else {
-				keys.dnskeys = append(keys.dnskeys, oldZSK)
-				keys.signingZSKs = append(keys.signingZSKs, oldZSK)
-				keys.signingZSKPs = append(keys.signingZSKPs, oldZSKPriv)
+				return nil, fmt.Errorf("loading old-algorithm ZSK %d for rollover (if the rollover is complete and the old key is gone, run `dnssec-tudor rollover complete %s`): %w", zoneState.Rollover.OldZSKID, domain, err)
 			}
+			keys.dnskeys = append(keys.dnskeys, oldZSK)
+			keys.signingZSKs = append(keys.signingZSKs, oldZSK)
+			keys.signingZSKPs = append(keys.signingZSKPs, oldZSKPriv)
 
 			slog.Info("[SIGN] Algorithm rollover: signing with both algorithms",
 				"old_algorithm", zoneState.Rollover.OldAlgorithm,
@@ -667,6 +678,178 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 	}
 
 	return signedRecords, nil
+}
+
+// verifySignedZone self-verifies the freshly produced records before they are published
+// (R-001). It works entirely in-memory on the exact records that will be written, reusing
+// the signer's own delegation model so verifier and signer share one view of what is
+// authoritative (no differential parsing). Any inconsistency returns an error, which keeps
+// the previous signed output serving rather than shipping a zone that SERVFAILs.
+//
+// Checks: (1) every RRSIG cryptographically verifies against a published DNSKEY of the
+// matching keytag/algorithm (catches wrong Labels/OrigTtl, key mixups, corrupt sigs);
+// (2) every non-occluded, non-delegation authoritative RRset (plus DS/NSEC at delegation
+// points) has at least one covering RRSIG; (3) the NSEC/NSEC3 Next pointers form a single
+// closed cycle over every emitted owner.
+func (s *Signer) verifySignedZone(domain string, signedRecords []dns.RR, keys *signingKeys) error {
+	delInfo := s.findDelegationPoints(domain, signedRecords)
+
+	dnskeysByTag := make(map[uint16][]*dns.DNSKEY)
+	for _, dk := range keys.dnskeys {
+		dnskeysByTag[dk.KeyTag()] = append(dnskeysByTag[dk.KeyTag()], dk)
+	}
+
+	type rrsetKey struct {
+		name   string
+		rrtype uint16
+	}
+	rrsets := make(map[rrsetKey][]dns.RR)
+	var rrsigs []*dns.RRSIG
+	var nsecs []*dns.NSEC
+	var nsec3s []*dns.NSEC3
+	for _, rr := range signedRecords {
+		if sig, ok := rr.(*dns.RRSIG); ok {
+			rrsigs = append(rrsigs, sig)
+			continue
+		}
+		name := strings.ToLower(rr.Header().Name)
+		k := rrsetKey{name, rr.Header().Rrtype}
+		rrsets[k] = append(rrsets[k], rr)
+		switch v := rr.(type) {
+		case *dns.NSEC:
+			nsecs = append(nsecs, v)
+		case *dns.NSEC3:
+			nsec3s = append(nsec3s, v)
+		}
+	}
+
+	// (1) Every RRSIG must verify against a published DNSKEY.
+	covered := make(map[rrsetKey]bool)
+	for _, sig := range rrsigs {
+		k := rrsetKey{strings.ToLower(sig.Hdr.Name), sig.TypeCovered}
+		rrset := rrsets[k]
+		if len(rrset) == 0 {
+			return fmt.Errorf("RRSIG for %s %s covers no RRset in the signed zone", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered])
+		}
+		candidates := dnskeysByTag[sig.KeyTag]
+		if len(candidates) == 0 {
+			return fmt.Errorf("RRSIG for %s %s references keytag %d absent from the published DNSKEY RRset", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered], sig.KeyTag)
+		}
+		verified := false
+		var lastErr error
+		for _, dk := range candidates {
+			if dk.Algorithm != sig.Algorithm {
+				continue
+			}
+			if err := sig.Verify(dk, rrset); err == nil {
+				verified = true
+				break
+			} else {
+				lastErr = err
+			}
+		}
+		if !verified {
+			return fmt.Errorf("RRSIG for %s %s (keytag %d) does not verify against the published DNSKEY: %v", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered], sig.KeyTag, lastErr)
+		}
+		covered[k] = true
+	}
+
+	// (2) Every authoritative RRset must have a covering RRSIG. Mirror signRecordsWithKeys:
+	// skip occluded names and, at a delegation point, everything but DS and NSEC.
+	for k := range rrsets {
+		if k.rrtype == dns.TypeRRSIG {
+			continue
+		}
+		if delInfo.isOccluded(k.name) {
+			continue
+		}
+		if delInfo.delegationPoints[k.name] && k.rrtype != dns.TypeDS && k.rrtype != dns.TypeNSEC {
+			continue
+		}
+		if !covered[k] {
+			return fmt.Errorf("authoritative RRset %s %s has no covering RRSIG", k.name, dns.TypeToString[k.rrtype])
+		}
+	}
+
+	// (3) NSEC/NSEC3 chain must be a single closed cycle over every emitted owner.
+	if len(nsecs) > 0 {
+		if err := verifyNSECChainClosure(nsecs); err != nil {
+			return err
+		}
+	}
+	if len(nsec3s) > 0 {
+		if err := verifyNSEC3ChainClosure(nsec3s); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// verifyNSECChainClosure asserts the NSEC Next pointers form one closed cycle.
+func verifyNSECChainClosure(nsecs []*dns.NSEC) error {
+	next := make(map[string]string, len(nsecs))
+	for _, n := range nsecs {
+		owner := strings.ToLower(dns.Fqdn(n.Hdr.Name))
+		if _, dup := next[owner]; dup {
+			return fmt.Errorf("NSEC chain has a duplicate owner %s", owner)
+		}
+		next[owner] = strings.ToLower(dns.Fqdn(n.NextDomain))
+	}
+	return walkDenialChain("NSEC", next)
+}
+
+// verifyNSEC3ChainClosure asserts the NSEC3 Next-hash pointers form one closed cycle over
+// the hashed owner names (the first label of each NSEC3 owner).
+func verifyNSEC3ChainClosure(nsec3s []*dns.NSEC3) error {
+	next := make(map[string]string, len(nsec3s))
+	for _, n := range nsec3s {
+		labels := dns.SplitDomainName(n.Hdr.Name)
+		if len(labels) == 0 {
+			return fmt.Errorf("NSEC3 owner %s has no hash label", n.Hdr.Name)
+		}
+		owner := strings.ToUpper(labels[0])
+		if _, dup := next[owner]; dup {
+			return fmt.Errorf("NSEC3 chain has a duplicate owner hash %s", owner)
+		}
+		next[owner] = strings.ToUpper(n.NextDomain)
+	}
+	return walkDenialChain("NSEC3", next)
+}
+
+// walkDenialChain follows next pointers from a deterministic start and asserts every owner
+// is visited exactly once and the chain closes back to the start (a single cycle).
+func walkDenialChain(kind string, next map[string]string) error {
+	total := len(next)
+	if total == 0 {
+		return nil
+	}
+	var start string
+	for k := range next {
+		if start == "" || k < start {
+			start = k
+		}
+	}
+	visited := make(map[string]bool, total)
+	cur := start
+	for i := 0; i < total; i++ {
+		if visited[cur] {
+			return fmt.Errorf("%s chain has a premature cycle at %s", kind, cur)
+		}
+		visited[cur] = true
+		nxt, ok := next[cur]
+		if !ok {
+			return fmt.Errorf("%s chain: owner %s points at a name with no %s record (dangling)", kind, cur, kind)
+		}
+		cur = nxt
+	}
+	if cur != start {
+		return fmt.Errorf("%s chain does not close: after %d hops from %s it ended at %s", kind, total, start, cur)
+	}
+	if len(visited) != total {
+		return fmt.Errorf("%s chain does not cover all %d owners (visited %d)", kind, total, len(visited))
+	}
+	return nil
 }
 
 // createRRSIG creates an RRSIG record for signing
@@ -1024,15 +1207,18 @@ func (s *Signer) writeSignedZone(domain, path string, records []dns.RR) error {
 	// Sort records: SOA first, then NS, then others, with RRSIG after each RRset
 	sortedRecords := sortZoneRecords(domain, records)
 
-	// Write to temp file first, then rename for atomicity.
-	// This prevents NSD from picking up a partial zone if the process is killed mid-write.
-	// Mode 0644 so NSD (running as a different user) can read the signed zone;
-	// explicit Chmod defeats a restrictive umask on the daemon process.
-	tempPath := path + ".tmp"
-	f, err := os.OpenFile(tempPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	// Write to a UNIQUE temp file in the output dir, then rename for atomicity. This
+	// prevents NSD from picking up a partial zone if the process is killed mid-write.
+	// A fixed "<path>.tmp" is shared by the daemon's signing loop and any concurrent CLI
+	// sign of the same zone; both O_TRUNC the same file and interleave, so whichever
+	// renames first publishes corrupted content (R-002). os.CreateTemp gives each writer
+	// its own temp file. Mode 0644 so NSD (running as a different user) can read the
+	// signed zone; explicit Chmod defeats a restrictive umask on the daemon process.
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tempPath := f.Name()
 	if err = f.Chmod(0644); err != nil {
 		f.Close()
 		os.Remove(tempPath)
