@@ -82,3 +82,12 @@ The three warn-and-continue branches in `loadKeysForSigning` (`sign.go`) — KSK
 Files: `sign.go`.
 Verification: `TestLoadKeysForSigning_MissingOldKeyIsFatal` (all three branches error when the old key's backup is absent). Full suite green under `-race`.
 
+---
+
+## Phase 3 — Signer CLI/daemon coordination
+
+**R-007 — Cross-process advisory lock on state.json.**
+Added `acquireStateLock`/`release` (`filelock_unix.go` via `syscall.Flock` on `<data_dir>/state.json.lock`, blocking with timeout; `filelock_windows.go` no-op stub since the supported deployment is Unix). The daemon's `signAllZones` now holds the lock across its whole ReloadFromDisk→sign→Save span and skips the cycle (logging) if it can't acquire it, never crashing the loop. All 8 mutating CLI commands (`sign`, `resign`, `add`, `remove`, `rollover start/complete/algorithm`, `import`) load state UNDER the lock via new `loadConfigStateLocked()` and `defer unlock()`; read-only commands are unchanged. Defense-in-depth: `signAllZones` re-runs `ReloadFromDisk` right before `Save`, and `ReloadFromDisk`'s merge now adopts a disk zone whose rollover differs when its LastSigned is not older (added `rolloverEqual`), so a CLI-started rollover isn't reverted.
+Files: `filelock_unix.go`, `filelock_windows.go`, `main.go`, `daemon.go`, `state.go`.
+Verification: `TestStateLock_MutualExclusion` (second acquire times out while held; succeeds after release), `TestReloadFromDisk_AdoptsRolloverAtEqualLastSigned`, `TestRolloverEqual`. Full suite green. (Pre-existing note: the project already does not build for Windows because `ownership.go` uses `syscall.Stat_t` untagged — unrelated to this change and not a review finding.)
+

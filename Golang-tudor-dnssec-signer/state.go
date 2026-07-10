@@ -174,14 +174,30 @@ func (s *State) ReloadFromDisk() error {
 	//   doesn't overwrite it with stale in-memory data on next Save)
 	for domain, diskZone := range diskState.Zones {
 		memZone, exists := s.Zones[domain]
-		if !exists {
+		switch {
+		case !exists:
 			s.Zones[domain] = diskZone
-		} else if diskZone.LastSigned.After(memZone.LastSigned) {
+		case diskZone.LastSigned.After(memZone.LastSigned):
+			s.Zones[domain] = diskZone
+		case !rolloverEqual(diskZone.Rollover, memZone.Rollover) && !diskZone.LastSigned.Before(memZone.LastSigned):
+			// A CLI `rollover start/complete` mutated the rollover state without a newer
+			// LastSigned; adopt it so the daemon's Save doesn't revert the rollover while
+			// the key files on disk are already rotated (R-007).
 			s.Zones[domain] = diskZone
 		}
 	}
 
 	return nil
+}
+
+// rolloverEqual reports whether two rollover states are equivalent for merge purposes.
+func rolloverEqual(a, b *RolloverState) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Type == b.Type && a.State == b.State &&
+		a.OldKeyID == b.OldKeyID && a.NewKeyID == b.NewKeyID &&
+		a.OldZSKID == b.OldZSKID && a.NewZSKID == b.NewZSKID
 }
 
 // Save persists the state to disk

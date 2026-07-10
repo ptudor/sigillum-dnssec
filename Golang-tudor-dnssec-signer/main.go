@@ -321,6 +321,33 @@ func loadConfigAndState() (*Config, *State, error) {
 	return cfg, state, nil
 }
 
+// loadConfigStateLocked loads config, acquires the cross-process state lock, then loads
+// state UNDER the lock. Mutating CLI commands use this and `defer unlock()` so their whole
+// load→mutate→Save span is serialized against the daemon's signing cycle and other CLI
+// commands (R-007) — otherwise a rollover/add/remove landing mid-cycle is clobbered by the
+// daemon's end-of-cycle Save. Read-only commands (status/ds/dnskey/validate/rollover
+// status) keep loadConfigAndState and take no lock.
+func loadConfigStateLocked() (cfg *Config, state *State, unlock func(), err error) {
+	cfg, err = LoadConfig(configPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("loading config: %w", err)
+	}
+	InitOwnershipTarget(cfg.DataDir)
+	if err := ensureDir(cfg.DataDir); err != nil {
+		return nil, nil, nil, fmt.Errorf("ensuring data_dir for state lock: %w", err)
+	}
+	lock, err := acquireStateLock(cfg.DataDir, 30*time.Second)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("acquiring state lock: %w", err)
+	}
+	state, err = LoadState(cfg.StatePath())
+	if err != nil {
+		lock.release()
+		return nil, nil, nil, fmt.Errorf("loading state: %w", err)
+	}
+	return cfg, state, lock.release, nil
+}
+
 // preflightConfigAppend verifies the config file can be opened for append.
 // Used by `add` to fail fast before generating keys or signing a zone when
 // the daemon user can't write to the config file.
@@ -463,10 +490,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 // runSign performs a one-shot sign of all zones
 func runSign(cmd *cobra.Command, args []string) error {
-	cfg, state, err := loadConfigAndState()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	slog.Info("[CLI] Signing all zones", "count", len(cfg.Zones))
 
@@ -497,10 +525,11 @@ func runSign(cmd *cobra.Command, args []string) error {
 func runResign(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
-	cfg, state, err := loadConfigAndState()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	// Check domain is managed
 	zoneState := state.GetZone(domain)
@@ -640,10 +669,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid domain name: %w", err)
 	}
 
-	cfg, state, err := loadConfigAndState()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	// Check zone file exists
 	if _, err := os.Stat(zonePath); os.IsNotExist(err) {
@@ -760,10 +790,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 func runRemove(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
-	_, state, err := loadConfigAndState()
+	_, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	if state.GetZone(domain) == nil {
 		return fmt.Errorf("domain %q is not managed", domain)
@@ -786,10 +817,11 @@ func runRemove(cmd *cobra.Command, args []string) error {
 func runRolloverStart(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
-	cfg, state, err := loadConfigAndState()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	zoneState := state.GetZone(domain)
 	if zoneState == nil {
@@ -866,10 +898,11 @@ func runRolloverStatus(cmd *cobra.Command, args []string) error {
 func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
-	cfg, state, err := loadConfigAndState()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	zoneState := state.GetZone(domain)
 	if zoneState == nil {
@@ -935,10 +968,11 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid algorithm %q (valid: ED25519, ECDSAP256SHA256, ECDSAP384SHA384)", targetAlgorithm)
 	}
 
-	cfg, state, err := loadConfigAndState()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	zoneState := state.GetZone(domain)
 	if zoneState == nil {
@@ -1128,10 +1162,11 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid domain name: %w", err)
 	}
 
-	cfg, state, err := loadConfigAndState()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	// Check zone file exists
 	if _, err := os.Stat(zonePath); os.IsNotExist(err) {

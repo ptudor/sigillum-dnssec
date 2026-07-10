@@ -261,6 +261,17 @@ func (d *Daemon) signAllZones() {
 	// Record that the signing loop is alive
 	d.lastSigningRun.Store(time.Now().Unix())
 
+	// Serialize the whole load-mutate-save span against mutating CLI commands (R-007). A
+	// CLI write landing between our ReloadFromDisk and Save would otherwise be clobbered
+	// by our whole-map Save, and a rollover started mid-cycle would be reverted. On
+	// contention, skip this cycle (safe — the next poll retries) rather than crash.
+	lock, err := acquireStateLock(snap.cfg.DataDir, 10*time.Second)
+	if err != nil {
+		slog.Warn("[DAEMON] Could not acquire state lock; skipping this signing cycle", "error", err)
+		return
+	}
+	defer lock.release()
+
 	// Reload state from disk to pick up any zones added by CLI commands
 	if err := snap.state.ReloadFromDisk(); err != nil {
 		slog.Warn("[DAEMON] Failed to reload state from disk", "error", err)
@@ -290,6 +301,13 @@ func (d *Daemon) signAllZones() {
 		if err := snap.rollover.CheckZSKRollover(domain); err != nil {
 			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
 		}
+	}
+
+	// Defense-in-depth: re-reload immediately before Save to adopt any CLI write that
+	// slipped in (the merge keeps our fresher-signed zones and adopts a disk zone whose
+	// rollover differs — see ReloadFromDisk), then persist the merged whole map.
+	if err := snap.state.ReloadFromDisk(); err != nil {
+		slog.Warn("[DAEMON] Failed to reload state from disk before save", "error", err)
 	}
 
 	// Save state
