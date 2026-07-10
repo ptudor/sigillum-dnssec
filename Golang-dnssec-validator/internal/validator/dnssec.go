@@ -229,11 +229,66 @@ func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRe
 	return link, nil
 }
 
-// VerifyDNSKEYRRSIG verifies that the DNSKEY RRset is properly signed
-// This performs FULL cryptographic verification - the whole point of a diagnostic tool
-func VerifyDNSKEYRRSIG(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecord) error {
+// CollectDSMatchedKeys returns every child DNSKEY whose digest matches one of the
+// parent's DS records (RFC 4034 §5.1.4). These are the only keys the parent's DS
+// authenticates; the DNSKEY RRset MUST be signed by one of them for the zone to be
+// secure (RFC 4035 §5.2). Returned in DNSKEY-slice order with duplicates removed.
+func CollectDSMatchedKeys(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRecord, zone string) []dnspkg.DNSKEYRecord {
+	matched := make([]dnspkg.DNSKEYRecord, 0)
+	seen := make(map[int]bool)
+	for _, ds := range parentDS {
+		for i := range childDNSKEY {
+			if seen[i] {
+				continue
+			}
+			if childDNSKEY[i].KeyTag != ds.KeyTag {
+				continue
+			}
+			if VerifyDSMatchesDNSKEY(ds, childDNSKEY[i], zone) {
+				matched = append(matched, childDNSKEY[i])
+				seen[i] = true
+			}
+		}
+	}
+	return matched
+}
+
+// CollectAnchorMatchedKeys returns every root DNSKEY whose computed DS digest matches
+// a trust anchor. These are the anchor-authenticated keys for the root zone; the root
+// DNSKEY RRset must be signed by one of them.
+func CollectAnchorMatchedKeys(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.Anchor) []dnspkg.DNSKEYRecord {
+	matched := make([]dnspkg.DNSKEYRecord, 0)
+	seen := make(map[int]bool)
+	for _, anchor := range anchors {
+		for i := range dnskeys {
+			if seen[i] {
+				continue
+			}
+			if dnskeys[i].KeyTag != uint16(anchor.KeyTag) || dnskeys[i].Algorithm != uint8(anchor.Algorithm) {
+				continue
+			}
+			computedDigest, err := ComputeDSDigestFromDNSKEY(".", dnskeys[i], uint8(anchor.DigestType))
+			if err != nil {
+				continue
+			}
+			if strings.EqualFold(computedDigest, anchor.Digest) {
+				matched = append(matched, dnskeys[i])
+				seen[i] = true
+			}
+		}
+	}
+	return matched
+}
+
+// VerifyDNSKEYRRSIGByKeys verifies that the DNSKEY RRset is signed by one of the
+// parent/anchor-authenticated keys — not merely by some key that happens to be present
+// in the RRset. This closes the RFC 4035 §5.2 binding: a rogue self-signed KSK added to
+// the served RRset must not be able to authenticate the RRset. authenticatedKeys is the
+// set produced by CollectDSMatchedKeys (non-root) or CollectAnchorMatchedKeys (root).
+// This performs FULL cryptographic verification — the whole point of a diagnostic tool.
+func VerifyDNSKEYRRSIGByKeys(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecord, authenticatedKeys []dnspkg.DNSKEYRecord) error {
 	// Find RRSIG covering DNSKEY (type 48)
-	rrsigRecord := FindRRSIGForType(48, rrsigs)
+	rrsigRecord := FindRRSIGForType(dns.TypeDNSKEY, rrsigs)
 	if rrsigRecord == nil {
 		return fmt.Errorf("no RRSIG for DNSKEY RRset")
 	}
@@ -246,13 +301,22 @@ func VerifyDNSKEYRRSIG(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecor
 		return fmt.Errorf("DNSKEY RRSIG not yet valid (inception: %s)", rrsigRecord.Inception.Format(time.RFC3339))
 	}
 
-	// Find the signing key
-	signingKeyRecord := FindKSKByKeyTag(rrsigRecord.KeyTag, dnskeys)
-	if signingKeyRecord == nil {
-		signingKeyRecord = FindDNSKEYByKeyTag(rrsigRecord.KeyTag, dnskeys)
+	if len(authenticatedKeys) == 0 {
+		return fmt.Errorf("no parent-authenticated (DS/anchor-matched) key available to verify the DNSKEY RRset")
+	}
+
+	// The signing key MUST be one of the parent/anchor-authenticated keys. Requiring
+	// membership here — rather than trusting the key named by the RRSIG — is what binds
+	// the DNSKEY RRset to the parent's DS (RFC 4035 §5.2).
+	var signingKeyRecord *dnspkg.DNSKEYRecord
+	for i := range authenticatedKeys {
+		if authenticatedKeys[i].KeyTag == rrsigRecord.KeyTag {
+			signingKeyRecord = &authenticatedKeys[i]
+			break
+		}
 	}
 	if signingKeyRecord == nil {
-		return fmt.Errorf("signing key (key tag %d) not found in DNSKEY RRset", rrsigRecord.KeyTag)
+		return fmt.Errorf("DNSKEY RRset is not signed by a parent-authenticated key (RRSIG key tag %d is not DS/anchor-matched)", rrsigRecord.KeyTag)
 	}
 
 	// Reconstruct the dns.DNSKEY for verification
