@@ -272,6 +272,16 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 				cached.RecordValidation = recordValidation
 				cached.Warnings = leafZone.Warnings
 			}
+			// R-082: fold the leaf record's signature outcome into the overall verdict. A
+			// secure chain over an answer whose RRSIG is missing/expired/forged (and which
+			// is not a verified denial) is not secure — the caller reads result.Result, so
+			// the record failure must move the verdict, not just the per-zone detail.
+			if verdict, msg := recordValidationVerdict(recordValidation); verdict != StatusSecure {
+				lastStatus = verdict
+				if msg != "" {
+					result.Errors = append(result.Errors, fmt.Sprintf("%s: %s", leafZone.Zone, msg))
+				}
+			}
 		}
 	}
 
@@ -594,6 +604,43 @@ func (v *Validator) verifyWildcard(validation *RecordValidation, qname string, r
 	validation.WildcardProofVerified = true
 }
 
+// recordValidationVerdict classifies a leaf RecordValidation into the verdict it should
+// contribute (R-082). A verified record signature or verified denial keeps the zone
+// secure; an unqueryable answer is indeterminate; a missing/expired/forged signature or
+// an unverifiable denial is bogus. A wildcard-synthesized answer whose record signature
+// verified but whose closest-encloser proof is incomplete stays secure here — it is
+// surfaced as a warning at the call site, matching the existing wildcard handling.
+func recordValidationVerdict(rv *RecordValidation) (ValidationStatus, string) {
+	if rv == nil || rv.RRSIGVerified {
+		return StatusSecure, ""
+	}
+
+	if isUnqueryableRecordError(rv.Error) {
+		msg := rv.Error
+		if msg == "" {
+			msg = "record could not be queried from authoritative servers"
+		}
+		return StatusIndeterminate, msg
+	}
+
+	msg := rv.Error
+	if msg == "" && rv.DenialProof != nil {
+		msg = rv.DenialProof.Error
+	}
+	if msg == "" {
+		msg = "record RRSIG could not be verified"
+	}
+	return StatusBogus, msg
+}
+
+// isUnqueryableRecordError reports whether a RecordValidation error reflects an inability
+// to obtain the answer (a resolver/query failure) rather than a signature failure. The
+// former is indeterminate; the latter is bogus.
+func isUnqueryableRecordError(errText string) bool {
+	return strings.HasPrefix(errText, "failed to resolve nameservers") ||
+		strings.HasPrefix(errText, "failed to query")
+}
+
 // validateZone validates a single zone
 // parentDNSKEY is used for DS RRSIG verification (nil for root zone)
 func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []string, parentDNSKEY []dnspkg.DNSKEYRecord) (*ZoneResult, error) {
@@ -700,10 +747,18 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		// Zone might be insecure - check for DS in parent
 		if zone != "." {
 			parentZone := GetParentZone(zone)
-			dsResult, err := v.queryDSFromParent(ctx, zone, parentZone, nsAddresses)
-			if err != nil || len(dsResult) == 0 {
-				// No DS in parent = insecure delegation
-				result.Status = StatusInsecure
+			dsResult, _, dsQR, err := v.queryDSFromParentWithValidation(ctx, zone, parentZone, nsAddresses, parentDNSKEY)
+			if err != nil {
+				// A query failure is not evidence of an insecure delegation; do not
+				// silently downgrade — report it as indeterminate.
+				result.Status = StatusIndeterminate
+				result.AddError(fmt.Sprintf("failed to query DS from parent: %v", err))
+				return result, nil
+			}
+			if len(dsResult) == 0 {
+				// No DS in parent: insecure delegation only if the parent authenticatedly
+				// proves the DS RRset is absent (R-081 downgrade guard).
+				v.finalizeNoDSDelegation(result, zone, parentDNSKEY, dsQR)
 				return result, nil
 			}
 			// DS exists but no DNSKEY = bogus
@@ -717,25 +772,13 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		return result, nil
 	}
 
-	// Verify DNSKEY RRSIG
-	if err := VerifyDNSKEYRRSIG(result.DNSKEY, result.RRSIG); err != nil {
-		result.Status = StatusBogus
-		result.AddError(fmt.Sprintf("DNSKEY RRSIG verification failed: %v", err))
-		return result, nil
-	}
+	// Establish the set of keys the parent authenticates for this zone. The DNSKEY RRset
+	// MUST be signed by one of THESE keys (RFC 4035 §5.2), so DS/anchor authentication is
+	// done first and its key identity is then required by the DNSKEY-RRSIG check below.
+	var authenticatedKeys []dnspkg.DNSKEYRecord
 
-	// RFC 4034 §3.1.3: Detect wildcard synthesis
-	if rrsig := FindRRSIGForType(dns.TypeDNSKEY, result.RRSIG); rrsig != nil {
-		if wildcard := DetectWildcardSynthesis(zone, *rrsig); wildcard != "" {
-			result.WildcardSource = wildcard
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("Response synthesized from wildcard %s", wildcard))
-		}
-	}
-
-	// Validate chain of trust
 	if zone == "." {
-		// Root zone - verify against trust anchors
+		// Root zone - verify DNSKEYs against the trust anchors (digest match).
 		activeAnchors := dnspkg.GetActiveAnchors(v.anchors)
 		link, err := VerifyRootTrustAnchor(result.DNSKEY, activeAnchors)
 		if err != nil {
@@ -744,10 +787,11 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			return result, nil
 		}
 		result.ChainLink = link
+		authenticatedKeys = CollectAnchorMatchedKeys(result.DNSKEY, activeAnchors)
 	} else {
 		// Non-root zone - verify DS from parent
 		parentZone := GetParentZone(zone)
-		dsRecords, dsValidation, err := v.queryDSFromParentWithValidation(ctx, zone, parentZone, nsAddresses, parentDNSKEY)
+		dsRecords, dsValidation, dsQR, err := v.queryDSFromParentWithValidation(ctx, zone, parentZone, nsAddresses, parentDNSKEY)
 		if err != nil {
 			result.Status = StatusIndeterminate
 			result.AddError(fmt.Sprintf("failed to query DS from parent: %v", err))
@@ -757,20 +801,31 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		// Store DS validation result
 		if dsValidation != nil {
 			result.DSValidation = dsValidation
-			if dsValidation.Error != "" {
-				result.Warnings = append(result.Warnings, fmt.Sprintf("DS RRSIG: %s", dsValidation.Error))
-			}
 		}
 
 		if len(dsRecords) == 0 {
-			// No DS = insecure delegation
-			result.Status = StatusInsecure
+			// No DS: insecure delegation only if the parent authenticatedly proves the
+			// DS RRset is absent (R-081 downgrade guard).
+			v.finalizeNoDSDelegation(result, zone, parentDNSKEY, dsQR)
 			return result, nil
 		}
 
 		result.DS = dsRecords
 
-		// Validate DS matches DNSKEY
+		// R-079: a secure delegation requires the DS RRset to be signed by the parent's
+		// authenticated DNSKEY. Without a verified DS RRSIG, a forged DS pointing at an
+		// attacker-generated key would be accepted. Fail closed to bogus.
+		if dsValidation == nil || !dsValidation.RRSIGVerified {
+			result.Status = StatusBogus
+			msg := "DS RRset is not signed by the parent (no verified DS RRSIG)"
+			if dsValidation != nil && dsValidation.Error != "" {
+				msg = fmt.Sprintf("DS RRSIG verification failed: %s", dsValidation.Error)
+			}
+			result.AddError(msg)
+			return result, nil
+		}
+
+		// Validate DS matches DNSKEY (digest) and record the chain link.
 		link, err := ValidateChainLink(dsRecords, result.DNSKEY, zone)
 		if err != nil {
 			result.Status = StatusBogus
@@ -779,6 +834,9 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		}
 		result.ChainLink = link
 
+		// R-080: the DNSKEY RRset must be signed by a key the DS actually authenticates.
+		authenticatedKeys = CollectDSMatchedKeys(dsRecords, result.DNSKEY, zone)
+
 		// Query RDAP for out-of-band DS verification (only for registrable domains)
 		if v.rdapClient != nil && IsRegistrableDomain(zone) {
 			rdapResult := v.queryRDAPSecureDNS(ctx, zone, dsRecords)
@@ -786,6 +844,24 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			if rdapResult != nil && rdapResult.DSMatch == DSMatchNone {
 				result.Warnings = append(result.Warnings, "RDAP DS records do not match DNS DS records")
 			}
+		}
+	}
+
+	// R-080: verify the DNSKEY RRset is signed by one of the parent/anchor-authenticated
+	// keys — not merely by a key present in the RRset. This binds the DNSKEY RRset to the
+	// parent's DS (RFC 4035 §5.2) and rejects a rogue self-signed KSK added to the RRset.
+	if err := VerifyDNSKEYRRSIGByKeys(result.DNSKEY, result.RRSIG, authenticatedKeys); err != nil {
+		result.Status = StatusBogus
+		result.AddError(fmt.Sprintf("DNSKEY RRSIG verification failed: %v", err))
+		return result, nil
+	}
+
+	// RFC 4034 §3.1.3: Detect wildcard synthesis (informational)
+	if rrsig := FindRRSIGForType(dns.TypeDNSKEY, result.RRSIG); rrsig != nil {
+		if wildcard := DetectWildcardSynthesis(zone, *rrsig); wildcard != "" {
+			result.WildcardSource = wildcard
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("Response synthesized from wildcard %s", wildcard))
 		}
 	}
 
@@ -811,8 +887,10 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 	return result, nil
 }
 
-// queryDSFromParentWithValidation queries DS records and verifies the DS RRSIG
-func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, parentZone string, fallbackServers []string, parentDNSKEY []dnspkg.DNSKEYRecord) ([]dnspkg.DSRecord, *DSValidation, error) {
+// queryDSFromParentWithValidation queries DS records and verifies the DS RRSIG.
+// It also returns the raw parent QueryResult so the caller can inspect the authenticated
+// denial (NSEC/NSEC3) when the DS RRset is absent (R-081 downgrade protection).
+func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, parentZone string, fallbackServers []string, parentDNSKEY []dnspkg.DNSKEYRecord) ([]dnspkg.DSRecord, *DSValidation, *dnspkg.QueryResult, error) {
 	validation := &DSValidation{
 		ParentZone: parentZone,
 	}
@@ -877,21 +955,160 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 				}
 			}
 
-			return result.DS, validation, nil
+			return result.DS, validation, result, nil
 		}
 		// NXDOMAIN or no DS records
 		if result != nil && result.RCode == dns.RcodeNameError {
-			return nil, validation, nil // Zone doesn't exist in parent
+			return nil, validation, result, nil // Zone doesn't exist in parent
 		}
 	}
 
-	return nil, validation, fmt.Errorf("failed to query DS from parent zone")
+	return nil, validation, nil, fmt.Errorf("failed to query DS from parent zone")
 }
 
-// queryDSFromParent queries DS records for a zone from its parent (compatibility wrapper)
-func (v *Validator) queryDSFromParent(ctx context.Context, zone, parentZone string, fallbackServers []string) ([]dnspkg.DSRecord, error) {
-	ds, _, err := v.queryDSFromParentWithValidation(ctx, zone, parentZone, fallbackServers, nil)
-	return ds, err
+// verifyDSAbsence checks that the parent authenticatedly denies the existence of a DS
+// RRset at childName (RFC 4035 §5.2, RFC 5155 §6 / §7.2.4). It returns the proof and
+// whether it is cryptographically verified. This is what distinguishes a genuine insecure
+// delegation from a DS-stripping downgrade attack: an on-path attacker can remove the DS
+// RRset from a response, but cannot forge the parent's signed NSEC/NSEC3 denial.
+func (v *Validator) verifyDSAbsence(childName string, parentDNSKEY []dnspkg.DNSKEYRecord, qr *dnspkg.QueryResult) (*NSECProof, bool) {
+	if qr == nil {
+		return &NSECProof{ResponseType: "DS-ABSENCE", Error: "no parent response available to prove DS absence"}, false
+	}
+	child := canonicalizeName(childName)
+
+	if len(qr.NSEC) > 0 {
+		proof := &NSECProof{ProofType: "NSEC", ResponseType: "DS-ABSENCE", Records: make([]string, 0)}
+		matched := false
+		for _, nsec := range qr.NSEC {
+			proof.Records = append(proof.Records, fmt.Sprintf("%s types: %v", nsec.Owner, nsec.TypeBitmap))
+			if canonicalizeName(nsec.Owner) != child {
+				continue
+			}
+			if HasTypeInBitmap("DS", nsec.TypeBitmap) {
+				proof.Error = "parent NSEC at the delegation point has the DS bit set"
+				return proof, false
+			}
+			// A delegation NSEC has the NS bit set and the SOA bit clear (RFC 6840 §4.4);
+			// this confirms it is a delegation point, not the apex or an empty non-terminal.
+			if !HasTypeInBitmap("NS", nsec.TypeBitmap) || HasTypeInBitmap("SOA", nsec.TypeBitmap) {
+				continue
+			}
+			matched = true
+			proof.CoveringNSEC = fmt.Sprintf("%s types: %v", nsec.Owner, nsec.TypeBitmap)
+			break
+		}
+		if !matched {
+			proof.Error = fmt.Sprintf("no NSEC at %s proves the DS RRset is absent", child)
+			return proof, false
+		}
+		if _, err := VerifyDenialRRSIGFromResponse(qr.RawResponse, dns.TypeNSEC, parentDNSKEY); err != nil {
+			proof.Error = fmt.Sprintf("NSEC RRSIG verification failed: %v", err)
+			return proof, false
+		}
+		proof.Verified = true
+		proof.Explanation = fmt.Sprintf("Authenticated NSEC proves no DS at %s (insecure delegation)", child)
+		return proof, true
+	}
+
+	if len(qr.NSEC3) > 0 {
+		proof := &NSECProof{ProofType: "NSEC3", ResponseType: "DS-ABSENCE", Records: make([]string, 0)}
+		params := qr.NSEC3[0]
+		if params.Algorithm != NSEC3HashSHA1 {
+			proof.Error = fmt.Sprintf("unsupported NSEC3 hash algorithm: %d (only SHA-1 supported)", params.Algorithm)
+			return proof, false
+		}
+		salt, err := hexDecode(params.Salt)
+		if err != nil {
+			proof.Error = fmt.Sprintf("invalid NSEC3 salt: %v", err)
+			return proof, false
+		}
+		childHash := computeNSEC3Hash(child, salt, params.Iterations)
+		for _, rec := range qr.NSEC3 {
+			proof.Records = append(proof.Records, fmt.Sprintf("%s → %s types: %v", rec.HashedOwner, rec.NextHashed, rec.TypeBitmap))
+		}
+		// 1) Direct match: an NSEC3 whose owner hash equals H(child) with the DS bit clear
+		//    and the NS bit set is the delegation-point NSEC3 (non-opt-out zones).
+		for _, rec := range qr.NSEC3 {
+			if !strings.EqualFold(rec.HashedOwner, childHash) {
+				continue
+			}
+			if HasTypeInBitmap("DS", rec.TypeBitmap) {
+				proof.Error = "parent NSEC3 at the delegation point has the DS bit set"
+				return proof, false
+			}
+			if !HasTypeInBitmap("NS", rec.TypeBitmap) {
+				continue
+			}
+			if _, err := VerifyDenialRRSIGFromResponse(qr.RawResponse, dns.TypeNSEC3, parentDNSKEY); err != nil {
+				proof.Error = fmt.Sprintf("NSEC3 RRSIG verification failed: %v", err)
+				return proof, false
+			}
+			proof.Verified = true
+			proof.CoveringNSEC = fmt.Sprintf("NSEC3 %s types: %v", rec.HashedOwner, rec.TypeBitmap)
+			proof.Explanation = fmt.Sprintf("Authenticated NSEC3 matches %s with the DS bit clear (insecure delegation)", child)
+			return proof, true
+		}
+		// 2) Opt-out cover: an opt-out NSEC3 (Flags bit 0 set) whose hash range covers
+		//    H(child) proves an unsigned delegation without its own NSEC3 (RFC 5155 §6).
+		for _, rec := range qr.NSEC3 {
+			if rec.Flags&0x01 == 0 {
+				continue
+			}
+			if hashBetween(childHash, rec.HashedOwner, rec.NextHashed) {
+				if _, err := VerifyDenialRRSIGFromResponse(qr.RawResponse, dns.TypeNSEC3, parentDNSKEY); err != nil {
+					proof.Error = fmt.Sprintf("NSEC3 RRSIG verification failed: %v", err)
+					return proof, false
+				}
+				proof.Verified = true
+				proof.CoveringNSEC = fmt.Sprintf("NSEC3 %s -> %s [opt-out]", rec.HashedOwner, rec.NextHashed)
+				proof.Explanation = fmt.Sprintf("Authenticated opt-out NSEC3 covers %s (insecure delegation)", child)
+				return proof, true
+			}
+		}
+		proof.Error = fmt.Sprintf("no NSEC3 proves the DS RRset is absent for %s", child)
+		return proof, false
+	}
+
+	return &NSECProof{ResponseType: "DS-ABSENCE", Error: "no NSEC/NSEC3 records accompany the DS-absent response"}, false
+}
+
+// finalizeNoDSDelegation sets result.Status for a zone whose parent returned no DS record.
+// When the parent is secure (we hold its authenticated DNSKEY), declaring the zone
+// "insecure" requires an authenticated proof that the DS RRset is genuinely absent
+// (R-081). Without such a proof the result is indeterminate (no denial at all) or bogus
+// (a denial that contradicts itself or fails to verify) — never a silent downgrade.
+func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone string, parentDNSKEY []dnspkg.DNSKEYRecord, qr *dnspkg.QueryResult) {
+	if len(parentDNSKEY) == 0 {
+		// The parent is not itself secured (insecure ancestor); there is no chain of
+		// trust to protect below it, so an unsigned delegation is genuinely insecure.
+		result.Status = StatusInsecure
+		return
+	}
+
+	proof, ok := v.verifyDSAbsence(zone, parentDNSKEY, qr)
+	if proof != nil {
+		result.DenialProof = proof
+	}
+	if ok {
+		result.Status = StatusInsecure
+		return
+	}
+
+	if qr == nil || (len(qr.NSEC) == 0 && len(qr.NSEC3) == 0) {
+		// No authenticated denial available at all: we cannot prove insecure, and a
+		// stripped DS would look identical. Fail to indeterminate rather than downgrade.
+		result.Status = StatusIndeterminate
+		result.AddError("insecure delegation claimed but the parent returned no authenticated proof of DS absence (possible downgrade attack)")
+		return
+	}
+
+	result.Status = StatusBogus
+	errMsg := "the parent's proof of DS absence did not verify (possible downgrade attack)"
+	if proof != nil && proof.Error != "" {
+		errMsg = fmt.Sprintf("the parent's proof of DS absence did not verify: %s", proof.Error)
+	}
+	result.AddError(errMsg)
 }
 
 // ValidateMultipleServers queries all servers in parallel and checks for consensus.
