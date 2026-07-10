@@ -507,10 +507,67 @@ func AddZoneToConfigFile(configPath, domain, zonePath string) error {
 	return nil
 }
 
-// RemoveZoneFromConfig removes a zone from the in-memory config
-// Note: This does NOT modify the config file - that would require full rewriting
-func (c *Config) RemoveZoneFromConfig(domain string) {
-	delete(c.Zones, domain)
+// RemoveZoneFromConfigFile deletes the [zones."<domain>"] table (the header written by
+// AddZoneToConfigFile plus every key line under it) from the config file, preserving all
+// other content and comments. It writes atomically (temp + rename, ownership preserved)
+// and keeps the file's existing mode so a secrets-bearing 0640 config is not loosened.
+// Returns errZoneNotInConfig if the table isn't present, so the caller can proceed.
+func RemoveZoneFromConfigFile(configPath, domain string) error {
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return fmt.Errorf("stat config file: %w", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("reading config file: %w", err)
+	}
+	lines := strings.Split(string(data), "\n")
+
+	header := fmt.Sprintf("[zones.%q]", domain) // e.g. [zones."ptudor.net"]
+	start := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) == header {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		return errZoneNotInConfig
+	}
+
+	// The table runs until the next TOML table header or EOF.
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		if isTOMLTableHeader(lines[i]) {
+			end = i
+			break
+		}
+	}
+
+	// Absorb one blank line immediately preceding the table (AddZoneToConfigFile prefixes
+	// one) so repeated add/remove cycles don't accumulate blank runs.
+	removeStart := start
+	if removeStart > 0 && strings.TrimSpace(lines[removeStart-1]) == "" {
+		removeStart--
+	}
+
+	kept := make([]string, 0, len(lines)-(end-removeStart))
+	kept = append(kept, lines[:removeStart]...)
+	kept = append(kept, lines[end:]...)
+
+	if err := writeFileAtomicOwned(configPath, []byte(strings.Join(kept, "\n")), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("writing config file: %w", err)
+	}
+	return nil
+}
+
+// errZoneNotInConfig is returned by RemoveZoneFromConfigFile when the zone table is absent.
+var errZoneNotInConfig = fmt.Errorf("zone table not found in config file")
+
+// isTOMLTableHeader reports whether a line is a TOML table header ("[...]" / "[[...]]").
+func isTOMLTableHeader(line string) bool {
+	t := strings.TrimSpace(line)
+	return strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]")
 }
 
 // ValidateDomainName checks that a domain name is safe for use in file paths.

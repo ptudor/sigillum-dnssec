@@ -174,7 +174,8 @@ dnssec-tudor add example.com /path/to/zone.db --config config.toml
 # Force re-sign a domain (bypasses change detection)
 dnssec-tudor resign example.com --config config.toml
 
-# Remove a domain (keys are NOT deleted)
+# Remove a domain from state AND the config file (keys are NOT deleted).
+# A running daemon still holds the old config in memory — send it SIGHUP to reload.
 dnssec-tudor remove example.com --config config.toml
 ```
 

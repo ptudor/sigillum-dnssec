@@ -790,26 +790,49 @@ func runAdd(cmd *cobra.Command, args []string) error {
 func runRemove(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
-	_, state, unlock, err := loadConfigStateLocked()
+	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	if state.GetZone(domain) == nil {
+	zoneState := state.GetZone(domain)
+	if zoneState == nil {
 		return fmt.Errorf("domain %q is not managed", domain)
 	}
+	zonePath := zoneState.Path
 
 	slog.Info("[CLI] Removing domain from management", "domain", domain)
-	state.RemoveZone(domain)
 
+	// Transactional removal (R-008): preflight the config file is writable, remove the
+	// zone from the config FIRST (so a running daemon can't re-adopt it next cycle), then
+	// clear state. On a state-save failure, restore the config entry so the two stay
+	// consistent. Keys are never deleted — a DS at the registrar may still reference them.
+	inConfig := false
+	if _, ok := cfg.Zones[domain]; ok {
+		inConfig = true
+		if err := preflightConfigAppend(configPath); err != nil {
+			return fmt.Errorf("config file %s not writable (needed to remove the zone entry): %w", configPath, err)
+		}
+		if err := RemoveZoneFromConfigFile(configPath, domain); err != nil && err != errZoneNotInConfig {
+			return fmt.Errorf("removing zone from config file: %w", err)
+		}
+	}
+
+	state.RemoveZone(domain)
 	if err := state.Save(); err != nil {
+		if inConfig {
+			if aerr := AddZoneToConfigFile(configPath, domain, zonePath); aerr != nil {
+				slog.Error("[CLI] Rollback: failed to restore config entry after state-save failure",
+					"domain", domain, "error", aerr)
+			}
+		}
 		return fmt.Errorf("saving state: %w", err)
 	}
 
 	fmt.Printf("Domain %s removed from management.\n", domain)
-	fmt.Printf("Note: Key files were NOT deleted.\n")
-	fmt.Printf("Note: You should manually remove the zone from config.toml.\n")
+	fmt.Printf("Note: Key files were NOT deleted (a DS at your registrar may still reference them).\n")
+	fmt.Printf("Note: A running daemon still holds the old config in memory; send it SIGHUP to reload.\n")
 	return nil
 }
 
@@ -1213,6 +1236,13 @@ func runImport(cmd *cobra.Command, args []string) error {
 			"zsk_algorithm", AlgorithmName(zsk.Algorithm))
 	}
 
+	// Preflight the config append before writing any key material (R-023, mirroring add):
+	// fail now if the config file isn't writable, rather than after converting keys and
+	// signing, which would leave state and config diverged with retry blocked.
+	if err := preflightConfigAppend(configPath); err != nil {
+		return fmt.Errorf("config file %s not writable (needed to register the imported zone): %w", configPath, err)
+	}
+
 	// Save keys in our format
 	keyGen := NewKeyGenerator(cfg)
 	if err := keyGen.saveKeyFiles(domain, "ksk", ksk, kskPriv); err != nil {
@@ -1261,8 +1291,21 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	// Config file is written last — state is already consistent
+	// Config file is written last — state is already consistent. If it fails despite the
+	// preflight (e.g. a race), unwind the state so it doesn't diverge from config and a
+	// retry isn't blocked at "already managed". Converted key files are left in place (a
+	// registrar DS may reference them) with a note (R-023).
 	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+		state.RemoveZone(domain)
+		if serr := state.Save(); serr != nil {
+			slog.Error("[CLI] Rollback: failed to remove zone from state after config-append failure",
+				"domain", domain, "error", serr)
+		}
+		signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
+		if rerr := os.Remove(signedPath); rerr != nil && !os.IsNotExist(rerr) {
+			slog.Warn("[CLI] Rollback: failed to remove signed zone", "path", signedPath, "error", rerr)
+		}
+		fmt.Fprintf(os.Stderr, "note: converted key files for %s were left in %s (a registrar DS may reference them); re-run import after fixing the config file\n", domain, cfg.KeysDir())
 		return fmt.Errorf("adding zone to config file: %w", err)
 	}
 
