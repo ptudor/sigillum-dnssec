@@ -194,18 +194,14 @@ func (s *State) Save() error {
 		return fmt.Errorf("marshaling state: %w", err)
 	}
 
-	// Write to temp file first, then rename for atomicity. writeFileOwned /
-	// renameOwned preserve the target directory's uid/gid when a mutating
-	// CLI command runs as root — without this, `dnssec-tudor add` run as
-	// root leaves a state.json the daemon user can't read.
-	tempPath := s.path + ".tmp"
-	if err := writeFileOwned(tempPath, data, 0600); err != nil {
+	// Write via a UNIQUE temp file, fsync, then rename for atomicity and durability. A
+	// fixed "state.json.tmp" is shared by the daemon and any concurrent mutating CLI
+	// command; concurrent Saves to the same temp corrupt or lose state (R-002). The atomic
+	// helper preserves the target directory's uid/gid so `dnssec-tudor add` run as root
+	// leaves a state.json the daemon user can still read, and fsyncs so a crash/power loss
+	// can't leave a truncated file (R-040).
+	if err := writeFileAtomicOwned(s.path, data, 0600); err != nil {
 		return fmt.Errorf("writing state file: %w", err)
-	}
-
-	if err := renameOwned(tempPath, s.path); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("renaming state file: %w", err)
 	}
 
 	return nil

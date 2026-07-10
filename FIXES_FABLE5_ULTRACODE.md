@@ -67,3 +67,18 @@ Verification: `TestSaveKeyFiles_BackupFailureAborts` (read-only keys dir → gen
 Files: `keys.go`.
 Verification: `TestRecoverKeyState_OrphanHalf` (delete either half → error, surviving half untouched, `recoverOrGenerateKeys` refuses). Green.
 
+**R-002 — Unique temp names for the signed zone and state.json.**
+`writeSignedZone` (`sign.go`) now writes to `os.CreateTemp(dir, "."+base+".*.tmp")` instead of a fixed `<path>.tmp`, so a concurrent daemon + CLI sign of the same zone no longer O_TRUNC the same temp and publish interleaved garbage. `State.Save` (`state.go`) now writes via `writeFileAtomicOwned` (unique temp + fsync + rename, ownership preserved), which also delivers the R-040 fsync.
+Files: `sign.go`, `state.go`.
+Verification: `TestWriteSignedZone_ConcurrentUniqueTemp` — 100 iterations of two goroutines writing different record sets to the same path; the file parses cleanly every time and no `.tmp` leaks. Passes under `-race`.
+
+**R-001 — Post-sign self-verification gate before publishing.**
+Added `verifySignedZone` + `verifyNSECChainClosure`/`verifyNSEC3ChainClosure`/`walkDenialChain` (`sign.go`), called in `SignZone` between `signRecordsWithKeys` and `writeSignedZone`. It runs in-memory on the exact records to be written, reusing `findDelegationPoints`/`isOccluded` (no differential parsing): (1) every RRSIG cryptographically verifies against a published DNSKEY of matching keytag/algorithm; (2) every non-occluded/non-delegation authoritative RRset (plus DS/NSEC at delegation points) has a covering RRSIG; (3) the NSEC/NSEC3 Next pointers form one closed cycle. On any failure `SignZone` errors, so the previous signed output keeps serving (the gate runs before the atomic write — "prior output untouched" is guaranteed by ordering).
+Files: `sign.go`.
+Verification: the full existing signing suite (which signs real NSEC and NSEC3 zones with delegations/occlusion) passes with the gate active — it does not false-positive on valid zones. New `TestVerifySignedZone_Valid` plus adversarial `TestVerifySignedZone_CorruptRRSIG` (check 1), `_MissingRRSIG` (check 2), `_BrokenNSECChain` (check 3) each assert the gate rejects the break.
+
+**R-003 — Rollover signing branches now fatal on a missing old key.**
+The three warn-and-continue branches in `loadKeysForSigning` (`sign.go`) — KSK `ds_add_wait`, ZSK signing phase, algorithm `ds_add_wait` — now return a wrapped error (matching the already-fatal ZSK pre-publish branch) naming `rollover complete` for operators whose old key is legitimately gone. The ZSK signing-phase branch uses `LoadPublicKeyByID` (only the public half is needed) but is still fatal. Backup failures at rollover *start* were made fatal under R-027.
+Files: `sign.go`.
+Verification: `TestLoadKeysForSigning_MissingOldKeyIsFatal` (all three branches error when the old key's backup is absent). Full suite green under `-race`.
+
