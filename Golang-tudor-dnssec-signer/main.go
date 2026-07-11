@@ -40,6 +40,11 @@ who just want zones signed without the complexity of full-featured solutions.
 
 It watches unsigned zone files, generates keys, signs zones automatically,
 and outputs signed zones for authoritative nameservers like NSD.`,
+		// Don't dump the full usage text on an operational error (e.g. "zone not
+		// managed") — that buries the real error. Cobra still prints the error
+		// itself (SilenceErrors stays false, and main relies on that), just not
+		// the usage (R-059).
+		SilenceUsage: true,
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			setupLogging()
 		},
@@ -828,22 +833,27 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 	slog.Info("[CLI] Added zone to config file", "config", configPath)
 
-	// Print DS records - load actual key for proper DS computation
+	// Print DS records — load actual key for proper DS computation. The add has
+	// already fully committed (keys written, zone signed, state + config
+	// persisted), so a failure to load the KSK for the convenience DS printout
+	// must NOT fail the command: warn and point the operator at `ds` (R-060).
 	kskKey, err := keyGen.LoadPublicKey(domain, "ksk")
-	if err != nil {
-		return fmt.Errorf("loading KSK for DS: %w", err)
-	}
 
 	fmt.Printf("\nDomain %s added successfully.\n", domain)
 	fmt.Printf("  Config updated: %s\n", configPath)
 	fmt.Printf("  Signed zone:    %s\n\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
-	if kskGenerated {
-		fmt.Println("Add the following DS record to your registrar:")
+	if err != nil {
+		slog.Warn("[CLI] zone added, but the KSK could not be loaded to print its DS record",
+			"domain", domain, "error", err)
+		fmt.Printf("Could not print the DS record automatically; run `dnssec-tudor ds %s` to retrieve it.\n", domain)
 	} else {
-		fmt.Println("Existing keys were reused. Verify this DS record matches your registrar:")
+		if kskGenerated {
+			fmt.Println("Add the following DS record to your registrar:")
+		} else {
+			fmt.Println("Existing keys were reused. Verify this DS record matches your registrar:")
+		}
+		fmt.Println(FormatDSRecordsFromKey(domain, kskKey))
 	}
-	dsOutput := FormatDSRecordsFromKey(domain, kskKey)
-	fmt.Println(dsOutput)
 	fmt.Println("Note: a running daemon picks up the new zone after SIGHUP (config reload).")
 
 	runPostSignHook(cfg, domain, zonePath)
