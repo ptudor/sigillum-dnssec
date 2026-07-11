@@ -97,6 +97,20 @@ serial_policy = "keep"          # "keep" or "epoch" — see Serial Management
 enabled = true
 listen = "127.0.0.1:8053"
 
+# Optional registrar API integration (opt-in). `digest_type` is registrar-agnostic
+# and belongs under [registrar] itself — NOT under [registrar.dynadot]. Each
+# registrar adapter is its own sub-table; a zone binds to one via `registrar = "…"`.
+[registrar]
+# digest_type = 2               # DS digest: 2 (SHA-256, default) or 4 (SHA-384)
+
+[registrar.dynadot]
+enabled = false
+api_key = ""                    # required; keep the config file mode 0640 or stricter
+api_secret = ""                 # required; HMAC-SHA256 key for X-Signature
+sandbox = false                 # true → api-sandbox.dynadot.com
+timeout = "30s"
+auto_publish = true             # push DS automatically on add/rollover events
+
 # Zone definitions
 [zones]
 [zones."example.com"]
@@ -154,8 +168,9 @@ detection), `published_serial` is what the world sees.
 # Run in foreground
 dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
 
-# With web UI on custom port
-dnssec-tudor serve --config /etc/dnssec-tudor/config.toml --web :8080
+# With web UI on custom port (loopback only — the dashboard is unauthenticated;
+# a non-loopback --web address is refused unless web.allow_remote = true)
+dnssec-tudor serve --config /etc/dnssec-tudor/config.toml --web 127.0.0.1:8080
 ```
 
 ### One-Shot Signing

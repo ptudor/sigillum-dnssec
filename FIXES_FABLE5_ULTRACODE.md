@@ -165,3 +165,37 @@ Verification: `TestRateLimiter_BoundedByMaxBuckets` — 5000 unique fresh IPs wi
 `internal/rdap/client.go` wraps `resp.Body` in `io.LimitReader(…, 1<<20)` (mirroring the anchors loader), so a compromised/oversized RDAP endpoint can't exhaust memory.
 Files: `internal/rdap/client.go`.
 Verification: `TestQueryDomain_ResponseSizeLimited` — a valid but >1 MiB JSON object is truncated at the cap and no longer parses (fails without the limit only by buffering the whole body).
+
+---
+
+## Phase 4 — signer config validation (R-005, R-013, R-014, R-015, R-016, R-054)
+
+**R-013 — Operational durations validated positive.**
+`Config.Validate` now rejects `poll_interval <= 0`, `health.shutdown_timeout <= 0`, `validate.timeout <= 0`, and `registrar.dynadot.timeout <= 0` (all default positive via DefaultConfig). A zero/negative `poll_interval` no longer panics `time.NewTicker` at startup or crashes a running daemon on SIGHUP; zero timeouts no longer silently disable the http.Client / graceful-shutdown deadlines. Three test config builders (which bypass DefaultConfig) were updated to set the now-required durations.
+Files: `config.go`, `dnssec_test.go`, `hardening_test.go`.
+Verification: `TestConfigValidate_OperationalDurationsPositive` (each of the four zero/negative → error; defaults pass).
+
+**R-014 — Rollover durations validated and ordered; Action string de-hardcoded.**
+`Validate` now requires `rollover_prepublish > 0`, `rollover_switch > 0`, and `rollover_switch < rollover_prepublish` (naming both keys) so a swapped/collapsed pre-publish window is rejected at load. The `startZSKRollover` Action message is built from the configured `RolloverSwitch` via a new `humanizeRolloverDelay` helper instead of the literal "in 7 days".
+Files: `config.go`, `rollover.go`.
+Verification: `TestConfigValidate_RolloverDurations` (switch≥prepublish, negative, zero all rejected; defaults pass), `TestHumanizeRolloverDelay` (7d→"7 day(s)", 1s→"1s").
+
+**R-015 — Strict TOML decoding.**
+`LoadConfig` now decodes via `toml.NewDecoder(...).DisallowUnknownFields()` and surfaces `*toml.StrictMissingError`, so a typo like `signture_validity` or a key in the wrong table is a load-time error instead of a silent revert to defaults. Confirmed the signer uses `pelletier/go-toml/v2` (not BurntSushi as the docs claim — R-055), so the go-toml/v2 strict API is correct. Every key in testdata/README/QUICKSTART maps to a struct tag, so valid configs still load.
+Files: `config.go`.
+Verification: `TestLoadConfig_StrictUnknownKey` (typo'd key → error naming it), `TestLoadConfig_TestdataStillLoads` (shipped testdata/config.toml still loads).
+
+**R-016 — `digest_type` documentation corrected to the [registrar] table.**
+CLAUDE.md's `# digest_type = 2` example moved out from under `[registrar.dynadot]` to a `[registrar]` table with a note that it is registrar-agnostic (and that misplacing it is now a strict-decode error). README gained a `[registrar]`/`[registrar.dynadot]` config section (it previously documented none). The field was NOT moved in code (registrar-level is the deliberate design).
+Files: `CLAUDE.md`, `README.md`.
+Verification: `TestLoadConfig_RegistrarDigestType` — `[registrar] digest_type = 4` → `Registrar.DigestType() == 4`; `[registrar.dynadot] digest_type = 4` → strict-decode error.
+
+**R-054 — CLAUDE.md zone examples quoted.**
+Changed the three `[zones.ptudor.net]`/`[zones.ptudor.com]`/`[zones.example.org]` unquoted dotted headers to the quoted `[zones."…"]` form (the unquoted form parses as nested tables and silently registers zero zones), with a note. README already used the quoted form.
+Files: `CLAUDE.md`.
+Verification: adopting R-015 makes the unquoted form a load-time error; the quoted form matches the working `add`/testdata convention.
+
+**R-005 — `serve --web` re-enforces the loopback guard the flag bypassed.**
+`runServe` now calls `checkWebFlagListen(cfg)` after applying the `--web` override (which happens after `Config.Validate` already ran): a non-loopback `--web` address is refused unless `web.allow_remote = true`, closing the hole where `--web :8053` bound the unauthenticated dashboard on all interfaces. Docs updated to loopback forms: `CLAUDE.md`, `README.md`, `apache.conf.example`, `dnssec_signer.rc.d`.
+Files: `main.go`, `CLAUDE.md`, `README.md`, `apache.conf.example`, `dnssec_signer.rc.d`.
+Verification: `TestCheckWebFlagListen` (`:8053` rejected; `allow_remote` permits; `127.0.0.1:8053` allowed; disabled web skips).

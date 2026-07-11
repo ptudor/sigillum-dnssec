@@ -9,7 +9,8 @@
 #
 # dnssec_signer_enable="YES"
 # dnssec_signer_config="/usr/local/etc/tudordns/dnssec-signer.toml"
-# dnssec_signer_web=":8053"  # Optional: enable web UI
+# dnssec_signer_web="127.0.0.1:8053"  # Optional: enable web UI (loopback only;
+#                                     # a non-loopback address needs web.allow_remote=true)
 #
 # Create the service user and group before starting:
 #   pw groupadd -n dnssec
