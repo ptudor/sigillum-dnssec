@@ -38,8 +38,10 @@ func InitOwnershipTarget(refPath string) {
 
 	info, err := os.Stat(refPath)
 	if err != nil {
-		// data_dir might not exist yet (first add); fall back to its parent.
-		// If that fails too, we quietly skip chowning — better than blocking.
+		// data_dir may not exist yet (e.g. first `add`). We can't infer an
+		// owner to inherit, so we quietly skip chowning rather than block the
+		// command — the daemon runs as its own user and will create/own the
+		// tree itself on first start.
 		return
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -157,15 +159,4 @@ func syncDir(dir string) {
 	if err := d.Sync(); err != nil {
 		slog.Debug("[FS] Directory fsync failed", "dir", dir, "error", err)
 	}
-}
-
-// cliRootAdvisory returns a human-readable description of what the CLI is
-// about to do regarding ownership. Used by commands that want to surface
-// it in their own output (e.g. `add`) in addition to the startup warning.
-// Empty string when no adjustment will happen.
-func cliRootAdvisory() string {
-	if !ownership.active {
-		return ""
-	}
-	return fmt.Sprintf("running as root; files will be chowned to uid=%d gid=%d", ownership.uid, ownership.gid)
 }

@@ -521,8 +521,13 @@ func stripInputDNSSEC(domain string, records []dns.RR) []dns.RR {
 	return out
 }
 
-// validateZone performs sanity checks on a parsed zone
-func (s *Signer) validateZone(domain string, records []dns.RR) error {
+// validateZoneRecords is the single source of truth for the structural sanity
+// rules a zone must satisfy before signing: exactly one SOA at the apex, at
+// least one NS at the apex, and every authoritative owner name at or below the
+// apex (R-035). Both the in-memory signing path (Signer.validateZone) and the
+// file-based CLI path (ValidateZoneFile) call this so the rules can't drift
+// between `add`/`import` and signing (R-075).
+func validateZoneRecords(domain string, records []dns.RR) error {
 	apex := dns.Fqdn(domain)
 	apexLower := strings.ToLower(apex)
 
@@ -567,8 +572,14 @@ func (s *Signer) validateZone(domain string, records []dns.RR) error {
 	return nil
 }
 
-// ValidateZoneFile validates a zone file without requiring a full Signer.
-// It checks that the file is parseable and contains required records (SOA, NS at apex).
+// validateZone performs sanity checks on a parsed zone.
+func (s *Signer) validateZone(domain string, records []dns.RR) error {
+	return validateZoneRecords(domain, records)
+}
+
+// ValidateZoneFile validates a zone file without requiring a full Signer. It
+// checks that the file is parseable and satisfies the same structural rules as
+// the signing path (shared via validateZoneRecords).
 func ValidateZoneFile(domain, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -577,42 +588,17 @@ func ValidateZoneFile(domain, path string) error {
 	defer f.Close()
 
 	apex := dns.Fqdn(domain)
-	apexLower := strings.ToLower(apex)
 
-	var soaCount int
-	var nsAtApex bool
-
+	var records []dns.RR
 	zp := dns.NewZoneParser(f, apex, path)
 	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
-		name := strings.ToLower(rr.Header().Name)
-		switch rr.Header().Rrtype {
-		case dns.TypeSOA:
-			soaCount++
-			if name != apexLower {
-				return fmt.Errorf("SOA record at %s not at zone apex %s", name, apex)
-			}
-		case dns.TypeNS:
-			if name == apexLower {
-				nsAtApex = true
-			}
-		}
+		records = append(records, rr)
 	}
-
 	if err := zp.Err(); err != nil {
 		return fmt.Errorf("parsing zone file: %w", err)
 	}
 
-	if soaCount == 0 {
-		return fmt.Errorf("zone has no SOA record")
-	}
-	if soaCount > 1 {
-		return fmt.Errorf("zone has %d SOA records (must have exactly 1)", soaCount)
-	}
-	if !nsAtApex {
-		return fmt.Errorf("zone has no NS records at apex")
-	}
-
-	return nil
+	return validateZoneRecords(domain, records)
 }
 
 // delegationInfo holds information about delegation points in a zone

@@ -110,18 +110,19 @@ const (
 	ZSKRolloverStateRetired    = "retired"     // Old ZSK removed
 )
 
-// KSK rollover states (semi-automatic)
+// KSK rollover states (semi-automatic). There is no ds_remove_wait phase: once
+// the operator confirms the new DS is live, `rollover complete` clears the
+// rollover and the next sign drops the old KSK in one step.
 const (
-	KSKRolloverStateActive       = "active"         // Normal operation
-	KSKRolloverStateDSAddWait    = "ds_add_wait"    // Waiting for new DS at registrar
-	KSKRolloverStateDSRemoveWait = "ds_remove_wait" // Waiting for old DS removal
-	KSKRolloverStateComplete     = "complete"       // Rollover finished
+	KSKRolloverStateActive    = "active"      // Normal operation
+	KSKRolloverStateDSAddWait = "ds_add_wait" // Waiting for new DS at registrar
+	KSKRolloverStateComplete  = "complete"    // Rollover finished
 )
 
-// Algorithm rollover states (manual, requires DS update)
+// Algorithm rollover states (manual, requires DS update). Same single-step
+// completion as KSK — no separate ds_remove_wait phase.
 const (
-	AlgoRolloverStateDSAddWait    = "algo_ds_add_wait"    // New algorithm keys published, waiting for DS
-	AlgoRolloverStateDSRemoveWait = "algo_ds_remove_wait" // Signing with new only, waiting for old DS removal
+	AlgoRolloverStateDSAddWait = "algo_ds_add_wait" // New algorithm keys published, waiting for DS
 )
 
 // NewState creates a new empty state

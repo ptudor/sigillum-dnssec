@@ -657,19 +657,22 @@ func AlgorithmName(alg uint8) string {
 	return fmt.Sprintf("Unknown(%d)", alg)
 }
 
-// AlgorithmFromName returns the algorithm number from name.
+// AlgorithmFromName returns the algorithm number from name, restricted to the
+// three algorithms this signer can actually generate and sign with (ED25519 and
+// ECDSA P-256/P-384). RSA names are intentionally rejected: generateDNSSECKey /
+// signRRSIG cannot produce or sign RSA keys, so advertising RSASHA256/RSASHA512
+// here would be a false promise (R-062). Keep this set in lockstep with the
+// key-generation and signing code.
 // Returns an error if the algorithm name is not recognized.
 func AlgorithmFromName(name string) (uint8, error) {
 	names := map[string]uint8{
 		"ED25519":         dns.ED25519,
 		"ECDSAP256SHA256": dns.ECDSAP256SHA256,
 		"ECDSAP384SHA384": dns.ECDSAP384SHA384,
-		"RSASHA256":       dns.RSASHA256,
-		"RSASHA512":       dns.RSASHA512,
 	}
 	alg, ok := names[name]
 	if !ok {
-		return 0, fmt.Errorf("unknown algorithm: %q", name)
+		return 0, fmt.Errorf("unsupported algorithm: %q (supported: ED25519, ECDSAP256SHA256, ECDSAP384SHA384)", name)
 	}
 	return alg, nil
 }

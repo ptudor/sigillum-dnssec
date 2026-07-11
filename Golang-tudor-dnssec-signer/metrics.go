@@ -2,6 +2,7 @@ package main
 
 import (
 	"expvar"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -12,6 +13,7 @@ var (
 	expvarZonesTotal          = expvar.NewInt("dnssec_zones_total")
 	expvarZonesHealthy        = expvar.NewInt("dnssec_zones_healthy")
 	expvarZonesActionRequired = expvar.NewInt("dnssec_zones_action_required")
+	expvarZonesWarning        = expvar.NewInt("dnssec_zones_warning")
 	expvarZonesErrors         = expvar.NewInt("dnssec_zones_errors")
 	expvarSigningOpsSuccess   = expvar.NewInt("dnssec_signing_operations_success")
 	expvarSigningOpsFailure   = expvar.NewInt("dnssec_signing_operations_failure")
@@ -36,6 +38,12 @@ var (
 		Namespace: "dnssec_tudor",
 		Name:      "zones_action_required",
 		Help:      "Number of zones requiring action (e.g., DS update)",
+	})
+
+	zonesWarning = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "dnssec_tudor",
+		Name:      "zones_warning",
+		Help:      "Number of zones in warning state (attention needed soon)",
 	})
 
 	zonesWithErrors = promauto.NewGauge(prometheus.GaugeOpts{
@@ -111,21 +119,51 @@ var (
 	}, []string{"hook"})
 )
 
+// exportedDomains tracks the per-domain metric series currently published so
+// UpdateZoneMetrics can delete the series of zones that have left the state.
+// Without this, a removed/renamed zone keeps its last per-domain gauge value
+// forever — an expiry timestamp frozen in the past becomes a permanent false
+// "signatures expired" alert, and label cardinality only grows (R-042).
+var (
+	exportedDomainsMu sync.Mutex
+	exportedDomains   = map[string]struct{}{}
+)
+
+// deleteZoneMetrics removes every per-domain metric series for a domain that is
+// no longer managed. DeletePartialMatch clears all series carrying the domain
+// label regardless of the other labels (type/status/action), so a single call
+// per vec covers the multi-label rollover/signing series too.
+func deleteZoneMetrics(domain string) {
+	labels := prometheus.Labels{"domain": domain}
+	lastSigningTimestamp.DeletePartialMatch(labels)
+	signatureExpiryTimestamp.DeletePartialMatch(labels)
+	kskExpiryTimestamp.DeletePartialMatch(labels)
+	zskExpiryTimestamp.DeletePartialMatch(labels)
+	rolloversInProgress.DeletePartialMatch(labels)
+	signingOperationsTotal.DeletePartialMatch(labels)
+	signingDurationSeconds.DeletePartialMatch(labels)
+	rolloverOperationsTotal.DeletePartialMatch(labels)
+}
+
 // UpdateZoneMetrics updates all zone-related metrics from state
 func UpdateZoneMetrics(state *State) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
-	var total, healthy, actionRequired, errors int
+	var total, healthy, actionRequired, warning, errors int
+	current := make(map[string]struct{}, len(state.Zones))
 
 	for domain, zone := range state.Zones {
 		total++
+		current[domain] = struct{}{}
 		status := zone.Status()
 		switch status {
 		case "healthy":
 			healthy++
 		case "action_required":
 			actionRequired++
+		case "warning":
+			warning++
 		case "error":
 			errors++
 		}
@@ -158,13 +196,26 @@ func UpdateZoneMetrics(state *State) {
 	zonesTotal.Set(float64(total))
 	zonesHealthy.Set(float64(healthy))
 	zonesActionRequired.Set(float64(actionRequired))
+	zonesWarning.Set(float64(warning))
 	zonesWithErrors.Set(float64(errors))
 
 	// Update expvar metrics to mirror Prometheus
 	expvarZonesTotal.Set(int64(total))
 	expvarZonesHealthy.Set(int64(healthy))
 	expvarZonesActionRequired.Set(int64(actionRequired))
+	expvarZonesWarning.Set(int64(warning))
 	expvarZonesErrors.Set(int64(errors))
+
+	// Drop per-domain series for zones no longer in state so a removed zone's
+	// gauges (esp. signature-expiry) don't linger as permanent false alerts.
+	exportedDomainsMu.Lock()
+	for domain := range exportedDomains {
+		if _, ok := current[domain]; !ok {
+			deleteZoneMetrics(domain)
+		}
+	}
+	exportedDomains = current
+	exportedDomainsMu.Unlock()
 }
 
 // RecordSigningOperation records metrics for a signing operation
