@@ -125,8 +125,8 @@
 <body>
     <h1>dnssec-tudor</h1>
     <p class="subtitle">DNSSEC Signing Dashboard
-        {{if .Validation}}<a href="/" style="margin-left:1rem;color:var(--text-dim);font-size:0.875rem;">Hide Validation</a>
-        {{else}}<a href="/?validate=true" style="margin-left:1rem;color:var(--accent);font-size:0.875rem;">Validate Now</a>
+        {{if .Validation}}<a href="?" style="margin-left:1rem;color:var(--text-dim);font-size:0.875rem;">Hide Validation</a>
+        {{else}}<a href="?validate=true" style="margin-left:1rem;color:var(--accent);font-size:0.875rem;">Validate Now</a>
         {{end}}
     </p>
 

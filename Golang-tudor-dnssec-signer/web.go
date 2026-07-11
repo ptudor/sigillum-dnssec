@@ -7,8 +7,76 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
+
+// Live-DNS validation of every zone is expensive (NS + DS/DNSKEY/SOA queries
+// per zone, each with a multi-second timeout). Running it inline in the request
+// on every `?validate=true` / `/api/validate` hit lets a client trigger repeated
+// many-second, many-query runs and can blow past the 30s WriteTimeout. These
+// bound it (R-043): results are cached for a short TTL, only one validation runs
+// at a time (single-flight), and a request waits at most validationMaxWait for a
+// fresh result before returning whatever is cached (possibly stale/nil) while
+// the run finishes in the background.
+const (
+	validationCacheTTL = 30 * time.Second
+	validationMaxWait  = 20 * time.Second // < the 30s WriteTimeout
+)
+
+type validationCache struct {
+	mu       sync.Mutex
+	result   *ValidateOutput
+	computed time.Time
+	inflight chan struct{} // non-nil while a computation runs; closed on completion
+}
+
+var dashboardValidationCache = &validationCache{}
+
+// get returns a recent ValidateAll result. It serves a fresh cached result
+// immediately, runs at most one computation at a time, and never blocks the
+// caller longer than maxWait — on timeout it returns the last cached result
+// (which may be nil on a cold start) while the in-flight computation continues.
+func (c *validationCache) get(compute func() *ValidateOutput, ttl, maxWait time.Duration) *ValidateOutput {
+	c.mu.Lock()
+	if c.result != nil && time.Since(c.computed) < ttl {
+		r := c.result
+		c.mu.Unlock()
+		return r
+	}
+	done := c.inflight
+	if done == nil {
+		done = make(chan struct{})
+		c.inflight = done
+		go func() {
+			out := compute()
+			c.mu.Lock()
+			c.result = out
+			c.computed = time.Now()
+			c.inflight = nil
+			c.mu.Unlock()
+			close(done)
+		}()
+	}
+	stale := c.result
+	c.mu.Unlock()
+
+	select {
+	case <-done:
+		c.mu.Lock()
+		r := c.result
+		c.mu.Unlock()
+		return r
+	case <-time.After(maxWait):
+		return stale // may be nil; the background run will refresh the cache
+	}
+}
+
+// cachedValidateAll is the bounded entry point the web handlers use instead of
+// calling v.ValidateAll() directly.
+func cachedValidateAll(v *Validator) *ValidateOutput {
+	return dashboardValidationCache.get(v.ValidateAll, validationCacheTTL, validationMaxWait)
+}
 
 //go:embed templates/*.html
 var templateFS embed.FS
@@ -108,21 +176,24 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state
 		}
 	}
 
-	// Run validation if requested via query parameter
+	// Run validation if requested via query parameter (bounded + cached, R-043).
 	var validation map[string]*ValidationResult
 	if r.URL.Query().Get("validate") == "true" {
 		v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
-		valOutput := v.ValidateAll()
-		validation = valOutput.Zones
+		if valOutput := cachedValidateAll(v); valOutput != nil {
+			validation = valOutput.Zones
+		}
 	}
 
+	// The template renders no secret-bearing config fields, so the full *Config
+	// (which holds the Dynadot api_key/api_secret and heartbeat api_key) is
+	// deliberately NOT passed to the template — only the data the dashboard
+	// actually needs (R-067).
 	data := struct {
-		Config     *Config
 		Status     *StatusOutput
 		DSRecords  map[string]string
 		Validation map[string]*ValidationResult
 	}{
-		Config:     cfg,
 		Status:     status,
 		DSRecords:  dsRecords,
 		Validation: validation,
@@ -193,11 +264,17 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *
 }
 
 func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
-	w.Header().Set("Content-Type", "application/json")
-
 	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
-	output := v.ValidateAll()
+	output := cachedValidateAll(v) // bounded + cached (R-043)
+	if output == nil {
+		// Cold start still running past the wait budget — tell the client to retry
+		// rather than block the handler or emit a null body.
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "validation in progress, retry shortly", http.StatusServiceUnavailable)
+		return
+	}
 
+	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(output); err != nil {
 		slog.Debug("[WEB] Failed to encode validation response", "error", err)
 	}
