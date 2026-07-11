@@ -536,10 +536,13 @@ func TestHealthEndpoints_SecurityHeaders(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// R53-012: Non-destructive health checks
+// R53-012 / R-071: health check writability probe. R-071 changed the check
+// from inspecting the owner-write mode bit (which gave false 503s for a
+// group-writable dir the daemon can write) to an actual temp-file
+// create/remove — still artifact-free (it cleans up), just accurate.
 // ---------------------------------------------------------------------------
 
-func TestCheckDirWritable_StatBased(t *testing.T) {
+func TestCheckDirWritable(t *testing.T) {
 	t.Run("writable directory passes", func(t *testing.T) {
 		dir := t.TempDir()
 		if err := checkDirWritable(dir); err != nil {
@@ -567,17 +570,19 @@ func TestCheckDirWritable_StatBased(t *testing.T) {
 		}
 	})
 
-	t.Run("no temp files created during check", func(t *testing.T) {
+	t.Run("write probe leaves no artifacts", func(t *testing.T) {
 		dir := t.TempDir()
-		// Count files before
 		before, _ := os.ReadDir(dir)
 
-		_ = checkDirWritable(dir)
+		if err := checkDirWritable(dir); err != nil {
+			t.Fatalf("writable dir should pass: %v", err)
+		}
 
-		// Count files after
+		// The probe may create a temp file transiently, but must remove it —
+		// no net files remain after the check.
 		after, _ := os.ReadDir(dir)
 		if len(after) != len(before) {
-			t.Error("health check should not create any files")
+			t.Errorf("write probe must clean up its temp file; before=%d after=%d", len(before), len(after))
 		}
 	})
 }

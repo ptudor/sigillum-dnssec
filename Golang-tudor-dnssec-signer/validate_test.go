@@ -416,3 +416,104 @@ func TestValidateZoneNotFound(t *testing.T) {
 		t.Error("expected errors for nonexistent zone")
 	}
 }
+
+// TestQueryDirect_RetriesTCPOnTruncation (R-050): a UDP answer with TC=1 must
+// trigger a TCP retry so large DNSKEY/RRSIG answers aren't silently lost.
+func TestQueryDirect_RetriesTCPOnTruncation(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("udp listen: %v", err)
+	}
+	addr := pc.LocalAddr().String()
+	ln, err := net.Listen("tcp", addr) // same host:port, TCP side
+	if err != nil {
+		t.Fatalf("tcp listen: %v", err)
+	}
+
+	// UDP: reply truncated with no answer. TCP: reply with the full DNSKEY.
+	udpSrv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Truncated = true
+		w.WriteMsg(m)
+	})}
+	tcpSrv := &dns.Server{Listener: ln, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = append(m.Answer, &dns.DNSKEY{
+			Hdr:       dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
+			Flags:     257,
+			Protocol:  3,
+			Algorithm: dns.ED25519,
+			PublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		})
+		w.WriteMsg(m)
+	})}
+	go udpSrv.ActivateAndServe()
+	go tcpSrv.ActivateAndServe()
+	time.Sleep(10 * time.Millisecond)
+	defer udpSrv.Shutdown()
+	defer tcpSrv.Shutdown()
+
+	msg, err := queryDirect(addr, "example.com.", dns.TypeDNSKEY, 2*time.Second)
+	if err != nil {
+		t.Fatalf("queryDirect: %v", err)
+	}
+	if msg.Truncated {
+		t.Error("expected the non-truncated TCP answer after retry")
+	}
+	if len(msg.Answer) == 0 {
+		t.Error("expected the full DNSKEY answer from the TCP retry, got none")
+	}
+}
+
+// TestResolveNS_CaseInsensitiveGlue (R-051): glue whose owner name differs only
+// in case from the NS target must still be matched (DNS names are
+// case-insensitive).
+func TestResolveNS_CaseInsensitiveGlue(t *testing.T) {
+	addr, cleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if r.Question[0].Qtype == dns.TypeNS {
+			m.Answer = append(m.Answer, &dns.NS{
+				Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 3600},
+				Ns:  "ns1.example.com.",
+			})
+			// Glue with an UPPERCASE owner name (different case than the NS target).
+			m.Extra = append(m.Extra, &dns.A{
+				Hdr: dns.RR_Header{Name: "NS1.EXAMPLE.COM.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 3600},
+				A:   net.ParseIP("192.0.2.53"),
+			})
+		}
+		w.WriteMsg(m)
+	})
+	defer cleanup()
+
+	v := &Validator{resolver: addr, timeout: 2 * time.Second}
+	got, err := v.resolveNS("example.com")
+	if err != nil {
+		t.Fatalf("resolveNS: %v", err)
+	}
+	if got != "192.0.2.53:53" {
+		t.Errorf("expected case-insensitively matched glue 192.0.2.53:53, got %q", got)
+	}
+}
+
+// TestResolverReachable (R-049): a responding resolver is reachable; a
+// blackholed one is not — the distinction lets ValidateZone avoid mislabeling a
+// validator-side resolver outage as a bogus zone.
+func TestResolverReachable(t *testing.T) {
+	addr, cleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		w.WriteMsg(m)
+	})
+	defer cleanup()
+
+	if !(&Validator{resolver: addr, timeout: 2 * time.Second}).resolverReachable() {
+		t.Error("a responding resolver must be reported reachable")
+	}
+	if (&Validator{resolver: "192.0.2.1:53", timeout: 200 * time.Millisecond}).resolverReachable() {
+		t.Error("a blackholed resolver (TEST-NET-1) must be reported unreachable")
+	}
+}

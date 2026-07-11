@@ -209,12 +209,21 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 	)
 
 	// Override: if the authoritative NS is unreachable, the zone is broken
-	// regardless of whether DS exists at the parent. Validating resolvers
-	// will return SERVFAIL for every query to this zone.
+	// regardless of whether DS exists at the parent — validating resolvers will
+	// SERVFAIL every query to this zone. But an all-error state looks identical
+	// when it's OUR local resolver that is down, which is a validator-side
+	// problem, not a zone failure. Probe the resolver to tell them apart so we
+	// don't mislabel a resolver outage as a bogus zone (R-049).
 	if result.DNSKEYCheck.Status == "error" &&
 		result.RRSIGCheck.Status == "error" &&
 		result.SOACheck.Status == "error" {
-		result.Overall = "fail"
+		if v.resolverReachable() {
+			result.Overall = "fail"
+		} else {
+			result.Overall = "error"
+			result.Errors = append(result.Errors,
+				"all checks errored and the local resolver did not respond — this is likely a validator-side resolver problem, not a zone failure")
+		}
 	}
 
 	// Override: a zone whose parent publishes a DS (so resolvers WILL try to
@@ -592,15 +601,17 @@ func (v *Validator) resolveNS(zone string) (string, error) {
 	// Try to resolve each NS to an address — IPv4 first, then IPv6 so
 	// IPv6-only nameservers can still be validated.
 	for _, nsName := range nsNames {
-		// Check additional section first
+		// Check additional section (glue) first. DNS names are case-insensitive
+		// (RFC 4034 §6.1), so compare canonically — a server that preserves the
+		// original case in glue would otherwise miss this fast path (R-051).
 		for _, rr := range r.Extra {
 			switch addr := rr.(type) {
 			case *dns.A:
-				if dns.Fqdn(addr.Hdr.Name) == dns.Fqdn(nsName) {
+				if dns.CanonicalName(addr.Hdr.Name) == dns.CanonicalName(nsName) {
 					return net.JoinHostPort(addr.A.String(), "53"), nil
 				}
 			case *dns.AAAA:
-				if dns.Fqdn(addr.Hdr.Name) == dns.Fqdn(nsName) {
+				if dns.CanonicalName(addr.Hdr.Name) == dns.CanonicalName(nsName) {
 					return net.JoinHostPort(addr.AAAA.String(), "53"), nil
 				}
 			}
@@ -650,6 +661,20 @@ func (v *Validator) resolverAddr() string {
 	return "1.1.1.1:53"
 }
 
+// resolverReachable does a lightweight sanity query (root NS, RD=1) against the
+// configured resolver to distinguish a local-resolver outage from an
+// authoritative-side failure (R-049). Any answer at all (even SERVFAIL) means
+// the resolver is up; a transport error means it is not.
+func (v *Validator) resolverReachable() bool {
+	m := new(dns.Msg)
+	m.SetQuestion(".", dns.TypeNS)
+	m.RecursionDesired = true
+	c := new(dns.Client)
+	c.Timeout = v.timeout
+	_, _, err := c.Exchange(m, v.resolverAddr())
+	return err == nil
+}
+
 // queryDirect sends a DNS query directly to a specific server with the DO (DNSSEC OK) bit set.
 func queryDirect(server, qname string, qtype uint16, timeout time.Duration) (*dns.Msg, error) {
 	m := new(dns.Msg)
@@ -663,6 +688,17 @@ func queryDirect(server, qname string, qtype uint16, timeout time.Duration) (*dn
 	r, _, err := c.Exchange(m, server)
 	if err != nil {
 		return nil, err
+	}
+
+	// A large DNSKEY/RRSIG answer can exceed the UDP buffer; on TC=1 the server
+	// signals "retry over TCP". Without this we'd silently lose records and the
+	// downstream checks would misreport (R-050).
+	if r.Truncated {
+		c.Net = "tcp"
+		r, _, err = c.Exchange(m, server)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if r.Rcode != dns.RcodeSuccess {
