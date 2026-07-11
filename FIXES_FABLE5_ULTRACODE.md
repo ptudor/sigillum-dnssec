@@ -199,3 +199,22 @@ Verification: adopting R-015 makes the unquoted form a load-time error; the quot
 `runServe` now calls `checkWebFlagListen(cfg)` after applying the `--web` override (which happens after `Config.Validate` already ran): a non-loopback `--web` address is refused unless `web.allow_remote = true`, closing the hole where `--web :8053` bound the unauthenticated dashboard on all interfaces. Docs updated to loopback forms: `CLAUDE.md`, `README.md`, `apache.conf.example`, `dnssec_signer.rc.d`.
 Files: `main.go`, `CLAUDE.md`, `README.md`, `apache.conf.example`, `dnssec_signer.rc.d`.
 Verification: `TestCheckWebFlagListen` (`:8053` rejected; `allow_remote` permits; `127.0.0.1:8053` allowed; disabled web skips).
+
+---
+
+## Phase 5 — signer `validate` command verdicts (R-012, R-045, R-046, R-047, R-048)
+
+**R-045 / R-046 / R-047 — DS check: both digests, rollover-aware, no fail-open.**
+`checkDSAtParent` now takes the set of acceptable KSKs (the current KSK plus, during a KSK/algorithm rollover, the old KSK loaded by `LoadPublicKeyByID` — mirroring `BuildDSSet`) and a `kskUnloadable` flag. The pure `evaluateDSMatch` helper computes each acceptable KSK's DS in BOTH SHA-256 and SHA-384 and matches the parent DS against any of them (R-045: a SHA-384-only parent no longer false-fails; R-046: an `ds_add_wait` parent holding only the old DS no longer false-fails). When no local KSK can be loaded but a DS exists, the status is `error`, not a fail-open `pass` (R-047).
+Files: `validate.go`, `validate_test.go` (call-site signature).
+Verification: `TestEvaluateDSMatch` — SHA-384 DS matches; old-KSK DS matches during rollover; unloadable KSK → error (not pass); no/non-matching DS → fail.
+
+**R-048 — bogus zone no longer reported "partial".**
+`bogusWhenDSPresent` downgrades the overall verdict to `fail` when the parent publishes a DS but the DNSKEY or RRSIG check failed (a SERVFAIL/bogus condition), applied as an override in `ValidateZone`. The `{pass,partial,fail,error}` vocabulary and `computeOverall` are unchanged.
+Files: `validate.go`.
+Verification: `TestBogusWhenDSPresent` — DS-found + DNSKEY/RRSIG fail → fail; DS-found + both pass → unchanged; no DS → unchanged.
+
+**R-012 — expired signatures are no longer a false "pass".**
+`checkRRSIGPresent` now evaluates temporal validity via the pure `evalRRSIGCover` (RFC 1982 arithmetic through `RRSIG.ValidityPeriod`), and — when the local key tag is known — only counts an RRSIG whose KeyTag matches (SOA↔ZSK, DNSKEY↔KSK). An out-of-window RRSIG sets neither `SOASigned` nor `DNSKEYSigned`; a present-but-expired signature is a hard `fail` naming the expiry (resolvers SERVFAIL); a valid signature within `signature_refresh` of expiry is `partial`. JSON field names / status vocabulary unchanged.
+Files: `validate.go`.
+Verification: `TestEvalRRSIGCover` — in-window counts; expired does not; foreign key tag ignored when tag known; unknown tag accepts any signer.
