@@ -451,7 +451,14 @@ func recoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *KeyState, 
 func (kg *KeyGenerator) LoadKeyPair(domain, keyType string) (*dns.DNSKEY, []byte, error) {
 	keysDir := kg.cfg.KeysDir()
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
-	return kg.loadKeyPairFromPath(baseName)
+	dnskey, priv, err := kg.loadKeyPairFromPath(baseName)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateLoadedKey(dnskey, domain, keyType); err != nil {
+		return nil, nil, fmt.Errorf("%s key for %s: %w", keyType, domain, err)
+	}
+	return dnskey, priv, nil
 }
 
 // LoadPublicKey loads only the public half of a key. Callers that just need
@@ -460,14 +467,28 @@ func (kg *KeyGenerator) LoadKeyPair(domain, keyType string) (*dns.DNSKEY, []byte
 // files aren't read — and don't need to be readable — on those paths.
 func (kg *KeyGenerator) LoadPublicKey(domain, keyType string) (*dns.DNSKEY, error) {
 	keysDir := kg.cfg.KeysDir()
-	return kg.loadPublicKeyFromPath(filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType)))
+	dnskey, err := kg.loadPublicKeyFromPath(filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType)))
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLoadedKey(dnskey, domain, keyType); err != nil {
+		return nil, fmt.Errorf("%s key for %s: %w", keyType, domain, err)
+	}
+	return dnskey, nil
 }
 
 // LoadPublicKeyByID loads the public half of a backed-up key by its key tag
 // (the rollover backup naming convention: <domain>.<type>.<tag>.key).
 func (kg *KeyGenerator) LoadPublicKeyByID(domain, keyType string, keyID uint16) (*dns.DNSKEY, error) {
 	keysDir := kg.cfg.KeysDir()
-	return kg.loadPublicKeyFromPath(filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID)))
+	dnskey, err := kg.loadPublicKeyFromPath(filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID)))
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLoadedKey(dnskey, domain, keyType); err != nil {
+		return nil, fmt.Errorf("%s key %d for %s: %w", keyType, keyID, domain, err)
+	}
+	return dnskey, nil
 }
 
 func (kg *KeyGenerator) loadPublicKeyFromPath(baseName string) (*dns.DNSKEY, error) {
@@ -482,6 +503,36 @@ func (kg *KeyGenerator) loadPublicKeyFromPath(baseName string) (*dns.DNSKEY, err
 	return dnskey, nil
 }
 
+// validateLoadedKey rejects a DNSKEY loaded from disk that does not match the
+// domain and role it was loaded for: the owner name must be the zone apex, the
+// flags must match the role (257 for a KSK, 256 for a ZSK), and the algorithm
+// must be one this signer supports. Without this a wrong file — a mismatched
+// owner, a ZSK in a KSK slot, or an unexpected algorithm — would be used
+// silently (R-061). The signer's own generated keys always satisfy this.
+func validateLoadedKey(dnskey *dns.DNSKEY, domain, keyType string) error {
+	if !strings.EqualFold(dnskey.Hdr.Name, dns.Fqdn(domain)) {
+		return fmt.Errorf("key owner %q does not match zone %q", dnskey.Hdr.Name, dns.Fqdn(domain))
+	}
+	var wantFlags uint16
+	switch keyType {
+	case "ksk":
+		wantFlags = 257
+	case "zsk":
+		wantFlags = 256
+	default:
+		return fmt.Errorf("unknown key role %q", keyType)
+	}
+	if dnskey.Flags != wantFlags {
+		return fmt.Errorf("key flags %d do not match role %q (want %d)", dnskey.Flags, keyType, wantFlags)
+	}
+	switch dnskey.Algorithm {
+	case dns.ED25519, dns.ECDSAP256SHA256, dns.ECDSAP384SHA384:
+	default:
+		return fmt.Errorf("unsupported key algorithm %d in %s key for %s", dnskey.Algorithm, keyType, domain)
+	}
+	return nil
+}
+
 // fileExists reports whether path exists (as any file type).
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
@@ -492,7 +543,14 @@ func fileExists(path string) bool {
 func (kg *KeyGenerator) loadKeyPairByID(domain, keyType string, keyID uint16) (*dns.DNSKEY, []byte, error) {
 	keysDir := kg.cfg.KeysDir()
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
-	return kg.loadKeyPairFromPath(baseName)
+	dnskey, priv, err := kg.loadKeyPairFromPath(baseName)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateLoadedKey(dnskey, domain, keyType); err != nil {
+		return nil, nil, fmt.Errorf("%s key %d for %s: %w", keyType, keyID, domain, err)
+	}
+	return dnskey, priv, nil
 }
 
 // loadKeyPairFromPath loads a key pair from the given base path
