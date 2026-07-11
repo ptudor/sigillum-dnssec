@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -47,10 +48,13 @@ func tierDelay(count int) time.Duration {
 	}
 }
 
-// gate blocks until the caller is allowed to issue its next request. Safe
-// for concurrent callers — the mutex is held across the sleep on purpose,
-// which serializes callers (exactly what a rate limiter wants).
-func (l *slidingLimiter) gate() {
+// gate blocks until the caller is allowed to issue its next request, or until
+// ctx is cancelled (in which case it returns ctx.Err() and does not consume a
+// slot). Safe for concurrent callers — the mutex is held across the wait on
+// purpose, which serializes callers (exactly what a rate limiter wants).
+// Honoring ctx keeps a graceful shutdown or a caller deadline from being stuck
+// behind the 2s throttle tier (R-073).
+func (l *slidingLimiter) gate(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -64,12 +68,18 @@ func (l *slidingLimiter) gate() {
 
 	if !l.last.IsZero() {
 		minGap := tierDelay(l.count)
-		elapsed := now.Sub(l.last)
-		if elapsed < minGap {
-			time.Sleep(minGap - elapsed)
+		if wait := minGap - now.Sub(l.last); wait > 0 {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 
 	l.count++
 	l.last = time.Now()
+	return nil
 }

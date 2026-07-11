@@ -20,6 +20,10 @@ import (
 	"github.com/miekg/dns"
 )
 
+// sharedDynadotLimiter is the process-wide Dynadot rate limiter. Shared by
+// every DynadotClient so the sliding window spans operations (R-073).
+var sharedDynadotLimiter = newSlidingLimiter()
+
 // DynadotClient talks to Dynadot's restful/v2 API.
 //
 // Authentication uses two separate credentials:
@@ -96,7 +100,11 @@ func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
 		userAgent:     ua,
 		sendRequestID: cfg.SendRequestID,
 		http:          &http.Client{Timeout: timeout},
-		limiter:       newSlidingLimiter(),
+		// Share ONE limiter across every DynadotClient in the process: RegistrarFor
+		// builds a fresh client per call, so a per-client limiter would reset the
+		// sliding window on each operation and never actually throttle a bulk push
+		// across operations. One Dynadot account == one rate budget (R-073).
+		limiter: sharedDynadotLimiter,
 	}, nil
 }
 
@@ -185,8 +193,12 @@ func (e *apiError) bestErrorMessage() string {
 func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
 	// Gate every outgoing request through the sliding-scale limiter so
 	// bursts self-throttle before Dynadot's 60/min cap kicks in with a 429.
+	// The limiter honors ctx, so a cancelled/expired caller isn't stuck behind
+	// the throttle (R-073).
 	if c.limiter != nil {
-		c.limiter.gate()
+		if err := c.limiter.gate(ctx); err != nil {
+			return nil, fmt.Errorf("rate limiter wait cancelled: %w", err)
+		}
 	}
 
 	var bodyBytes []byte

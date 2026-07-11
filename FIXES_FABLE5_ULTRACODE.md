@@ -289,3 +289,13 @@ Verification: `grep -rn BurntSushi --include='*.md'` across the repo returns onl
 `generateKey` accepted whatever 16-bit key tag a fresh key got, with no check — a collision (≈1/65536, a when-not-if across many zones and 90-day ZSK rollovers) corrupts rollover identity (OldKeyID == NewKeyID), clobbers a tag-named backup, and makes Dynadot's upsert-by-key_tag replace the old DS instead of adding. It now regenerates (bounded, 10 attempts) while the new tag collides, via a pure `tagInUse` predicate over `existingKeyTags` (the live KSK/ZSK tags plus every backed-up key file's tag — which also covers a rollover's old key, backed up as `<domain>.<type>.<tag>.key`). Separately, `rollover.backupKey` now refuses to overwrite an existing backup that holds *different* key material (an identical re-backup stays idempotent). `KeyState.ID == keytag`, backup naming, and DS formats are unchanged; collisions are debug-logged.
 Files: `keys.go`, `rollover.go`, `keys_lowfindings_test.go`.
 Verification: `TestExistingKeyTags` (live + backup tags collected; `tagInUse` membership), `TestBackupKey_RefusesDifferingBackup` (differing backup refused and untouched; identical re-backup idempotent).
+
+**R-072 — `dynadot-probe.sh` no longer prints the API key and runs on bash 3.2.**
+The probe echoed the full `string_to_sign` (which begins with the API key) to stdout, and used the bash-4-only `${1,,}` lowercasing that fails on macOS's default bash 3.2. The displayed string-to-sign now redacts the key to `<api_key>` (the real key still goes into the HMAC and the Authorization header), and `dnssec_path` lowercases via `tr`.
+Files: `scripts/dynadot-probe.sh`.
+Verification: `bash -n` clean; no remaining `${var,,}`/`${var^^}` constructs; the printed string-to-sign shows `<api_key>` not the credential.
+
+**R-073 — One shared Dynadot rate limiter; `gate` honors context.**
+Each `RegistrarFor` built a fresh `DynadotClient` with a fresh limiter, so the sliding window reset every operation and never actually throttled a bulk push across operations; and `gate()` slept without observing cancellation. Now `NewDynadotClient` uses a process-wide `sharedDynadotLimiter` (one Dynadot account == one rate budget), and `gate(ctx)` selects on `ctx.Done()` — returning the context error and consuming no slot on cancellation, so a graceful shutdown or an expired caller deadline isn't stuck behind the 2s throttle tier (this also stops the limiter from silently burning the R-004 restore budget).
+Files: `registrar_ratelimit.go`, `registrar_dynadot.go`, `registrar_ratelimit_test.go`.
+Verification: `TestSlidingLimiter_HonorsContext` (a cancelled ctx makes gate return the error and consume no slot); existing tier/gap/idle-reset tests still pass.
