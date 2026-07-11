@@ -72,7 +72,23 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 	})
 
 	RecordRolloverOperation(domain, "ksk", "start")
-	return rm.state.Save()
+	if err := rm.state.Save(); err != nil {
+		// R-038: the key files are already rotated (live = new KSK) but the state
+		// did not persist. Revert the in-memory rollover and restore the old KSK
+		// files so the next sign doesn't publish a KSK the parent DS doesn't
+		// reference (→ SERVFAIL) with no rollover record to recover from.
+		rm.state.Mutate(func() {
+			zoneState.KSK = oldKSK
+			zoneState.Rollover = nil
+			zoneState.ForceResign = false
+		})
+		if rerr := rm.restoreKeyFromBackup(domain, "ksk", oldKSK.ID); rerr != nil {
+			slog.Error("[ROLLOVER] CRITICAL: could not restore old KSK files after a failed rollover-start save; manual recovery required",
+				"domain", domain, "save_error", err, "restore_error", rerr)
+		}
+		return fmt.Errorf("saving KSK rollover state (key rotation rolled back): %w", err)
+	}
+	return nil
 }
 
 // CompleteKSKRollover finalizes a KSK rollover
@@ -140,6 +156,23 @@ func (rm *RolloverManager) CheckZSKRollover(domain string) error {
 		return rm.handleZSKRolloverState(domain, zoneState)
 	}
 
+	// A KSK/algorithm rollover occupies the single Rollover slot, so an automatic
+	// ZSK rollover cannot start while one is pending (a KSK rollover often sits in
+	// ds_add_wait for days awaiting a manual parent-DS update). Surface a warning
+	// when the ZSK is due rather than letting it silently age past its lifetime
+	// with no signal (R-041).
+	if zoneState.Rollover != nil {
+		if daysUntilExpiry <= prepublishDays {
+			rm.state.Mutate(func() {
+				zoneState.AddWarning(fmt.Sprintf(
+					"ZSK rollover is due (expires in ~%.0f days) but is blocked by the in-progress %s rollover; complete that rollover to resume automatic ZSK rollover",
+					daysUntilExpiry, zoneState.Rollover.Type))
+			})
+			return rm.state.Save()
+		}
+		return nil
+	}
+
 	// Start a rollover once inside the prepublish window — including when
 	// the ZSK is already past its expiry date (e.g. the daemon was down
 	// across the window). The old `daysUntilExpiry > 0` guard meant an
@@ -168,9 +201,13 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState)
 		return fmt.Errorf("backing up old ZSK before rollover: %w", err)
 	}
 
-	// Generate new ZSK
+	// Generate the new ZSK with the EXISTING ZSK's algorithm, not the current
+	// config default (R-039). If the operator changed [dnssec].algorithm after
+	// the zone was signed, GenerateZSK would mint a new ZSK in the new algorithm
+	// while the KSK stays the old one — an unintended algorithm mismatch that
+	// must instead go through the dedicated `rollover algorithm` flow.
 	keyGen := NewKeyGenerator(rm.cfg)
-	newZSK, err := keyGen.GenerateZSK(domain)
+	newZSK, err := keyGen.GenerateZSKWithAlgorithm(domain, oldZSK.Algorithm)
 	if err != nil {
 		return fmt.Errorf("generating new ZSK: %w", err)
 	}
@@ -205,63 +242,111 @@ func humanizeRolloverDelay(d time.Duration) string {
 	return d.String()
 }
 
+// dnskeyTTLFloor is the minimum time that must elapse after a phase's DNSKEY
+// RRset is published before the rollover advances, so resolvers have had time to
+// (a) cache the pre-published key and (b) let cached RRSIGs by the retiring key
+// age out. Uses the configured DNSKEY TTL, with a conservative 24h fallback when
+// it is 0 (which means "use the SOA TTL"). R-011.
+func (rm *RolloverManager) dnskeyTTLFloor() time.Duration {
+	ttl := time.Duration(rm.cfg.DNSSEC.DNSKEYTtl) * time.Second
+	if ttl <= 0 {
+		return 24 * time.Hour
+	}
+	return ttl
+}
+
 func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *ZoneState) error {
 	rollover := zoneState.Rollover
 	now := time.Now().UTC()
-	daysSinceStart := now.Sub(rollover.Started).Hours() / 24
 
-	// Get configurable timing
-	switchDays := rm.cfg.DNSSEC.RolloverSwitch.Duration.Hours() / 24
-	prepublishDays := rm.cfg.DNSSEC.RolloverPrepublish.Duration.Hours() / 24
+	switchDuration := rm.cfg.DNSSEC.RolloverSwitch.Duration
+	prepublishDuration := rm.cfg.DNSSEC.RolloverPrepublish.Duration
+	ttlFloor := rm.dnskeyTTLFloor()
+	lastSigned := zoneState.LastSigned
 
 	switch rollover.State {
 	case ZSKRolloverStatePrePublish:
-		// After switch_days, start signing with new key
-		if daysSinceStart >= switchDays {
-			slog.Info("[ROLLOVER] ZSK rollover: switching to new key", "domain", domain, "new_key_id", rollover.NewKeyID)
-
-			// Load and update ZSK state
-			keyGen := NewKeyGenerator(rm.cfg)
-			newZSK, _, err := keyGen.LoadKeyPair(domain, "zsk")
-			if err != nil {
-				return fmt.Errorf("loading new ZSK: %w", err)
-			}
-
-			rm.state.Mutate(func() {
-				rollover.State = ZSKRolloverStateSigning
-				rollover.Action = "Automatic: signing with new ZSK, old ZSK still published"
-				zoneState.ZSK = &KeyState{
-					ID: newZSK.KeyTag(),
-					// Algorithm comes from the key itself — the config may
-					// have changed since this key was generated.
-					Algorithm:   AlgorithmName(newZSK.Algorithm),
-					Created:     rollover.Started,
-					Expires:     rollover.Started.Add(rm.cfg.GetZoneZSKLifetime(domain)),
-					RolloverDue: rollover.Started.Add(time.Duration(float64(rm.cfg.GetZoneZSKLifetime(domain)) * 0.75)),
-				}
-				zoneState.ForceResign = true
-			})
-
-			return rm.state.Save()
+		// Advance to "signing" only when ALL of the following hold (R-011), rather
+		// than on wall-time-since-start alone — otherwise a daemon that was down or
+		// failing across the window collapses both transitions into consecutive
+		// polls, signing with a key validators never cached:
+		//  (1) the pre-publish phase has lasted at least the switch duration;
+		//  (2) the pre-published DNSKEY RRset was actually signed after the phase
+		//      began (LastSigned after phaseStart) — else the new ZSK was never
+		//      published;
+		//  (3) a DNSKEY-TTL floor has elapsed since that publish.
+		phaseStart := rollover.Started
+		if now.Sub(phaseStart) < switchDuration {
+			return nil
 		}
+		if !lastSigned.After(phaseStart) {
+			slog.Debug("[ROLLOVER] ZSK pre_publish: waiting for the pre-published key set to be signed", "domain", domain)
+			return nil
+		}
+		if now.Sub(lastSigned) < ttlFloor {
+			slog.Debug("[ROLLOVER] ZSK pre_publish: waiting DNSKEY-TTL floor after publish", "domain", domain, "floor", ttlFloor.String())
+			return nil
+		}
+
+		slog.Info("[ROLLOVER] ZSK rollover: switching to new key", "domain", domain, "new_key_id", rollover.NewKeyID)
+		keyGen := NewKeyGenerator(rm.cfg)
+		newZSK, _, err := keyGen.LoadKeyPair(domain, "zsk")
+		if err != nil {
+			return fmt.Errorf("loading new ZSK: %w", err)
+		}
+		rm.state.Mutate(func() {
+			rollover.State = ZSKRolloverStateSigning
+			rollover.PhaseStarted = now // gate the signing phase from here (R-011)
+			rollover.Action = "Automatic: signing with new ZSK, old ZSK still published"
+			zoneState.ZSK = &KeyState{
+				ID: newZSK.KeyTag(),
+				// Algorithm comes from the key itself — the config may
+				// have changed since this key was generated.
+				Algorithm:   AlgorithmName(newZSK.Algorithm),
+				Created:     rollover.Started,
+				Expires:     rollover.Started.Add(rm.cfg.GetZoneZSKLifetime(domain)),
+				RolloverDue: rollover.Started.Add(time.Duration(float64(rm.cfg.GetZoneZSKLifetime(domain)) * 0.75)),
+			}
+			zoneState.ForceResign = true
+		})
+		return rm.state.Save()
 
 	case ZSKRolloverStateSigning:
-		// After prepublish_days total, complete rollover
-		if daysSinceStart >= prepublishDays {
-			slog.Info("[ROLLOVER] ZSK rollover: completing", "domain", domain)
-
-			// Clear rollover state; the next sign drops the old ZSK from
-			// the published DNSKEY RRset.
-			rm.state.Mutate(func() {
-				zoneState.Rollover = nil
-				zoneState.ForceResign = true
-				zoneState.ClearWarnings()
-			})
-
-			RecordRolloverOperation(domain, "zsk", "complete")
-			slog.Info("[ROLLOVER] ZSK rollover completed automatically", "domain", domain)
-			return rm.state.Save()
+		// Complete only when ALL hold (R-011): the signing phase has dwelled long
+		// enough, the new ZSK's signatures were actually published after the
+		// switch, and the DNSKEY-TTL floor has elapsed — so resolvers no longer
+		// hold old-ZSK RRSIGs cached when the old ZSK is dropped.
+		phaseStart := rollover.PhaseStarted
+		if phaseStart.IsZero() {
+			phaseStart = rollover.Started // old state files predating phase_started
 		}
+		signingDuration := prepublishDuration - switchDuration
+		if signingDuration <= 0 {
+			signingDuration = switchDuration // defensive; R-014 enforces switch < prepublish
+		}
+		if now.Sub(phaseStart) < signingDuration {
+			return nil
+		}
+		if !lastSigned.After(phaseStart) {
+			slog.Debug("[ROLLOVER] ZSK signing: waiting for the new ZSK's signatures to be published", "domain", domain)
+			return nil
+		}
+		if now.Sub(lastSigned) < ttlFloor {
+			slog.Debug("[ROLLOVER] ZSK signing: waiting DNSKEY-TTL floor before dropping old ZSK", "domain", domain, "floor", ttlFloor.String())
+			return nil
+		}
+
+		slog.Info("[ROLLOVER] ZSK rollover: completing", "domain", domain)
+		// Clear rollover state; the next sign drops the old ZSK from the
+		// published DNSKEY RRset.
+		rm.state.Mutate(func() {
+			zoneState.Rollover = nil
+			zoneState.ForceResign = true
+			zoneState.ClearWarnings()
+		})
+		RecordRolloverOperation(domain, "zsk", "complete")
+		slog.Info("[ROLLOVER] ZSK rollover completed automatically", "domain", domain)
+		return rm.state.Save()
 	}
 
 	return nil
@@ -281,6 +366,23 @@ func (rm *RolloverManager) backupKey(domain, keyType string, keyID uint16) error
 		return err
 	}
 
+	return nil
+}
+
+// restoreKeyFromBackup copies the tag-suffixed backup of a key back over the
+// live key files, undoing an in-place rotation. Used to roll back a rollover
+// start whose state Save failed, so state.json and the on-disk keys do not
+// diverge into a published-key-without-matching-DS SERVFAIL (R-038).
+func (rm *RolloverManager) restoreKeyFromBackup(domain, keyType string, keyID uint16) error {
+	keysDir := rm.cfg.KeysDir()
+	base := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
+	backup := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
+	if err := copyFile(backup+".private", base+".private"); err != nil {
+		return err
+	}
+	if err := copyFile(backup+".key", base+".key"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -309,6 +411,9 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 	if oldAlgorithm == targetAlgorithm {
 		return fmt.Errorf("zone already using algorithm %s", targetAlgorithm)
 	}
+	// Capture the old key states for rollback if the state Save fails (R-038).
+	oldKSKState := zoneState.KSK
+	oldZSKState := zoneState.ZSK
 
 	slog.Info("[ROLLOVER] Starting algorithm rollover",
 		"domain", domain,
@@ -358,7 +463,31 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 	})
 
 	RecordRolloverOperation(domain, "algorithm", "start")
-	return rm.state.Save()
+	if err := rm.state.Save(); err != nil {
+		// R-038: both key pairs are already rotated on disk but the state did not
+		// persist. Revert in-memory and restore the old KSK+ZSK files so the next
+		// sign doesn't publish new-algorithm keys with no rollover record (the
+		// parent DS still references the old algorithm → SERVFAIL).
+		rm.state.Mutate(func() {
+			zoneState.KSK = oldKSKState
+			zoneState.ZSK = oldZSKState
+			zoneState.Rollover = nil
+			zoneState.ForceResign = false
+		})
+		var rerr error
+		if e := rm.restoreKeyFromBackup(domain, "ksk", oldKSKState.ID); e != nil {
+			rerr = e
+		}
+		if e := rm.restoreKeyFromBackup(domain, "zsk", oldZSKState.ID); e != nil {
+			rerr = e
+		}
+		if rerr != nil {
+			slog.Error("[ROLLOVER] CRITICAL: could not restore old key files after a failed algorithm-rollover-start save; manual recovery required",
+				"domain", domain, "save_error", err, "restore_error", rerr)
+		}
+		return fmt.Errorf("saving algorithm rollover state (key rotation rolled back): %w", err)
+	}
+	return nil
 }
 
 // CompleteAlgorithmRollover finalizes an algorithm rollover
