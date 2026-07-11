@@ -148,8 +148,13 @@ call() {
   echo "variant:    $VARIANT"
   echo "body bytes: ${#body}"
   if [[ -n "$body" ]]; then echo "body:       $body"; fi
-  echo "string_to_sign (each newline shown as \\n):"
-  printf '  %s\n' "${string_to_sign//$'\n'/\\n}"
+  # Redact the api key (the first line of string_to_sign) so this output is safe
+  # to paste into a bug report. The real key still goes into the HMAC above and
+  # the Authorization header below.
+  local redacted_sts
+  redacted_sts=$(printf '%s\n%s\n%s\n%s' "<api_key>" "$path" "$req_id" "$body")
+  echo "string_to_sign (api key redacted; each newline shown as \\n):"
+  printf '  %s\n' "${redacted_sts//$'\n'/\\n}"
   echo "signature:  $sig"
   echo
 
@@ -176,7 +181,9 @@ call() {
 
 dnssec_path() {
   # Lowercase + strip trailing dot, matching dnssecPath() in the Go adapter.
-  local d="${1,,}"
+  # Use tr (not the bash-4 ${var,,}) so this runs on macOS's default bash 3.2.
+  local d
+  d=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   d="${d%.}"
   printf '/restful/v2/domains/%s/dnssec' "$d"
 }
