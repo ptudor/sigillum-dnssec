@@ -299,3 +299,13 @@ Verification: `bash -n` clean; no remaining `${var,,}`/`${var^^}` constructs; th
 Each `RegistrarFor` built a fresh `DynadotClient` with a fresh limiter, so the sliding window reset every operation and never actually throttled a bulk push across operations; and `gate()` slept without observing cancellation. Now `NewDynadotClient` uses a process-wide `sharedDynadotLimiter` (one Dynadot account == one rate budget), and `gate(ctx)` selects on `ctx.Done()` — returning the context error and consuming no slot on cancellation, so a graceful shutdown or an expired caller deadline isn't stuck behind the 2s throttle tier (this also stops the limiter from silently burning the R-004 restore budget).
 Files: `registrar_ratelimit.go`, `registrar_dynadot.go`, `registrar_ratelimit_test.go`.
 Verification: `TestSlidingLimiter_HonorsContext` (a cancelled ctx makes gate return the error and consume no slot); existing tier/gap/idle-reset tests still pass.
+
+**R-076 — validate.go check-decision logic is covered.**
+The pass/fail/partial decision logic of the four checks (the site of R-012/R-045..R-048) is exercised by the pure-helper table tests added when those findings were fixed: `TestEvaluateDSMatch` (SHA-384 DS matches; old-KSK DS accepted during rollover; unloadable local KSK does not fail open; no-DS and non-matching-DS are fail), `TestEvalRRSIGCover` (expired RRSIG is not "signed"; foreign-key RRSIG ignored), `TestBogusWhenDSPresent` (present-DS + failing-DNSKEY/RRSIG → fail), and `TestComputeOverall`. All the review's requested cases (expired RRSIG, SHA-384 DS, missing/unloadable KSK, present-DS/failing-DNSKEY) are present.
+Files: `validate_verdict_test.go`, `validate_test.go` (existing coverage; verified, no new gap).
+Verification: the four decision helpers each have table cases that would have failed before the R-012/R-045..R-048 fixes and pass now.
+
+**R-077 — ZSK rollover transitions and state round-trip are covered.**
+The rollover phase-transition timing (pre_publish→signing gating on per-phase dwell time) is exercised by `TestZSKRollover_PhaseGating` / `TestCheckZSKRollover_StartsWhenAlreadyExpired`. The previously-missing state.json schema round-trip is now added: `TestStateSchemaRoundTrip` (a fully-populated state including the newer `source_mtime`/`source_size`, rollover `phase_started`, and `force_resign` fields survives Save+LoadState) and `TestStateLoad_OldSchemaTolerant` (an older state.json without those fields loads cleanly with them defaulting to zero/nil).
+Files: `state_roundtrip_test.go` (new), plus existing `rollover_phase5_test.go`.
+Verification: both new tests pass; the old-schema test confirms the omitempty back-compat the R-011/R-022 fixes depend on.
