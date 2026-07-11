@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 )
@@ -357,6 +359,21 @@ func (rm *RolloverManager) backupKey(domain, keyType string, keyID uint16) error
 	keysDir := rm.cfg.KeysDir()
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
 	backupName := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
+
+	// Refuse to clobber an existing backup that holds DIFFERENT key material. A
+	// key-tag collision (R-029) would otherwise overwrite another key's backup
+	// under the same <type>.<tag> name, destroying the only copy of that key. An
+	// identical existing backup is fine (idempotent re-backup).
+	if existing, err := os.ReadFile(backupName + ".key"); err == nil {
+		src, err := os.ReadFile(baseName + ".key")
+		if err != nil {
+			return fmt.Errorf("reading %s key for backup: %w", keyType, err)
+		}
+		if !bytes.Equal(existing, src) {
+			return fmt.Errorf("backup %s already exists with different key material (key-tag collision?); refusing to overwrite", backupName+".key")
+		}
+		return nil // already backed up with identical content
+	}
 
 	// Copy key file to backup (don't move, in case rollover fails)
 	if err := copyFile(baseName+".key", backupName+".key"); err != nil {
