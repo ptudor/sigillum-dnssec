@@ -173,9 +173,13 @@ func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *C
 	}
 }
 
-// checkDirWritable verifies a directory exists and appears writable by
-// checking stat and permission bits. This avoids creating temp files on
-// every health probe, keeping checks non-destructive and fast.
+// checkDirWritable verifies a directory exists and is actually writable by the
+// daemon, by creating and immediately removing a temp file. Inspecting only the
+// owner-write mode bit (the previous heuristic) gave false 503s for a
+// group-writable directory the daemon can legitimately write — e.g. a
+// root:daemon 0770 dir with the daemon user in the group, where the owner-write
+// bit describes root, not the daemon (R-071). A temp create/remove is cheap
+// enough for a health probe and reflects real writability.
 func checkDirWritable(dir string) error {
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -184,10 +188,14 @@ func checkDirWritable(dir string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", dir)
 	}
-	// Check owner-write bit as a heuristic — this covers the common case
-	// where the daemon runs as the directory owner.
-	if info.Mode().Perm()&0200 == 0 {
-		return fmt.Errorf("%s is not writable", dir)
+	f, err := os.CreateTemp(dir, ".health-write-check-*")
+	if err != nil {
+		return fmt.Errorf("%s is not writable: %w", dir, err)
+	}
+	name := f.Name()
+	f.Close()
+	if err := os.Remove(name); err != nil {
+		slog.Warn("[HEALTH] failed to remove write-check temp file", "path", name, "error", err)
 	}
 	return nil
 }
