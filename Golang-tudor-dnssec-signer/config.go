@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -281,7 +283,18 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	cfg := DefaultConfig()
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	// Strict decoding: reject unknown/misspelled keys instead of silently
+	// ignoring them. For a signing daemon a typo like `signture_validity` or a
+	// key in the wrong table would otherwise revert crypto-timing/security
+	// settings to defaults with no diagnostic (R-015). Every key in
+	// testdata/README/QUICKSTART maps to a struct tag, so valid configs still load.
+	dec := toml.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(cfg); err != nil {
+		var strictErr *toml.StrictMissingError
+		if errors.As(err, &strictErr) {
+			return nil, fmt.Errorf("parsing config file: unknown key(s):\n%s", strictErr.String())
+		}
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
@@ -345,6 +358,38 @@ func (c *Config) Validate() error {
 	if c.DNSSEC.SignatureRefresh.Duration >= c.DNSSEC.SignatureValidity.Duration {
 		return fmt.Errorf("signature_refresh (%s) must be less than signature_validity (%s)",
 			c.DNSSEC.SignatureRefresh.String(), c.DNSSEC.SignatureValidity.String())
+	}
+
+	// Rollover timings must be positive and correctly ordered (R-014). A
+	// rollover_switch >= rollover_prepublish makes completion drop the old ZSK
+	// on the next poll while resolvers still hold the DNSKEY RRset without the
+	// new key — bogus for up to the DNSKEY TTL. Zero/negative collapses the
+	// pre-publish safety window entirely.
+	if c.DNSSEC.RolloverPrepublish.Duration <= 0 {
+		return fmt.Errorf("rollover_prepublish must be positive")
+	}
+	if c.DNSSEC.RolloverSwitch.Duration <= 0 {
+		return fmt.Errorf("rollover_switch must be positive")
+	}
+	if c.DNSSEC.RolloverSwitch.Duration >= c.DNSSEC.RolloverPrepublish.Duration {
+		return fmt.Errorf("rollover_switch (%s) must be less than rollover_prepublish (%s)",
+			c.DNSSEC.RolloverSwitch.String(), c.DNSSEC.RolloverPrepublish.String())
+	}
+
+	// Operational durations must be positive (R-013). A zero/negative
+	// poll_interval panics time.NewTicker at startup and on SIGHUP; zero
+	// timeouts disable the respective http.Client / graceful-shutdown deadlines.
+	if c.PollInterval.Duration <= 0 {
+		return fmt.Errorf("poll_interval must be positive")
+	}
+	if c.Health.ShutdownTimeout.Duration <= 0 {
+		return fmt.Errorf("health.shutdown_timeout must be positive")
+	}
+	if c.Validation.Timeout.Duration <= 0 {
+		return fmt.Errorf("validate.timeout must be positive")
+	}
+	if c.Registrar.Dynadot.Timeout.Duration <= 0 {
+		return fmt.Errorf("registrar.dynadot.timeout must be positive")
 	}
 
 	// Validate NSEC3 iterations (RFC 9276 recommends 0)

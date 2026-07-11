@@ -7,7 +7,9 @@
 #   2. Ensure mod_proxy, mod_proxy_http, mod_proxy_balancer are loaded
 #   3. Restart Apache: service apache24 restart
 #
-# Note: The web UI is optional. Enable it by starting the daemon with --web :8053
+# Note: The web UI is optional. Enable it by starting the daemon with --web 127.0.0.1:8053
+#       (the unauthenticated dashboard is loopback-only; a non-loopback address is
+#        refused unless web.allow_remote = true — front it with this Apache proxy)
 # This dashboard is for internal use only - shows key status, DS records, etc.
 # =============================================================================
 

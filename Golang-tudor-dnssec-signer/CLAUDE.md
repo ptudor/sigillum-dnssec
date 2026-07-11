@@ -88,8 +88,9 @@ Design constraints:
 # Run the daemon (foreground, logs to stderr, reloads on SIGHUP)
 dnssec-tudor serve
 
-# Run with web UI enabled
-dnssec-tudor serve --web :8053
+# Run with web UI enabled (loopback only — the dashboard is unauthenticated;
+# a non-loopback --web address is refused unless web.allow_remote = true)
+dnssec-tudor serve --web 127.0.0.1:8053
 
 # One-shot: sign all zones, print status JSON to stdout, exit
 dnssec-tudor sign
@@ -160,6 +161,12 @@ listen = "127.0.0.1:8053"
 
 # Optional registrar API integration. Each sub-section configures one registrar.
 # Zones reference a registrar by its key (e.g. `registrar = "dynadot"`).
+[registrar]
+# digest_type is a [registrar]-level (registrar-agnostic) setting and MUST live
+# under [registrar], NOT [registrar.dynadot]. Placing it under the sub-table is
+# silently ignored (rejected as an unknown key with strict decoding).
+# digest_type = 2               # Digest algorithm for DS: 2 (SHA-256, default) or 4 (SHA-384)
+
 [registrar.dynadot]
 enabled = true
 api_key = ""                    # required; protect with config file mode 0640
@@ -167,19 +174,20 @@ api_secret = ""                 # required; HMAC-SHA256 key for X-Signature
 sandbox = false                 # true → api-sandbox.dynadot.com (safe for testing)
 timeout = "30s"
 auto_publish = true             # Push DS automatically on add/rollover events
-# digest_type = 2               # Digest algorithm for DS: 2 (SHA-256, default) or 4 (SHA-384)
 
-# Zone definitions — explicit paths, can be anywhere
+# Zone definitions — explicit paths, can be anywhere. Zone table headers MUST be
+# quoted (`[zones."name"]`); the unquoted dotted form is parsed as nested tables
+# and silently registers zero zones.
 # Supports hierarchical organization: zones/net/ptudor/zone.db
-[zones.ptudor.net]
+[zones."ptudor.net"]
 path = "/etc/dnssec-tudor/zones/net/ptudor/zone.db"
 registrar = "dynadot"           # Opt-in: push DS via the registrar above
 
-[zones.ptudor.com]
+[zones."ptudor.com"]
 path = "/etc/dnssec-tudor/zones/com/ptudor/zone.db"
 ksk_lifetime = "5y"  # Override: I'm extra lazy about this one
 
-[zones.example.org]
+[zones."example.org"]
 path = "/srv/dns/org/example/zone.db"  # Can live anywhere
 # (no registrar field — DS must be copy-pasted to the registrar manually)
 

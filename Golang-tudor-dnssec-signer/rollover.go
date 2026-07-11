@@ -183,7 +183,7 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState)
 			OldKeyID: oldZSK.ID,
 			NewKeyID: newZSK.ID,
 			Started:  time.Now().UTC(),
-			Action:   "Automatic: new ZSK is pre-published, will switch to signing in 7 days",
+			Action:   fmt.Sprintf("Automatic: new ZSK is pre-published, will switch to signing in %s", humanizeRolloverDelay(rm.cfg.DNSSEC.RolloverSwitch.Duration)),
 		}
 		zoneState.ForceResign = true
 
@@ -192,6 +192,17 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState)
 
 	RecordRolloverOperation(domain, "zsk", "start")
 	return rm.state.Save()
+}
+
+// humanizeRolloverDelay renders a rollover delay for the operator-facing Action
+// string: whole days when >= a day, otherwise the raw duration (test configs use
+// seconds). Built from the configured RolloverSwitch rather than a hardcoded
+// "7 days" so the message tracks the actual config (R-014).
+func humanizeRolloverDelay(d time.Duration) string {
+	if d >= 24*time.Hour {
+		return fmt.Sprintf("%.0f day(s)", d.Hours()/24)
+	}
+	return d.String()
 }
 
 func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *ZoneState) error {

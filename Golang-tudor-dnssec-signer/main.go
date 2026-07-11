@@ -419,6 +419,17 @@ func unwindAdd(cfg *Config, state *State, domain string, removeKSK, removeZSK bo
 }
 
 // runServe runs the daemon
+// checkWebFlagListen re-enforces the loopback guard on the web dashboard after
+// the `--web` flag override, which is applied after Config.Validate() already
+// ran. The dashboard has no authentication, so a non-loopback listen is only
+// allowed when web.allow_remote is explicitly set in config (R-005).
+func checkWebFlagListen(cfg *Config) error {
+	if cfg.Web.Enabled && !cfg.Web.AllowRemote {
+		return validateLoopbackAddr(cfg.Web.Listen, "--web")
+	}
+	return nil
+}
+
 func runServe(cmd *cobra.Command, args []string) error {
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
@@ -430,6 +441,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if webAddr != "" {
 		cfg.Web.Enabled = true
 		cfg.Web.Listen = webAddr
+	}
+
+	// Re-apply the loopback guard the flag path bypassed: loadConfigAndState ran
+	// Validate() before this override, so `--web :8053` (a form every shipped doc
+	// used to recommend) would otherwise bind all interfaces with no auth. The
+	// dashboard is unauthenticated; keep it loopback-only unless allow_remote is
+	// explicitly set in config (R-005).
+	if err := checkWebFlagListen(cfg); err != nil {
+		return err
 	}
 
 	slog.Info("[DAEMON] Starting dnssec-tudor",
