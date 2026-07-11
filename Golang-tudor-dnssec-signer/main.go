@@ -725,7 +725,14 @@ func runValidate(cmd *cobra.Command, args []string) error {
 // runAdd adds a new domain
 func runAdd(cmd *cobra.Command, args []string) error {
 	domain := args[0]
-	zonePath := args[1]
+	// Record an absolute path: a cwd-relative arg works at add time but breaks
+	// when the daemon later starts from a different working directory (systemd
+	// with no WorkingDirectory → /). Resolve it now so the config always holds
+	// an absolute path (R-017).
+	zonePath, err := filepath.Abs(args[1])
+	if err != nil {
+		return fmt.Errorf("resolving zone path %q: %w", args[1], err)
+	}
 
 	if err := ValidateDomainName(domain); err != nil {
 		return fmt.Errorf("invalid domain name: %w", err)
@@ -1277,7 +1284,12 @@ func runDNSKEY(cmd *cobra.Command, args []string) error {
 // runImport imports existing BIND-style keys
 func runImport(cmd *cobra.Command, args []string) error {
 	domain := args[0]
-	zonePath := args[1]
+	// Store an absolute path (see runAdd / R-017): a relative path recorded here
+	// breaks once the daemon starts from a different working directory.
+	zonePath, err := filepath.Abs(args[1])
+	if err != nil {
+		return fmt.Errorf("resolving zone path %q: %w", args[1], err)
+	}
 	kskPath, _ := cmd.Flags().GetString("ksk")
 	zskPath, _ := cmd.Flags().GetString("zsk")
 

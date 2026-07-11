@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,39 +157,36 @@ type Duration struct {
 	time.Duration
 }
 
-// UnmarshalText implements encoding.TextUnmarshaler for Duration
+// UnmarshalText implements encoding.TextUnmarshaler for Duration.
+//
+// Year/month/day suffixes are not supported by time.ParseDuration, so they are
+// handled here. The numeric prefix must be a *complete* valid float:
+// strconv.ParseFloat rejects trailing garbage like "1x2d" that the previous
+// fmt.Sscanf("%f") would silently truncate to 1 (R-053).
 func (d *Duration) UnmarshalText(text []byte) error {
 	s := string(text)
 
-	// Handle year/month suffixes not supported by time.ParseDuration
 	if len(s) > 0 {
-		suffix := s[len(s)-1]
-		switch suffix {
+		var unit float64
+		switch s[len(s)-1] {
 		case 'y', 'Y':
-			// Parse years (approximate: 365 days)
-			var years float64
-			if _, err := fmt.Sscanf(s[:len(s)-1], "%f", &years); err == nil {
-				d.Duration = time.Duration(years * 365 * 24 * float64(time.Hour))
-				return nil
-			}
+			unit = 365 * 24 * float64(time.Hour) // approximate: 365 days
 		case 'M':
-			// Parse months (approximate: 30 days)
-			var months float64
-			if _, err := fmt.Sscanf(s[:len(s)-1], "%f", &months); err == nil {
-				d.Duration = time.Duration(months * 30 * 24 * float64(time.Hour))
-				return nil
-			}
+			unit = 30 * 24 * float64(time.Hour) // approximate: 30 days
 		case 'd', 'D':
-			// Parse days
-			var days float64
-			if _, err := fmt.Sscanf(s[:len(s)-1], "%f", &days); err == nil {
-				d.Duration = time.Duration(days * 24 * float64(time.Hour))
-				return nil
+			unit = 24 * float64(time.Hour)
+		}
+		if unit != 0 {
+			n, err := strconv.ParseFloat(s[:len(s)-1], 64)
+			if err != nil {
+				return fmt.Errorf("invalid duration %q: %w", s, err)
 			}
+			d.Duration = time.Duration(n * unit)
+			return nil
 		}
 	}
 
-	// Fall back to standard duration parsing
+	// Fall back to standard duration parsing (h/m/s, e.g. "5m", "90s").
 	dur, err := time.ParseDuration(s)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", s, err)
@@ -302,7 +301,36 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("validating config: %w", err)
 	}
 
+	warnIfConfigWorldReadable(path, cfg)
+
 	return cfg, nil
+}
+
+// warnIfConfigWorldReadable warns when the config carries registrar/heartbeat
+// secrets but its file mode is looser than the documented 0640 (root-owned,
+// group-readable by the daemon user). CLAUDE.md requires "mode 0640 or
+// stricter"; a world-readable config with a Dynadot key/secret or heartbeat key
+// is a real credential leak. We warn (rather than refuse) so a perms mistake
+// never turns into a signing outage, but surface it loudly with remediation
+// (R-052). The 0037 mask flags group-write and any other-access, while still
+// permitting the allowed group-read bit of 0640.
+func warnIfConfigWorldReadable(path string, cfg *Config) {
+	hasSecrets := cfg.Registrar.Dynadot.APIKey != "" ||
+		cfg.Registrar.Dynadot.APISecret != "" ||
+		cfg.Heartbeat.APIKey != ""
+	if !hasSecrets {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return // already read successfully above; a stat race here isn't worth failing on
+	}
+	if extra := info.Mode().Perm() & 0o037; extra != 0 {
+		slog.Warn("[CONFIG] config holds secrets but is more permissive than 0640; tighten it",
+			"path", path,
+			"mode", fmt.Sprintf("%#o", info.Mode().Perm()),
+			"remediation", fmt.Sprintf("chmod 0640 %s (and ensure it is root-owned)", path))
+	}
 }
 
 // Validate checks the configuration for errors
@@ -415,8 +443,16 @@ func (c *Config) Validate() error {
 		if zone.Path == "" {
 			return fmt.Errorf("zone %q has no path specified", domain)
 		}
-		if _, err := os.Stat(zone.Path); os.IsNotExist(err) {
-			return fmt.Errorf("zone file for %q does not exist: %s", domain, zone.Path)
+		// A missing or otherwise unstattable zone file must NOT be fatal for the
+		// whole config: one deleted/renamed/unmounted zone would otherwise refuse
+		// startup entirely (a restart loop under Restart=on-failure while every
+		// other zone's signatures march toward expiry — a total outage from one
+		// bad entry). Warn and continue so the daemon starts and signs the other
+		// zones; the broken one surfaces as a per-zone error in status/health once
+		// signing runs. Covers both ENOENT and non-ENOENT stat errors (R-017).
+		if _, err := os.Stat(zone.Path); err != nil {
+			slog.Warn("[CONFIG] zone file is not accessible; the daemon will still start and sign the other zones",
+				"domain", domain, "path", zone.Path, "error", err)
 		}
 		if zone.Registrar != "" {
 			switch strings.ToLower(zone.Registrar) {
