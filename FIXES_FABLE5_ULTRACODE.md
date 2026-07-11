@@ -218,3 +218,32 @@ Verification: `TestBogusWhenDSPresent` — DS-found + DNSKEY/RRSIG fail → fail
 `checkRRSIGPresent` now evaluates temporal validity via the pure `evalRRSIGCover` (RFC 1982 arithmetic through `RRSIG.ValidityPeriod`), and — when the local key tag is known — only counts an RRSIG whose KeyTag matches (SOA↔ZSK, DNSKEY↔KSK). An out-of-window RRSIG sets neither `SOASigned` nor `DNSKEYSigned`; a present-but-expired signature is a hard `fail` naming the expiry (resolvers SERVFAIL); a valid signature within `signature_refresh` of expiry is `partial`. JSON field names / status vocabulary unchanged.
 Files: `validate.go`.
 Verification: `TestEvalRRSIGCover` — in-window counts; expired does not; foreign key tag ignored when tag known; unknown tag accepts any signer.
+
+---
+
+## Phase 5 — signer rollover correctness (R-011, R-037, R-038, R-039, R-041)
+
+**R-039 — auto ZSK rollover keeps the existing key's algorithm.**
+`startZSKRollover` now generates the new ZSK via `GenerateZSKWithAlgorithm(domain, oldZSK.Algorithm)` instead of `GenerateZSK` (which used the current config default). If the operator changed `[dnssec].algorithm` after signing, the auto ZSK rollover no longer mints a mismatched-algorithm ZSK; algorithm changes must go through the dedicated `rollover algorithm` flow.
+Files: `rollover.go`.
+Verification: `TestStartZSKRollover_KeepsExistingAlgorithm` — ED25519 zone, config flipped to ECDSAP256SHA256, ZSK rollover → the new live ZSK is still ED25519.
+
+**R-011 — ZSK phase transitions gated on real per-phase progress, not wall clock.**
+Added `RolloverState.PhaseStarted` (`phase_started,omitempty`; falls back to `Started` for old state files). `handleZSKRolloverState` now advances each ZSK phase only when ALL hold: (1) the phase has dwelled at least its duration; (2) the phase's DNSKEY RRset was actually signed after the phase began (`LastSigned > phaseStart`); (3) a DNSKEY-TTL floor (`DNSKEYTtl`, or 24h when 0) has elapsed since that publish. `PhaseStarted` is stamped on the pre_publish→signing switch. This stops the "collapsed after downtime" failure where both transitions fire in consecutive polls, signing with a key validators never cached. JSON field names / state strings unchanged.
+Files: `rollover.go`, `state.go`.
+Verification: `TestZSKRollover_PhaseGating` — pre_publish with `Started` 30d ago but never signed in-phase does NOT advance; once signed in-phase + TTL floor elapsed, it advances to signing and stamps PhaseStarted.
+
+**R-041 — a pending KSK/algorithm rollover no longer silently stalls the ZSK.**
+`CheckZSKRollover` now, when a non-ZSK rollover occupies the single Rollover slot and the ZSK is within its pre-publish window, records a clear zone warning ("ZSK rollover is due … but is blocked by the in-progress ksk rollover …") instead of silently doing nothing. The KSK/algorithm flow is untouched.
+Files: `rollover.go`.
+Verification: `TestCheckZSKRollover_BlockedByKSKRolloverWarns` — KSK rollover in ds_add_wait + a due ZSK → the zone gets the blocked warning and the KSK rollover is left intact.
+
+**R-038 — rollover start rolls back key rotation if the state Save fails.**
+`StartKSKRollover` and `StartAlgorithmRollover` now, on a `state.Save()` failure after the key files were already rotated on disk, revert the in-memory rollover and restore the old key files from the tag-suffixed backup (new `restoreKeyFromBackup`). This prevents the divergence where the live key is the new one but state.json has no rollover — which the next sign would turn into a published-key-without-matching-DS SERVFAIL. A restore failure is logged CRITICAL for manual recovery.
+Files: `rollover.go`.
+Verification: `TestStartKSKRollover_RollsBackOnSaveFailure` — inject a Save failure (state path → nonexistent dir); the in-memory KSK/rollover revert and the live `.ksk.key` is restored to the old key.
+
+**R-037 — rollover completion requires the new DS to be live at the parent.**
+`runRolloverComplete` now, for KSK/algorithm rollovers, performs a live parent-DS query (`verifyNewKSKDSAtParent`, reusing the validator's `checkDSAtParent` against the new KSK only) before retiring the old KSK, and refuses with a clear message if the new DS isn't visible. A new `--force` flag is the explicit escape hatch (prints a SERVFAIL warning). The parent's live DS is the ground truth, so this covers both registrar-automated and manual zones; the manual workflow keeps working via `--force`.
+Files: `main.go`.
+Verification: `TestVerifyNewKSKDSAtParent_UnreachableIsNotPresent` — an unreachable/unconfirmable parent reports not-present, so completion refuses. (Full "DS present → proceeds" path is verified manually against a live/mocked parent.)

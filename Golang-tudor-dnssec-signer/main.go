@@ -147,6 +147,10 @@ visibility at authoritative nameservers, and SOA serial consistency.`,
 		Args:  cobra.ExactArgs(1),
 		RunE:  runRolloverComplete,
 	}
+	// --force skips the parent-DS visibility check (R-037). Retiring the old KSK
+	// before the new DS is live at the parent SERVFAILs the zone, so verification
+	// is on by default.
+	rolloverCompleteCmd.Flags().Bool("force", false, "complete even if the new KSK's DS is not yet visible at the parent (dangerous)")
 
 	rolloverAlgorithmCmd := &cobra.Command{
 		Use:   "algorithm <domain> <new-algorithm>",
@@ -952,6 +956,25 @@ func runRolloverStatus(cmd *cobra.Command, args []string) error {
 }
 
 // runRolloverComplete finalizes a KSK or algorithm rollover
+// verifyNewKSKDSAtParent performs a live parent-DS query and reports whether the
+// zone's current (new) KSK's DS is present there. Used to gate rollover
+// completion so the old KSK isn't retired before the new DS is live (R-037). The
+// parent's live DS is the ground truth resolvers see, so this works for both
+// registrar-automated and manual zones.
+func verifyNewKSKDSAtParent(cfg *Config, state *State, domain string) (bool, string) {
+	keyGen := NewKeyGenerator(cfg)
+	newKSK, err := keyGen.LoadPublicKey(domain, "ksk")
+	if err != nil {
+		return false, fmt.Sprintf("could not load the new KSK to verify its DS: %v", err)
+	}
+	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+	res := v.checkDSAtParent(domain, []*dns.DNSKEY{newKSK}, false)
+	if res.MatchesKSK {
+		return true, res.Details
+	}
+	return false, res.Details
+}
+
 func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
@@ -968,6 +991,25 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 
 	if zoneState.Rollover == nil {
 		return fmt.Errorf("no rollover in progress for %s", domain)
+	}
+
+	// Before retiring the old KSK, require the new KSK's DS to be live at the
+	// parent — otherwise completion drops the old KSK while the parent still
+	// references only it, and every validating resolver SERVFAILs. --force is the
+	// explicit escape hatch for operators who have verified propagation another
+	// way (R-037). Only KSK/algorithm rollovers touch the parent DS.
+	force, _ := cmd.Flags().GetBool("force")
+	if t := zoneState.Rollover.Type; t == "ksk" || t == "algorithm" {
+		if force {
+			fmt.Println("Warning: --force set; skipping the parent-DS check. If the new DS is not yet live, the zone will SERVFAIL until it propagates.")
+		} else {
+			present, details := verifyNewKSKDSAtParent(cfg, state, domain)
+			if !present {
+				return fmt.Errorf("refusing to complete: the new KSK's DS is not visible at the parent yet (%s).\n"+
+					"Publish the new DS at your registrar and wait for it to propagate, then retry — or pass --force if you have verified it another way", details)
+			}
+			fmt.Printf("Verified new KSK's DS is present at the parent (%s).\n", details)
+		}
 	}
 
 	rolloverMgr := NewRolloverManager(cfg, state)

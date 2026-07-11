@@ -94,6 +94,11 @@ type RolloverState struct {
 	OldAlgorithm string    `json:"old_algorithm,omitempty"` // For algorithm rollover
 	NewAlgorithm string    `json:"new_algorithm,omitempty"` // For algorithm rollover
 	Started      time.Time `json:"started"`
+	// PhaseStarted marks when the current phase began (set on the ZSK
+	// pre_publish→signing transition). Zero on old state files / at rollover
+	// start; callers fall back to Started. Used to gate ZSK phase transitions on
+	// actual per-phase dwell time, not wall-time-since-start (R-011).
+	PhaseStarted time.Time `json:"phase_started,omitempty"`
 	Action       string    `json:"action"` // Human-readable next step
 }
 
