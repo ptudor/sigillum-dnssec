@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -434,6 +436,132 @@ func TestDynadotReplaceDS_EmptySkipsPut(t *testing.T) {
 	}
 	if len(methods) != 1 || methods[0] != http.MethodDelete {
 		t.Fatalf("expected a single DELETE, got %v", methods)
+	}
+}
+
+// TestDynadotReplaceDS_RestoreRetrySucceeds (R-004): after the DELETE, the
+// restore PUT fails twice (HTTP 500) and then succeeds. ReplaceDS must retry
+// and return nil — the zone is never left stranded with zero DS.
+func TestDynadotReplaceDS_RestoreRetrySucceeds(t *testing.T) {
+	var puts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPut {
+			puts++
+			// puts==1 is the pre-DELETE publish (ok); puts 2 and 3 are restore
+			// attempts that fail; puts 4 is the restore attempt that succeeds.
+			if puts == 2 || puts == 3 {
+				w.WriteHeader(http.StatusInternalServerError)
+				io.WriteString(w, `{"code":500,"message":"transient"}`)
+				return
+			}
+		}
+		io.WriteString(w, `{"code":200,"message":"Success"}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	if err := c.ReplaceDS(context.Background(), "example.com", []*dns.DS{mkDS(1, 15, 2, "aa")}); err != nil {
+		t.Fatalf("ReplaceDS should recover after transient restore failures: %v", err)
+	}
+	if puts != 4 {
+		t.Fatalf("expected 4 PUTs (1 publish + 3 restore attempts), got %d", puts)
+	}
+}
+
+// TestDynadotReplaceDS_RestorePermanentFailureReturnsSentinel (R-004): if the
+// restore never succeeds after the DELETE, ReplaceDS returns an error that
+// unwraps to ErrRegistrarDSEmpty so callers can escalate the zero-DS strand.
+func TestDynadotReplaceDS_RestorePermanentFailureReturnsSentinel(t *testing.T) {
+	var puts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPut {
+			puts++
+			if puts >= 2 { // every restore attempt fails
+				w.WriteHeader(http.StatusInternalServerError)
+				io.WriteString(w, `{"code":500,"message":"down"}`)
+				return
+			}
+		}
+		io.WriteString(w, `{"code":200,"message":"Success"}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	err := c.ReplaceDS(context.Background(), "example.com", []*dns.DS{mkDS(1, 15, 2, "aa")})
+	if err == nil {
+		t.Fatal("expected an error when the restore permanently fails")
+	}
+	if !errors.Is(err, ErrRegistrarDSEmpty) {
+		t.Fatalf("error must unwrap to ErrRegistrarDSEmpty, got: %v", err)
+	}
+}
+
+// TestDynadotReplaceDS_RestoreSurvivesParentCancel (R-004): cancelling the
+// caller's context during the restore must NOT abort it — the restore runs on
+// a context detached from the caller (context.WithoutCancel + fresh timeout),
+// so the DELETE→restore window is closed even if the caller is torn down.
+func TestDynadotReplaceDS_RestoreSurvivesParentCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sawDelete, sawRestorePut bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodDelete:
+			sawDelete = true
+		case http.MethodPut:
+			if sawDelete {
+				sawRestorePut = true
+				cancel() // tear down the caller's context mid-restore
+			}
+		}
+		io.WriteString(w, `{"code":200,"message":"Success"}`)
+	}))
+	defer srv.Close()
+
+	c := &DynadotClient{apiKey: "k", apiSecret: "s", baseURL: srv.URL, http: srv.Client()}
+	if err := c.ReplaceDS(ctx, "example.com", []*dns.DS{mkDS(1, 15, 2, "aa")}); err != nil {
+		t.Fatalf("restore on a detached context must survive parent cancellation: %v", err)
+	}
+	if !sawRestorePut {
+		t.Fatal("restore PUT was not issued after the DELETE")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("test bug: expected the parent context to have been cancelled")
+	}
+}
+
+// TestRecordRegistrarWarning (R-032): an auto-publish failure must land in the
+// zone's status warnings and be persisted, not just printed to stderr, so
+// `status`/the dashboard reflect it. Also verifies dedup.
+func TestRecordRegistrarWarning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := NewState(path)
+	state.SetZone("example.com", &ZoneState{Path: "/tmp/example.com.zone"})
+
+	const msg = "registrar auto-publish failed: boom"
+	recordRegistrarWarning(state, "example.com", msg)
+	recordRegistrarWarning(state, "example.com", msg) // dedup: second call must not duplicate
+
+	z := state.GetZoneCopy("example.com")
+	if z == nil {
+		t.Fatal("zone missing from state")
+	}
+	if len(z.Warnings) != 1 || z.Warnings[0] != msg {
+		t.Fatalf("expected exactly one warning %q, got %v", msg, z.Warnings)
+	}
+
+	// The warning must survive a reload (it was persisted to disk).
+	reloaded, err := LoadState(path)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	rz := reloaded.GetZoneCopy("example.com")
+	if rz == nil || len(rz.Warnings) != 1 || rz.Warnings[0] != msg {
+		t.Fatalf("warning not persisted across reload: %+v", rz)
 	}
 }
 

@@ -2,13 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 
 	"github.com/miekg/dns"
 )
+
+// ErrRegistrarDSEmpty is returned when a ReplaceDS sequence has already wiped
+// the registrar's DS set (the DELETE succeeded) but could not restore the
+// intended records afterward, so the parent is left holding zero DS — a silent
+// DNSSEC outage (the zone downgrades to insecure delegation). Callers detect it
+// with errors.Is and must escalate: log at Error with remediation and persist a
+// zone warning so `status` stops reporting the zone healthy (R-004, R-032).
+var ErrRegistrarDSEmpty = errors.New("registrar left zone with zero DS at parent (restore failed after clear)")
 
 // Registrar is the minimal contract a registrar adapter must satisfy so the
 // signer can manage DS records on its behalf.
@@ -74,11 +82,16 @@ func BuildDSSet(cfg *Config, state *State, domain string) ([]*dns.DS, error) {
 	if zoneState.Rollover != nil && (zoneState.Rollover.Type == "ksk" || zoneState.Rollover.Type == "algorithm") {
 		oldKSK, err := keyGen.LoadPublicKeyByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 		if err != nil {
-			slog.Warn("[REGISTRAR] cannot load backed-up old KSK during rollover; DS set will include new KSK only",
-				"domain", domain, "old_key_id", zoneState.Rollover.OldKeyID, "error", err)
-		} else {
-			out = append(out, oldKSK.ToDS(digestType))
+			// The old KSK's DS MUST stay at the parent until `rollover complete`.
+			// If the backed-up old key can't be loaded we cannot compute its DS,
+			// and handing a new-KSK-only set to ReplaceDS would DELETE the old DS
+			// mid-rollover — every resolver still validating via the old chain
+			// goes bogus. Refuse rather than silently shrink the set to new-only
+			// (R-031; the missing-backup root cause is R-027).
+			return nil, fmt.Errorf("zone %s: cannot load backed-up old KSK (id %d) during %s rollover; refusing to build a DS set that would drop the old DS at the parent: %w",
+				domain, zoneState.Rollover.OldKeyID, zoneState.Rollover.Type, err)
 		}
+		out = append(out, oldKSK.ToDS(digestType))
 	}
 
 	return out, nil

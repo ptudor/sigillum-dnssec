@@ -18,7 +18,7 @@ Minimal, opinionated DNSSEC signing daemon for sysadmins managing zones on NSD o
 
 **Commands**: `serve`, `sign`, `add`, `remove`, `status`, `ds`, `dnskey`, `rollover`
 
-Uses `github.com/miekg/dns` and `github.com/BurntSushi/toml` (the only project on BurntSushi rather than go-toml).
+Uses `github.com/miekg/dns` and `github.com/pelletier/go-toml/v2` (same TOML library as the other daemons; despite older notes, no project here is on BurntSushi).
 
 ### Golang-dnssec-validator
 Web-based DNSSEC troubleshooting and validation tool with a polished UI — think DNSViz or `drill`, but in the browser, with real-time streaming results and comprehensive diagnostics.

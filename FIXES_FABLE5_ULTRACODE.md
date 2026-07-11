@@ -275,3 +275,12 @@ Verification: `TestSupportedQueryType`, `TestValidatorLeafTypeName`. Full suite 
 Replaced `verifyActualRecord`'s break-on-first-success loop with `queryLeafAllServers`: in quick mode it returns the first usable answer; in extended mode it queries EVERY authoritative server, uses the first usable answer for cryptographic verification, and records any server whose answer disagrees (via a TTL-insensitive `leafFingerprint` over RCODE + sorted leaf/CNAME rdata) in the new `RecordValidation.ServerDisagreements`. This extends the "query every NS, flag inconsistencies" feature — previously only the DNSKEY step — to the leaf answer.
 Files: `internal/validator/validator.go`, `internal/validator/result.go`.
 Verification: `TestLeafFingerprint` — same answer/different TTL fingerprints identically (no false disagreement); different answers fingerprint differently.
+
+---
+
+## Phase 6 — docs, dead code, tests, maintainability
+
+**R-055 — doc drift: BurntSushi → go-toml corrected.**
+Both projects use `github.com/pelletier/go-toml/v2` (go.mod: signer v2.1.1, validator v2.2.4); nothing here is on BurntSushi. `daemons/dnssec/CLAUDE.md:21` now reads `github.com/pelletier/go-toml/v2` with an explicit "no project here is on BurntSushi" note, and the signer `CLAUDE.md:457` dependency bullet reads `pelletier/go-toml/v2` (noting the strict `DisallowUnknownFields` decoding from R-015). `~/Git/CLAUDE.md` never named BurntSushi. This removes the misdirection that R-015 flagged (the two libraries have different strict-mode APIs).
+Files: `CLAUDE.md`, `Golang-tudor-dnssec-signer/CLAUDE.md`.
+Verification: `grep -rn BurntSushi --include='*.md'` across the repo returns only the review/FIXES logs and the "not on BurntSushi" disclaimer — no doc claims BurntSushi is used.

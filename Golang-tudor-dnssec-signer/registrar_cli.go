@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,19 @@ import (
 	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
 )
+
+// recordRegistrarWarning attaches a warning to the zone's status (deduped) and
+// persists state, so `dnssec-tudor status` and the dashboard reflect a
+// registrar auto-publish failure that the operator would otherwise only see on
+// stderr — honoring the documented "added to the zone's warnings array"
+// contract (R-032). Mutation and Save each take the state write lock
+// separately (Mutate's fn must not re-enter State methods).
+func recordRegistrarWarning(state *State, domain, msg string) {
+	state.UpdateZone(domain, func(z *ZoneState) { z.AddWarning(msg) })
+	if err := state.Save(); err != nil {
+		slog.Error("[REGISTRAR] failed to persist zone warning", "domain", domain, "warning", msg, "error", err)
+	}
+}
 
 // registrarContext returns a short-lived context for a single API call.
 // The underlying http.Client already enforces a timeout; this ctx is
@@ -139,6 +153,17 @@ func runRegistrarPush(cmd *cobra.Command, args []string) error {
 		slog.Warn("[REGISTRAR] replacing DS set — brief window with no DS at parent",
 			"domain", domain, "removing", len(extra), "adding", len(missing))
 		if err := reg.ReplaceDS(ctx, domain, want); err != nil {
+			if errors.Is(err, ErrRegistrarDSEmpty) {
+				// Restore failed after the DELETE: the parent now holds zero DS.
+				// Persist a zone warning and log remediation in addition to the
+				// non-zero exit, so status/dashboard surface the outage (R-004).
+				slog.Error("[REGISTRAR] DS restore failed — parent left with ZERO DS; zone will go bogus until republished",
+					"domain", domain, "registrar", reg.Name(),
+					"remediation", fmt.Sprintf("re-run `dnssec-tudor registrar push %s`", domain),
+					"error", err)
+				recordRegistrarWarning(state, domain,
+					fmt.Sprintf("URGENT: registrar left zone with ZERO DS at parent; re-run `dnssec-tudor registrar push %s`: %v", domain, err))
+			}
 			return fmt.Errorf("registrar replace_ds: %w", err)
 		}
 		fmt.Printf("Replaced DS record set at %s for %s (%d removed, %d installed).\n",
@@ -228,7 +253,9 @@ func printJSON(v any) error {
 func maybeAutoPublishDS(cfg *Config, state *State, domain string, op string) {
 	reg, err := RegistrarFor(cfg, domain)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: registrar lookup failed: %v\n", err)
+		msg := fmt.Sprintf("registrar auto-publish failed: registrar lookup failed: %v", err)
+		fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+		recordRegistrarWarning(state, domain, msg)
 		return
 	}
 	if reg == nil {
@@ -241,7 +268,9 @@ func maybeAutoPublishDS(cfg *Config, state *State, domain string, op string) {
 
 	want, err := BuildDSSet(cfg, state, domain)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: cannot build DS set for auto-publish: %v\n", err)
+		msg := fmt.Sprintf("registrar auto-publish failed: cannot build DS set: %v", err)
+		fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+		recordRegistrarWarning(state, domain, msg)
 		return
 	}
 
@@ -260,16 +289,32 @@ func maybeAutoPublishDS(cfg *Config, state *State, domain string, op string) {
 		// stays published throughout the rollover window.
 		slog.Info("[REGISTRAR] auto-publishing DS (additive)", "domain", domain, "registrar", reg.Name(), "op", op)
 		if err := reg.AddDS(ctx, domain, want); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: registrar auto-publish failed: %v\n", err)
+			msg := fmt.Sprintf("registrar auto-publish failed: %v", err)
+			fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+			recordRegistrarWarning(state, domain, msg)
 			return
 		}
 	case "rollover_complete":
 		// Rollover finalization: remove the old KSK's DS and leave only the
 		// new one. ReplaceDS is PUT-first internally, so a publish failure
-		// aborts before any destructive DELETE.
+		// aborts before any destructive DELETE — except a transient failure of
+		// the post-DELETE restore, which strands the zone with zero DS at the
+		// parent (ErrRegistrarDSEmpty). Escalate that case to Error with
+		// remediation, since the zone is actively going bogus (R-004 + R-032).
 		slog.Info("[REGISTRAR] auto-publishing DS (replace)", "domain", domain, "registrar", reg.Name(), "op", op)
 		if err := reg.ReplaceDS(ctx, domain, want); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: registrar auto-publish failed: %v\n", err)
+			if errors.Is(err, ErrRegistrarDSEmpty) {
+				slog.Error("[REGISTRAR] DS restore failed — parent left with ZERO DS; zone will go bogus until republished",
+					"domain", domain, "registrar", reg.Name(),
+					"remediation", fmt.Sprintf("run `dnssec-tudor registrar push %s` to republish the DS set immediately", domain),
+					"error", err)
+				recordRegistrarWarning(state, domain,
+					fmt.Sprintf("URGENT: registrar left zone with ZERO DS at parent; run `dnssec-tudor registrar push %s` immediately: %v", domain, err))
+			} else {
+				msg := fmt.Sprintf("registrar auto-publish failed: %v", err)
+				fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+				recordRegistrarWarning(state, domain, msg)
+			}
 			return
 		}
 	default:
