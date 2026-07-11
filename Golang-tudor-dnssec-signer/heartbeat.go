@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// heartbeatEventQueueSize bounds the async per-event heartbeat queue. When a
+// blackholed endpoint stalls delivery, the oldest queued events are dropped so
+// the signing loop never blocks and the most recent state still gets through.
+const heartbeatEventQueueSize = 64
+
 // HeartbeatClient sends periodic heartbeats to AnyStatus monitoring service
 type HeartbeatClient struct {
 	cfg *HeartbeatConfig
@@ -23,6 +28,11 @@ type HeartbeatClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// events carries per-signing-event heartbeats (signing:*, rollover:*) to a
+	// background worker so those sends are fire-and-forget and never block the
+	// signing loop on the monitoring endpoint (R-044).
+	events chan string
 
 	httpClient *http.Client
 }
@@ -48,9 +58,50 @@ func NewHeartbeatClient(cfg *HeartbeatConfig) *HeartbeatClient {
 		cfg:    &resolvedCfg,
 		ctx:    ctx,
 		cancel: cancel,
+		events: make(chan string, heartbeatEventQueueSize),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+	}
+}
+
+// enqueue queues a per-event heartbeat for asynchronous delivery so the signing
+// loop never blocks on the monitoring endpoint. On backpressure (a slow or
+// blackholed endpoint) it drops the OLDEST queued event to make room, so the
+// newest state still gets through (R-044).
+func (c *HeartbeatClient) enqueue(action string) {
+	if !c.cfg.Enabled {
+		return
+	}
+	select {
+	case c.events <- action:
+		return
+	default:
+	}
+	// Queue full: drop the oldest, then enqueue the newest.
+	select {
+	case <-c.events:
+	default:
+	}
+	select {
+	case c.events <- action:
+	default:
+		slog.Debug("[HEARTBEAT] event queue full; dropping event", "action", action)
+	}
+}
+
+// eventLoop delivers queued per-event heartbeats until the client is stopped.
+func (c *HeartbeatClient) eventLoop() {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case action := <-c.events:
+			if err := c.Send(action); err != nil {
+				slog.Debug("[HEARTBEAT] async event send failed", "action", action, "error", err)
+			}
+		}
 	}
 }
 
@@ -114,9 +165,11 @@ func (c *HeartbeatClient) Start() {
 		slog.Warn("[HEARTBEAT] Failed to send starting heartbeat", "error", err)
 	}
 
-	// Start background goroutine
+	// Start the background idle loop and the async per-event delivery worker.
 	c.wg.Add(1)
 	go c.backgroundLoop()
+	c.wg.Add(1)
+	go c.eventLoop()
 
 	slog.Info("[HEARTBEAT] Started background heartbeat",
 		"interval_minutes", c.cfg.IntervalMinutes,
@@ -164,39 +217,30 @@ func (c *HeartbeatClient) backgroundLoop() {
 	}
 }
 
-// SigningStart sends a heartbeat indicating signing has started
+// SigningStart sends a heartbeat indicating signing has started. Async
+// (fire-and-forget) so it never blocks the signing loop (R-044).
 func (c *HeartbeatClient) SigningStart(domain string) {
-	if c.cfg.Enabled {
-		c.Send(fmt.Sprintf("signing:start domain=%s", domain))
-	}
+	c.enqueue(fmt.Sprintf("signing:start domain=%s", domain))
 }
 
-// SigningComplete sends a heartbeat indicating signing has completed
+// SigningComplete sends a heartbeat indicating signing has completed (async).
 func (c *HeartbeatClient) SigningComplete(domain string, serial uint32) {
-	if c.cfg.Enabled {
-		c.Send(fmt.Sprintf("signing:complete domain=%s serial=%d", domain, serial))
-	}
+	c.enqueue(fmt.Sprintf("signing:complete domain=%s serial=%d", domain, serial))
 }
 
-// SigningError sends a heartbeat indicating a signing error
+// SigningError sends a heartbeat indicating a signing error (async).
 func (c *HeartbeatClient) SigningError(domain string) {
-	if c.cfg.Enabled {
-		c.Send(fmt.Sprintf("signing:error domain=%s", domain))
-	}
+	c.enqueue(fmt.Sprintf("signing:error domain=%s", domain))
 }
 
-// RolloverStart sends a heartbeat indicating a rollover has started
+// RolloverStart sends a heartbeat indicating a rollover has started (async).
 func (c *HeartbeatClient) RolloverStart(domain, rolloverType string) {
-	if c.cfg.Enabled {
-		c.Send(fmt.Sprintf("rollover:start domain=%s type=%s", domain, rolloverType))
-	}
+	c.enqueue(fmt.Sprintf("rollover:start domain=%s type=%s", domain, rolloverType))
 }
 
-// RolloverComplete sends a heartbeat indicating a rollover has completed
+// RolloverComplete sends a heartbeat indicating a rollover has completed (async).
 func (c *HeartbeatClient) RolloverComplete(domain, rolloverType string) {
-	if c.cfg.Enabled {
-		c.Send(fmt.Sprintf("rollover:complete domain=%s type=%s", domain, rolloverType))
-	}
+	c.enqueue(fmt.Sprintf("rollover:complete domain=%s type=%s", domain, rolloverType))
 }
 
 // LastStatus returns the last action sent and when it was sent
