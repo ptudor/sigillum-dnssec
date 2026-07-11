@@ -166,7 +166,7 @@ func TestDSCheck(t *testing.T) {
 
 	// checkDSAtParent with an unreachable resolver to verify error handling
 	v := &Validator{resolver: "192.0.2.1:53", timeout: 1 * time.Second}
-	result := v.checkDSAtParent("test.invalid.", nil)
+	result := v.checkDSAtParent("test.invalid.", nil, false)
 	if result.Status != "error" {
 		t.Errorf("expected status=error for unreachable resolver, got %q (details: %s)", result.Status, result.Details)
 	}
