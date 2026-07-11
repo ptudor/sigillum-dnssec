@@ -177,13 +177,19 @@ func (d *Daemon) Reload(cfg *Config, state *State) {
 	oldHeartbeat.Stop()
 	newHeartbeat.Start()
 
-	// Reset signing loop ticker if poll interval changed
+	// Reset signing loop ticker if poll interval changed. Drain any pending
+	// (older) reset first, then send the newest interval, so two rapid SIGHUPs
+	// leave the ticker on the LATEST interval rather than keeping the first and
+	// dropping the second (R-057). Reload is serialized (single signal
+	// goroutine) and the ticker consumer is alive during reload, so the send
+	// after draining cannot block.
 	if cfg.PollInterval.Duration != oldCfg.PollInterval.Duration {
 		select {
-		case d.tickerReset <- cfg.PollInterval.Duration:
-			slog.Info("[DAEMON] Poll interval updated", "old", oldCfg.PollInterval.String(), "new", cfg.PollInterval.String())
+		case <-d.tickerReset:
 		default:
 		}
+		d.tickerReset <- cfg.PollInterval.Duration
+		slog.Info("[DAEMON] Poll interval updated", "old", oldCfg.PollInterval.String(), "new", cfg.PollInterval.String())
 	}
 
 	// Warn if listen addresses changed (requires restart)

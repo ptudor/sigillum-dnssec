@@ -486,10 +486,26 @@ func runServe(cmd *cobra.Command, args []string) error {
 		case sig := <-sigCh:
 			switch sig {
 			case syscall.SIGHUP:
+				// Reopen the log file first so logrotate (rename + SIGHUP) doesn't
+				// leave us writing to the unlinked fd. Uses the same CLI-provided
+				// level/format/output; only the underlying handle is refreshed (R-056).
+				setupLogging()
 				slog.Info("[DAEMON] Received SIGHUP, reloading configuration and state")
 				newCfg, err := LoadConfig(configPath)
 				if err != nil {
 					slog.Error("[DAEMON] Failed to reload config", "error", err)
+					continue
+				}
+				// Re-apply the --web flag override: LoadConfig rebuilt cfg from the
+				// file only, so without this a SIGHUP would flip a flag-enabled
+				// dashboard back to the file's (default-disabled) web config while
+				// the web server keeps running — an inconsistent state (R-058).
+				if webAddr != "" {
+					newCfg.Web.Enabled = true
+					newCfg.Web.Listen = webAddr
+				}
+				if err := checkWebFlagListen(newCfg); err != nil {
+					slog.Error("[DAEMON] Reload rejected: --web override fails the loopback guard", "error", err)
 					continue
 				}
 				newState, err := LoadState(newCfg.StatePath())
