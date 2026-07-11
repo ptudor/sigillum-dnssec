@@ -537,8 +537,29 @@ func runSign(cmd *cobra.Command, args []string) error {
 	slog.Info("[CLI] Signing all zones", "count", len(cfg.Zones))
 
 	signer := NewSigner(cfg, state)
-	if err := signer.SignAll(); err != nil {
-		return fmt.Errorf("signing failed: %w", err)
+	// Capture but don't early-return on a partial failure: healthy zones were
+	// still signed (their signed files written), so the post-sign hook must
+	// still fire and the status JSON must still print. We surface the failure
+	// via the exit code at the end so cron/CI detect it (R-024).
+	signErr := signer.SignAll()
+
+	// Advance automatic ZSK rollovers on the one-shot path too, so a cron-only
+	// deployment (no long-running `serve`) actually performs the rollover that
+	// checkRolloverWarnings promises — otherwise the ZSK never rolls and the
+	// warning eventually becomes "expired" (R-036). Mirrors the daemon's
+	// per-zone post-sign rollover check; the advanced state is persisted below.
+	rollover := NewRolloverManager(cfg, state)
+	for domain := range cfg.Zones {
+		zoneState := state.GetZone(domain)
+		if zoneState == nil || zoneState.ZSK == nil {
+			continue
+		}
+		if err := rollover.CheckZSKRollover(domain); err != nil {
+			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
+		}
+	}
+	if err := state.Save(); err != nil {
+		return fmt.Errorf("saving state after rollover checks: %w", err)
 	}
 
 	// Execute post-sign hook once after all zones are signed
@@ -556,6 +577,9 @@ func runSign(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println(string(jsonData))
 
+	if signErr != nil {
+		return fmt.Errorf("signing failed: %w", signErr)
+	}
 	return nil
 }
 

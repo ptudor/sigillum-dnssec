@@ -30,16 +30,26 @@ func NewSigner(cfg *Config, state *State) *Signer {
 	}
 }
 
-// SignAll signs all configured zones
+// SignAll signs all configured zones. Per-zone failures are logged, recorded in
+// the zone's Errors, and do not abort the loop (other zones keep signing); state
+// is always saved. It returns a non-nil error when any zone failed to
+// initialize or sign, so one-shot callers (cron/CI via `sign`) detect it by
+// exit code (R-024).
 func (s *Signer) SignAll() error {
+	var total, failed int
 	for domain, zoneCfg := range s.cfg.Zones {
+		total++
 		zoneState := s.state.GetZone(domain)
 
-		// Initialize zone if not in state — recover existing keys from disk
-		// first to preserve the DS chain of trust. A recovery failure must
-		// not abort the whole SignAll loop: log it, attach it to this zone
-		// as an error, and move on so other zones keep signing.
-		if zoneState == nil {
+		// Initialize a zone that is absent, or present only as a keyless
+		// placeholder from a prior failed init — recover existing keys from disk
+		// first to preserve the DS chain of trust. Re-running the init branch for
+		// a placeholder (nil KSK/ZSK) is what lets a transient first-sign failure
+		// (e.g. keys dir briefly unwritable) be retried next cycle instead of
+		// permanently disabling key generation for that zone (R-033). A recovery
+		// failure is logged and attached to the zone as an error; the loop moves
+		// on so other zones keep signing.
+		if zoneState == nil || zoneState.KSK == nil || zoneState.ZSK == nil {
 			keyGen := NewKeyGenerator(s.cfg)
 			ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 			if err != nil {
@@ -47,6 +57,7 @@ func (s *Signer) SignAll() error {
 				placeholder := &ZoneState{Path: zoneCfg.Path}
 				placeholder.AddError(err.Error())
 				s.state.SetZone(domain, placeholder)
+				failed++
 				continue
 			}
 			zoneState = &ZoneState{
@@ -60,12 +71,19 @@ func (s *Signer) SignAll() error {
 		if err := s.SignZone(domain); err != nil {
 			slog.Error("[SIGN] Failed to sign zone", "domain", domain, "error", err)
 			s.state.Mutate(func() { zoneState.AddError(err.Error()) })
+			failed++
 		} else {
 			s.state.Mutate(zoneState.ClearErrors)
 		}
 	}
 
-	return s.state.Save()
+	if err := s.state.Save(); err != nil {
+		return err
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d zones failed to sign", failed, total)
+	}
+	return nil
 }
 
 // SignZone signs a single zone

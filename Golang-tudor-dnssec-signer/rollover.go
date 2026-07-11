@@ -407,6 +407,14 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 		return fmt.Errorf("rollover already in progress")
 	}
 
+	// A zone whose key init previously failed can be present only as a keyless
+	// placeholder (see SignAll / R-033). Guard against the nil deref the way the
+	// KSK-rollover path does, so an algorithm rollover on such a zone returns a
+	// descriptive error instead of panicking (R-025).
+	if zoneState.KSK == nil || zoneState.ZSK == nil {
+		return fmt.Errorf("zone %s has no usable keys (key initialization previously failed); fix the underlying issue and re-run `dnssec-tudor sign` before attempting an algorithm rollover", domain)
+	}
+
 	oldAlgorithm := zoneState.KSK.Algorithm
 	if oldAlgorithm == targetAlgorithm {
 		return fmt.Errorf("zone already using algorithm %s", targetAlgorithm)
