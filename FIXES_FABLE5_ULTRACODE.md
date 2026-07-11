@@ -261,3 +261,17 @@ Verification: `TestSignZone_StripsInputDNSSEC` — input with a stray RRSIG(A)/N
 `validateZone` now verifies every record's owner is at or below the apex (`dns.IsSubDomain(apex, name)`) and rejects with an error naming the offending owner, so a stray/typo'd out-of-zone name can't be signed into a broken NSEC/NSEC3 chain. Occlusion/delegation/glue handling (all in-zone) is unaffected.
 Files: `sign.go`.
 Verification: `TestSignZone_RejectsOutOfZoneOwner` — a zone containing `evil.org. A` → `SignZone` errors naming `evil.org`.
+
+---
+
+## Phase 5 — validator record type & leaf multi-server (R-083, R-100)
+
+**R-083 — the documented `type` parameter is honored.**
+Added a `queryType` field to `Validator` (default A) with `SetQueryType`, `leafType`, `leafTypeName`, and a package-level `SupportedQueryType` that parses/validates the type string against a supported set (A, AAAA, MX, TXT, NS, SOA, SRV, CAA, PTR, NAPTR, CNAME, SPF; empty→A; unsupported→rejected). Both handlers now read `type`, 400 on unsupported, and `SetQueryType`. The leaf query (`verifyActualRecord`, `checkAndFollowCNAME`), the denial `qtype`, `FindRRSIGForType`, and `VerifyRRsetRRSIGFromResponse` all use the configured type instead of hardcoded `dns.TypeA`; `result.QueryType` reflects it.
+Files: `internal/validator/validator.go`, `handlers.go`.
+Verification: `TestSupportedQueryType`, `TestValidatorLeafTypeName`. Full suite green.
+
+**R-100 — leaf record queried across all servers with disagreement reporting.**
+Replaced `verifyActualRecord`'s break-on-first-success loop with `queryLeafAllServers`: in quick mode it returns the first usable answer; in extended mode it queries EVERY authoritative server, uses the first usable answer for cryptographic verification, and records any server whose answer disagrees (via a TTL-insensitive `leafFingerprint` over RCODE + sorted leaf/CNAME rdata) in the new `RecordValidation.ServerDisagreements`. This extends the "query every NS, flag inconsistencies" feature — previously only the DNSKEY step — to the leaf answer.
+Files: `internal/validator/validator.go`, `internal/validator/result.go`.
+Verification: `TestLeafFingerprint` — same answer/different TTL fingerprints identically (no false disagreement); different answers fingerprint differently.
