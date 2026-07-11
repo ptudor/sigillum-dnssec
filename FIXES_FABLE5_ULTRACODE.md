@@ -247,3 +247,17 @@ Verification: `TestStartKSKRollover_RollsBackOnSaveFailure` — inject a Save fa
 `runRolloverComplete` now, for KSK/algorithm rollovers, performs a live parent-DS query (`verifyNewKSKDSAtParent`, reusing the validator's `checkDSAtParent` against the new KSK only) before retiring the old KSK, and refuses with a clear message if the new DS isn't visible. A new `--force` flag is the explicit escape hatch (prints a SERVFAIL warning). The parent's live DS is the ground truth, so this covers both registrar-automated and manual zones; the manual workflow keeps working via `--force`.
 Files: `main.go`.
 Verification: `TestVerifyNewKSKDSAtParent_UnreachableIsNotPresent` — an unreachable/unconfirmable parent reports not-present, so completion refuses. (Full "DS present → proceeds" path is verified manually against a live/mocked parent.)
+
+---
+
+## Phase 5 — signer input hygiene (R-034, R-035)
+
+**R-034 — stale DNSSEC records in the input zone are stripped before signing.**
+`parseZoneFile` now calls `stripInputDNSSEC`, which drops any RRSIG/NSEC/NSEC3/NSEC3PARAM and any apex DNSKEY present in the input (a WARN logs the count) before validation and chain generation. Feeding an already-signed file (wrong path, or re-processing) no longer produces a duplicated/self-referential chain or an RRSIG-over-RRSIG. DS records at delegations are preserved.
+Files: `sign.go`.
+Verification: `TestSignZone_StripsInputDNSSEC` — input with a stray RRSIG(A)/NSEC3PARAM/apex DNSKEY → output has exactly one NSEC3PARAM, no RRSIG-over-RRSIG, and the stale key-tag-1111 RRSIG and input DNSKEY are gone.
+
+**R-035 — out-of-zone owner names are rejected.**
+`validateZone` now verifies every record's owner is at or below the apex (`dns.IsSubDomain(apex, name)`) and rejects with an error naming the offending owner, so a stray/typo'd out-of-zone name can't be signed into a broken NSEC/NSEC3 chain. Occlusion/delegation/glue handling (all in-zone) is unaffected.
+Files: `sign.go`.
+Verification: `TestSignZone_RejectsOutOfZoneOwner` — a zone containing `evil.org. A` → `SignZone` errors naming `evil.org`.

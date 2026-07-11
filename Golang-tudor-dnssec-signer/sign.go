@@ -478,12 +478,47 @@ func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
 		return nil, 0, fmt.Errorf("parsing zone: %w", err)
 	}
 
+	// Strip any DNSSEC records the signer manages itself before validation and
+	// chain generation (R-034), so an already-signed file fed by mistake is
+	// re-signed cleanly instead of producing a duplicated/self-referential chain.
+	records = stripInputDNSSEC(domain, records)
+
 	// Validate zone structure
 	if err := s.validateZone(domain, records); err != nil {
 		return nil, 0, fmt.Errorf("zone validation failed: %w", err)
 	}
 
 	return records, serial, nil
+}
+
+// stripInputDNSSEC removes DNSSEC records that the signer generates itself from a
+// parsed input zone — stale RRSIG/NSEC/NSEC3/NSEC3PARAM and any apex DNSKEY — so
+// re-signing produces a valid single chain rather than duplicating/conflicting
+// with the input's records or signing a stray RRSIG RRset. DS records at
+// delegations are legitimate and preserved. R-034.
+func stripInputDNSSEC(domain string, records []dns.RR) []dns.RR {
+	apexLower := strings.ToLower(dns.Fqdn(domain))
+	out := make([]dns.RR, 0, len(records))
+	stripped := 0
+	for _, rr := range records {
+		switch rr.Header().Rrtype {
+		case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeNSEC3PARAM:
+			stripped++
+			continue
+		case dns.TypeDNSKEY:
+			// The signer manages the apex DNSKEY RRset; drop any in the input.
+			if strings.ToLower(rr.Header().Name) == apexLower {
+				stripped++
+				continue
+			}
+		}
+		out = append(out, rr)
+	}
+	if stripped > 0 {
+		slog.Warn("[SIGN] Stripped pre-existing DNSSEC records from input zone (the signer manages its own chain)",
+			"domain", domain, "count", stripped)
+	}
+	return out
 }
 
 // validateZone performs sanity checks on a parsed zone
@@ -496,6 +531,15 @@ func (s *Signer) validateZone(domain string, records []dns.RR) error {
 
 	for _, rr := range records {
 		name := strings.ToLower(rr.Header().Name)
+
+		// Every authoritative owner name must be at or below the apex. An
+		// out-of-zone owner (a typo, or the wrong file) would otherwise be signed
+		// and inserted into the NSEC/NSEC3 chain, breaking canonical ordering and
+		// the denial-of-existence proofs (the chain would "cover" names outside
+		// the zone). Reject rather than emit a subtly broken zone (R-035).
+		if !dns.IsSubDomain(apex, rr.Header().Name) {
+			return fmt.Errorf("record owner %s is not within zone %s", rr.Header().Name, apex)
+		}
 
 		switch rr.Header().Rrtype {
 		case dns.TypeSOA:
