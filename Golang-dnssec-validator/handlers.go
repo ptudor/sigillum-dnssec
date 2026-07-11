@@ -111,6 +111,15 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		mode = "extended"
 	}
 
+	// Parse and validate the record type parameter (default A). R-083.
+	qtype, ok := validator.SupportedQueryType(r.URL.Query().Get("type"))
+	if !ok {
+		statusCode = "400"
+		writeProblemDetails(w, ErrTypeBadRequest, "Invalid Type",
+			http.StatusBadRequest, "unsupported record type (supported: A, AAAA, MX, TXT, NS, SOA, SRV, CAA, PTR, NAPTR, CNAME, SPF)", r.URL.Path)
+		return
+	}
+
 	// Enforce the global concurrency cap before committing to any work or SSE
 	// headers: reject with 503 + Retry-After when at capacity (R-086).
 	if !h.acquireValidationSlot() {
@@ -192,6 +201,9 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		v.SetQuickMode(true)
 	}
 
+	// Set the leaf record type to validate (R-083).
+	v.SetQueryType(qtype)
+
 	// Set up event callback
 	v.SetEventCallback(func(event validator.SSEEvent) {
 		cancelOnWriteError(sse.WriteEvent(event.Type, event.Data), event.Type)
@@ -258,6 +270,15 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		mode = "extended"
 	}
 
+	// Parse and validate the record type parameter (default A). R-083.
+	qtype, ok := validator.SupportedQueryType(r.URL.Query().Get("type"))
+	if !ok {
+		writeProblemDetails(w, ErrTypeBadRequest, "Invalid Type",
+			http.StatusBadRequest, "unsupported record type (supported: A, AAAA, MX, TXT, NS, SOA, SRV, CAA, PTR, NAPTR, CNAME, SPF)", r.URL.Path)
+		RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
+		return
+	}
+
 	// Enforce the global concurrency cap before starting work (R-086).
 	if !h.acquireValidationSlot() {
 		w.Header().Set("Retry-After", "5")
@@ -295,6 +316,9 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	if mode == "quick" {
 		v.SetQuickMode(true)
 	}
+
+	// Set the leaf record type to validate (R-083).
+	v.SetQueryType(qtype)
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)

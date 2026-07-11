@@ -3,6 +3,7 @@ package validator
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,8 @@ type Validator struct {
 	queryTimeout  time.Duration
 	totalTimeout  time.Duration
 	maxConcurrent int
-	quickMode     bool // true = query first responding NS only; false = query all
+	quickMode     bool   // true = query first responding NS only; false = query all
+	queryType     uint16 // leaf record type to validate (default A) — R-083
 	eventCallback EventCallback
 	rdapClient    *rdap.Client
 }
@@ -35,12 +37,59 @@ func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, a
 		queryTimeout:  queryTimeout,
 		totalTimeout:  totalTimeout,
 		maxConcurrent: maxConcurrent,
+		queryType:     dns.TypeA,
 	}
 }
 
 // SetQuickMode enables quick mode (query first responding NS only)
 func (v *Validator) SetQuickMode(quick bool) {
 	v.quickMode = quick
+}
+
+// SetQueryType sets the leaf record type to validate (default A). Plumbs the
+// documented `type` query parameter through to the leaf query and denial
+// reasoning (R-083).
+func (v *Validator) SetQueryType(t uint16) {
+	if t == 0 {
+		t = dns.TypeA
+	}
+	v.queryType = t
+}
+
+// leafType returns the configured leaf query type, defaulting to A.
+func (v *Validator) leafType() uint16 {
+	if v.queryType == 0 {
+		return dns.TypeA
+	}
+	return v.queryType
+}
+
+// leafTypeName is the string form of the leaf query type (e.g. "A", "MX").
+func (v *Validator) leafTypeName() string {
+	if name, ok := dns.TypeToString[v.leafType()]; ok {
+		return name
+	}
+	return "A"
+}
+
+// SupportedQueryType parses a record-type string into a dns type, restricted to
+// the types this validator can meaningfully fetch and verify at the leaf. An
+// empty string defaults to A; an unsupported type returns ok=false (R-083).
+func SupportedQueryType(s string) (uint16, bool) {
+	if s == "" {
+		return dns.TypeA, true
+	}
+	t, ok := dns.StringToType[strings.ToUpper(s)]
+	if !ok {
+		return 0, false
+	}
+	switch t {
+	case dns.TypeA, dns.TypeAAAA, dns.TypeMX, dns.TypeTXT, dns.TypeNS,
+		dns.TypeSOA, dns.TypeSRV, dns.TypeCAA, dns.TypePTR, dns.TypeNAPTR,
+		dns.TypeCNAME, dns.TypeSPF:
+		return t, true
+	}
+	return 0, false
 }
 
 // SetRDAPClient sets the RDAP client for out-of-band DS record verification
@@ -87,7 +136,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 	// Create result
 	result := &ValidationResult{
 		Domain:      NormalizeDomain(domain),
-		QueryType:   "A",
+		QueryType:   v.leafTypeName(),
 		Result:      StatusValidating,
 		Chain:       make([]ZoneResult, 0),
 		CNAMEChains: make([]CNAMEChainResult, 0),
@@ -354,10 +403,10 @@ func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, dept
 		}
 	}
 
-	// Query A record from authoritative servers to check for CNAME
+	// Query the leaf record type from authoritative servers to check for CNAME.
 	var queryResult *dnspkg.QueryResult
 	for _, addr := range nsAddresses {
-		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, dns.TypeA)
+		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, v.leafType())
 		if err == nil && result.Error == "" {
 			queryResult = result
 			break
@@ -407,6 +456,72 @@ func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, dept
 	}, nil
 }
 
+// queryLeafAllServers queries the leaf record from the authoritative servers.
+// In quick mode it returns the first usable answer. In extended mode it queries
+// EVERY server, returns the first usable answer for the cryptographic
+// verification, and reports any server whose answer disagrees with it — the
+// "query every NS, flag inconsistencies" feature, previously applied only to the
+// DNSKEY step (R-100).
+func (v *Validator) queryLeafAllServers(ctx context.Context, nsAddresses []string, domain string) (*dnspkg.QueryResult, []string) {
+	var first *dnspkg.QueryResult
+	var firstFP string
+	var disagreements []string
+
+	for _, addr := range nsAddresses {
+		select {
+		case <-ctx.Done():
+			return first, disagreements
+		default:
+		}
+		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, v.leafType())
+		if err != nil || result == nil || result.Error != "" {
+			continue
+		}
+		if first == nil {
+			first = result
+			firstFP = v.leafFingerprint(result)
+			if v.quickMode {
+				return first, nil
+			}
+			continue
+		}
+		if v.leafFingerprint(result) != firstFP {
+			disagreements = append(disagreements, fmt.Sprintf(
+				"%s (%s) returned a different %s answer (%s) than %s (%s) (%s)",
+				result.Server, result.IP, v.leafTypeName(), result.RCodeName,
+				first.Server, first.IP, first.RCodeName))
+		}
+	}
+	return first, disagreements
+}
+
+// leafFingerprint builds a TTL-insensitive canonical summary of a server's
+// answer for the leaf type (RCODE plus the sorted leaf/CNAME rdata), so answers
+// can be compared across servers without flagging benign TTL differences.
+func (v *Validator) leafFingerprint(qr *dnspkg.QueryResult) string {
+	parts := []string{qr.RCodeName}
+	if len(qr.RawResponse) > 0 {
+		var msg dns.Msg
+		if err := msg.Unpack(qr.RawResponse); err == nil {
+			var rrs []string
+			for _, rr := range msg.Answer {
+				t := rr.Header().Rrtype
+				if t != v.leafType() && t != dns.TypeCNAME {
+					continue
+				}
+				h := rr.Header()
+				saved := h.Ttl
+				h.Ttl = 0
+				rrs = append(rrs, strings.ToLower(rr.String()))
+				h.Ttl = saved
+			}
+			sort.Strings(rrs)
+			parts = append(parts, rrs...)
+		}
+	}
+	return strings.Join(parts, "|")
+}
+
 // verifyActualRecord queries and verifies the actual record (A, AAAA, etc.) RRSIG
 func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string, dnskeys []dnspkg.DNSKEYRecord) *RecordValidation {
 	if len(dnskeys) == 0 {
@@ -417,7 +532,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, zone)
 	if err != nil || len(nsRecords) == 0 {
 		return &RecordValidation{
-			RecordType: "A",
+			RecordType: v.leafTypeName(),
 			Error:      fmt.Sprintf("failed to resolve nameservers: %v", err),
 		}
 	}
@@ -430,25 +545,21 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		}
 	}
 
-	// Query A record from authoritative servers
-	var queryResult *dnspkg.QueryResult
-	for _, addr := range nsAddresses {
-		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, dns.TypeA)
-		if err == nil && result.Error == "" {
-			queryResult = result
-			break
-		}
-	}
+	// Query the leaf record type from authoritative servers. In extended mode we
+	// query every server and flag per-server disagreement (R-100); the first
+	// usable answer is used for the cryptographic verification below.
+	queryResult, disagreements := v.queryLeafAllServers(ctx, nsAddresses, domain)
 
 	if queryResult == nil {
 		return &RecordValidation{
-			RecordType: "A",
-			Error:      "failed to query A record from authoritative servers",
+			RecordType: v.leafTypeName(),
+			Error:      fmt.Sprintf("failed to query %s record from authoritative servers", v.leafTypeName()),
 		}
 	}
 
 	validation := &RecordValidation{
-		RecordType: "A",
+		RecordType:          v.leafTypeName(),
+		ServerDisagreements: disagreements,
 	}
 
 	// Check for NXDOMAIN/NODATA with NSEC/NSEC3 proofs
@@ -456,7 +567,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		// Check for denial proofs if this is NXDOMAIN or NODATA
 		if len(queryResult.NSEC) > 0 {
 			// Verify NSEC denial proof with full RRSIG verification
-			proof := VerifyNSECDenialWithRRSIG(domain, dns.TypeA, queryResult.NSEC, queryResult.RRSIG, dnskeys, queryResult.RawResponse, queryResult.RCode)
+			proof := VerifyNSECDenialWithRRSIG(domain, v.leafType(), queryResult.NSEC, queryResult.RRSIG, dnskeys, queryResult.RawResponse, queryResult.RCode)
 			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
@@ -466,7 +577,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 			return validation
 		} else if len(queryResult.NSEC3) > 0 {
 			// Verify NSEC3 denial proof with full RRSIG verification
-			proof := VerifyNSEC3DenialWithRRSIG(domain, dns.TypeA, queryResult.NSEC3, queryResult.RRSIG, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
+			proof := VerifyNSEC3DenialWithRRSIG(domain, v.leafType(), queryResult.NSEC3, queryResult.RRSIG, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
 			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
@@ -477,8 +588,8 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		}
 	}
 
-	// Find RRSIG for A record (type 1)
-	rrsigA := FindRRSIGForType(dns.TypeA, queryResult.RRSIG)
+	// Find RRSIG for the leaf record type
+	rrsigA := FindRRSIGForType(v.leafType(), queryResult.RRSIG)
 	if rrsigA == nil {
 		// Maybe it's a CNAME - check for CNAME RRSIG
 		if len(queryResult.CNAME) > 0 {
@@ -539,7 +650,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	if rrsigA.SignerName == zone || rrsigA.SignerName == dns.Fqdn(zone) {
-		count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, dns.TypeA, *signingKey, rrsigA.KeyTag)
+		count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, v.leafType(), *signingKey, rrsigA.KeyTag)
 		if err == nil {
 			validation.RRSIGVerified = true
 			validation.SigningKeyTag = signingKey.KeyTag

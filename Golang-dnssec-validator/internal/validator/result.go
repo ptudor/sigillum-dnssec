@@ -187,6 +187,7 @@ type RecordValidation struct {
 	WildcardSource        string     `json:"wildcard_source,omitempty"`         // The wildcard (e.g. "*.example.com.")
 	WildcardProofVerified bool       `json:"wildcard_proof_verified,omitempty"` // No-exact-match NSEC/NSEC3 proof verified
 	WildcardProof         *NSECProof `json:"wildcard_proof,omitempty"`          // RFC 4035 §5.3.4 / RFC 5155 §8.8 proof
+	ServerDisagreements   []string   `json:"server_disagreements,omitempty"`    // per-server leaf-answer disagreements (R-100)
 	Error                 string     `json:"error,omitempty"`
 }
 
