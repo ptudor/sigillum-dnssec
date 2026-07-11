@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -458,17 +459,14 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 		return true, "zone file modified"
 	}
 
-	// Check if serial changed
-	_, serial, err := s.parseZoneFile(domain, zonePath)
-	if err != nil {
-		slog.Error("[SIGN] Failed to parse zone file for serial check", "domain", domain, "error", err)
-		// File inaccessible but signatures are valid — skip
-	} else if serial != zoneState.Serial {
-		return true, fmt.Sprintf("serial changed: %d -> %d", zoneState.Serial, serial)
-	} else {
-		slog.Debug("[SIGN] Serial unchanged", "domain", domain, "serial", serial)
-	}
-
+	// Steady state: mtime ≤ LastSigned, signatures are not near expiry, and no
+	// rollover is pending. A serial change can only happen by writing the file,
+	// which bumps mtime (already handled above), so there is nothing to detect
+	// here — we deliberately do NOT parse the file on every idle poll just to
+	// re-read an unchanged serial (wasteful I/O/CPU at many zones, R-064). The
+	// only case this skips is a content edit that preserves an older mtime
+	// (e.g. `cp -p` from a backup); that is picked up at the next
+	// signature-refresh re-sign.
 	return false, ""
 }
 
@@ -482,6 +480,12 @@ func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
 	var records []dns.RR
 	var serial uint32
 
+	// $INCLUDE is intentionally NOT enabled (SetIncludeAllowed stays false): the
+	// signer manages one self-contained zone file per zone, and enabling
+	// includes would add an arbitrary-file-read surface plus cwd-relative path
+	// ambiguity for a daemon that may run from `/`. A zone using $INCLUDE fails
+	// with miekg's clear "$INCLUDE directive not allowed" error naming the line;
+	// the limitation is documented in CLAUDE.md (R-065). Inline the records.
 	zp := dns.NewZoneParser(f, dns.Fqdn(domain), path)
 	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
 		records = append(records, rr)
@@ -1094,36 +1098,64 @@ func (s *Signer) addEmptyNonTerminals(names map[string]bool, typesByName map[str
 	}
 }
 
-// canonicalLess compares two domain names in canonical order (RFC 4034 §6.1)
-func canonicalLess(a, b string) bool {
-	// Compare labels from right to left
-	aLabels := dns.SplitDomainName(strings.ToLower(a))
-	bLabels := dns.SplitDomainName(strings.ToLower(b))
+// canonicalLabelBytes converts a presentation-format DNS label to its
+// canonical wire-format octets (RFC 4034 §6.1): decimal `\DDD` and `\X` escapes
+// are resolved to the raw bytes they denote, and ASCII A–Z is lowercased. This
+// must be done on the unescaped octets — comparing presentation strings
+// mis-orders names containing escaped octets relative to wire order (R-066).
+func canonicalLabelBytes(label string) []byte {
+	out := make([]byte, 0, len(label))
+	for i := 0; i < len(label); i++ {
+		b := label[i]
+		if b == '\\' && i+1 < len(label) {
+			// \DDD decimal escape (exactly three digits) or \X single-char escape.
+			if i+3 < len(label) &&
+				label[i+1] >= '0' && label[i+1] <= '9' &&
+				label[i+2] >= '0' && label[i+2] <= '9' &&
+				label[i+3] >= '0' && label[i+3] <= '9' {
+				b = byte((int(label[i+1]-'0')*100 + int(label[i+2]-'0')*10 + int(label[i+3]-'0')))
+				i += 3
+			} else {
+				b = label[i+1]
+				i++
+			}
+		}
+		if b >= 'A' && b <= 'Z' {
+			b += 32 // lowercase ASCII per canonical form
+		}
+		out = append(out, b)
+	}
+	return out
+}
 
-	// Compare from the end (rightmost label first)
+// canonicalLess compares two domain names in canonical order (RFC 4034 §6.1):
+// right-to-left, label by label, each label compared as canonical wire-format
+// octets (see canonicalLabelBytes) so escaped-octet owner names order correctly.
+func canonicalLess(a, b string) bool {
+	aLabels := dns.SplitDomainName(a)
+	bLabels := dns.SplitDomainName(b)
+
 	for i := 0; ; i++ {
 		aIdx := len(aLabels) - 1 - i
 		bIdx := len(bLabels) - 1 - i
 
-		// If we've exhausted one name
 		if aIdx < 0 && bIdx < 0 {
 			return false // Equal
 		}
 		if aIdx < 0 {
-			return true // Shorter name comes first
+			return true // Shorter name (fewer labels) comes first
 		}
 		if bIdx < 0 {
 			return false
 		}
 
-		// Compare labels
-		if aLabels[aIdx] < bLabels[bIdx] {
+		switch bytes.Compare(canonicalLabelBytes(aLabels[aIdx]), canonicalLabelBytes(bLabels[bIdx])) {
+		case -1:
 			return true
-		}
-		if aLabels[aIdx] > bLabels[bIdx] {
+		case 1:
 			return false
 		}
-		// Labels equal, continue to next
+		// Labels equal, continue to the next-more-significant label.
 	}
 }
 
@@ -1334,8 +1366,11 @@ func sortZoneRecords(domain string, records []dns.RR) []dns.RR {
 		groups[key] = append(groups[key], rr)
 	}
 
-	// Sort keys: apex first, then by name, then by type (SOA, NS, DNSKEY, then others)
-	apex := dns.Fqdn(domain)
+	// Sort keys: apex first, then by name, then by type (SOA, NS, DNSKEY, then others).
+	// Lowercase the apex to match the lowercased key names above — otherwise a
+	// mixed-case zone key in config (e.g. "Example.COM") breaks apex-first
+	// ordering (R-063).
+	apex := strings.ToLower(dns.Fqdn(domain))
 	sort.Slice(keys, func(i, j int) bool {
 		// Apex comes first
 		iApex := keys[i].name == apex

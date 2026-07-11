@@ -54,6 +54,9 @@ This tool exists because every DNSSEC solution is either:
 - Manage your primary/secondary topology
 - Support HSMs or PKCS#11
 - Run as anything other than a single daemon on one machine
+- Process `$INCLUDE` directives in zone files — each zone must be a single
+  self-contained file (a zone using `$INCLUDE` fails to parse with a clear
+  "`$INCLUDE` directive not allowed" error). Inline the included records.
 
 ### What It Optionally Does (Registrar Integration)
 
