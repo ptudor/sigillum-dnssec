@@ -4,7 +4,111 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// TestNeedsSign_UsesSourceModTimeNotLastSigned (R-022 fidelity): change
+// detection compares against the parse-time source mtime, so an edit whose mtime
+// is after that reference but before LastSigned is still detected (the old
+// LastSigned comparison would miss it).
+func TestNeedsSign_UsesSourceModTimeNotLastSigned(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatal(err)
+	}
+	domain := "fidelity.example"
+	zonePath := filepath.Join(dataDir, domain+".zone")
+	if err := os.WriteFile(zonePath, []byte(validZoneContent(domain)), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// t0 = parse-time reference; t1 = the edit (between t0 and t2); t2 = LastSigned.
+	// t1 is well in the past so the quiescence re-stat doesn't apply.
+	t0 := time.Now().Add(-1 * time.Hour)
+	t1 := time.Now().Add(-30 * time.Minute)
+	t2 := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(zonePath, t1, t1); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(zonePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state := NewState(cfg.StatePath())
+	keyGen := NewKeyGenerator(cfg)
+	ksk, _ := keyGen.GenerateKSK(domain)
+	zsk, _ := keyGen.GenerateZSK(domain)
+	zs := &ZoneState{
+		Path:          zonePath,
+		KSK:           ksk,
+		ZSK:           zsk,
+		SourceModTime: t0,
+		SourceSize:    fi.Size(), // real size → size check is a no-op; mtime drives it
+		LastSigned:    t2,
+		SignaturesExp: time.Now().Add(10 * 24 * time.Hour), // not near expiry
+	}
+	state.SetZone(domain, zs)
+
+	need, reason := NewSigner(cfg, state).NeedsSign(domain, zonePath, zs)
+	if !need {
+		t.Errorf("NeedsSign must detect an edit whose mtime > SourceModTime even when < LastSigned; got need=%v reason=%q", need, reason)
+	}
+}
+
+// TestNeedsSign_DefersStillSettlingFile (R-022 quiescence): a source file that
+// is still being written (mtime fresh and changing) is deferred rather than
+// signed truncated.
+func TestNeedsSign_DefersStillSettlingFile(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := testConfig(t, dataDir)
+	if err := ensureDir(cfg.KeysDir()); err != nil {
+		t.Fatal(err)
+	}
+	domain := "settling.example"
+	zonePath := filepath.Join(dataDir, domain+".zone")
+	if err := os.WriteFile(zonePath, []byte(validZoneContent(domain)), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep appending to the file so its size keeps changing across the
+	// quiescence re-stat window.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if f, err := os.OpenFile(zonePath, os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+				f.WriteString("; still writing\n")
+				f.Close()
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	defer close(stop)
+
+	state := NewState(cfg.StatePath())
+	keyGen := NewKeyGenerator(cfg)
+	ksk, _ := keyGen.GenerateKSK(domain)
+	zsk, _ := keyGen.GenerateZSK(domain)
+	zs := &ZoneState{
+		Path:          zonePath,
+		KSK:           ksk,
+		ZSK:           zsk,
+		SourceModTime: time.Now().Add(-1 * time.Hour), // so the fresh file reads as changed
+		SignaturesExp: time.Now().Add(10 * 24 * time.Hour),
+	}
+	state.SetZone(domain, zs)
+
+	need, _ := NewSigner(cfg, state).NeedsSign(domain, zonePath, zs)
+	if need {
+		t.Error("a still-being-written file should be deferred (need=false), not signed mid-write")
+	}
+}
 
 // validZoneContent returns a minimal signable zone (SOA + apex NS + one A).
 func validZoneContent(domain string) string {

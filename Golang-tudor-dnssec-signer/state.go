@@ -24,14 +24,22 @@ type ZoneState struct {
 	// is bumped on every signing event so secondaries pick up refreshed
 	// signatures. Serial keeps tracking the unsigned file for change
 	// detection.
-	PublishedSerial uint32         `json:"published_serial,omitempty"`
-	LastSigned      time.Time      `json:"last_signed"`
-	SignaturesExp   time.Time      `json:"signatures_expire"`
-	KSK             *KeyState      `json:"ksk,omitempty"`
-	ZSK             *KeyState      `json:"zsk,omitempty"`
-	Rollover        *RolloverState `json:"rollover,omitempty"`
-	Warnings        []string       `json:"warnings,omitempty"`
-	Errors          []string       `json:"errors,omitempty"`
+	PublishedSerial uint32    `json:"published_serial,omitempty"`
+	LastSigned      time.Time `json:"last_signed"`
+	// SourceModTime/SourceSize are the unsigned zone file's mtime and size
+	// captured at PARSE time. They are the change-detection reference (NeedsSign
+	// compares against these, not LastSigned): stamping the reference at parse
+	// time means an edit that lands between parse and completion is still
+	// detected next cycle, and it survives across LastSigned being set later
+	// (R-022). Omitempty + absent-tolerant for state.json back-compat.
+	SourceModTime time.Time      `json:"source_mtime,omitempty"`
+	SourceSize    int64          `json:"source_size,omitempty"`
+	SignaturesExp time.Time      `json:"signatures_expire"`
+	KSK           *KeyState      `json:"ksk,omitempty"`
+	ZSK           *KeyState      `json:"zsk,omitempty"`
+	Rollover      *RolloverState `json:"rollover,omitempty"`
+	Warnings      []string       `json:"warnings,omitempty"`
+	Errors        []string       `json:"errors,omitempty"`
 	// ForceResign is set whenever a rollover transition changes which keys
 	// must be published or used for signing, and cleared on the next
 	// successful sign. It replaces the old "re-sign every cycle while a

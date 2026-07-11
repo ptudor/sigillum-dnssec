@@ -98,6 +98,18 @@ func (s *Signer) SignZone(domain string) error {
 
 	slog.Info("[SIGN] Signing zone", "domain", domain, "path", zoneState.Path)
 
+	// Capture the source file's mtime/size at PARSE time so it becomes the
+	// change-detection reference (R-022). Recording it here — not after signing —
+	// means an edit that lands between this parse and the LastSigned stamp is
+	// still detected on the next NeedsSign. A stat failure is non-fatal (the
+	// parse below will surface a real read error); leave the reference untouched.
+	var srcModTime time.Time
+	var srcSize int64
+	if fi, statErr := os.Stat(zoneState.Path); statErr == nil {
+		srcModTime = fi.ModTime()
+		srcSize = fi.Size()
+	}
+
 	// Parse the zone file
 	records, serial, err := s.parseZoneFile(domain, zoneState.Path)
 	if err != nil {
@@ -175,6 +187,10 @@ func (s *Signer) SignZone(domain string) error {
 		zoneState.Serial = serial
 		zoneState.PublishedSerial = published
 		zoneState.LastSigned = now
+		if !srcModTime.IsZero() {
+			zoneState.SourceModTime = srcModTime
+			zoneState.SourceSize = srcSize
+		}
 		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
 		zoneState.ForceResign = false
 		zoneState.ClearWarnings()
@@ -400,6 +416,14 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 	return keys, nil
 }
 
+const (
+	// zoneWriteQuiescenceWindow: a source change whose mtime is this fresh is
+	// treated as possibly still-being-written and re-checked before signing.
+	zoneWriteQuiescenceWindow = 3 * time.Second
+	// zoneWriteSettleDelay: how long to wait before the quiescence re-stat.
+	zoneWriteSettleDelay = 750 * time.Millisecond
+)
+
 // NeedsSign checks if a zone needs to be signed
 func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool, string) {
 	// New zone - always sign
@@ -450,23 +474,43 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool,
 		return false, ""
 	}
 
+	// Change-detection reference: the source mtime/size captured at PARSE time
+	// (R-022), NOT LastSigned. This catches an edit that landed between the last
+	// parse and its LastSigned stamp. Old state has no source_mtime — fall back
+	// to LastSigned so upgraded zones don't re-sign forever.
+	changeRef := zoneState.SourceModTime
+	if changeRef.IsZero() {
+		changeRef = zoneState.LastSigned
+	}
 	slog.Debug("[SIGN] Checking zone mtime",
 		"domain", domain,
 		"file_mtime", info.ModTime().Format(time.RFC3339),
-		"last_signed", zoneState.LastSigned.Format(time.RFC3339))
+		"change_ref", changeRef.Format(time.RFC3339))
 
-	if info.ModTime().After(zoneState.LastSigned) {
+	sizeChanged := zoneState.SourceSize != 0 && info.Size() != zoneState.SourceSize
+	if info.ModTime().After(changeRef) || sizeChanged {
+		// Quiescence: a very recent change may still be mid-write (a generator
+		// doing `> zone`, an editor save). Re-stat after a short delay; if the
+		// mtime/size changed again the write is ongoing, so defer to the next
+		// tick rather than sign a truncated file. Expiry/rollover signing above
+		// is never deferred (R-022).
+		if time.Since(info.ModTime()) < zoneWriteQuiescenceWindow {
+			time.Sleep(zoneWriteSettleDelay)
+			if info2, err2 := os.Stat(zonePath); err2 == nil &&
+				(info2.ModTime() != info.ModTime() || info2.Size() != info.Size()) {
+				slog.Debug("[SIGN] Zone file still settling; deferring to next tick", "domain", domain)
+				return false, ""
+			}
+		}
 		return true, "zone file modified"
 	}
 
-	// Steady state: mtime ≤ LastSigned, signatures are not near expiry, and no
-	// rollover is pending. A serial change can only happen by writing the file,
-	// which bumps mtime (already handled above), so there is nothing to detect
-	// here — we deliberately do NOT parse the file on every idle poll just to
-	// re-read an unchanged serial (wasteful I/O/CPU at many zones, R-064). The
-	// only case this skips is a content edit that preserves an older mtime
-	// (e.g. `cp -p` from a backup); that is picked up at the next
-	// signature-refresh re-sign.
+	// Steady state: the source is unchanged since it was last parsed, signatures
+	// are not near expiry, and no rollover is pending. We deliberately do NOT
+	// parse the file on every idle poll just to re-read an unchanged serial
+	// (wasteful I/O/CPU at many zones, R-064). The only case this skips is a
+	// content edit that preserves an older mtime/size (e.g. `cp -p` from a
+	// backup); that is picked up at the next signature-refresh re-sign.
 	return false, ""
 }
 
