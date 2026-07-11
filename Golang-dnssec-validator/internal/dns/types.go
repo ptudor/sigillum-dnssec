@@ -17,6 +17,7 @@ type DNSKEYRecord struct {
 	KeyTag    uint16 `json:"key_tag"`    // Computed identifier
 	IsKSK     bool   `json:"is_ksk"`
 	IsZSK     bool   `json:"is_zsk"`
+	IsRevoked bool   `json:"is_revoked,omitempty"` // RFC 5011 REVOKE bit set
 }
 
 // DSRecord represents a DS record

@@ -609,7 +609,14 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 				if signingKey == nil {
 					signingKey = FindDNSKEYByKeyTag(rrsigCNAME.KeyTag, dnskeys)
 				}
-				if signingKey != nil {
+				switch {
+				case signingKey == nil:
+					validation.Error = fmt.Sprintf("CNAME signing key (tag %d) not found", rrsigCNAME.KeyTag)
+				case !leafSignerMatchesZone(rrsigCNAME.SignerName, zone):
+					// Defense-in-depth: the signature must be by a key in THIS
+					// zone, mirroring the A-record path's signer-name check (R-096).
+					validation.Error = fmt.Sprintf("CNAME RRSIG signer %s does not match zone %s", rrsigCNAME.SignerName, zone)
+				default:
 					count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, dns.TypeCNAME, *signingKey, rrsigCNAME.KeyTag)
 					if err == nil {
 						validation.RRSIGVerified = true
@@ -619,8 +626,6 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 					} else {
 						validation.Error = fmt.Sprintf("CNAME RRSIG cryptographic verification failed: %v", err)
 					}
-				} else {
-					validation.Error = fmt.Sprintf("CNAME signing key (tag %d) not found", rrsigCNAME.KeyTag)
 				}
 				return validation
 			}
@@ -649,7 +654,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		return validation
 	}
 
-	if rrsigA.SignerName == zone || rrsigA.SignerName == dns.Fqdn(zone) {
+	if leafSignerMatchesZone(rrsigA.SignerName, zone) {
 		count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, v.leafType(), *signingKey, rrsigA.KeyTag)
 		if err == nil {
 			validation.RRSIGVerified = true
@@ -664,6 +669,15 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	return validation
+}
+
+// leafSignerMatchesZone reports whether a leaf RRSIG's signer name is the zone
+// that should have signed it. A leaf answer (A/AAAA/CNAME/…) must be signed by a
+// key in its own zone; a signature by any other name is rejected as
+// defense-in-depth atop the cryptographic key-tag match. Both the A and CNAME
+// verification paths share this one rule so they cannot drift apart (R-096).
+func leafSignerMatchesZone(signerName, zone string) bool {
+	return signerName == zone || signerName == dns.Fqdn(zone)
 }
 
 // verifyWildcard checks the RFC 4035 §5.3.4 / RFC 5155 §8.8 requirement that a

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -323,6 +324,63 @@ func TestHandleValidateSSE_WriteFailureReturnsQuickly(t *testing.T) {
 		// success
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("HandleValidateSSE did not return promptly after SSE write failure")
+	}
+}
+
+// TestHandleValidateSSE_RefusesReconnect (R-090): an EventSource auto-reconnect
+// carries the Last-Event-ID header (the per-stream id the server stamps on every
+// event). The server must NOT start a fresh validation on reconnect; it sends a
+// terminal, fatal event so the client stops looping instead of silently
+// re-running the whole chain walk.
+func TestHandleValidateSSE_RefusesReconnect(t *testing.T) {
+	h := newTestHandlers(true)
+	h.config.TotalTimeout = 1 * time.Second
+
+	req := httptest.NewRequest(http.MethodGet, "/validate?domain=example.com", nil)
+	req.Header.Set("Last-Event-ID", "req-abc123")
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.HandleValidateSSE(w, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("reconnect was not refused promptly; validation likely re-ran")
+	}
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "not resumable") {
+		t.Errorf("expected a terminal error event refusing the reconnect, got: %q", body)
+	}
+	// A refused reconnect must run no validation, so none of the events a real
+	// run emits (start/zone) may appear.
+	if strings.Contains(body, "event: start") || strings.Contains(body, "event: zone") {
+		t.Error("validation must not run on reconnect (no start/zone events expected)")
+	}
+}
+
+// TestSSEWriter_StreamIDStamped (R-090): once a per-stream id is set, every event
+// is prefixed with an `id:` line so the browser records it as Last-Event-ID and
+// echoes it back on an auto-reconnect (which the handler then refuses).
+func TestSSEWriter_StreamIDStamped(t *testing.T) {
+	w := httptest.NewRecorder()
+	sse, err := NewSSEWriter(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sse.SetStreamID("req-xyz")
+	if err := sse.WriteEvent("start", map[string]string{"domain": "example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "id: req-xyz\n") {
+		t.Errorf("expected an id line stamped on the event, got: %q", body)
+	}
+	if !strings.Contains(body, "event: start\n") {
+		t.Errorf("expected the start event, got: %q", body)
 	}
 }
 

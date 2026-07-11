@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -69,8 +71,11 @@ type Config struct {
 	// Only requests coming from these CIDRs will have proxy headers trusted.
 	TrustedProxyCIDRs []string `toml:"trusted_proxy_cidrs"`
 
-	// Optional CIDR allowlist for /metrics endpoint.
-	// Empty means no CIDR restriction.
+	// CIDR allowlist for the /metrics endpoint. Defaults to loopback-only
+	// (127.0.0.0/8, ::1/128) so metrics are not world-readable out of the box
+	// (R-098). Set to the monitoring host/CIDR to scrape remotely, or to
+	// ["0.0.0.0/0", "::/0"] to expose to everyone. An explicit empty list
+	// removes all CIDR restriction.
 	MetricsAllowedCIDRs []string `toml:"metrics_allowed_cidrs"`
 
 	// Heartbeat monitoring (AnyStatus)
@@ -146,7 +151,16 @@ func DefaultConfig() *Config {
 			"127.0.0.0/8",
 			"::1/128",
 		},
-		MetricsAllowedCIDRs: []string{},
+		// Secure by default: /metrics is loopback-only unless the operator
+		// widens it (R-098). Prometheus metrics expose request/validation
+		// internals, so they should not be world-readable out of the box. To
+		// scrape from another host, set metrics_allowed_cidrs to the monitoring
+		// host/CIDR; to intentionally expose them to everyone, set
+		// ["0.0.0.0/0", "::/0"].
+		MetricsAllowedCIDRs: []string{
+			"127.0.0.0/8",
+			"::1/128",
+		},
 		// Heartbeat defaults
 		Heartbeat: HeartbeatConfig{
 			Enabled:         false,
@@ -169,7 +183,17 @@ func LoadFromFile(path string) (*Config, error) {
 	}
 
 	cfg := DefaultConfig()
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	// Strict decoding: reject unknown/misspelled keys instead of silently
+	// ignoring them, so a typo like `max_concurent_validations` is a load-time
+	// error rather than a silent revert to the default (R-093; same class as the
+	// signer's R-015).
+	dec := toml.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(cfg); err != nil {
+		var strictErr *toml.StrictMissingError
+		if errors.As(err, &strictErr) {
+			return nil, fmt.Errorf("parsing config file: unknown key(s):\n%s", strictErr.String())
+		}
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 

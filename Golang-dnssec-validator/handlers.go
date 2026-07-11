@@ -120,6 +120,31 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refuse an EventSource auto-reconnect (R-090). A browser whose SSE stream
+	// dropped mid-validation reconnects transparently, echoing the per-stream id
+	// we stamp on every event (below) back in the Last-Event-ID header. A
+	// validation is not resumable, and silently starting a fresh one on every
+	// dropped connection wastes work and amplifies outbound DNS (atop R-086).
+	// Send a terminal event so the client stops instead of looping, and take no
+	// validation slot. Done before acquireValidationSlot so a reconnect storm
+	// can't exhaust capacity.
+	if r.Header.Get("Last-Event-ID") != "" {
+		sse, err := NewSSEWriter(w)
+		if err != nil {
+			statusCode = "500"
+			writeProblemDetails(w, ErrTypeInternalServerError, "Internal Server Error",
+				http.StatusInternalServerError, "streaming not supported", r.URL.Path)
+			return
+		}
+		IncrementActiveSSEConnections()
+		defer DecrementActiveSSEConnections()
+		_ = sse.WriteEvent("error", validator.ErrorEvent{
+			Message: "validation stream ended and is not resumable; please retry",
+			Fatal:   true,
+		})
+		return
+	}
+
 	// Enforce the global concurrency cap before committing to any work or SSE
 	// headers: reject with 503 + Retry-After when at capacity (R-086).
 	if !h.acquireValidationSlot() {
@@ -139,6 +164,11 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 			http.StatusInternalServerError, "streaming not supported", r.URL.Path)
 		return
 	}
+
+	// Stamp every event with this request's id so an EventSource reconnect
+	// echoes it back in Last-Event-ID and is refused above rather than
+	// silently re-running the validation (R-090).
+	sse.SetStreamID(requestID)
 
 	IncrementActiveSSEConnections()
 	defer DecrementActiveSSEConnections()

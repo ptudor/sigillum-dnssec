@@ -130,3 +130,31 @@ func TestAllowCIDRs(t *testing.T) {
 		t.Fatalf("problem.Type = %q, want %q", problem.Type, ErrTypeForbidden)
 	}
 }
+
+// TestMetricsDefaultLoopbackOnly (R-098): with the default configuration the
+// /metrics route is served only to loopback clients — a remote client is 403'd,
+// a loopback client gets through. This is the end-to-end proof that the
+// loopback-only default is actually wired into the route, not just the config.
+func TestMetricsDefaultLoopbackOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	store := NewAnchorsStore("/nonexistent", "http://nonexistent")
+	s := NewServer(cfg, store)
+
+	// Remote (non-loopback) client: denied.
+	reqRemote := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	reqRemote.RemoteAddr = "203.0.113.7:1234"
+	wRemote := httptest.NewRecorder()
+	s.mux.ServeHTTP(wRemote, reqRemote)
+	if wRemote.Code != http.StatusForbidden {
+		t.Errorf("non-loopback /metrics status = %d, want 403 (default must be loopback-only)", wRemote.Code)
+	}
+
+	// Loopback client: allowed.
+	reqLocal := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	reqLocal.RemoteAddr = "127.0.0.1:1234"
+	wLocal := httptest.NewRecorder()
+	s.mux.ServeHTTP(wLocal, reqLocal)
+	if wLocal.Code != http.StatusOK {
+		t.Errorf("loopback /metrics status = %d, want 200", wLocal.Code)
+	}
+}
