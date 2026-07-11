@@ -101,19 +101,24 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 	for _, rr := range allRRs {
 		switch v := rr.(type) {
 		case *dns.DNSKEY:
-			// RFC 4034 Section 2.1.1 DNSKEY Flags:
-			// Bit 7 (value 256): Zone Key flag - key can sign zone data
-			// Bit 15 (value 1): SEP flag - Secure Entry Point (conventionally KSK)
-			// KSK = Zone Key + SEP (256 + 1 = 257)
-			// ZSK = Zone Key only (256)
+			// RFC 4034 §2.1.1 DNSKEY flags, classified by BIT rather than exact
+			// equality so a key carrying the REVOKE bit (RFC 5011) or any extra
+			// flag is still recognized (R-095):
+			//   Zone Key  (0x0100 = 256): the key signs zone data
+			//   SEP       (0x0001 =   1): Secure Entry Point (conventionally the KSK)
+			//   REVOKE    (0x0080 = 128): RFC 5011 revoked
+			// KSK = Zone Key + SEP; ZSK = Zone Key without SEP.
+			isZoneKey := v.Flags&0x0100 != 0
+			isSEP := v.Flags&0x0001 != 0
 			dnskey := DNSKEYRecord{
 				Flags:     v.Flags,
 				Protocol:  v.Protocol,
 				Algorithm: v.Algorithm,
 				PublicKey: v.PublicKey, // miekg/dns already provides base64
 				KeyTag:    v.KeyTag(),
-				IsKSK:     v.Flags == 257, // Zone Key (256) + SEP (1)
-				IsZSK:     v.Flags == 256, // Zone Key only
+				IsKSK:     isZoneKey && isSEP,
+				IsZSK:     isZoneKey && !isSEP,
+				IsRevoked: v.Flags&0x0080 != 0,
 			}
 			result.DNSKEY = append(result.DNSKEY, dnskey)
 

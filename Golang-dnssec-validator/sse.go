@@ -8,8 +8,9 @@ import (
 
 // SSEWriter writes Server-Sent Events to an HTTP response
 type SSEWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
+	w        http.ResponseWriter
+	flusher  http.Flusher
+	streamID string
 }
 
 // NewSSEWriter creates a new SSE writer
@@ -32,11 +33,28 @@ func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, error) {
 	}, nil
 }
 
+// SetStreamID sets a per-stream SSE id that is emitted with every subsequent
+// event. The browser echoes the most recently received id back in the
+// Last-Event-ID request header when its EventSource auto-reconnects; stamping a
+// stable per-request id lets the server detect and refuse that reconnect
+// instead of silently re-running the whole validation (R-090).
+func (s *SSEWriter) SetStreamID(id string) {
+	s.streamID = id
+}
+
 // WriteEvent writes an SSE event with the given type and data
 func (s *SSEWriter) WriteEvent(eventType string, data interface{}) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal event data: %w", err)
+	}
+
+	// Stamp the per-stream id (if any) so the client records it as
+	// Last-Event-ID and echoes it on an auto-reconnect (R-090).
+	if s.streamID != "" {
+		if _, err := fmt.Fprintf(s.w, "id: %s\n", s.streamID); err != nil {
+			return fmt.Errorf("failed to write event id: %w", err)
+		}
 	}
 
 	// Write event type

@@ -13,7 +13,7 @@ This project follows the TudorDNS-Golang common patterns:
 | **Metrics** | Prometheus + expvar endpoints |
 | **Rate Limiting** | Per-IP token bucket algorithm |
 | **Graceful Shutdown** | SIGINT/SIGTERM with request draining |
-| **Configuration** | Environment variables with sensible defaults |
+| **Configuration** | TOML file (preferred), environment variables as fallback |
 | **Health Checks** | `/health` and `/healthz` endpoints |
 | **Database** | None — stateless validation service |
 
@@ -560,9 +560,18 @@ type RRSIGRecord struct {
 
 ## Configuration
 
-All configuration is via **environment variables** (not TOML). This follows the TudorDNS convention for web services — TOML is only used by dnssec-signer because it's a local daemon with complex zone configurations.
+Configuration is **TOML-first, with environment variables as a fallback** — this is exactly what `Load()` does: it reads a TOML file if one is found, and only falls back to environment variables when none is.
 
-Create a `.env` file or systemd EnvironmentFile based on `.env.example`:
+1. **TOML file (preferred).** Pass an explicit path with `-config /path/to/dnssec-validator.toml`, or drop the file at one of the default paths, checked in order:
+   - `/usr/local/etc/tudordns/dnssec-validator.toml`
+   - `/etc/tudordns/dnssec-validator.toml`
+   - `./dnssec-validator.toml`
+
+   Copy `dnssec-validator.toml.example` as your starting point. Unknown/misspelled keys are rejected at load time (strict decoding), so a typo is a startup error rather than a silently ignored setting.
+
+2. **Environment variables (fallback).** When no TOML file is present — typical for a container or a minimal systemd unit — the same settings are read from the process environment (set them with systemd `Environment=`/`EnvironmentFile=` or exported shell variables). This project does **not** read a `.env` dotfile; TOML is the house configuration format.
+
+### Environment variable fallback reference
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -589,8 +598,8 @@ and logged as malformed, then the default is used — use plain integers.
 
 | Project Type | Config Method | Example |
 |--------------|---------------|---------|
-| Web services (FastCGI/HTTP) | Environment variables | rdap-proxy, dns-query, this project |
-| Local daemons with complex config | TOML files | dnssec-signer |
+| FastCGI web services | Environment variables | rdap-proxy, dns-query |
+| Standalone HTTP / local daemons | TOML file (env-var fallback) | this project, dnssec-signer |
 | CLI tools | Command-line flags | All projects for one-shot commands |
 
 ## Deployment
@@ -797,7 +806,7 @@ go test -tags=integration ./...
 ```
 Golang-dnssec-validator/
 ├── CLAUDE.md                 # This file — project spec and standards
-├── .env.example              # Environment variable template
+├── dnssec-validator.toml.example  # Config template (TOML — the preferred format)
 ├── Makefile                  # Build targets (see Common Patterns)
 ├── go.mod
 ├── go.sum

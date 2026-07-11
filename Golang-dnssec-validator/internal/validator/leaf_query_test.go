@@ -46,6 +46,30 @@ func TestValidatorLeafTypeName(t *testing.T) {
 	}
 }
 
+// R-096: a leaf RRSIG (A or CNAME) is accepted only when its signer name is the
+// zone itself; a foreign signer is rejected. Both verification paths share this
+// one predicate so the CNAME branch can't silently omit the check the A branch
+// has.
+func TestLeafSignerMatchesZone(t *testing.T) {
+	cases := []struct {
+		signer string
+		zone   string
+		want   bool
+	}{
+		{"example.com.", "example.com.", true}, // exact match
+		{"example.com.", "example.com", true},  // zone missing trailing dot
+		{"evil.example.", "example.com.", false},
+		{"com.", "example.com.", false},             // parent is not the signer
+		{"sub.example.com.", "example.com.", false}, // child label, not the apex
+		{"", "example.com.", false},
+	}
+	for _, c := range cases {
+		if got := leafSignerMatchesZone(c.signer, c.zone); got != c.want {
+			t.Errorf("leafSignerMatchesZone(%q, %q) = %v, want %v", c.signer, c.zone, got, c.want)
+		}
+	}
+}
+
 // R-100: leafFingerprint compares the answer across servers, ignoring benign TTL
 // differences and flagging genuinely different answers.
 func TestLeafFingerprint(t *testing.T) {

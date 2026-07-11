@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -137,5 +139,58 @@ func TestConfigValidate_MetricsAllowedCIDRsRejectInvalid(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "metrics_allowed_cidrs") {
 		t.Fatalf("Validate() error = %q, expected metrics_allowed_cidrs message", err.Error())
+	}
+}
+
+// TestDefaultConfig_MetricsLoopbackOnly (R-098): /metrics is loopback-only by
+// default so Prometheus internals are not world-readable out of the box. An
+// empty default would mean "no CIDR restriction" — the bug this fixes.
+func TestDefaultConfig_MetricsLoopbackOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	if len(cfg.MetricsAllowedCIDRs) == 0 {
+		t.Fatal("default MetricsAllowedCIDRs must not be empty (empty = unrestricted)")
+	}
+	want := map[string]bool{"127.0.0.0/8": true, "::1/128": true}
+	for _, c := range cfg.MetricsAllowedCIDRs {
+		if !want[c] {
+			t.Errorf("unexpected default metrics CIDR %q (default must be loopback-only)", c)
+		}
+		delete(want, c)
+	}
+	if len(want) != 0 {
+		t.Errorf("default metrics CIDRs missing loopback entries: %v", want)
+	}
+}
+
+// TestLoadFromFile_RejectsUnknownKey (R-093): strict TOML decoding turns a
+// misspelled key into a load-time error instead of silently ignoring it.
+func TestLoadFromFile_RejectsUnknownKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.toml")
+	// `max_concurent` is a typo of `max_concurrent` (missing an 'r').
+	content := "listen_addr = \":9999\"\nmax_concurent = 5\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFromFile(path); err == nil {
+		t.Fatal("expected error for unknown/misspelled key, got nil")
+	} else if !strings.Contains(err.Error(), "unknown key") {
+		t.Errorf("error should name the unknown key, got: %v", err)
+	}
+}
+
+// TestLoadFromFile_AcceptsKnownKeys (R-093): a config using only recognized keys
+// still loads and applies, so strict decoding doesn't break valid files.
+func TestLoadFromFile_AcceptsKnownKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.toml")
+	content := "listen_addr = \":9999\"\nmax_concurrent = 7\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("valid config should load: %v", err)
+	}
+	if cfg.ListenAddr != ":9999" || cfg.MaxConcurrent != 7 {
+		t.Errorf("config not applied: listen=%q max_concurrent=%d", cfg.ListenAddr, cfg.MaxConcurrent)
 	}
 }
