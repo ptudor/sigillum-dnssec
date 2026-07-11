@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,14 +69,35 @@ func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride
 
 	slog.Info("[KEY] Generating key", "domain", domain, "type", keyType, "algorithm", algorithm)
 
-	// Generate the key pair
-	dnskey, privateKey, err := generateDNSSECKey(domain, algorithm, flags)
-	if err != nil {
-		return nil, fmt.Errorf("generating %s: %w", keyType, err)
+	// Regenerate on a key-tag collision (bounded). A 16-bit key tag is not unique
+	// (RFC 4034 App. B); a collision with the zone's current keys or a backed-up
+	// key would corrupt rollover identity (OldKeyID == NewKeyID), clobber a
+	// backup file named by tag, and make Dynadot's upsert-by-key_tag replace the
+	// old DS instead of adding — so mint a fresh key until the tag is unused
+	// (R-029). ~1/65536 per generation, so this loop almost never iterates.
+	existingTags := kg.existingKeyTags(domain)
+	const maxTagAttempts = 10
+	var dnskey *dns.DNSKEY
+	var privateKey []byte
+	var keyTag uint16
+	for attempt := 1; ; attempt++ {
+		var err error
+		dnskey, privateKey, err = generateDNSSECKey(domain, algorithm, flags)
+		if err != nil {
+			return nil, fmt.Errorf("generating %s: %w", keyType, err)
+		}
+		keyTag = dnskey.KeyTag()
+		if !tagInUse(keyTag, existingTags) {
+			break
+		}
+		if attempt >= maxTagAttempts {
+			slog.Warn("[KEY] key tag still collides after retries; proceeding",
+				"domain", domain, "type", keyType, "tag", keyTag, "attempts", attempt)
+			break
+		}
+		slog.Debug("[KEY] regenerating on key-tag collision",
+			"domain", domain, "type", keyType, "tag", keyTag, "attempt", attempt)
 	}
-
-	// Compute key tag
-	keyTag := dnskey.KeyTag()
 
 	// Save key files
 	if err := kg.saveKeyFiles(domain, keyType, dnskey, privateKey); err != nil {
@@ -90,6 +112,52 @@ func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride
 		Expires:     now.Add(lifetime),
 		RolloverDue: now.Add(time.Duration(float64(lifetime) * 0.75)), // 75% of lifetime
 	}, nil
+}
+
+// tagInUse reports whether keyTag collides with a tag already used by the zone.
+// Pure so it can be unit-tested (R-029); the set is built by existingKeyTags.
+func tagInUse(keyTag uint16, existingTags map[uint16]bool) bool {
+	return existingTags[keyTag]
+}
+
+// existingKeyTags collects every key tag currently in use for a domain: the tags
+// of its live KSK/ZSK plus the tags of every backed-up key file. Rollover backs
+// up old keys as <domain>.<type>.<tag>.key (the numeric field IS the key tag,
+// since KeyState.ID == keytag), so scanning those filenames also covers an
+// in-progress rollover's old key. A read/parse failure just yields fewer known
+// tags (collision avoidance is best-effort, never fatal).
+func (kg *KeyGenerator) existingKeyTags(domain string) map[uint16]bool {
+	tags := make(map[uint16]bool)
+	dir := kg.cfg.KeysDir()
+
+	// Backup files: <domain>.<ksk|zsk>.<tag>.key
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".key") {
+				continue
+			}
+			for _, kt := range []string{"ksk", "zsk"} {
+				prefix := domain + "." + kt + "."
+				if !strings.HasPrefix(name, prefix) {
+					continue
+				}
+				mid := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".key")
+				if n, err := strconv.ParseUint(mid, 10, 16); err == nil {
+					tags[uint16(n)] = true
+				}
+			}
+		}
+	}
+
+	// Current live keys (not tag-named): parse them for their tags.
+	for _, kt := range []string{"ksk", "zsk"} {
+		if dk, err := kg.loadPublicKeyFromPath(filepath.Join(dir, domain+"."+kt)); err == nil {
+			tags[dk.KeyTag()] = true
+		}
+	}
+
+	return tags
 }
 
 // generateDNSSECKey generates a DNSKEY and corresponding private key
