@@ -109,19 +109,25 @@ func (c *DynadotClient) Name() string { return "dynadot" }
 // (HTTP 400 with Dynadot's specific error body) on the server side.
 //
 // Emits a debug log of the string being signed when DEBUG is enabled so
-// operators can eyeball byte-for-byte what went into the HMAC. The api key
-// is shown in full (it's in the Authorization header anyway); the secret
-// is never logged, only the resulting signature.
+// operators can eyeball byte-for-byte what went into the HMAC. Neither the
+// api key nor the secret is ever logged (CLAUDE.md contract): the key is
+// redacted to a fixed placeholder in the logged string-to-sign, and only the
+// resulting signature and the field lengths are surfaced.
 func (c *DynadotClient) sign(path, requestID, body string) string {
 	stringToSign := c.apiKey + "\n" + path + "\n" + requestID + "\n" + body
 	mac := hmac.New(sha256.New, []byte(c.apiSecret))
 	mac.Write([]byte(stringToSign))
 	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 
+	// Log the string-to-sign with the api key redacted so troubleshooting at
+	// debug level never leaks the credential into logs that may be shipped or
+	// retained. The remaining fields (path, request id, body) are what actually
+	// vary between requests and are non-secret.
+	redactedStringToSign := "<api_key>\n" + path + "\n" + requestID + "\n" + body
 	slog.Debug("[REGISTRAR] dynadot signing",
 		"api_key_len", len(c.apiKey),
 		"api_secret_len", len(c.apiSecret),
-		"string_to_sign", stringToSign,
+		"string_to_sign_redacted", redactedStringToSign,
 		"signature", sig)
 
 	return sig
@@ -518,6 +524,15 @@ func (c *DynadotClient) AddDS(ctx context.Context, domain string, records []*dns
 //
 // Passing an empty `records` slice is `registrar clear` — performs only
 // the DELETE, no PUTs.
+//
+// The restore (step 3) is the one window where a transient failure is
+// genuinely dangerous: the DELETE has already wiped the set, so giving up here
+// strands the zone with zero DS at the parent. To make the restore maximally
+// failure-proof it runs on a context detached from the caller (a cancelled or
+// nearly-expired parent deadline must not abort it) with a fresh generous
+// budget, and is retried with short backoff. If it still can't restore, the
+// error unwraps to ErrRegistrarDSEmpty so the caller escalates loudly and
+// records a zone warning (R-004).
 func (c *DynadotClient) ReplaceDS(ctx context.Context, domain string, records []*dns.DS) error {
 	if len(records) > 0 {
 		if err := c.AddDS(ctx, domain, records); err != nil {
@@ -533,7 +548,31 @@ func (c *DynadotClient) ReplaceDS(ctx context.Context, domain string, records []
 	if len(records) == 0 {
 		return nil
 	}
-	return c.AddDS(ctx, domain, records)
+
+	// Restore, detached from the caller's context so a cancel or an almost-spent
+	// parent deadline can't abort a restore whose failure would leave zero DS.
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+
+	const restoreAttempts = 3
+	var restoreErr error
+retry:
+	for attempt := 1; attempt <= restoreAttempts; attempt++ {
+		if restoreErr = c.AddDS(restoreCtx, domain, records); restoreErr == nil {
+			return nil
+		}
+		slog.Warn("[REGISTRAR] dynadot DS restore attempt failed",
+			"domain", domain, "attempt", attempt, "max_attempts", restoreAttempts, "error", restoreErr)
+		if attempt < restoreAttempts {
+			select {
+			case <-restoreCtx.Done():
+				break retry // budget exhausted; stop retrying and surface the sentinel
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+	}
+	return fmt.Errorf("%w: zone %s restore failed after %d attempts: %v",
+		ErrRegistrarDSEmpty, domain, restoreAttempts, restoreErr)
 }
 
 // parseDynadotUint8 parses Dynadot's algorithm / digest_type field into the

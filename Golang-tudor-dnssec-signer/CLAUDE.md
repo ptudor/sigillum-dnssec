@@ -454,7 +454,7 @@ After signing, the daemon runs the `post_sign` hook (e.g., `nsd-control reload`)
 ### Dependencies
 - Use `miekg/dns` for zone parsing and DNSSEC operations
 - Embed web UI with `embed` directive
-- TOML config with `BurntSushi/toml` or `pelletier/go-toml`
+- TOML config with `pelletier/go-toml/v2` (uses strict decoding — `DisallowUnknownFields` — so misspelled keys error at load)
 - No database — state is a single JSON file
 
 ### Code Organization
