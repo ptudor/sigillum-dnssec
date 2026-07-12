@@ -570,4 +570,102 @@ The review traces the signer and validator from configuration and process startu
 
 **Verification:** Verify A and CNAME signatures with lower/upper/mixed-case signer and zone spellings, missing trailing dots, an actually different zone, and a deceptive suffix (`notexample.com`). Valid case variants pass; non-equal names fail.
 
-<!-- Additional findings and the required final summary/fix order are appended in later review-only checkpoints. -->
+### R-041 — Startup writability probing truncates and deletes a pre-existing file
+
+**Severity:** Medium
+
+**Location:** `Golang-tudor-dnssec-signer/daemon.go:249-258`, `Daemon.checkDirWritable`; startup validation for data/output/keys directories
+
+**Problem:** The daemon tests writability by creating the fixed path `.startup_check` with truncation semantics and then deleting it. If an operator, deployment tool, or another process already owns a file at that name, every daemon startup destroys it. Close/remove errors are also ignored, so the probe can report success while leaving an artifact or after an unsuccessful flush.
+
+**Evidence:** `os.Create(filepath.Join(dir, ".startup_check"))` is equivalent to create-or-truncate; there is no existence check or `O_EXCL`. The function unconditionally calls `os.Remove(testFile)`. The health checker already demonstrates the safe pattern with `os.CreateTemp` and a unique name.
+
+**Fix specification:** Use a unique same-directory temporary file created exclusively, close it with error checking, then remove only that exact file and surface cleanup failure appropriately. Never open, truncate, chmod, chown, or remove a pre-existing path. Preserve the directories checked and startup's fail-fast writability guarantee.
+
+**Verification:** Place distinctive `.startup_check` files in every checked directory, start validation, and assert their bytes/mode/owner survive. Inject create/write/close/remove failures and concurrent probes; verify unique artifacts, accurate errors, and no leftovers after success.
+
+### R-042 — Rollover backup and restore copies are neither atomic nor durable
+
+**Severity:** Medium
+
+**Location:** `Golang-tudor-dnssec-signer/hooks.go:208-237`, `copyFile`; `Golang-tudor-dnssec-signer/rollover.go:382-440`, `backupKey`/`restoreKeyFromBackup`; `Golang-tudor-dnssec-signer/keys.go`, backup-copy callers
+
+**Problem:** Key backup/restore opens the destination with `O_TRUNC`, streams bytes directly, and does not fsync the file or directory. An I/O error or crash can leave a truncated backup or live key half. A rollover can then durably record the new generation even though the only recovery copy of the old private key was never durable; restore can also produce a mixed live pair by replacing private and public files separately.
+
+**Evidence:** `copyFile` writes the final destination in place, explicitly closes but never syncs it or its directory. `backupKey` performs public and private copies sequentially; `restoreKeyFromBackup` performs private then public sequentially. These paths are the rollback foundation for the state-save failures in R-004/R-005, so a partial copy defeats those higher-level recovery attempts.
+
+**Fix specification:** Stage, validate, fsync, and commit a complete public/private backup generation atomically, with a manifest/pointer or recoverable pair transaction coordinated with R-013. Restore must likewise expose either the complete old or complete new live pair, never truncate a live half in place. Preserve current key encodings, modes/ownership, tag-suffixed backup naming compatibility, and idempotent identical-backup behavior.
+
+**Verification:** Fault every read/write/close/sync/rename and kill the process between pair steps. After restart, assert a complete validated backup and live pair from one generation remain; no zero-length/mixed halves are selectable. Cover initial backup, completing a half-written legacy backup, identical/different collision handling, rollback, and non-root/root ownership.
+
+### R-043 — Non-zone and invalid-protocol DNSKEYs can authenticate signatures
+
+**Severity:** High
+
+**Location:** `Golang-dnssec-validator/internal/dns/query.go:113-135`, DNSKEY parsing; `Golang-dnssec-validator/internal/validator/dnssec.go:102-129`, key lookup; `CollectDSMatchedKeys`, `CollectAnchorMatchedKeys`, and all signature-verification key selection
+
+**Problem:** The validator records the Zone Key flag and Protocol field but never enforces them before using a DNSKEY. A DS can match a key with Zone Key clear or Protocol other than 3, and that key can then verify DNSKEY/data/denial signatures and produce `secure`. RFC 4034 explicitly forbids using a non-zone key to verify RRSIGs and requires a non-3 Protocol key to be treated invalid.
+
+**Evidence:** Parsing computes `IsKSK`/`IsZSK`, but `FindDNSKEYByKeyTag` and DS/anchor collection fall back to/accept any record without `Flags&256` or `Protocol` checks. `reconstructDNSKEY` passes the invalid values to the crypto library; a successful mathematical signature is treated as sufficient. `IsRevoked` is likewise never consulted for root trust-anchor lifecycle (to be addressed with R-024).
+
+**Fix specification:** Centralize DNSKEY eligibility: Protocol must be 3, Zone Key flag must be set for signature verification, algorithm must be locally usable, and RFC 5011 revoke state must be honored for trust anchors. SEP must remain only a hint—do not require it for a DS-authenticated zone key. Keep invalid keys visible in diagnostics/JSON but exclude them from authenticated/signing candidates and explain the rejection. Preserve public record schemas.
+
+**Verification:** Construct cryptographically correct chains using Protocol 2, flags 0/1/128, valid 256/257 keys, reserved ignored bits, and revoked anchors. Invalid keys must never yield secure; valid ZSK-referenced DS and KSK conventions must continue to work. Test every leaf/DS/DNSKEY/denial key-selection path.
+
+### R-044 — Key-tag collisions cause valid signatures and DS links to be rejected by slice order
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/dnssec.go:102-129`, `Find*ByKeyTag`; `ValidateChainLink`; `verifyDNSKEYRRSIGOne`; `VerifyDenialRRSIGFromResponse`; leaf and DS RRSIG verification callers
+
+**Problem:** A DNSSEC key tag is only a 16-bit hint, but most paths return the first key with a tag and never try another colliding key. If that first key has the wrong algorithm/material/role, a later key that really verifies the DS or signature is ignored, producing a false bogus result. This contradicts the code's own correct digest treatment and RFC 6840 collision guidance.
+
+**Evidence:** `FindKSKByKeyTag`, `FindZSKByKeyTag`, and `FindDNSKEYByKeyTag` return on their first match. `ValidateChainLink` does not continue to another same-tag KSK after a digest mismatch; `verifyDNSKEYRRSIGOne` selects the first authenticated key with the tag; denial and leaf paths do the same. Response ordering therefore changes the verdict.
+
+**Fix specification:** Treat key tag as a candidate filter, additionally match RRSIG algorithm, enforce R-043 eligibility, and try every candidate cryptographically until one succeeds. DS matching must test every same-tag/algorithm DNSKEY digest. Keep deterministic diagnostics for all failures and never collapse keys into a map keyed only by tag (including R-035 comparisons). Preserve successful first-match performance as a fast path and public APIs where possible.
+
+**Verification:** Generate/construct two distinct DNSKEYs with one tag, put the valid candidate before and after the invalid one, and exercise DS link, DNSKEY RRSIG, DS RRSIG, leaf, and denial validation. Both orders must give the same result; wrong algorithm, no valid candidate, and two valid candidates must be diagnosed correctly.
+
+### R-045 — NSEC ordering compares presentation strings rather than canonical wire names
+
+**Severity:** Medium — Needs investigation
+
+**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:472-500`, `canonicalizeName`/`canonicallyBetween`; `splitLabels`/`compareCanonical`; all NSEC range proofs
+
+**Problem:** RFC 4034 canonical order compares unescaped, lowercased label octets from right to left. The validator lowercases presentation strings and splits on literal dots, so escaped octets (including escaped dots) sort and split incorrectly. A signed NSEC interval can consequently be rejected or, more seriously, accepted for a QNAME that is not canonically inside it, creating a false authenticated denial.
+
+**Evidence:** `splitLabels` uses `strings.Split` and `compareCanonical` uses Go string `<`; neither decodes `\\DDD`/single-character escapes. The sibling signer already implements `canonicalLabelBytes`/`canonicalLess` specifically because presentation comparison mis-orders these names and has tests for escaped octets. Validator tests cover only ordinary ASCII labels.
+
+**Fix specification:** Parse names with a DNS-aware label parser and compare canonical wire octets exactly as RFC 4034 section 6.1 specifies, including escaped dot/octet, case folding, root, and prefix ordering. Exact-owner equality must use the same canonical representation. Do not change NSEC3 base32hex ordering. Investigation should construct signed intervals around escaped labels and identify current false-positive as well as false-negative cases.
+
+**Verification:** Port the signer's escaped-label vectors and add full signed NSEC NXDOMAIN/NODATA/wildcard proofs using `\\000`, `\\046`, `\\065`, high octets, case variants, and prefix names. Compare results against miekg/wire-order reference and a known validating resolver.
+
+### R-046 — Slow SSE clients can hold validation capacity forever
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/server.go:30`, `82-85`, and `248-258`; `Golang-dnssec-validator/sse.go:45-98`; `Golang-dnssec-validator/handlers.go:148-195` and event callback
+
+**Problem:** SSE is excluded from every write deadline because streams are long-lived. Event writes and flushes run synchronously inside validation callbacks while the global validation semaphore is held. If a client stops reading and the socket buffer fills, the handler blocks in write/flush; the validation context's timer cannot interrupt a blocked `ResponseWriter`, so enough slow clients permanently exhaust all validation slots.
+
+**Evidence:** Server `WriteTimeout` is zero and `/validate` is not wrapped by `withWriteDeadline`. `SSEWriter` calls `fmt.Fprintf` then `Flush` with no response-controller deadline. `cancelOnWriteError` can cancel only after a write returns an error, and `defer releaseValidationSlot` cannot run while the callback is blocked.
+
+**Fix specification:** Apply a sliding per-event write/flush deadline via `http.ResponseController` (reset for each event/keepalive), close/cancel the stream on deadline, and ensure semaphore/gauge release. Retain long-lived SSE by avoiding one absolute whole-stream deadline. Bound queued events if validation and writing are decoupled, preserve event order/JSON/path, and handle writers that do not support deadlines conservatively.
+
+**Verification:** Use a real TCP client that stops reading after headers and a deadline-aware blocking writer; fill buffers and assert the handler, validation context, semaphore, and gauges clear within the configured bound. Cover normal long streams, slow-but-progressing readers, disconnects, proxy flushing, unsupported deadline writers, and shutdown.
+
+### R-047 — Enabled heartbeat configuration can leak credentials or silently disable monitoring
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/config.go:319-413`, `Config.Validate`; `Golang-dnssec-validator/internal/heartbeat/heartbeat.go:42-67` and `69-116`
+
+**Problem:** When heartbeat is enabled, configuration validates only the interval. An HTTP URL sends the API key in cleartext form data (and a default redirect policy can downgrade a configured HTTPS POST via 307/308). Missing API key or app does not fail startup; `NewClient` silently returns a disabled client, so an operator can believe monitoring is active while no heartbeat is sent.
+
+**Evidence:** `Config.Validate` has an HTTPS check for root anchors but none for heartbeat URL/redirects or required credentials. `NewClient` returns `{enabled:false}` for missing key/app without error. `Send` places `api_key` in the POST body and uses an `http.Client` with default redirect behavior.
+
+**Fix specification:** If enabled, require nonempty API key/app, parse and require HTTPS, and reject scheme-downgrade/unapproved-origin redirects; fail configuration/startup with a clear non-secret error. If loopback HTTP is needed for testing, require an explicit narrowly scoped opt-in added backward-compatibly. Preserve disabled-by-default behavior, form schema, endpoint defaults, and never log the key.
+
+**Verification:** Test enabled with missing fields, malformed URL, HTTP, HTTPS->HTTP 307/308, cross-origin redirect, valid HTTPS, disabled incomplete config, and explicit loopback override if added. Capture requests to assert the API key never reaches an insecure/unapproved destination or logs.
+
+<!-- Additional low-severity findings and the required final summary/fix order are appended in the final review-only checkpoint. -->
