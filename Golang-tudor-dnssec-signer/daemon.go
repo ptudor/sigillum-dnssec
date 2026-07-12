@@ -246,15 +246,23 @@ func (d *Daemon) validateStartup() error {
 	return nil
 }
 
-// checkDirWritable verifies a directory is writable
+// checkDirWritable verifies a directory is writable by creating and removing a
+// unique temporary file. It must never open, truncate, or remove a pre-existing
+// fixed-name path: the previous ".startup_check" (os.Create = create-or-truncate)
+// would destroy any operator/tooling file of that name on every startup (R-041).
 func (d *Daemon) checkDirWritable(dir, name string) error {
-	testFile := filepath.Join(dir, ".startup_check")
-	f, err := os.Create(testFile)
+	f, err := os.CreateTemp(dir, ".startup_check-*")
 	if err != nil {
 		return fmt.Errorf("%s not writable (%s): %w", name, dir, err)
 	}
-	f.Close()
-	os.Remove(testFile)
+	testFile := f.Name()
+	if err := f.Close(); err != nil {
+		os.Remove(testFile)
+		return fmt.Errorf("%s writability probe close failed (%s): %w", name, dir, err)
+	}
+	if err := os.Remove(testFile); err != nil {
+		return fmt.Errorf("%s writability probe cleanup failed (%s): %w", name, dir, err)
+	}
 	return nil
 }
 
@@ -465,6 +473,19 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 			ZSK:  zsk,
 		}
 		snap.state.SetZone(domain, zoneState)
+	}
+
+	// R-003: the active config is authoritative for the source path. Change
+	// detection above used zoneCfg.Path, but SignZone reads zoneState.Path — if the
+	// operator edited the zone's `path` and reloaded, reconcile the state to the
+	// config path so we parse/sign the SAME file change detection saw, not the stale
+	// path in state.json. SignZone captures source mtime/size and writes output only
+	// after a successful parse, so a failed/unparseable new path leaves the prior
+	// signed output and change-detection bookkeeping intact.
+	if zoneState.Path != zoneCfg.Path {
+		slog.Info("[DAEMON] Zone source path changed in config; signing the new path",
+			"domain", domain, "old_path", zoneState.Path, "new_path", zoneCfg.Path)
+		snap.state.UpdateZone(domain, func(zs *ZoneState) { zs.Path = zoneCfg.Path })
 	}
 
 	// Sign the zone
