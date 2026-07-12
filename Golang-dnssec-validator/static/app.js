@@ -5,6 +5,7 @@
     const form = document.getElementById('validate-form');
     const domainInput = document.getElementById('domain-input');
     const modeSelect = document.getElementById('mode-select');
+    const typeSelect = document.getElementById('type-select');
     const validateBtn = document.getElementById('validate-btn');
     const statusEl = document.getElementById('status');
     const statusTextEl = statusEl.querySelector('.status-text');
@@ -18,6 +19,10 @@
     const zoneContentEl = document.getElementById('zone-content');
     const rawJsonEl = document.getElementById('raw-json');
     const copyLinkBtn = document.getElementById('copy-link-btn');
+
+    // Record types the API accepts (mirrors the type-select options). An invalid
+    // URL value must not silently select a different non-A type (R-049).
+    const SUPPORTED_TYPES = ['A','AAAA','MX','TXT','NS','SOA','CNAME','CAA','SRV','PTR','NAPTR','SPF'];
 
     // State
     let currentResult = null;
@@ -36,7 +41,7 @@
             btn.addEventListener('click', function() {
                 var domain = this.getAttribute('data-domain');
                 domainInput.value = domain;
-                startValidation(domain, modeSelect.value);
+                startValidation(domain, modeSelect.value, typeSelect.value);
             });
         });
 
@@ -52,9 +57,13 @@
         if (mode === 'quick' || mode === 'extended') {
             modeSelect.value = mode;
         }
+        const type = (params.get('type') || '').toUpperCase();
+        if (type && SUPPORTED_TYPES.indexOf(type) !== -1) {
+            typeSelect.value = type;
+        }
         if (domain) {
             domainInput.value = domain;
-            startValidation(domain, modeSelect.value);
+            startValidation(domain, modeSelect.value, typeSelect.value);
         }
     }
 
@@ -71,11 +80,16 @@
     }
 
     // Update URL without reloading
-    function updateURL(domain, mode) {
+    function updateURL(domain, mode, type) {
         const url = new URL(window.location);
         url.searchParams.set('domain', domain);
         if (mode) {
             url.searchParams.set('mode', mode);
+        }
+        if (type && type !== 'A') {
+            url.searchParams.set('type', type);
+        } else {
+            url.searchParams.delete('type');
         }
         if (url.search === window.location.search) {
             return;
@@ -89,12 +103,15 @@
         const domain = domainInput.value.trim();
         if (!domain) return;
 
-        startValidation(domain, modeSelect.value);
+        startValidation(domain, modeSelect.value, typeSelect.value);
     }
 
     // Start validation via SSE
-    function startValidation(domain, mode) {
-        updateURL(domain, mode);
+    function startValidation(domain, mode, type) {
+        if (!type || SUPPORTED_TYPES.indexOf(type) === -1) {
+            type = 'A';
+        }
+        updateURL(domain, mode, type);
 
         // Cancel any existing connection
         if (eventSource) {
@@ -107,7 +124,7 @@
         validateBtn.disabled = true;
 
         // Connect to SSE endpoint (relative URL for path prefix support)
-        const sseUrl = 'validate?domain=' + encodeURIComponent(domain) + '&mode=' + encodeURIComponent(mode);
+        const sseUrl = 'validate?domain=' + encodeURIComponent(domain) + '&mode=' + encodeURIComponent(mode) + '&type=' + encodeURIComponent(type);
         eventSource = new EventSource(sseUrl);
 
         eventSource.addEventListener('start', function(e) {

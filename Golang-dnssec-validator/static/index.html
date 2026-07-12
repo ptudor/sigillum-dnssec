@@ -27,6 +27,20 @@
                            placeholder="Enter domain (e.g., iana.org)"
                            autocomplete="off" autocapitalize="none" autocorrect="off"
                            spellcheck="false" required>
+                    <select id="type-select" name="type" aria-label="Record type">
+                        <option value="A">A</option>
+                        <option value="AAAA">AAAA</option>
+                        <option value="MX">MX</option>
+                        <option value="TXT">TXT</option>
+                        <option value="NS">NS</option>
+                        <option value="SOA">SOA</option>
+                        <option value="CNAME">CNAME</option>
+                        <option value="CAA">CAA</option>
+                        <option value="SRV">SRV</option>
+                        <option value="PTR">PTR</option>
+                        <option value="NAPTR">NAPTR</option>
+                        <option value="SPF">SPF</option>
+                    </select>
                     <select id="mode-select" name="mode" aria-label="Validation mode">
                         <option value="extended">Extended</option>
                         <option value="quick">Quick</option>
