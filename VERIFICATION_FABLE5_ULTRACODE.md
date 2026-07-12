@@ -14,12 +14,14 @@
 
 ## Verdict summary
 
-| Verdict | Count | IDs |
+| Verdict | At verification (2026-07-11) | After worklist resolution (same day) |
 |---|---|---|
-| **PASS** | 91 | all IDs not listed below |
-| **PARTIAL** | 8 | R-001, R-008, R-028, R-076, R-077 (signer); R-081, R-082, R-088 (validator) |
-| **FAIL** | 0 | — |
-| **SKIP — justified** | 1 | R-099 |
+| **PASS** | 91 | 96 |
+| **PARTIAL** | 8 — R-001, R-008, R-028, R-076, R-077 (signer); R-081, R-082, R-088 (validator) | 3 — R-001 (owner-set coverage gap in the verify gate), R-008 (daemon-resurrection residual), R-076 (helper-level-only test coverage) |
+| **FAIL** | 0 | 0 |
+| **SKIP — justified** | 1 — R-099 | 1 — R-099 |
+
+The per-finding verdicts below are the record **as of the verification pass**; the follow-up fixes that moved R-028, R-077, R-081, R-082, and R-088 to PASS are documented in **Worklist resolution** below.
 
 **Meaning of the verdicts.** PASS: the fix is present, resolves the finding as specified, respects the must-not-change constraints, and any caveats are minor (test-coverage weakness, cosmetic residue). PARTIAL: the fix genuinely closes the core problem but either leaves a specified piece unimplemented, violates a stated constraint on one path, or introduces a real (always fail-closed) regression that needs follow-up. No fix was found absent or ineffective.
 
@@ -43,6 +45,29 @@ These were found by re-checking the changed code, as the verification task requi
 12. **Post-sign verify gate can reject a previously-shippable zone with mixed-case duplicate owner spellings** (from R-001). `signRecordsWithKeys` groups case-insensitively but miekg `Verify`/`IsRRset` compares owner names case-sensitively, so an RRset spelled `www`/`WWW` now fails the gate (`sign.go:840`) though it signs and validates fine on the wire. Fail-closed and loud; rare input. Fix: canonicalize owner case before verification (or when grouping).
 13. **Backup-exists skips check only the `.key` half** (from R-027/R-029). Both `backupExistingKeyFiles` (`keys.go:305-311`) and `backupKey` (`rollover.go:367-376`) treat a tag-named backup as complete when only its `.key` exists; a crash between `backupKey`'s two copies followed by a retry can lose the old `.private`'s only copy (fail-loud downstream, never silent; very narrow window). Fix: require the backup `.private` too before skipping.
 14. **Daemon init branch not widened for keyless placeholders** (from R-033). `SignAll`'s condition was widened but `daemon.go:451` still tests only `zoneState == nil`, so a placeholder written by cron `sign` and merged into a running daemon is healed only by the next CLI `sign`, not by the daemon. Fix: mirror the widened condition.
+
+## Worklist resolution (2026-07-11, same-day follow-up)
+
+All 14 worklist items were implemented immediately after the verification pass, in the commit series following this document's commit. Both projects re-verified afterward: `gofmt -l` / `go vet` clean, full `go test -race -count=1 ./...` green in each. New tests live in `verification_fixes*_test.go` (signer), `internal/validator/verification_fixes_test.go` and `internal/dns/answer_types_test.go` (validator).
+
+1. **RESOLVED** — `keyPairAbsent(keysDir, domain, role)` (main.go): `runAdd`'s `kskGenerated`/`zskGenerated` now mean "both halves absent beforehand," so `unwindAdd` can never delete a surviving orphan half. End-to-end test drives a failed `add` over a `.private`-only orphan and asserts the orphan survives (fails against the old flag computation).
+2. **RESOLVED** — additive `QueryResult.AnswerTypes` (internal/dns) + pure `isDenialForType(qr, qtype)` predicate: a NOERROR/CNAME-free response routes to the NODATA denial path only when the answer section holds no records of the queried type; wildcard-expanded positive answers proceed to the RRSIG path where `verifyWildcard` applies. → R-082 to PASS.
+3. **RESOLVED** — `nextParentDNSKEY(prev, zoneResult)` threads parent keys at both `validateWithCache` sites: an insecure zone clears the set (descendants reach `finalizeNoDSDelegation`'s insecure-ancestor branch and read `insecure`); indeterminate/bogus parents keep the previous keys (fail closed, no laundering). → R-081's dead branch is reachable.
+4. **RESOLVED** — `RolloverState.PhaseFirstSigned` (`phase_first_signed,omitempty`): the DNSKEY-TTL floor gate measures from the phase's first observed publish, stamped on the first rollover check that sees gate (b) satisfied and reset on phase transition; applied to both pre_publish and signing phases. Old state files stamp on first check (≤1 poll late). Frequent re-signs no longer stall the rollover; schema round-trip tested.
+5. **RESOLVED** — `FindRRSIGsForType` (plural) + any-one-verifies iteration in `VerifyDNSKEYRRSIGByKeys` and the DS check (`verifyDSRRSIGSet`/`verifyDSRRSIGOne`): RFC 4035 §5.3.3 semantics; R-080's authenticated-key-set membership requirement unchanged per signature; aggregate errors when none verifies. Double-signature tests (rogue-first + genuine-last → accepted; all-rogue → rejected) with real-key crypto.
+6. **RESOLVED** — `nsec3IterationsOverCap` guard at the top of `verifyDSAbsence`'s NSEC3 branch, before any hashing; through `finalizeNoDSDelegation` an over-cap NSEC3 yields `bogus`, never `insecure`. → R-088 to PASS.
+7. **RESOLVED** — the `validationCache` compute goroutine recovers panics (slog.Error + stack), and its cleanup (cache-if-non-nil, clear inflight, close done) runs in a defer on both paths — waiters unblock to the stale/nil fallback and a later `get` recomputes; the daemon survives (test proves the pre-fix code crashed the test binary).
+8. **RESOLVED** — `resolveRegistrarLocked` (via `loadConfigStateLocked`) for the mutating `registrar push`/`clear`; read-only `get`/`verify` stay unlocked. The `ErrRegistrarDSEmpty` warning's `state.Save()` now runs under the R-007 flock; lock-held and released-on-error paths tested.
+9. **RESOLVED** — `newSyslogHandler` returns its `io.Closer` on both platforms; `setupLogging` tracks it (`syslogCloser`) and `closeSyslogWriter()` closes the previous connection before each re-dial. No more fd-per-SIGHUP leak.
+10. **RESOLVED** — `evalRRSIGCover` clears `expired`/`expiredExp` when a valid, tag-accepted signature is found, restoring the documented "ALL out of window" invariant; order-independence table-tested both ways.
+11. **RESOLVED** — `isZoneTableHeader` matcher (whitespace, trailing `#` comment, both TOML quote styles) replaces the exact match in `RemoveZoneFromConfigFile`, and `runRemove` now errors — instead of printing success — when the parsed config confirms the zone but the rewriter cannot locate its header.
+12. **RESOLVED** — `rrsetForVerify` in the post-sign gate: case-divergent owner groups are verified against lowercased `dns.Copy` clones (RFC 4034 §6.2 canonical form), written records never mutated, uniform groups uncopied. Mixed-case zones sign again; a corrupt RRSIG in such a zone is still rejected.
+13. **RESOLVED** — both backup-exists skip paths (`backupKey`, `backupExistingKeyFiles`) complete a half-written backup by copying the live `.private` into the backup slot before skipping; differing-content refusal unchanged; nothing is ever deleted.
+14. **RESOLVED** — daemon's `checkAndSignZone` init condition widened to match `SignAll` (`zoneState == nil || KSK == nil || ZSK == nil`); a keyless placeholder is healed by the next daemon cycle (test mirrors `TestSignAll_RetriesKeylessPlaceholder`).
+
+Also closed alongside: the R-077 signing→complete test gap (`TestZSKRollover_SigningPhaseGating` — dwell gate, signed-after-PhaseStarted gate, and completion effects including the old ZSK actually dropping from the published DNSKEY RRset) → R-077 to PASS.
+
+**Still open (documented, deliberate):** R-001's chain-closure check still validates pointer-cycle consistency rather than cross-checking the expected owner set (and no test drives a broken zone through `SignZone` itself); R-008's daemon-resurrection residual (the state merge never removes zones, so a daemon poll between `remove` and SIGHUP re-persists the entry — preventing it safely needs a deletion-aware merge, a design change beyond this pass); R-076's remaining wiring-level test debt. The lesser residuals list below is unchanged except where a worklist item superseded it.
 
 Lesser residuals (documented, acceptable as-is): `Shutdown()` holding `d.mu` across `srv.Shutdown` can make graceful shutdown wait the full timeout in a sub-microsecond race window (bounded, R-006); pre-existing startup-window unlocked `d.cfg`/`d.heartbeat` reads in `daemon.go:93/210-241/265` (racy only if SIGHUP lands before the first cycle — same class R-018 fixed elsewhere); `validateStartup`'s pre-existing unlocked `state.Save()` (`daemon.go:241`); a successful re-sign's `ClearWarnings` time-bounds the R-032 URGENT zero-DS warning to the next signing event; R-046's unloadable-old-KSK breadcrumb logs at Debug only; R-083's error strings still say "A record" regardless of the queried type (display only); anchors loader would follow an https→http redirect (requires a broken mirror, TLS intact); R-052 will always warn on Windows (synthesized file modes) and warns on 0750 (group-execute) — both benign; sibling of R-039 (pre-existing, out of the review's scope): manual `StartKSKRollover` still mints the new KSK with the config-default algorithm.
 
@@ -168,4 +193,4 @@ A consistent pattern across both projects: the fixes' *helper functions* are wel
 
 ## Conclusion
 
-The FIXES log's completion claim holds with qualifications: all 100 findings were addressed, 91 verified fully sound, none failed outright, and the one SKIP is justified. The 8 PARTIALs and the 14-item worklist above are the delta between "addressed" and "done" — every one fails closed, and the two most user-visible (worklist items 1 and 2: `unwindAdd` deleting an orphan key half, and wildcard answers reading bogus) are the ones to fix first.
+The FIXES log's completion claim holds with qualifications: all 100 findings were addressed, 91 verified fully sound at verification time, none failed outright, and the one SKIP is justified. The 8 PARTIALs and the 14-item worklist were the delta between "addressed" and "done" — every one fail-closed. All 14 worklist items were resolved the same day (see **Worklist resolution**), moving R-028, R-077, R-081, R-082, and R-088 to PASS. What remains open is documented above: R-001's owner-set coverage gap, R-008's daemon-resurrection residual, and R-076's wiring-level test debt — none of them a correctness regression, all fail-closed or test-only.
