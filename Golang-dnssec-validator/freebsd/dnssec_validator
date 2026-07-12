@@ -8,42 +8,89 @@
 #
 # dnssec_validator_enable="YES"
 #
+# Optional overrides (defaults shown):
+# dnssec_validator_svcuser="dnssec-validator"
+# dnssec_validator_command="/usr/local/sbin/dnssec-validator.sh"
+# dnssec_validator_logdir="/var/log/tudordns"
+#
+# Create the service user and log dir before starting:
+#   pw useradd -n dnssec-validator -d /nonexistent -s /usr/sbin/nologin -c "DNSSEC Validator Service"
+#   install -d -o dnssec-validator /var/log/tudordns
+#
+# The wrapper (dnssec-validator.sh) sources the env file and exec()s the
+# binary; see QUICKSTART-FREEBSD.md.
 
 . /etc/rc.subr
 
 name="dnssec_validator"
-rcvar="dnssec_validator_enable"
+rcvar="${name}_enable"
 
 load_rc_config $name
 
 : ${dnssec_validator_enable:="NO"}
+: ${dnssec_validator_svcuser:="dnssec-validator"}
+: ${dnssec_validator_command:="/usr/local/sbin/dnssec-validator.sh"}
+: ${dnssec_validator_logdir:="/var/log/tudordns"}
+: ${dnssec_validator_pidfile:="/var/run/${name}.pid"}
 
-# Don't set dnssec_validator_user - rc.subr would add another su wrapper
-# We handle user switching in command_args instead
+pidfile="${dnssec_validator_pidfile}"
 
-pidfile="/var/run/${name}.pid"
-procname="/usr/local/sbin/dnssec-validator"
+# Privilege drop is done by `daemon -u` (below), NOT an su(1) wrapper, so the
+# child pid daemon(8) records in ${pidfile} is the wrapper -> exec()'d binary
+# itself -- status/stop/restart therefore act on the real listener. The old
+# `daemon ... /usr/bin/su -m user -c wrapper` form recorded su's pid instead,
+# which made `status` report "not running" while the daemon was live and made
+# `stop` signal su rather than the binary (so a restart never cut over and a
+# fresh start collided on the listen port). Using a non-magic *_svcuser var
+# (not ${name}_user) keeps rc.subr from re-wrapping our custom commands in su.
 
-# Use daemon(8) to properly daemonize, with wrapper to source env file
-command="/usr/sbin/daemon"
-command_args="-p ${pidfile} -S -T dnssec_validator /usr/bin/su -m dnssec-validator -c /usr/local/sbin/dnssec-validator.sh"
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+status_cmd="${name}_status"
+restart_cmd="${name}_restart"
 
-start_precmd="${name}_prestart"
-stop_postcmd="${name}_poststop"
-
-dnssec_validator_prestart()
+dnssec_validator_start()
 {
-    # Create log directory if needed (app writes to LOG_FILE from env)
-    install -d -o dnssec-validator /var/log/tudordns
+    if [ -f "${pidfile}" ] && kill -0 $(cat ${pidfile}) 2>/dev/null; then
+        echo "${name} is already running as pid $(cat ${pidfile})"
+        return 1
+    fi
 
-    # Pre-create pidfile writable by dnssec-validator user
-    touch ${pidfile}
-    chown dnssec-validator ${pidfile}
+    # App writes its structured log under here (LOG_FILE in the env file).
+    install -d -o ${dnssec_validator_svcuser} ${dnssec_validator_logdir}
+
+    echo "Starting ${name}."
+    /usr/sbin/daemon -p ${pidfile} -u ${dnssec_validator_svcuser} \
+        -S -T ${name} ${dnssec_validator_command}
 }
 
-dnssec_validator_poststop()
+dnssec_validator_stop()
 {
+    if [ -f "${pidfile}" ] && kill -0 $(cat ${pidfile}) 2>/dev/null; then
+        echo "Stopping ${name}."
+        kill -TERM $(cat ${pidfile})
+        wait_for_pids $(cat ${pidfile})
+    else
+        echo "${name} is not running."
+    fi
     rm -f ${pidfile}
+}
+
+dnssec_validator_status()
+{
+    if [ -f "${pidfile}" ] && kill -0 $(cat ${pidfile}) 2>/dev/null; then
+        echo "${name} is running as pid $(cat ${pidfile})"
+    else
+        echo "${name} is not running"
+        return 1
+    fi
+}
+
+dnssec_validator_restart()
+{
+    dnssec_validator_stop
+    sleep 1
+    dnssec_validator_start
 }
 
 run_rc_command "$1"
