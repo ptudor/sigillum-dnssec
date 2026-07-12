@@ -196,3 +196,20 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 
 ### R-014 — Root initialization creates unusable service tree — SKIPPED
 - **Reason:** The fix requires making privileged bootstrap ownership explicit — "Accept/configure the intended daemon account or fail before creating artifacts." There is no daemon user/group config field, and adding one is a schema/design decision (field names, validation, application to every writer) whose exact shape I would be guessing. The only no-schema alternative — fail whenever root bootstraps a missing data_dir — over-triggers: a legitimate all-root deployment (daemon also runs as root) has NO config signal to distinguish it from the drop-privileges case, so failing would break it. Because I cannot distinguish the two intents from existing configuration, and guessing a new config surface is exactly what the task forbids, this is skipped rather than implemented incorrectly.
+
+## Phase 6 — Rollover timing & publication policy (bounded pieces)
+
+### R-060 — Invalid DS digest silently defaults to SHA-256 — FIXED
+- **Change:** `Config.Validate` now rejects any registrar `digest_type` other than 0 (unset/default), 2 (SHA-256), or 4 (SHA-384), before any key/state/output/registrar mutation. Previously `RegistrarConfig.DigestType()` silently coerced every unsupported value to 2, so a typo published a different DS representation than intended with no error. The method's defensive default is retained but now unreachable for invalid values (Validate gates first).
+- **Files:** `Golang-tudor-dnssec-signer/config.go`, `phase6_lowfindings_test.go` (new)
+- **Verification:** `TestR060_ValidateRejectsInvalidDigestType` — 1/3/5/255/-1 rejected; 0/2/4 accepted. Existing `DigestType()` method test (value 1 → 2) still passes (it does not go through Validate). Full signer suite green.
+
+### R-022 — Key generation accepts tag collision after retries — FIXED
+- **Change:** After `maxTagAttempts` unresolved key-tag collisions, key generation now returns a hard error (naming domain/role/attempt count and the colliding tag, no secret material) and leaves every live/backup key and state entry unchanged — no files are written at that point. Previously it logged a warning and `break`, then installed the colliding key, corrupting rollover identity (`OldKeyID == NewKeyID`), clobbering the tag-named backup, and making registrar upsert-by-key-tag replace the old DS.
+- **Files:** `Golang-tudor-dnssec-signer/keys.go`
+- **Verification:** Build clean; full signer suite green (normal generation, which never exhausts the retries, is unaffected — the loop breaks on the first unique tag). The collision itself is ~1/65536 per attempt so it cannot be forced deterministically without a generator seam (R-059); the change is a warn→fail-closed with no files written before the return.
+
+### R-021 — Rollover metrics keep stale active types — FIXED
+- **Change:** `UpdateZoneMetrics` now zeros all three supported rollover-type series (`ksk`/`zsk`/`algorithm`) for each domain on every refresh, THEN sets the single current type, instead of only zeroing them in the no-rollover branch. A direct type→type transition (e.g. ksk → algorithm) between scrapes no longer leaves the previous type's gauge stuck at 1.
+- **Files:** `Golang-tudor-dnssec-signer/metrics.go`, `phase6_lowfindings_test.go` (new)
+- **Verification:** `TestR021_RolloverMetricsNoStaleType` — ksk→algorithm→nil transitions each leave exactly one (then zero) type series at 1; the old type is always zeroed. Full signer suite green.

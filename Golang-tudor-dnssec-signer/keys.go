@@ -91,9 +91,13 @@ func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride
 			break
 		}
 		if attempt >= maxTagAttempts {
-			slog.Warn("[KEY] key tag still collides after retries; proceeding",
-				"domain", domain, "type", keyType, "tag", keyTag, "attempts", attempt)
-			break
+			// R-022: a colliding tag corrupts rollover identity (OldKeyID ==
+			// NewKeyID), clobbers a tag-named backup, and makes registrar upsert
+			// replace the old DS. Rather than install that unsafe key (the previous
+			// warn+break), fail closed and leave every live/backup key and state
+			// entry unchanged — no files have been written yet at this point.
+			return nil, fmt.Errorf("could not generate a %s for %q with a unique key tag after %d attempts (last colliding tag %d); aborting without changing any key or state",
+				keyType, domain, attempt, keyTag)
 		}
 		slog.Debug("[KEY] regenerating on key-tag collision",
 			"domain", domain, "type", keyType, "tag", keyTag, "attempt", attempt)
