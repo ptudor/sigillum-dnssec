@@ -75,13 +75,13 @@ func TestExtractClientIP_UntrustedProxyIgnoresXFF(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/api/validate", nil)
-	req.RemoteAddr = "8.8.8.8:12345"
+	req.RemoteAddr = "203.0.113.9:12345"
 	req.Header.Set("X-Forwarded-For", "203.0.113.7")
 	req.Header.Set("X-Real-IP", "203.0.113.8")
 
 	got := extractClientIP(req)
-	if got != "8.8.8.8" {
-		t.Fatalf("extractClientIP = %q, want %q", got, "8.8.8.8")
+	if got != "203.0.113.9" {
+		t.Fatalf("extractClientIP = %q, want %q", got, "203.0.113.9")
 	}
 }
 

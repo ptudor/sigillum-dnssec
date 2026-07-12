@@ -78,7 +78,7 @@ type RegistrarDynadotConfig struct {
 
 // ValidateConfig holds settings for internet DNSSEC validation checks
 type ValidateConfig struct {
-	Resolver string   `toml:"resolver"` // e.g. "8.8.8.8:53", default: system resolver
+	Resolver string   `toml:"resolver"` // e.g. "127.0.0.1:53", default: system resolver
 	Timeout  Duration `toml:"timeout"`  // default: 5s
 }
 
