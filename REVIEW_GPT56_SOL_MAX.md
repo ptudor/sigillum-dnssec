@@ -402,4 +402,172 @@ The review traces the signer and validator from configuration and process startu
 
 **Verification:** For every RRset class, test expired-only, not-yet-valid-only, valid-bad-plus-expired-good, expired-bad-plus-valid-good, same-tag different-key, wrong owner/signer, and one fully valid among multiple signatures. Specifically assert expired DS-absence proof cannot produce `insecure`. Run with a fake clock across skew and serial-time wrap cases.
 
+### R-029 — Equivalent DNS names can be managed as independent zones with conflicting keys
+
+**Severity:** High
+
+**Location:** `Golang-tudor-dnssec-signer/config.go:336-467`, config validation; `Golang-tudor-dnssec-signer/config.go:679-697`, `ValidateDomainName`; `Golang-tudor-dnssec-signer/main.go`, `runAdd`/`runImport` exact-key checks; state/key/output path construction throughout the signer
+
+**Problem:** DNS names are case-insensitive and an optional trailing root dot does not change identity, but configuration/state maps and filesystem names use the operator's spelling verbatim. `example.com`, `Example.COM`, and `example.com.` can therefore be added as separate managed zones, generating independent KSK/DS sets for one DNS zone. Automatic registrar publication can oscillate the parent between those sets; case-insensitive filesystems can also make the nominally separate key paths collide.
+
+**Evidence:** `ValidateDomainName` accepts upper case and trailing dots but returns no canonical identity. Config validation iterates map keys without checking normalized duplicates, and add/import reject only exact `cfg.Zones[domain]`/`state.GetZone(domain)` matches. `GetZone*`, key filenames, backup names, signed outputs, metrics labels, and registrar operations retain the raw key string, while DNS wire operations call `dns.Fqdn`/case-insensitive routines.
+
+**Fix specification:** Define one canonical management identity (lowercase, no trailing root dot is compatible with existing filenames) and apply it at every CLI/config/state/API boundary. Reject a config containing duplicate canonical identities before any signing or registrar action. Provide a safe migration/diagnostic for a single legacy mixed-case/dotted entry that reuses its existing keys and never silently merges, deletes, renames, or regenerates competing key sets. Preserve DNS owner semantics, public command shapes, and ability to sign mixed-case owner names within a zone.
+
+**Verification:** Attempt every case/trailing-dot pair in one config and through sequential add/import commands; assert rejection before filesystem/state/registrar changes. Test legacy single-entry loading and migration on case-sensitive and case-insensitive filesystems, state reload, rollover backups, metrics, API lookup, and registrar push all resolve to one identity and retain the existing DS-matched KSK.
+
+### R-030 — Unauthenticated zone-cut discovery can turn a parent referral into a false secure NODATA answer
+
+**Severity:** High
+
+**Location:** `Golang-dnssec-validator/internal/dns/resolver.go:172-245`, `CheckZoneCut`/`DiscoverZoneCuts`; `Golang-dnssec-validator/internal/dns/query.go:65-75`, authoritative flag capture; `Golang-dnssec-validator/internal/validator/validator.go:178-189` and `539-603`; `Golang-dnssec-validator/internal/validator/nsec.go:172-208`, NSEC NODATA logic
+
+**Problem:** The security-critical zone hierarchy is inferred from an unvalidated recursive resolver. If it omits a child cut, leaf validation asks the signed parent for data at the delegation. A parent referral is not an authoritative leaf answer, but the validator ignores the captured AA flag and merges the authority NSEC. For a query at the delegation name, the signed parent-side NSEC (NS set, SOA clear, queried type absent) is accepted as NODATA, yielding `secure` even though the child may publish different data.
+
+**Evidence:** `CheckZoneCut` trusts whether the recursive response places NS in Answer; a NOERROR response without it means “not a zone.” `verifyActualRecord` then treats any NOERROR empty Answer plus NSEC/NSEC3 as denial. `verifyNSECNODATA` requires only owner equality and absence of QTYPE/CNAME; it does not reject the delegation pattern `NS && !SOA`. `QueryResult.Authoritative` is stored but never read anywhere. A signed NSEC referral is cryptographically valid under the parent key, so crypto alone does not correct the authority-boundary error.
+
+**Fix specification:** Derive cuts from authenticated referrals while walking from the root (or independently confirm recursive hints against the currently authenticated parent); recursive resolution may accelerate address discovery but must not decide authority. Require an authoritative final answer from the correct zone, distinguish referrals from NODATA, and reject an NS-without-SOA denial as generic leaf NODATA. Apply equivalent correct-zone/delegation checks to NSEC3 and CNAME discovery. Preserve configurable recursive resolvers as hints, API/result shapes, and direct authoritative querying.
+
+**Verification:** Use a fake recursive resolver that hides a real child cut, then have the parent return a correctly signed NSEC/NSEC3 referral while the child has an A record. Assert the validator follows the referral and validates the child, never secure-NODATA at the parent. Cover secure/insecure delegations, apex NODATA (`NS+SOA`, valid), non-authoritative responses, CNAME targets, glue failures, and honest discovery.
+
+### R-031 — Supported query types collapse to `UNKNOWN` in denial bitmaps
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/dns/types.go:174-195`, `TypeName`; `Golang-dnssec-validator/internal/dns/query.go:163-193`, NSEC/NSEC3 parsing; `Golang-dnssec-validator/internal/validator/validator.go:75-93`, `SupportedQueryType`; `Golang-dnssec-validator/internal/validator/nsec.go`, NODATA checks
+
+**Problem:** PTR, SRV, NAPTR, and SPF are accepted query types but absent from the local type-name map. They—and every other unlisted bitmap type—become the same string `UNKNOWN`. A legitimate NODATA proof for SRV can be rejected merely because the owner has an unrelated SSHFP/other unlisted type, and diagnostics cannot identify which type was present. This creates false bogus results for a public API feature.
+
+**Evidence:** `SupportedQueryType` accepts numeric types 12, 33, 35, and 99. `TypeName` omits all four and returns `UNKNOWN`; the parser stores only these strings. NODATA comparison asks whether the query's `UNKNOWN` occurs in the bitmap, so any different unlisted type is indistinguishable from the queried one.
+
+**Fix specification:** Use miekg/dns's complete type registry and a unique `TYPE<decimal>` fallback for unknown numeric types. Prefer retaining numeric bitmap values internally so display naming cannot affect validation. Preserve existing JSON type names for already-known types and accepted query-type/API behavior.
+
+**Verification:** Exhaustively round-trip every supported type through NSEC and NSEC3 parsing. For each of PTR/SRV/NAPTR/SPF, prove NODATA succeeds with unrelated SSHFP/unknown types present and fails when the queried bit is present. Test unknown TYPE#### values remain distinct and existing A/AAAA/MX behavior is unchanged.
+
+### R-032 — Chain validation incorrectly requires every DS algorithm to work
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/dnssec.go:182-245`, `ValidateChainLink`; corresponding multi-algorithm tests/comments
+
+**Problem:** A delegation with one valid algorithm path and one stale, unsupported, or temporarily incomplete rollover path is declared bogus. Validators are supposed to accept any single valid supported path; requiring every DS algorithm makes legitimate algorithm rollovers and heterogeneous validator capabilities fail.
+
+**Evidence:** DS records are grouped by algorithm and the function returns an error as soon as any group has no matching DNSKEY. Its comment attributes the opposite rule to RFC 6840. RFC 6840 section 5.11 says validators should accept any single valid path and should not insist all DS/DNSKEY algorithms work; completeness is an optional diagnostic for servers.
+
+**Fix specification:** Separate validation security from completeness diagnostics. Determine locally supported algorithm/digest paths, accept the chain when any supported DS exactly matches a DNSKEY and the later DNSKEY RRSIG verification succeeds, and optionally warn about other broken signaled paths. Treat an authenticated DS set with no locally supported path according to RFC 4035 unsupported-algorithm semantics rather than automatically bogus; treat supported paths that all cryptographically fail as bogus. Preserve result/status APIs and full-match diagnostic visibility.
+
+**Verification:** Update tests that enshrine all-algorithm failure. Cover one valid plus one stale path, valid supported plus unknown algorithm, unsupported-only DS, multiple digests for one key, all supported paths invalid, and two valid rollover paths. Assert the selected authenticated-key set still limits DNSKEY RRSIG verification correctly.
+
+### R-033 — A signed child below an insecure ancestor is mislabeled bogus when an unauthenticated DS exists
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/validator.go:191-299`, parent-state threading; `nextParentDNSKEY`; `Golang-dnssec-validator/internal/validator/validator.go:909-1012`, non-root validation
+
+**Problem:** Once an ancestor is proven insecure, descendants cannot regain a chain to the configured root (absent a separate local trust anchor). The code represents that state only by clearing `parentDNSKEY`. If a lower parent response contains a DS, the child path then demands a verified DS RRSIG with the now-nil keys and returns bogus. That DS is unauthenticated under the root and must not change the overall insecure state by itself.
+
+**Evidence:** `nextParentDNSKEY` returns nil for `StatusInsecure`. The no-DS branch has a special nil-parent path returning insecure, which existing tests cover. The DS-present branch has no equivalent: `queryDSFromParentWithValidation` cannot set `RRSIGVerified` with no keys, and lines 982-989 classify it bogus. The no-DNSKEY/DS-present branch similarly returns bogus before considering ancestor state.
+
+**Fix specification:** Thread an explicit parent security state separately from key material. Below an insecure ancestor, keep the overall result insecure and treat descendant DNSKEY/DS/self-signature observations as diagnostics only unless an explicitly configured local trust anchor starts a new validation island. Preserve fail-closed behavior below secure or indeterminate ancestors and existing status/API enums.
+
+**Verification:** Build chains with secure root -> insecure delegation -> child having DS+DNSKEY, DS without DNSKEY, DNSKEY without DS, and deeper descendants; all remain insecure, with useful diagnostics. Confirm the same combinations immediately below a secure parent remain secure/bogus/indeterminate as appropriate, and an optional future local-anchor path is isolated.
+
+### R-034 — CNAME loops and depth exhaustion silently terminate as secure
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/validator.go:120-132`, validation recursion; `Golang-dnssec-validator/internal/validator/validator.go:333-356`, depth gate; `checkAndFollowCNAME`
+
+**Problem:** CNAME traversal has only a depth counter. At depth 10 it simply stops looking and returns the security status accumulated so far, normally `secure`; there is no visited-name set or error. A two-name loop repeats until the cutoff and is then reported secure, and a valid chain longer than the policy limit is presented as fully validated although its terminal target was never checked.
+
+**Evidence:** The sole guard is `if depth < maxCNAMEDepth`; the `else` path records nothing. `validatedZones` caches zone results, not visited CNAME owner/target names, so it cannot detect loops within or across zones. `checkAndFollowCNAME` always recursively validates the target without a name-level cycle check.
+
+**Fix specification:** Carry a canonical-name visited set and explicit traversal path. A repeated owner/target is a CNAME-loop failure (bogus DNS data); exceeding a configurable safety depth without a loop is indeterminate/policy-limited unless the full target was otherwise proven. Include a clear result error/path, stop emitting misleading complete events, and preserve the current default limit and JSON compatibility through optional fields.
+
+**Verification:** Test A->B->A, self-CNAME, mixed-case cycles, loops across zones, exactly-limit and limit+1 acyclic chains, and a normal chain. Assert no loop/depth-exceeded result is secure and event/cached-zone behavior terminates with bounded queries.
+
+### R-035 — Multi-server mode selects unverified input-order responses and compares only key tags
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/validator.go:473-537`, leaf querying; `Golang-dnssec-validator/internal/validator/validator.go:859-904`, DNSKEY selection; `Golang-dnssec-validator/internal/validator/validator.go:1057-1101`, parent DS query; `Golang-dnssec-validator/internal/validator/validator.go:1316-1410`, `ValidateMultipleServers`/`compareDNSKEYSets`
+
+**Problem:** Extended mode gathers several DNSKEY responses but marks every transport-level NOERROR response `secure`, selects the first by input address order before cryptographic validation, and treats disagreements as warnings. Empty responses are excluded from comparison, and equal key-tag sets are called equal even if flags, algorithms, or public keys differ. DS queries stop at the first NOERROR/NXDOMAIN server, while leaf queries are sequential and likewise verify the first usable answer. A broken first server can make a valid zone bogus/indeterminate despite later valid servers, and per-server JSON can show green for unverified data.
+
+**Evidence:** `AddressResult.Status` initializes to `StatusSecure` before any DNSSEC check. Selection at lines 881-887 takes the first such response, including an empty DNSKEY set. `compareDNSKEYSets` maps only `KeyTag`; 16-bit collisions are expected. The reference loop ignores any response with zero keys. Parent DS returns inside its first-success loop, and leaf fingerprints do not determine which response is cryptographically selected.
+
+**Fix specification:** Cryptographically validate each server's context-bound response before assigning its security status. In extended mode, accept any fully valid path while reporting every timeout, empty/referral, bogus, and byte-level RRset disagreement; choose deterministically from valid responses, not address order. Fingerprint complete canonical owner/RDATA (TTL-insensitive where appropriate), including key flags/protocol/algorithm/public key and denial context. Query parent DS authorities consistently. Preserve quick-mode latency goals, endpoint schemas, and the distinction between server inconsistency and overall DNSSEC validity.
+
+**Verification:** Test first-empty/later-valid, first-bogus/later-valid, all-bogus, timeout, same-tag-different-key, same keys different order/TTL, RRSIG rollover, inconsistent DS/NXDOMAIN, and leaf disagreements. Assert per-server status reflects crypto, overall choice is deterministic, and extended mode actually accounts for every reachable server.
+
+### R-036 — One-record NSEC and NSEC3 chains never cover any absent name
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:481-515`, `canonicallyBetween` and `hashBetween`; all NSEC/NSEC3 denial and wildcard callers
+
+**Problem:** In a denial chain containing one owner, the record's next owner equals itself and the interval wraps across the entire namespace except that owner. Both interval helpers treat `start == end` as an empty normal interval, so legitimate minimal signed zones cannot prove NXDOMAIN, wildcard nonexistence, opt-out coverage, or similar denials.
+
+**Evidence:** Wrap handling is entered only for `start > end`. Equality falls through to `name > start && name < end`, which is impossible; the hash helper is identical. Existing interval tests cover normal/wrap/equal-endpoint queries but no equal start/end chain.
+
+**Fix specification:** Implement the DNSSEC cyclic interval rule explicitly: when start equals end, every value except the owner/start is covered. Keep endpoints exclusive and preserve canonical DNS label ordering/base32hex ordering for all other cases. Ensure exact-owner matches continue through the separate existence/type-bitmap path.
+
+**Verification:** Add one-owner NSEC and NSEC3 zones proving several absent names on both sides of the owner, with the exact owner excluded. Run those records through NXDOMAIN, NODATA where applicable, wildcard, and DS-absence callers, plus existing multi-record/wrap tests.
+
+### R-037 — NSEC3 proof logic combines records with incompatible hash parameters
+
+**Severity:** Medium — Needs investigation
+
+**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:293-413`, `VerifyNSEC3Denial` and helpers; `Golang-dnssec-validator/internal/validator/nsec.go:625-660`, wildcard proof; `Golang-dnssec-validator/internal/validator/validator.go:1209-1271`, DS absence
+
+**Problem:** Hashes are computed using the first record's algorithm/iterations/salt, but matching/coverage searches consider every NSEC3 record in the response. During an NSEC3 salt/parameter transition—or with replayed signed records—records from distinct chains can be combined into a logical proof that no single chain establishes. RFC 5155 permits treating mixed-parameter responses as bogus; it does not permit comparing a hash from one parameter space with ranges from another.
+
+**Evidence:** `params := records[0]` supplies salt/iterations, while `nsec3Matches`, `nsec3Covers`, and direct loops never compare each record's tuple to `params`. `VerifyDenialRRSIGFromResponse` can authenticate all involved records because both chains may be legitimately signed, so cryptographic verification does not enforce logical parameter consistency. The same pattern appears in wildcard and delegation proofs.
+
+**Fix specification:** Partition records by complete `(zone, hash algorithm, iterations, salt)` tuple and require every component of a proof to come from one supported, internally consistent chain. Reject malformed mixed data or independently test each chain without cross-combination. Enforce correct owner-zone suffix and hash length. Preserve valid transition responses when one complete chain proves the answer. Investigation should construct simultaneous signed old/new-salt responses and enumerate whether current helpers can false-accept NXDOMAIN, NODATA, wildcard, or DS absence.
+
+**Verification:** Create two individually incomplete, differently salted signed chains whose union satisfies the current searches; assert the union cannot verify. Then test two complete chains (either may verify), mixed algorithms/iterations/salts/zones, ordering changes, replayed records, and single consistent chains across every caller.
+
+### R-038 — Wildcard NODATA responses are unsupported and reported bogus
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:172-208`, `verifyNSECNODATA`; `Golang-dnssec-validator/internal/validator/nsec.go:380-413`, `verifyNSEC3NODATA`; leaf denial dispatch in `verifyActualRecord`
+
+**Problem:** When a wildcard exists but lacks the requested type, the authenticated NODATA proof is about the wildcard owner plus the closest-encloser/no-closer-match proof. The implementation only accepts an NSEC/NSEC3 whose owner/hash exactly matches QNAME, so standards-compliant wildcard NODATA responses fail and make a valid zone look bogus.
+
+**Evidence:** Both NODATA helpers compare only QNAME (or `H(QNAME)`) and never search for the generated `*.<closest-encloser>` owner or validate its accompanying closest-encloser proof. RFC 5155 section 8.7 explicitly requires closest-encloser proof plus a matching wildcard NSEC3 with QTYPE and CNAME absent; no test covers this response class.
+
+**Fix specification:** Distinguish exact-name, empty-nonterminal, and wildcard NODATA. For wildcard NODATA, validate the complete closest-encloser/no-closer-match proof and the authenticated wildcard NSEC/NSEC3 bitmap with QTYPE and CNAME absent, using one consistent chain per R-037. Do not weaken ordinary exact-name NODATA or confuse this with positive wildcard answers in R-026. Preserve result JSON while explaining which proof form succeeded.
+
+**Verification:** Add RFC-style NSEC and NSEC3 wildcard NODATA fixtures for present/absent QTYPE, CNAME set, missing/forged closest-encloser component, wrong wildcard owner, mixed parameters, and valid exact-name/empty-nonterminal NODATA. Only complete valid forms may remain secure.
+
+### R-039 — Zero currently active anchors is treated as a bogus root instead of unavailable trust
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/dns/anchors.go:148-175`, `GetActiveAnchors`; `Golang-dnssec-validator/internal/validator/validator.go:162-172` and `944-955`; `Golang-dnssec-validator/handlers.go:203-213`, `322-329`; `Golang-dnssec-validator/health.go:45-64`
+
+**Problem:** Availability checks look only at the unfiltered anchor slice. If every entry is future-dated, expired, or has an invalid validity timestamp, requests proceed with zero active anchors and label the real root DNSKEY `bogus`. This is local trust configuration/update failure, not evidence that the root zone is bogus, and readiness incorrectly remains healthy.
+
+**Evidence:** `Validate` and both handlers check `len(anchors.Anchors)`, while root validation later calls `GetActiveAnchors` and passes the possibly empty result to `VerifyRootTrustAnchor`; its no-match error is converted to `StatusBogus`. Health also reports any nonempty raw slice “available.”
+
+**Fix specification:** Validate and snapshot the active anchor set before DNS work. With none active, return service-unavailable/indeterminate with a trust-anchor diagnostic and fail readiness; expose invalid/future/expired counts and dates without secrets. Coordinate with R-024/R-025 so an authenticated successor becomes active at the correct time and last-known-good handling cannot silently extend an expired anchor. Preserve status/API enums and future-anchor preloading.
+
+**Verification:** Test future-only, expired-only, malformed-date-only, current+future, current+expired, clock skew, and transition instants. Assert health/readiness, JSON/SSE status, and metrics distinguish unavailable local trust from a cryptographically bogus root.
+
+### R-040 — RRSIG signer-name comparison is case-sensitive
+
+**Severity:** Medium
+
+**Location:** `Golang-dnssec-validator/internal/validator/validator.go:713-720`, `leafSignerMatchesZone`; A/CNAME leaf verification callers
+
+**Problem:** DNS names are case-insensitive, but a legitimate RRSIG whose Signer Name uses different letter case from the discovered zone is rejected. This creates a false bogus leaf verdict even though cryptographic canonicalization accepts the signature.
+
+**Evidence:** The helper uses Go string equality against `zone` and `dns.Fqdn(zone)`; neither lowercases nor uses DNS name equality. The parser preserves the response's presentation case. Other parts of the code already canonicalize DNS names, so this isolated exact comparison is inconsistent.
+
+**Fix specification:** Compare canonical FQDNs with a DNS-aware case-insensitive routine (for example `dns.EqualDomainName`) after validating syntax. Apply the same rule to all signer/owner/parent-zone bindings introduced by R-027/R-028, without allowing subdomains or merely suffix-matching names. Preserve original presentation strings in JSON.
+
+**Verification:** Verify A and CNAME signatures with lower/upper/mixed-case signer and zone spellings, missing trailing dots, an actually different zone, and a deceptive suffix (`notexample.com`). Valid case variants pass; non-equal names fail.
+
 <!-- Additional findings and the required final summary/fix order are appended in later review-only checkpoints. -->
