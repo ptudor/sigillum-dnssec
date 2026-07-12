@@ -61,9 +61,30 @@ func NewClient(cfg Config) *Client {
 		app:        cfg.App,
 		statusURL:  cfg.StatusURL,
 		instanceID: instanceID,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		enabled:    true,
+		httpClient: &http.Client{
+			Timeout:       10 * time.Second,
+			CheckRedirect: heartbeatRedirectPolicy,
+		},
+		enabled: true,
 	}
+}
+
+// heartbeatRedirectPolicy refuses a redirect that would downgrade the scheme
+// (HTTPS to anything else) or cross to a different origin (host:port). The API key
+// travels in the POST body, so a 307/308 redirect to an HTTP or foreign host would
+// leak it — validating only the configured URL is insufficient without this (R-047).
+func heartbeatRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	orig := via[0].URL
+	if orig.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing heartbeat redirect from %s to %s scheme (downgrade would leak api_key)", orig.Scheme, req.URL.Scheme)
+	}
+	if !strings.EqualFold(req.URL.Host, orig.Host) {
+		return fmt.Errorf("refusing cross-origin heartbeat redirect from %q to %q", orig.Host, req.URL.Host)
+	}
+	return nil
 }
 
 // Send sends a heartbeat with the given action.
