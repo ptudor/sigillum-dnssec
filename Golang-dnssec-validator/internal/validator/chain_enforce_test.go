@@ -305,7 +305,10 @@ func TestRecordValidationVerdict(t *testing.T) {
 	}{
 		{"nil stays secure", nil, StatusSecure},
 		{"verified answer secure", &RecordValidation{RRSIGVerified: true}, StatusSecure},
-		{"verified wildcard with warning secure", &RecordValidation{RRSIGVerified: true, Wildcard: true, Error: "wildcard answer lacks proof"}, StatusSecure},
+		// R-026: a wildcard answer whose data RRSIG verified but whose no-exact-match
+		// proof did not verify is bogus, not secure.
+		{"wildcard without verified proof is bogus", &RecordValidation{RRSIGVerified: true, Wildcard: true, Error: "wildcard answer lacks proof"}, StatusBogus},
+		{"wildcard with verified proof secure", &RecordValidation{RRSIGVerified: true, Wildcard: true, WildcardProofVerified: true}, StatusSecure},
 		{"expired signature bogus", &RecordValidation{Error: "A record RRSIG expired at 2020-01-01T00:00:00Z"}, StatusBogus},
 		{"forged signature bogus", &RecordValidation{Error: "A record RRSIG cryptographic verification failed: bad"}, StatusBogus},
 		{"missing rrsig bogus", &RecordValidation{Error: "no RRSIG for A record"}, StatusBogus},

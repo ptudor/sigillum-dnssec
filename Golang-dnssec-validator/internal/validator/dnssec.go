@@ -214,8 +214,11 @@ func FindDSByKeyTag(keyTag uint16, dsRecords []dnspkg.DSRecord) *dnspkg.DSRecord
 }
 
 // ValidateChainLink validates the chain of trust between DS and DNSKEY records.
-// Per RFC 6840 Section 5.11, if multiple algorithms are present in DS records,
-// ALL algorithms MUST have at least one valid DS→DNSKEY chain for the zone to be secure.
+// Per RFC 6840 Section 5.11 a validator accepts the delegation when ANY single DS
+// exactly matches a DNSKEY (and the later DNSKEY-RRSIG check succeeds); it must NOT
+// require every DS algorithm to have a working path (R-032). Algorithms whose DS has
+// no matching DNSKEY are recorded as diagnostics, not treated as bogus — that keeps
+// legitimate algorithm rollovers and heterogeneous validator capabilities working.
 func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRecord, zone string) (*ChainLink, error) {
 	link := &ChainLink{
 		ChildZone:    zone,
@@ -228,51 +231,26 @@ func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRe
 		return nil, fmt.Errorf("no DS records in parent zone")
 	}
 
-	// Group DS records by algorithm (RFC 6840 §5.11 requirement)
-	algorithmDS := make(map[uint8][]dnspkg.DSRecord)
-	for _, ds := range parentDS {
-		algorithmDS[ds.Algorithm] = append(algorithmDS[ds.Algorithm], ds)
-	}
-
-	// Each algorithm present MUST have at least one valid DS→DNSKEY match
+	// R-032: accept the delegation as soon as ANY single DS exactly matches an
+	// eligible DNSKEY. RFC 6840 §5.11 does not require every DS algorithm to have a
+	// working path; requiring that breaks algorithm rollovers and heterogeneous
+	// validators. Key tags collide, so try every eligible same-tag DNSKEY (R-043/R-044).
 	var firstValidKSK *dnspkg.DNSKEYRecord
-	var validatedAlgorithms []uint8
-
-	for alg, dsRecords := range algorithmDS {
-		algValidated := false
-
-		for _, ds := range dsRecords {
-			// Key tags collide (RFC 6840), so try EVERY eligible same-tag DNSKEY
-			// against this DS digest, not just the first (R-043/R-044).
-			var matched *dnspkg.DNSKEYRecord
-			for i := range childDNSKEY {
-				if childDNSKEY[i].KeyTag != ds.KeyTag || !childDNSKEY[i].EligibleForVerification() {
-					continue
-				}
-				if VerifyDSMatchesDNSKEY(ds, childDNSKEY[i], zone) {
-					matched = &childDNSKEY[i]
-					break
-				}
+	for _, ds := range parentDS {
+		for i := range childDNSKEY {
+			if childDNSKEY[i].KeyTag != ds.KeyTag || !childDNSKEY[i].EligibleForVerification() {
+				continue
 			}
-
-			if matched != nil {
-				algValidated = true
-				if firstValidKSK == nil {
-					firstValidKSK = matched
-					link.Algorithm = dnspkg.AlgorithmName(ds.Algorithm)
-					link.DigestType = dnspkg.DigestTypeName(ds.DigestType)
-					link.KeyTag = ds.KeyTag
-				}
-				break // This algorithm validated, move to next
+			if VerifyDSMatchesDNSKEY(ds, childDNSKEY[i], zone) {
+				firstValidKSK = &childDNSKEY[i]
+				link.Algorithm = dnspkg.AlgorithmName(ds.Algorithm)
+				link.DigestType = dnspkg.DigestTypeName(ds.DigestType)
+				link.KeyTag = ds.KeyTag
+				break
 			}
 		}
-
-		if algValidated {
-			validatedAlgorithms = append(validatedAlgorithms, alg)
-		} else {
-			// Algorithm present in DS but no valid DNSKEY = BOGUS per RFC 6840
-			return link, fmt.Errorf("algorithm %d (%s) has DS but no matching DNSKEY (RFC 6840 §5.11)",
-				alg, dnspkg.AlgorithmName(alg))
+		if firstValidKSK != nil {
+			break
 		}
 	}
 
