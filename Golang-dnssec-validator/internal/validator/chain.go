@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"golang.org/x/net/publicsuffix"
 	"strings"
 )
 
@@ -141,31 +142,30 @@ func ExtractTLD(domain string) string {
 // (i.e., directly under a TLD, like "example.com" but not "www.example.com").
 // This is a simplified check - doesn't handle complex TLDs like "co.uk".
 func IsRegistrableDomain(zone string) bool {
-	zone = NormalizeDomain(zone)
-	if zone == "." {
+	z := NormalizeDomain(zone)
+	if z == "." {
 		return false
 	}
-	// Registrable domains have exactly 2 labels (e.g., "example.com.")
-	// This is a simple heuristic; real-world would need a public suffix list
-	return GetZoneLabels(zone) == 2
+	// R-051: the RDAP cross-check should run only when the validated zone IS the
+	// registrable domain (eTLD+1), determined by the public suffix list — not a
+	// two-label heuristic that skips real registrants like example.co.uk and would
+	// query public suffixes like co.uk as if they were registrants.
+	reg := GetRegistrableDomain(z)
+	return reg != "" && reg == z
 }
 
-// GetRegistrableDomain extracts the registrable domain from a full domain.
-// e.g., "www.example.com." -> "example.com."
-// Returns empty string for TLDs and root.
+// GetRegistrableDomain returns the registrable domain (effective TLD + 1) for the
+// given name using the public suffix list, or "" for a public suffix, TLD, root, or
+// otherwise non-registrable name (R-051). e.g. "www.example.co.uk." -> "example.co.uk.".
 func GetRegistrableDomain(domain string) string {
-	domain = NormalizeDomain(domain)
-	labels := GetZoneLabels(domain)
-
-	if labels < 2 {
+	d := strings.TrimSuffix(NormalizeDomain(domain), ".")
+	if d == "" {
 		return ""
 	}
-
-	// Take the last 2 labels
-	parts := strings.Split(strings.TrimSuffix(domain, "."), ".")
-	if len(parts) < 2 {
+	etld1, err := publicsuffix.EffectiveTLDPlusOne(d)
+	if err != nil {
+		// d is itself a public suffix (e.g. "co.uk", "com") or is malformed.
 		return ""
 	}
-
-	return strings.Join(parts[len(parts)-2:], ".") + "."
+	return etld1 + "."
 }
