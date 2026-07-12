@@ -94,6 +94,81 @@ func cachedValidateAll(v *Validator) *ValidateOutput {
 	return dashboardValidationCache.get(v.ValidateAll, validationCacheTTL, validationMaxWait)
 }
 
+// zoneValidationCache bounds the per-zone /api/validate/{domain} endpoint the same
+// way dashboardValidationCache bounds the aggregate one (R-018): one single-flight
+// slot per domain with a short result TTL, so repeated or concurrent requests for a
+// zone coalesce into one live-DNS run instead of each spawning fresh many-query,
+// many-second validations. The map is keyed by domain and only ever holds managed
+// zones (callers check state.GetZone first), so it cannot grow unboundedly.
+type zoneValidationCache struct {
+	mu     sync.Mutex
+	byZone map[string]*zoneValEntry
+}
+
+type zoneValEntry struct {
+	result   *ValidationResult
+	computed time.Time
+	inflight chan struct{}
+}
+
+var dashboardZoneValidationCache = &zoneValidationCache{byZone: map[string]*zoneValEntry{}}
+
+func (c *zoneValidationCache) get(domain string, compute func() *ValidationResult, ttl, maxWait time.Duration) *ValidationResult {
+	c.mu.Lock()
+	e := c.byZone[domain]
+	if e == nil {
+		e = &zoneValEntry{}
+		c.byZone[domain] = e
+	}
+	if e.result != nil && time.Since(e.computed) < ttl {
+		r := e.result
+		c.mu.Unlock()
+		return r
+	}
+	done := e.inflight
+	if done == nil {
+		done = make(chan struct{})
+		e.inflight = done
+		go func() {
+			var out *ValidationResult
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("[WEB] Panic in per-zone dashboard validation (recovered)",
+						"domain", domain, "panic", r, "stack", string(debug.Stack()))
+				}
+				c.mu.Lock()
+				if out != nil {
+					e.result = out
+					e.computed = time.Now()
+				}
+				e.inflight = nil
+				c.mu.Unlock()
+				close(done)
+			}()
+			out = compute()
+		}()
+	}
+	stale := e.result
+	c.mu.Unlock()
+
+	select {
+	case <-done:
+		c.mu.Lock()
+		r := e.result
+		c.mu.Unlock()
+		return r
+	case <-time.After(maxWait):
+		return stale // may be nil on a cold start; the background run refreshes the cache
+	}
+}
+
+// cachedValidateZone is the bounded entry point for per-zone validation.
+func cachedValidateZone(v *Validator, domain string) *ValidationResult {
+	return dashboardZoneValidationCache.get(domain, func() *ValidationResult {
+		return v.ValidateZone(domain)
+	}, validationCacheTTL, validationMaxWait)
+}
+
 //go:embed templates/*.html
 var templateFS embed.FS
 
@@ -311,7 +386,9 @@ func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config,
 	w.Header().Set("Content-Type", "application/json")
 
 	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
-	result := v.ValidateZone(domain)
+	// R-018: route through the bounded per-zone single-flight cache instead of
+	// running a fresh live validation on every request.
+	result := cachedValidateZone(v, domain)
 
 	if err := json.NewEncoder(w).Encode(result); err != nil {
 		slog.Debug("[WEB] Failed to encode validation response", "error", err)
