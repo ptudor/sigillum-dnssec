@@ -212,9 +212,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			result.Chain = append(result.Chain, *cachedResult)
 
 			// Update parent DNSKEY from cached result for next zone's DS verification
-			if len(cachedResult.DNSKEY) > 0 {
-				parentDNSKEY = cachedResult.DNSKEY
-			}
+			parentDNSKEY = nextParentDNSKEY(parentDNSKEY, cachedResult)
 
 			// Track overall status from cached result
 			switch cachedResult.Status {
@@ -259,9 +257,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 		}
 
 		// Update parent DNSKEY for next zone's DS verification
-		if len(zoneResult.DNSKEY) > 0 {
-			parentDNSKEY = zoneResult.DNSKEY
-		}
+		parentDNSKEY = nextParentDNSKEY(parentDNSKEY, zoneResult)
 
 		// Cache the result for potential reuse
 		validatedZones[zone] = zoneResult
@@ -375,6 +371,24 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 	}
 
 	return result, nil
+}
+
+// nextParentDNSKEY decides which DNSKEY set to carry into the next (child)
+// zone's DS verification after a zone in the walk resolves. A proven-insecure
+// zone terminates the chain of trust, so its descendants must reach the
+// insecure-ancestor branch of finalizeNoDSDelegation (empty parent keys) and
+// read insecure — not be asked for a DS-absence proof that only the nearest
+// SIGNED ancestor's keys could have produced. An indeterminate or bogus zone
+// must NOT clear the keys: an unauthenticated parent would otherwise launder
+// its children into insecure (fail closed).
+func nextParentDNSKEY(prev []dnspkg.DNSKEYRecord, zr *ZoneResult) []dnspkg.DNSKEYRecord {
+	if zr.Status == StatusInsecure {
+		return nil
+	}
+	if len(zr.DNSKEY) > 0 {
+		return zr.DNSKEY
+	}
+	return prev
 }
 
 // checkAndFollowCNAME checks if the domain has a CNAME and validates the target
@@ -563,7 +577,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	// Check for NXDOMAIN/NODATA with NSEC/NSEC3 proofs
-	if queryResult.RCode == dns.RcodeNameError || (queryResult.RCode == dns.RcodeSuccess && len(queryResult.CNAME) == 0) {
+	if isDenialForType(queryResult, v.leafType()) {
 		// Check for denial proofs if this is NXDOMAIN or NODATA
 		if len(queryResult.NSEC) > 0 {
 			// Verify NSEC denial proof with full RRSIG verification
@@ -669,6 +683,31 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	return validation
+}
+
+// isDenialForType reports whether qr is a denial of existence (NXDOMAIN or
+// NODATA) for qtype, as opposed to a positive answer. An RFC-compliant
+// wildcard-expanded positive answer also carries NSEC/NSEC3 records — the
+// no-closer-match proof (RFC 4035 §3.1.3.3) — so the presence of denial
+// records alone must not divert a response that answers the query into the
+// NODATA verification path; only a CNAME-free NOERROR response whose answer
+// section is empty for the queried type is a NODATA candidate.
+func isDenialForType(qr *dnspkg.QueryResult, qtype uint16) bool {
+	if qr.RCode == dns.RcodeNameError {
+		return true
+	}
+	return qr.RCode == dns.RcodeSuccess && len(qr.CNAME) == 0 && !answerContainsType(qr, qtype)
+}
+
+// answerContainsType reports whether the response's ANSWER section holds at
+// least one record of the given type.
+func answerContainsType(qr *dnspkg.QueryResult, qtype uint16) bool {
+	for _, t := range qr.AnswerTypes {
+		if t == qtype {
+			return true
+		}
+	}
+	return false
 }
 
 // leafSignerMatchesZone reports whether a leaf RRSIG's signer name is the zone
@@ -1048,36 +1087,7 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 
 			// Verify DS RRSIG if we have parent's DNSKEY
 			if len(parentDNSKEY) > 0 && len(result.RRSIG) > 0 {
-				// Find the RRSIG for DS
-				dsRRSIG := FindRRSIGForType(dns.TypeDS, result.RRSIG)
-				if dsRRSIG != nil {
-					// Find signing key
-					signingKey := FindZSKByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
-					if signingKey == nil {
-						signingKey = FindDNSKEYByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
-					}
-					if signingKey != nil {
-						// Verify RRSIG time validity
-						if VerifyRRSIGValid(*dsRRSIG) {
-							if _, err := VerifyRRsetRRSIGFromResponse(result.RawResponse, dns.TypeDS, *signingKey, dsRRSIG.KeyTag); err == nil {
-								validation.RRSIGVerified = true
-								validation.ParentSigningKey = signingKey.KeyTag
-							} else {
-								validation.Error = fmt.Sprintf("DS RRSIG cryptographic verification failed: %v", err)
-							}
-						} else {
-							if dsRRSIG.IsExpired {
-								validation.Error = fmt.Sprintf("DS RRSIG expired at %s", dsRRSIG.Expiration.Format("2006-01-02T15:04:05Z"))
-							} else {
-								validation.Error = fmt.Sprintf("DS RRSIG not yet valid (inception: %s)", dsRRSIG.Inception.Format("2006-01-02T15:04:05Z"))
-							}
-						}
-					} else {
-						validation.Error = fmt.Sprintf("DS signing key (tag %d) not found in parent DNSKEY", dsRRSIG.KeyTag)
-					}
-				} else {
-					validation.Error = "no RRSIG for DS record"
-				}
+				verifyDSRRSIGSet(validation, result.RRSIG, parentDNSKEY, result.RawResponse)
 			}
 
 			return result.DS, validation, result, nil
@@ -1089,6 +1099,66 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 	}
 
 	return nil, validation, nil, fmt.Errorf("failed to query DS from parent zone")
+}
+
+// verifyDSRRSIGSet verifies the DS RRset's covering RRSIGs against the parent's
+// authenticated DNSKEYs and records the outcome on validation. Per RFC 4035
+// §5.3.3 the RRset is authenticated if ANY covering RRSIG verifies — a parent
+// mid-rollover (double-signature) legitimately serves several — so every
+// covering RRSIG is tried before the verification is reported as failed.
+func verifyDSRRSIGSet(validation *DSValidation, rrsigs []dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) {
+	dsRRSIGs := FindRRSIGsForType(dns.TypeDS, rrsigs)
+	if len(dsRRSIGs) == 0 {
+		validation.Error = "no RRSIG for DS record"
+		return
+	}
+
+	var errs []string
+	for _, dsRRSIG := range dsRRSIGs {
+		keyTag, err := verifyDSRRSIGOne(dsRRSIG, parentDNSKEY, rawResponse)
+		if err == nil {
+			validation.RRSIGVerified = true
+			validation.ParentSigningKey = keyTag
+			return
+		}
+		errs = append(errs, err.Error())
+	}
+
+	if len(errs) == 1 {
+		validation.Error = errs[0]
+		return
+	}
+	parts := make([]string, len(errs))
+	for i, e := range errs {
+		parts[i] = fmt.Sprintf("key tag %d: %s", dsRRSIGs[i].KeyTag, e)
+	}
+	validation.Error = fmt.Sprintf("none of %d RRSIGs over the DS RRset verified under the parent's DNSKEYs: %s", len(errs), strings.Join(parts, "; "))
+}
+
+// verifyDSRRSIGOne checks a single RRSIG over the DS RRset against the parent's
+// authenticated DNSKEYs: signing-key lookup, time validity, and full
+// cryptographic verification. It returns the signing key's tag on success.
+func verifyDSRRSIGOne(dsRRSIG dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) (uint16, error) {
+	signingKey := FindZSKByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
+	if signingKey == nil {
+		signingKey = FindDNSKEYByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
+	}
+	if signingKey == nil {
+		return 0, fmt.Errorf("DS signing key (tag %d) not found in parent DNSKEY", dsRRSIG.KeyTag)
+	}
+
+	if !VerifyRRSIGValid(dsRRSIG) {
+		if dsRRSIG.IsExpired {
+			return 0, fmt.Errorf("DS RRSIG expired at %s", dsRRSIG.Expiration.Format("2006-01-02T15:04:05Z"))
+		}
+		return 0, fmt.Errorf("DS RRSIG not yet valid (inception: %s)", dsRRSIG.Inception.Format("2006-01-02T15:04:05Z"))
+	}
+
+	if _, err := VerifyRRsetRRSIGFromResponse(rawResponse, dns.TypeDS, *signingKey, dsRRSIG.KeyTag); err != nil {
+		return 0, fmt.Errorf("DS RRSIG cryptographic verification failed: %v", err)
+	}
+
+	return signingKey.KeyTag, nil
 }
 
 // verifyDSAbsence checks that the parent authenticatedly denies the existence of a DS
@@ -1138,6 +1208,13 @@ func (v *Validator) verifyDSAbsence(childName string, parentDNSKEY []dnspkg.DNSK
 
 	if len(qr.NSEC3) > 0 {
 		proof := &NSECProof{ProofType: "NSEC3", ResponseType: "DS-ABSENCE", Records: make([]string, 0)}
+		// RFC 9276: refuse excessive iteration counts before any hashing (R-088).
+		// Failing the proof here keeps this fail-closed: an over-cap NSEC3 can
+		// never be used to prove an insecure delegation.
+		if iters, over := nsec3IterationsOverCap(qr.NSEC3); over {
+			proof.Error = fmt.Sprintf("NSEC3 iterations=%d exceeds RFC 9276 cap of %d; refusing (CPU-amplification DoS vector)", iters, NSEC3MaxRecommendedIterations)
+			return proof, false
+		}
 		params := qr.NSEC3[0]
 		if params.Algorithm != NSEC3HashSHA1 {
 			proof.Error = fmt.Sprintf("unsupported NSEC3 hash algorithm: %d (only SHA-1 supported)", params.Algorithm)

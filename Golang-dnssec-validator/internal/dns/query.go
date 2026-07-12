@@ -94,6 +94,17 @@ func (q *Querier) QueryNS(ctx context.Context, server, zone string) (*QueryResul
 
 // parseResponse extracts DNSSEC records from a DNS response
 func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
+	// Record the distinct RR types present in the ANSWER section before the
+	// sections are merged below.
+	seenAnswerTypes := make(map[uint16]bool)
+	for _, rr := range resp.Answer {
+		t := rr.Header().Rrtype
+		if !seenAnswerTypes[t] {
+			seenAnswerTypes[t] = true
+			result.AnswerTypes = append(result.AnswerTypes, t)
+		}
+	}
+
 	// Parse all sections: Answer, Ns (Authority), Extra
 	allRRs := append(resp.Answer, resp.Ns...)
 	allRRs = append(allRRs, resp.Extra...)
