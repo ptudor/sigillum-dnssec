@@ -260,6 +260,18 @@ func (s *State) GetZone(domain string) *ZoneState {
 	return s.Zones[domain]
 }
 
+// ZoneNames returns the raw zone-name keys currently in state (RLock-protected).
+// Used for canonical-identity conflict checks (R-029).
+func (s *State) ZoneNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	names := make([]string, 0, len(s.Zones))
+	for name := range s.Zones {
+		names = append(names, name)
+	}
+	return names
+}
+
 // GetZoneCopy returns a deep copy of a zone's state, or nil if not found.
 // Safe to read and serialize from any goroutine.
 func (s *State) GetZoneCopy(domain string) *ZoneState {

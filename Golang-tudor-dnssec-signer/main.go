@@ -820,6 +820,13 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("domain %q is already managed (in state.json)", domain)
 	}
 
+	// R-029: reject a canonically-equivalent existing zone (differing only in case
+	// or a trailing dot) so we never create a second competing key/DS set for one
+	// DNS zone.
+	if existing, dup := canonicalConflict(cfg, state, domain); dup {
+		return fmt.Errorf("domain %q is the same DNS zone as already-managed %q (case/trailing-dot only); use the existing entry", domain, existing)
+	}
+
 	slog.Info("[CLI] Adding domain", "domain", domain, "path", zonePath)
 
 	// Pre-flight: confirm the config file is appendable BEFORE doing anything
@@ -1390,6 +1397,10 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 	if state.GetZone(domain) != nil {
 		return fmt.Errorf("domain %q is already managed (in state.json)", domain)
+	}
+	// R-029: reject a canonically-equivalent existing zone (case/trailing-dot only).
+	if existing, dup := canonicalConflict(cfg, state, domain); dup {
+		return fmt.Errorf("domain %q is the same DNS zone as already-managed %q (case/trailing-dot only); use the existing entry", domain, existing)
 	}
 
 	slog.Info("[CLI] Importing keys for domain", "domain", domain, "ksk", kskPath, "zsk", zskPath)
