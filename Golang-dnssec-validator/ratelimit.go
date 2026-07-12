@@ -22,6 +22,7 @@ type RateLimiter struct {
 	cleanup    time.Duration // cleanup interval
 	maxBuckets int           // hard cap on live buckets (R-091)
 	stopCh     chan struct{}
+	stopOnce   sync.Once // makes Stop idempotent (R-053)
 }
 
 type tokenBucket struct {
@@ -134,8 +135,13 @@ func (rl *RateLimiter) cleanupLoop() {
 }
 
 // Stop stops the cleanup goroutine
+// Stop halts the background cleanup loop. It is idempotent and concurrency-safe:
+// a repeated or concurrent Server.Shutdown (a normal lifecycle expectation) no
+// longer panics with "close of closed channel" (R-053).
 func (rl *RateLimiter) Stop() {
-	close(rl.stopCh)
+	rl.stopOnce.Do(func() {
+		close(rl.stopCh)
+	})
 }
 
 // Middleware returns an HTTP middleware that applies rate limiting
