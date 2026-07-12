@@ -629,7 +629,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 					// zone, mirroring the A-record path's signer-name check (R-096).
 					validation.Error = fmt.Sprintf("CNAME RRSIG signer %s does not match zone %s", rrsigCNAME.SignerName, zone)
 				default:
-					count, err := VerifyRRsetRRSIGFromResponseAnyKey(queryResult.RawResponse, dns.TypeCNAME, candidates, rrsigCNAME.KeyTag)
+					count, err := VerifyRRsetRRSIGFromResponseAnyKey(queryResult.RawResponse, dns.TypeCNAME, candidates, rrsigCNAME.KeyTag, domain, true)
 					if err == nil {
 						validation.RRSIGVerified = true
 						validation.SigningKeyTag = rrsigCNAME.KeyTag
@@ -665,7 +665,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	if leafSignerMatchesZone(rrsigA.SignerName, zone) {
-		count, err := VerifyRRsetRRSIGFromResponseAnyKey(queryResult.RawResponse, v.leafType(), candidates, rrsigA.KeyTag)
+		count, err := VerifyRRsetRRSIGFromResponseAnyKey(queryResult.RawResponse, v.leafType(), candidates, rrsigA.KeyTag, domain, true)
 		if err == nil {
 			validation.RRSIGVerified = true
 			validation.SigningKeyTag = rrsigA.KeyTag
@@ -712,7 +712,10 @@ func answerContainsType(qr *dnspkg.QueryResult, qtype uint16) bool {
 // defense-in-depth atop the cryptographic key-tag match. Both the A and CNAME
 // verification paths share this one rule so they cannot drift apart (R-096).
 func leafSignerMatchesZone(signerName, zone string) bool {
-	return signerName == zone || signerName == dns.Fqdn(zone)
+	// DNS names are case-insensitive (RFC 4034 canonicalization lowercases before
+	// signing), so compare canonical FQDNs — but require exact name equality, not
+	// a suffix/subdomain match (R-040).
+	return dns.CanonicalName(signerName) == dns.CanonicalName(zone)
 }
 
 // verifyWildcard checks the RFC 4035 §5.3.4 / RFC 5155 §8.8 requirement that a
@@ -1083,7 +1086,7 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 
 			// Verify DS RRSIG if we have parent's DNSKEY
 			if len(parentDNSKEY) > 0 && len(result.RRSIG) > 0 {
-				verifyDSRRSIGSet(validation, result.RRSIG, parentDNSKEY, result.RawResponse)
+				verifyDSRRSIGSet(validation, zone, result.RRSIG, parentDNSKEY, result.RawResponse)
 			}
 
 			return result.DS, validation, result, nil
@@ -1102,7 +1105,7 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 // §5.3.3 the RRset is authenticated if ANY covering RRSIG verifies — a parent
 // mid-rollover (double-signature) legitimately serves several — so every
 // covering RRSIG is tried before the verification is reported as failed.
-func verifyDSRRSIGSet(validation *DSValidation, rrsigs []dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) {
+func verifyDSRRSIGSet(validation *DSValidation, childZone string, rrsigs []dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) {
 	dsRRSIGs := FindRRSIGsForType(dns.TypeDS, rrsigs)
 	if len(dsRRSIGs) == 0 {
 		validation.Error = "no RRSIG for DS record"
@@ -1111,7 +1114,7 @@ func verifyDSRRSIGSet(validation *DSValidation, rrsigs []dnspkg.RRSIGRecord, par
 
 	var errs []string
 	for _, dsRRSIG := range dsRRSIGs {
-		keyTag, err := verifyDSRRSIGOne(dsRRSIG, parentDNSKEY, rawResponse)
+		keyTag, err := verifyDSRRSIGOne(dsRRSIG, childZone, parentDNSKEY, rawResponse)
 		if err == nil {
 			validation.RRSIGVerified = true
 			validation.ParentSigningKey = keyTag
@@ -1134,7 +1137,7 @@ func verifyDSRRSIGSet(validation *DSValidation, rrsigs []dnspkg.RRSIGRecord, par
 // verifyDSRRSIGOne checks a single RRSIG over the DS RRset against the parent's
 // authenticated DNSKEYs: signing-key lookup, time validity, and full
 // cryptographic verification. It returns the signing key's tag on success.
-func verifyDSRRSIGOne(dsRRSIG dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) (uint16, error) {
+func verifyDSRRSIGOne(dsRRSIG dnspkg.RRSIGRecord, childZone string, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) (uint16, error) {
 	// Every eligible parent key sharing the tag is a candidate (R-043/R-044).
 	candidates := EligibleKeysByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
 	if len(candidates) == 0 {
@@ -1148,7 +1151,9 @@ func verifyDSRRSIGOne(dsRRSIG dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRe
 		return 0, fmt.Errorf("DS RRSIG not yet valid (inception: %s)", dsRRSIG.Inception.Format("2006-01-02T15:04:05Z"))
 	}
 
-	if _, err := VerifyRRsetRRSIGFromResponseAnyKey(rawResponse, dns.TypeDS, candidates, dsRRSIG.KeyTag); err != nil {
+	// R-027: the DS RRset must be owned by the exact child zone in the parent's
+	// Answer section, not a replayed DS for another delegation.
+	if _, err := VerifyRRsetRRSIGFromResponseAnyKey(rawResponse, dns.TypeDS, candidates, dsRRSIG.KeyTag, childZone, true); err != nil {
 		return 0, fmt.Errorf("DS RRSIG cryptographic verification failed: %v", err)
 	}
 
