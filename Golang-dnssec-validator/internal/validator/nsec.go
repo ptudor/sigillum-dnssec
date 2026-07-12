@@ -307,27 +307,69 @@ func VerifyNSEC3Denial(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Re
 	qname = canonicalizeName(qname)
 	zone = canonicalizeName(zone)
 
-	// Get NSEC3 parameters from first record (all should have same params)
-	nsec3 := nsec3Records[0]
-	if nsec3.Algorithm != NSEC3HashSHA1 {
-		return nil, fmt.Errorf("unsupported NSEC3 hash algorithm: %d (only SHA-1 supported)", nsec3.Algorithm)
+	// R-037: records from different NSEC3 chains (differing hash algorithm,
+	// iterations, or salt — e.g. a salt/parameter transition, or replayed records)
+	// must never be combined into one logical proof. Partition by parameter tuple
+	// and require the whole proof to come from a single internally-consistent chain;
+	// try each chain independently so a valid transition response still verifies.
+	var lastErr error
+	for _, group := range groupNSEC3ByParams(nsec3Records) {
+		params := group[0]
+		if params.Algorithm != NSEC3HashSHA1 {
+			lastErr = fmt.Errorf("unsupported NSEC3 hash algorithm: %d (only SHA-1 supported)", params.Algorithm)
+			continue
+		}
+		salt, err := hexDecode(params.Salt)
+		if err != nil {
+			lastErr = fmt.Errorf("invalid NSEC3 salt: %w", err)
+			continue
+		}
+
+		hashedQname := computeNSEC3Hash(qname, salt, params.Iterations)
+
+		var proof *NSECProof
+		if rcode == 3 { // NXDOMAIN
+			proof, err = verifyNSEC3NXDOMAIN(hashedQname, qname, group)
+		} else { // NODATA
+			proof, err = verifyNSEC3NODATA(hashedQname, qname, qtype, group)
+		}
+		if err == nil && proof != nil {
+			return proof, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
 	}
 
-	// Compute the hash of the query name
-	salt, err := hexDecode(nsec3.Salt)
-	if err != nil {
-		return nil, fmt.Errorf("invalid NSEC3 salt: %w", err)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no internally-consistent NSEC3 chain proves the denial for %s", qname)
 	}
+	return nil, lastErr
+}
 
-	hashedQname := computeNSEC3Hash(qname, salt, nsec3.Iterations)
-
-	// RFC 5155 §8.4-8.6: Check if hash falls in a gap
-	if rcode == 3 { // NXDOMAIN
-		return verifyNSEC3NXDOMAIN(hashedQname, qname, nsec3Records)
+// groupNSEC3ByParams partitions NSEC3 records into groups that share the same
+// (hash algorithm, iterations, salt) tuple — one internally-consistent chain each.
+// Group order follows first appearance so behavior is deterministic (R-037).
+func groupNSEC3ByParams(records []dnspkg.NSEC3Record) [][]dnspkg.NSEC3Record {
+	type paramKey struct {
+		alg  uint8
+		iter uint16
+		salt string
 	}
-
-	// NODATA case
-	return verifyNSEC3NODATA(hashedQname, qname, qtype, nsec3Records)
+	order := make([]paramKey, 0)
+	byKey := make(map[paramKey][]dnspkg.NSEC3Record)
+	for _, r := range records {
+		k := paramKey{r.Algorithm, r.Iterations, strings.ToUpper(r.Salt)}
+		if _, ok := byKey[k]; !ok {
+			order = append(order, k)
+		}
+		byKey[k] = append(byKey[k], r)
+	}
+	groups := make([][]dnspkg.NSEC3Record, 0, len(order))
+	for _, k := range order {
+		groups = append(groups, byKey[k])
+	}
+	return groups
 }
 
 // verifyNSEC3NXDOMAIN verifies NSEC3 proves the name doesn't exist.
