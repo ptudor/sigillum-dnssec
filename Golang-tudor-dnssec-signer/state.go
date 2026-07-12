@@ -33,14 +33,26 @@ type ZoneState struct {
 	// time means an edit that lands between parse and completion is still
 	// detected next cycle, and it survives across LastSigned being set later
 	// (R-022). Omitempty + absent-tolerant for state.json back-compat.
-	SourceModTime time.Time      `json:"source_mtime,omitempty"`
-	SourceSize    int64          `json:"source_size,omitempty"`
-	SignaturesExp time.Time      `json:"signatures_expire"`
-	KSK           *KeyState      `json:"ksk,omitempty"`
-	ZSK           *KeyState      `json:"zsk,omitempty"`
-	Rollover      *RolloverState `json:"rollover,omitempty"`
-	Warnings      []string       `json:"warnings,omitempty"`
-	Errors        []string       `json:"errors,omitempty"`
+	SourceModTime time.Time `json:"source_mtime,omitempty"`
+	SourceSize    int64     `json:"source_size,omitempty"`
+	SignaturesExp time.Time `json:"signatures_expire"`
+	// PublishedDNSKEYTTL is the TTL (seconds) of the DNSKEY RRset actually
+	// published at the last sign. Rollover phase gating uses it so the cache-safe
+	// wait matches what resolvers hold, even when dnskey_ttl = 0 and signing used
+	// the (possibly larger) SOA TTL (R-006). Absent in old state (0) → callers fall
+	// back to a conservative floor. Not decreased while a rollover is active.
+	PublishedDNSKEYTTL uint32 `json:"published_dnskey_ttl,omitempty"`
+	// PublishedMaxRRSIGTTL is the largest TTL (seconds) of any RRset signed at the
+	// last sign. A data RRSIG inherits its RRset's TTL, so an old-ZSK signature can
+	// remain cached this long — longer than the DNSKEY RRset. ZSK retirement waits
+	// max(DNSKEY-TTL, this) so the old ZSK is not dropped while a cached
+	// signature by it is still verifiable (R-007). Not decreased during a rollover.
+	PublishedMaxRRSIGTTL uint32         `json:"published_max_rrsig_ttl,omitempty"`
+	KSK                  *KeyState      `json:"ksk,omitempty"`
+	ZSK                  *KeyState      `json:"zsk,omitempty"`
+	Rollover             *RolloverState `json:"rollover,omitempty"`
+	Warnings             []string       `json:"warnings,omitempty"`
+	Errors               []string       `json:"errors,omitempty"`
 	// ForceResign is set whenever a rollover transition changes which keys
 	// must be published or used for signing, and cleared on the next
 	// successful sign. It replaces the old "re-sign every cycle while a

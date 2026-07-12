@@ -116,6 +116,17 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("parsing zone file: %w", err)
 	}
 
+	// R-007: the largest TTL among the zone's authoritative RRsets. A data RRSIG
+	// inherits its RRset's TTL, so an old-ZSK signature can outlive the DNSKEY RRset;
+	// ZSK retirement gates on this so the old key is not dropped while one of its
+	// cached signatures is still verifiable.
+	var maxRRSIGTTL uint32
+	for _, rr := range records {
+		if t := rr.Header().Ttl; t > maxRRSIGTTL {
+			maxRRSIGTTL = t
+		}
+	}
+
 	// Compute the serial to publish and rewrite the SOA before anything is
 	// signed — the SOA RRset's RRSIG covers the published serial.
 	published, err := s.publishedSerial(domain, serial, zoneState)
@@ -193,6 +204,17 @@ func (s *Signer) SignZone(domain string) error {
 		}
 		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
 		zoneState.ForceResign = false
+		// R-006: record the DNSKEY RRset TTL actually published (config value, or the
+		// SOA TTL when dnskey_ttl = 0) so rollover phase gating waits for the TTL
+		// resolvers really cache. Never shorten a previously-established wait while a
+		// rollover is active — only raise it (a mid-phase SOA TTL decrease must not
+		// let the phase advance early).
+		if zoneState.Rollover == nil || dnskeyTTL > zoneState.PublishedDNSKEYTTL {
+			zoneState.PublishedDNSKEYTTL = dnskeyTTL
+		}
+		if zoneState.Rollover == nil || maxRRSIGTTL > zoneState.PublishedMaxRRSIGTTL {
+			zoneState.PublishedMaxRRSIGTTL = maxRRSIGTTL
+		}
 		zoneState.ClearTransientWarnings()
 
 		// Check for upcoming rollovers
