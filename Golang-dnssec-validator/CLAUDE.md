@@ -875,7 +875,19 @@ The mirror daemon handles:
 - Safe file replacement (never overwrites valid with error)
 - Version archiving for rollback
 
-This validator should:
-- Prefer local file if fresh (< 24h old)
-- Fall back to URL fetch if local is stale/missing
-- Cache fetched anchors locally
+Actual current behavior (do not mistake the following for what the code does — see
+R-025/R-058):
+- On startup the validator loads the **local file first**; the configured URL is
+  used only when the file is missing/empty/invalid (`LoadAnchorsWithFallback`).
+- It does **not** compare the file's age or `GeneratedAt`, and a nonempty local
+  file is **not** re-fetched or refreshed from the URL — the 24h background
+  "refresh" re-reads the same file.
+- Fetched anchors are **not** written back to a local cache.
+- Every accepted anchor is authenticated against the pinned IANA root DS set
+  (R-024); anchors that do not match a pinned record are rejected/ignored.
+
+The freshness/rollover "prefer-fresh-then-fetch-and-cache" behavior described in
+older revisions of this section is **not implemented** (tracked as R-025). Until it
+is, keep the local anchor file current out of band (e.g. from the mirror) and note
+that the pre-published successor KSK is fail-closed until its authentic digest is
+pinned in the binary.

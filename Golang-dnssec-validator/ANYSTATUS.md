@@ -27,7 +27,7 @@ HEARTBEAT_ENABLED=true
 HEARTBEAT_API_KEY=paste-your-api-key-here
 HEARTBEAT_APP=dnssec-validator
 HEARTBEAT_STATUS_URL=/
-HEARTBEAT_INTERVAL=5m
+HEARTBEAT_INTERVAL_MINUTES=5
 ```
 
 ### 3. Restart the Service
@@ -50,7 +50,7 @@ Check the dashboard: https://www.any53.com/any53/anystatus/
 | `HEARTBEAT_APP` | `dnssec-validator` | Application identifier (must match registered app_key) |
 | `HEARTBEAT_STATUS_URL` | (none) | URL to status page (shown as link on dashboard) |
 | `HEARTBEAT_INSTANCE_ID` | (hostname) | Instance identifier for multiple instances |
-| `HEARTBEAT_INTERVAL` | `5m` | Background heartbeat interval |
+| `HEARTBEAT_INTERVAL_MINUTES` | `5` | Background heartbeat interval (integer minutes) |
 
 ---
 
@@ -78,7 +78,7 @@ dnssec-validator sends these actions to indicate what it's doing:
 
 Set your AnyStatus thresholds based on expected activity:
 
-| Scenario | `HEARTBEAT_INTERVAL` | `stale_threshold` | `dead_threshold` |
+| Scenario | `HEARTBEAT_INTERVAL_MINUTES` | `stale_threshold` | `dead_threshold` |
 |----------|---------------------|-------------------|------------------|
 | Active (frequent validations) | 5m | 15 | 60 |
 | Moderate | 10m | 30 | 120 |

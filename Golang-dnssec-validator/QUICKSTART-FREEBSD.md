@@ -31,8 +31,8 @@ cat > /usr/local/etc/tudordns/dnssec-validator.env << 'EOF'
 LISTEN_ADDR=127.0.0.1:8791
 ROOT_ANCHORS_PATH=/var/www/internet.any53.com/dns/anchors/root-anchors.json
 ROOT_ANCHORS_URL=https://internet.any53.com/dns/anchors/root-anchors.json
-QUERY_TIMEOUT=5s
-TOTAL_TIMEOUT=30s
+QUERY_TIMEOUT_SECONDS=5
+TOTAL_TIMEOUT_SECONDS=30
 MAX_CONCURRENT=10
 RATE_LIMIT_PER_SEC=10
 RATE_LIMIT_BURST=30
