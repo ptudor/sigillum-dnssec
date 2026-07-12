@@ -247,14 +247,37 @@ func humanizeRolloverDelay(d time.Duration) string {
 // dnskeyTTLFloor is the minimum time that must elapse after a phase's DNSKEY
 // RRset is published before the rollover advances, so resolvers have had time to
 // (a) cache the pre-published key and (b) let cached RRSIGs by the retiring key
-// age out. Uses the configured DNSKEY TTL, with a conservative 24h fallback when
-// it is 0 (which means "use the SOA TTL"). R-011.
-func (rm *RolloverManager) dnskeyTTLFloor() time.Duration {
-	ttl := time.Duration(rm.cfg.DNSSEC.DNSKEYTtl) * time.Second
+// age out. It uses the DNSKEY TTL ACTUALLY published for this zone (recorded at
+// sign time in zoneState.PublishedDNSKEYTTL), so a zone whose dnskey_ttl = 0 and
+// whose SOA TTL exceeds 24h is not advanced early against a hardcoded floor
+// (R-006). Falls back to the configured TTL, then a conservative 24h, for old
+// state that predates the recorded field.
+func (rm *RolloverManager) dnskeyTTLFloor(zoneState *ZoneState) time.Duration {
+	var ttl time.Duration
+	if zoneState != nil && zoneState.PublishedDNSKEYTTL > 0 {
+		ttl = time.Duration(zoneState.PublishedDNSKEYTTL) * time.Second
+	}
+	if cfgTTL := time.Duration(rm.cfg.DNSSEC.DNSKEYTtl) * time.Second; cfgTTL > ttl {
+		ttl = cfgTTL
+	}
 	if ttl <= 0 {
 		return 24 * time.Hour
 	}
 	return ttl
+}
+
+// zskRetireFloor is the minimum time after a ZSK's signatures were first published
+// in the signing phase before the old ZSK may be dropped: the larger of the
+// DNSKEY-TTL floor (R-006) and the largest signed RRset TTL (R-007), since a data
+// RRSIG by the retiring key stays cached for its RRset's TTL.
+func (rm *RolloverManager) zskRetireFloor(zoneState *ZoneState) time.Duration {
+	floor := rm.dnskeyTTLFloor(zoneState)
+	if zoneState != nil {
+		if rrsig := time.Duration(zoneState.PublishedMaxRRSIGTTL) * time.Second; rrsig > floor {
+			floor = rrsig
+		}
+	}
+	return floor
 }
 
 func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *ZoneState) error {
@@ -263,7 +286,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 
 	switchDuration := rm.cfg.DNSSEC.RolloverSwitch.Duration
 	prepublishDuration := rm.cfg.DNSSEC.RolloverPrepublish.Duration
-	ttlFloor := rm.dnskeyTTLFloor()
+	ttlFloor := rm.dnskeyTTLFloor(zoneState)
 	lastSigned := zoneState.LastSigned
 
 	switch rollover.State {
@@ -358,8 +381,13 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 				return err
 			}
 		}
-		if now.Sub(rollover.PhaseFirstSigned) < ttlFloor {
-			slog.Debug("[ROLLOVER] ZSK signing: waiting DNSKEY-TTL floor before dropping old ZSK", "domain", domain, "floor", ttlFloor.String())
+		// R-007: dropping the old ZSK requires that no cached signature by it can
+		// still be relied on. Data RRSIGs inherit their RRset's TTL, which can exceed
+		// the DNSKEY TTL, so the retirement wait is max(DNSKEY-TTL, largest signed
+		// RRset TTL), not the DNSKEY-TTL alone.
+		retireFloor := rm.zskRetireFloor(zoneState)
+		if now.Sub(rollover.PhaseFirstSigned) < retireFloor {
+			slog.Debug("[ROLLOVER] ZSK signing: waiting max(DNSKEY-TTL, data-RRSIG-TTL) before dropping old ZSK", "domain", domain, "floor", retireFloor.String())
 			return nil
 		}
 

@@ -57,7 +57,7 @@ dnssec_validator_start()
         return 1
     fi
 
-    # App writes its structured log under here (LOG_FILE in the env file).
+    # App writes its structured log under here (logging.file in the TOML).
     install -d -o ${dnssec_validator_svcuser} ${dnssec_validator_logdir}
 
     echo "Starting ${name}."
