@@ -247,7 +247,7 @@ func TestVerifyDSRRSIGSet_DoubleSignature(t *testing.T) {
 	// Non-matching RRSIG first (double-signature rollover shape): the DS RRset
 	// must verify via the second signature.
 	v1 := &DSValidation{ParentZone: parentZone}
-	verifyDSRRSIGSet(v1, []dnspkg.RRSIGRecord{rogueRRSIG, genuineRRSIG}, parentKeys, raw)
+	verifyDSRRSIGSet(v1, zone, []dnspkg.RRSIGRecord{rogueRRSIG, genuineRRSIG}, parentKeys, raw)
 	if !v1.RRSIGVerified {
 		t.Fatalf("DS RRset with any one RRSIG under the parent's keys must verify, got error: %s", v1.Error)
 	}
@@ -260,7 +260,7 @@ func TestVerifyDSRRSIGSet_DoubleSignature(t *testing.T) {
 
 	// Both RRSIGs by keys the parent does not hold: fail with an aggregate error.
 	v2 := &DSValidation{ParentZone: parentZone}
-	verifyDSRRSIGSet(v2, []dnspkg.RRSIGRecord{rogueRRSIG, rogueRRSIG}, parentKeys, raw)
+	verifyDSRRSIGSet(v2, zone, []dnspkg.RRSIGRecord{rogueRRSIG, rogueRRSIG}, parentKeys, raw)
 	if v2.RRSIGVerified {
 		t.Fatal("DS RRset with no verifiable RRSIG must not read verified")
 	}
@@ -270,7 +270,7 @@ func TestVerifyDSRRSIGSet_DoubleSignature(t *testing.T) {
 
 	// No covering RRSIG at all: same error as before.
 	v3 := &DSValidation{ParentZone: parentZone}
-	verifyDSRRSIGSet(v3, nil, parentKeys, raw)
+	verifyDSRRSIGSet(v3, zone, nil, parentKeys, raw)
 	if v3.RRSIGVerified || v3.Error != "no RRSIG for DS record" {
 		t.Fatalf("expected 'no RRSIG for DS record', got verified=%v error=%q", v3.RRSIGVerified, v3.Error)
 	}

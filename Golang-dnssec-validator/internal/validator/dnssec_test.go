@@ -568,7 +568,7 @@ func TestVerifyRRsetRRSIGFromResponse_EmptyRaw(t *testing.T) {
 		PublicKey: "dGVzdA==",
 	}
 
-	_, err := VerifyRRsetRRSIGFromResponse(nil, miekgdns.TypeA, key, 12345)
+	_, err := VerifyRRsetRRSIGFromResponse(nil, miekgdns.TypeA, key, 12345, "", true)
 	if err == nil {
 		t.Fatal("VerifyRRsetRRSIGFromResponse expected error for empty raw response")
 	}
@@ -582,7 +582,7 @@ func TestVerifyRRsetRRSIGFromResponse_MalformedRaw(t *testing.T) {
 		PublicKey: "dGVzdA==",
 	}
 
-	_, err := VerifyRRsetRRSIGFromResponse([]byte{0x00, 0x01, 0x02}, miekgdns.TypeA, key, 12345)
+	_, err := VerifyRRsetRRSIGFromResponse([]byte{0x00, 0x01, 0x02}, miekgdns.TypeA, key, 12345, "", true)
 	if err == nil {
 		t.Fatal("VerifyRRsetRRSIGFromResponse expected error for malformed raw response")
 	}
@@ -612,7 +612,7 @@ func TestVerifyRRsetRRSIGFromResponse_NoMatchingRRSIG(t *testing.T) {
 		PublicKey: "dGVzdA==",
 	}
 
-	_, err = VerifyRRsetRRSIGFromResponse(raw, miekgdns.TypeA, key, 12345)
+	_, err = VerifyRRsetRRSIGFromResponse(raw, miekgdns.TypeA, key, 12345, "example.com.", true)
 	if err == nil {
 		t.Fatal("VerifyRRsetRRSIGFromResponse expected error when no matching RRSIG exists")
 	}

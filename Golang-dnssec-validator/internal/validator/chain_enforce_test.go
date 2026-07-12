@@ -358,13 +358,13 @@ func TestDSRRSIGEnforcementMechanism(t *testing.T) {
 	}
 
 	// Genuine DS RRSIG verifies against the parent key.
-	if _, err := VerifyRRsetRRSIGFromResponse(raw, miekgdns.TypeDS, parentRec, parentKey.KeyTag()); err != nil {
+	if _, err := VerifyRRsetRRSIGFromResponse(raw, miekgdns.TypeDS, parentRec, parentKey.KeyTag(), zone, true); err != nil {
 		t.Fatalf("genuine DS RRSIG must verify: %v", err)
 	}
 
 	// A different (rogue) parent key cannot verify it — this is what R-079 gates on.
 	_, _, rogueRec := genTestDNSKEY(t, parentZone, 256)
-	if _, err := VerifyRRsetRRSIGFromResponse(raw, miekgdns.TypeDS, rogueRec, rogueRec.KeyTag); err == nil {
+	if _, err := VerifyRRsetRRSIGFromResponse(raw, miekgdns.TypeDS, rogueRec, rogueRec.KeyTag, zone, true); err == nil {
 		t.Fatal("DS RRSIG must not verify against a key that did not sign it")
 	}
 }

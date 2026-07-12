@@ -35,4 +35,20 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 - **Files:** `internal/validator/dnssec.go`, `internal/validator/validator.go`
 - **Verification:** `TestR044_ChainLinkTriesAllSameTagKeys` constructs two DNSKEYs sharing tag 1234 (decoy first, valid second) and asserts the chain still validates regardless of order. Full validator `go test -race -count=1` green; `go vet` clean.
 
+### R-027 — Leaf verification not bound to owner/section — FIXED (leaf/CNAME/DS binding via raw-response helpers)
+- **Change:** Added `expectedOwner string` and `answerOnly bool` parameters to `VerifyRRsetRRSIGFromResponse` (and its `AnyKey` wrapper). The raw-response verifier already re-parses the wire message (where owner and section survive), so it now (a) considers only the Answer section when `answerOnly` is set and (b) requires the signed RRset's owner to DNS-canonically equal the queried name. Wired the leaf A and CNAME verifiers to bind to the queried `domain` (Answer-only), and the DS verifier to bind to the exact child zone (threaded `childZone` through `verifyDSRRSIGSet`/`verifyDSRRSIGOne`, Answer-only). A cryptographically valid RRset for another owner replayed in Authority/Additional can no longer authenticate the queried name.
+- **Scope note:** This closes the exploit named in the Evidence (replayed valid RRset for a different owner/section). It does NOT perform the broader data-model refactor (preserving owner/section on every parsed record model and threading a query context into *every* verifier including the wildcard/NSEC internals) — that pervasive change touches `parseResponse` and all record types and belongs with R-026/R-030/R-036/R-037. Wildcard-synthesized answers are unaffected because the synthesized RR carries the queried owner in the Answer section.
+- **Files:** `internal/validator/dnssec.go`, `internal/validator/validator.go`, tests `owner_time_binding_r027_r028_test.go` (new) + updated `chain_enforce_test.go`, `dnssec_test.go`, `verification_fixes_test.go` callers
+- **Verification:** `TestR027_LeafBoundToAnswerOwner` — a validly-signed `other.example.com` A RRset placed in Additional is rejected for query `www.example.com`, while the same RRset in Answer at its true owner verifies. Full validator race suite green.
+
+### R-028 — Time check and crypto can accept different signatures — FIXED
+- **Change:** Added `rrsigWireTimeValid()` and now check each candidate signature's validity period (with `ClockSkewTolerance`) immediately before its cryptographic verification, inside the per-candidate loop of `VerifyRRsetRRSIGFromResponse` and `VerifyDenialRRSIGFromResponse` (the latter previously did no time check at all). Time and crypto are now bound to the *same* signature, so a valid-time-but-bad signature can no longer let a crypto-valid-but-expired one slip through, and expired authenticated denial can no longer downgrade a delegation.
+- **Files:** `internal/validator/dnssec.go`
+- **Verification:** `TestR028_ExpiredSignatureRejected` signs an A RRset with an expired-but-cryptographically-valid RRSIG and asserts the raw-response verifier rejects it. Existing double-signature/rollover tests still pass (any one in-time valid signature is accepted).
+
+### R-040 — Signer-name comparison is case-sensitive — FIXED
+- **Change:** `leafSignerMatchesZone` now compares `dns.CanonicalName(signerName) == dns.CanonicalName(zone)` — DNS-aware, case-insensitive, exact-name (no suffix/subdomain match).
+- **Files:** `internal/validator/validator.go`, `internal/validator/signer_name_r040_test.go` (new)
+- **Verification:** `TestR040_LeafSignerMatchesZone` — mixed-case and missing-trailing-dot variants match; `other.com`, deceptive suffix `notexample.com`, and subdomain `sub.example.com` do not.
+
 

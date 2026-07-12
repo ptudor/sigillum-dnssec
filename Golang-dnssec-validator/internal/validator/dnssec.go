@@ -118,13 +118,13 @@ func EligibleKeysByKeyTag(keyTag uint16, dnskeys []dnspkg.DNSKEYRecord) []dnspkg
 // verification robust to key-tag collisions (R-044): the RRSIG names a tag, but
 // several eligible keys may share it and only one actually signed. Candidates
 // must already be R-043-eligible.
-func VerifyRRsetRRSIGFromResponseAnyKey(rawResponse []byte, typeCovered uint16, candidates []dnspkg.DNSKEYRecord, keyTag uint16) (int, error) {
+func VerifyRRsetRRSIGFromResponseAnyKey(rawResponse []byte, typeCovered uint16, candidates []dnspkg.DNSKEYRecord, keyTag uint16, expectedOwner string, answerOnly bool) (int, error) {
 	if len(candidates) == 0 {
 		return 0, fmt.Errorf("no eligible signing key (tag %d) available", keyTag)
 	}
 	var lastErr error
 	for _, key := range candidates {
-		count, err := VerifyRRsetRRSIGFromResponse(rawResponse, typeCovered, key, keyTag)
+		count, err := VerifyRRsetRRSIGFromResponse(rawResponse, typeCovered, key, keyTag, expectedOwner, answerOnly)
 		if err == nil {
 			return count, nil
 		}
@@ -443,9 +443,27 @@ func verifyDNSKEYRRSIGOne(dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSI
 	return lastErr
 }
 
+// rrsigWireTimeValid reports whether a raw RRSIG is currently within its validity
+// period, allowing ClockSkewTolerance — the same semantics as VerifyRRSIGValid.
+// R-028 uses this to bind the time check to the exact signature being verified.
+func rrsigWireTimeValid(sig *dns.RRSIG) bool {
+	now := time.Now()
+	inception := time.Unix(int64(sig.Inception), 0)
+	expiration := time.Unix(int64(sig.Expiration), 0)
+	return now.After(inception.Add(-ClockSkewTolerance)) && now.Before(expiration.Add(ClockSkewTolerance))
+}
+
 // VerifyRRsetRRSIGFromResponse performs full cryptographic verification of an RRset
 // using the raw DNS response bytes and a trusted signing DNSKEY.
-func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signingKeyRecord dnspkg.DNSKEYRecord, keyTag uint16) (int, error) {
+//
+// R-027: when expectedOwner is non-empty the signed RRset must be owned by that
+// name (DNS-canonical comparison), and when answerOnly is true only the Answer
+// section is considered — so a valid RRset+RRSIG for a different owner replayed in
+// Authority/Additional cannot authenticate the queried name. R-028: each candidate
+// signature is checked for time validity AND cryptographic validity as one
+// indivisible unit, so a valid-time-but-bad signature can never let a
+// crypto-valid-but-expired signature slip through.
+func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signingKeyRecord dnspkg.DNSKEYRecord, keyTag uint16, expectedOwner string, answerOnly bool) (int, error) {
 	if len(rawResponse) == 0 {
 		return 0, fmt.Errorf("raw DNS response unavailable")
 	}
@@ -455,12 +473,23 @@ func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signin
 		return 0, fmt.Errorf("failed to unpack DNS response: %w", err)
 	}
 
+	// R-027: positive leaf/CNAME/DS data must come from the Answer section, never a
+	// replayed RRset placed in Authority/Additional.
+	var scan []dns.RR
+	if answerOnly {
+		scan = msg.Answer
+	} else {
+		scan = append(append(append([]dns.RR{}, msg.Answer...), msg.Ns...), msg.Extra...)
+	}
+
+	wantOwner := ""
+	if expectedOwner != "" {
+		wantOwner = dns.CanonicalName(expectedOwner)
+	}
+
 	rrsetByOwner := make(map[string][]dns.RR)
 	candidates := make([]*dns.RRSIG, 0)
-	allRRs := append(msg.Answer, msg.Ns...)
-	allRRs = append(allRRs, msg.Extra...)
-
-	for _, rr := range allRRs {
+	for _, rr := range scan {
 		switch v := rr.(type) {
 		case *dns.RRSIG:
 			if v.TypeCovered == typeCovered && v.KeyTag == keyTag {
@@ -468,7 +497,7 @@ func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signin
 			}
 		default:
 			if rr.Header().Rrtype == typeCovered {
-				owner := strings.ToLower(rr.Header().Name)
+				owner := dns.CanonicalName(rr.Header().Name)
 				rrsetByOwner[owner] = append(rrsetByOwner[owner], rr)
 			}
 		}
@@ -480,10 +509,21 @@ func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signin
 
 	var lastErr error
 	for _, sig := range candidates {
-		owner := strings.ToLower(sig.Hdr.Name)
+		owner := dns.CanonicalName(sig.Hdr.Name)
+		// R-027: the signed RRset must be at the queried owner.
+		if wantOwner != "" && owner != wantOwner {
+			lastErr = fmt.Errorf("RRSIG owner %s does not match queried owner %s", sig.Hdr.Name, expectedOwner)
+			continue
+		}
 		rrset := rrsetByOwner[owner]
 		if len(rrset) == 0 {
 			lastErr = fmt.Errorf("no RRset found for owner %s and type %d", sig.Hdr.Name, typeCovered)
+			continue
+		}
+
+		// R-028: bind the time check to THIS candidate before its crypto check.
+		if !rrsigWireTimeValid(sig) {
+			lastErr = fmt.Errorf("RRSIG (owner %s, key tag %d) outside its validity period", sig.Hdr.Name, sig.KeyTag)
 			continue
 		}
 
@@ -564,6 +604,13 @@ func VerifyDenialRRSIGFromResponse(rawResponse []byte, typeCovered uint16, dnske
 		ok := false
 		var lastErr error
 		for _, sig := range sigs {
+			// R-028: a denial signature must be within its validity period; bind the
+			// time check to THIS signature before doing its crypto. Expired
+			// authenticated denial must not downgrade a delegation.
+			if !rrsigWireTimeValid(sig) {
+				lastErr = fmt.Errorf("%s RRSIG at %s (key tag %d) outside its validity period", dnspkg.TypeName(typeCovered), owner, sig.KeyTag)
+				continue
+			}
 			// Try every eligible key sharing the tag (R-043/R-044): tags collide,
 			// and only a zone key with protocol 3 (not revoked) may authenticate.
 			cands := EligibleKeysByKeyTag(sig.KeyTag, dnskeys)
