@@ -96,4 +96,9 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 - **Files:** `internal/validator/validator.go`, `internal/validator/result.go`, `internal/validator/cname_guard_r034_test.go` (new)
 - **Verification:** `TestR034_CNAMEGuard` — self-loop and A→B→A (incl. mixed-case) are bogus, depth-limit is indeterminate, a normal hop proceeds and marks the target visited. (The loop/depth decision was extracted into the pure `cnameGuard` helper because the surrounding resolver is a concrete type, not mockable — that end-to-end coupling is R-059's concern.) Full module race suite green.
 
+### R-037 — Mixed NSEC3 parameters are combined — FIXED
+- **Change:** `VerifyNSEC3Denial` now partitions NSEC3 records into internally-consistent chains via new `groupNSEC3ByParams` (keyed on hash algorithm + iterations + salt, salt compared case-insensitively) and runs the NXDOMAIN/NODATA proof **within a single chain**, trying each chain independently and returning the first that fully proves the denial. Previously it took salt/iterations from `records[0]` while the coverage/match searches ranged over every record, so records from distinct chains (a salt/parameter transition or replayed records) could be cross-combined into a proof no single chain establishes.
+- **Files:** `internal/validator/nsec.go`, `internal/validator/nsec3_params_r037_test.go` (new)
+- **Verification:** `TestR037_GroupNSEC3ByParams` — differing salt/iterations yield distinct groups (same salt case-insensitively merges). `TestR037_ProvesViaConsistentChainRegardlessOfOrder` — a valid NODATA proof in the second (different-salt) chain still verifies, proving each chain is tried independently rather than only `records[0]`'s parameters. Existing NSEC3 tests pass.
+
 
