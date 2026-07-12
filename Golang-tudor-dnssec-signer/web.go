@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -49,13 +50,28 @@ func (c *validationCache) get(compute func() *ValidateOutput, ttl, maxWait time.
 		done = make(chan struct{})
 		c.inflight = done
 		go func() {
-			out := compute()
-			c.mu.Lock()
-			c.result = out
-			c.computed = time.Now()
-			c.inflight = nil
-			c.mu.Unlock()
-			close(done)
+			var out *ValidateOutput
+			// The cleanup runs in a defer so it happens even if compute panics:
+			// cache the result (when there is one), clear inflight so a later
+			// get starts a fresh run, and close done so current waiters
+			// unblock. A panic in validation is recovered here — matching
+			// checkAndSignZoneSafe's isolation discipline — rather than killing
+			// the daemon; nothing is cached, so waiters get the stale/nil
+			// fallback exactly like the timeout path.
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("[WEB] Panic in dashboard validation (recovered)", "panic", r, "stack", string(debug.Stack()))
+				}
+				c.mu.Lock()
+				if out != nil {
+					c.result = out
+					c.computed = time.Now()
+				}
+				c.inflight = nil
+				c.mu.Unlock()
+				close(done)
+			}()
+			out = compute()
 		}()
 	}
 	stale := c.result

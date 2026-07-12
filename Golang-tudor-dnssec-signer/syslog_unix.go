@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"log/syslog"
 )
@@ -17,16 +18,18 @@ type syslogHandler struct {
 	groups []string
 }
 
-// newSyslogHandler creates a new syslog handler
-func newSyslogHandler(level slog.Level) (slog.Handler, error) {
+// newSyslogHandler creates a new syslog handler. The returned io.Closer is the
+// underlying syslog connection; setupLogging tracks it so a SIGHUP re-run can
+// close the previous connection instead of leaking one fd per reload.
+func newSyslogHandler(level slog.Level) (slog.Handler, io.Closer, error) {
 	writer, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "dnssec-tudor")
 	if err != nil {
-		return nil, fmt.Errorf("connecting to syslog: %w", err)
+		return nil, nil, fmt.Errorf("connecting to syslog: %w", err)
 	}
 	return &syslogHandler{
 		writer: writer,
 		level:  level,
-	}, nil
+	}, writer, nil
 }
 
 func (h *syslogHandler) Enabled(_ context.Context, level slog.Level) bool {

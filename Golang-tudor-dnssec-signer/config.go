@@ -604,10 +604,9 @@ func RemoveZoneFromConfigFile(configPath, domain string) error {
 	}
 	lines := strings.Split(string(data), "\n")
 
-	header := fmt.Sprintf("[zones.%q]", domain) // e.g. [zones."ptudor.net"]
 	start := -1
 	for i, line := range lines {
-		if strings.TrimSpace(line) == header {
+		if isZoneTableHeader(line, domain) {
 			start = i
 			break
 		}
@@ -644,6 +643,32 @@ func RemoveZoneFromConfigFile(configPath, domain string) error {
 
 // errZoneNotInConfig is returned by RemoveZoneFromConfigFile when the zone table is absent.
 var errZoneNotInConfig = fmt.Errorf("zone table not found in config file")
+
+// isZoneTableHeader reports whether a config line is the [zones."<domain>"]
+// table header for the given domain. AddZoneToConfigFile writes exactly
+// `[zones."<domain>"]`, but hand-edited configs carry TOML-equivalent variants
+// an exact match would miss: surrounding whitespace, a trailing `# comment`,
+// or a single-quoted (literal-string) key. Missing the header would make
+// `remove` leave the entry behind so the zone is re-adopted on SIGHUP
+// (runRemove escalates that to an error rather than claiming success). This is
+// deliberately anchored to the two quote forms — not a general TOML parser.
+func isZoneTableHeader(line, domain string) bool {
+	t := strings.TrimSpace(line)
+	for _, header := range []string{
+		fmt.Sprintf("[zones.%q]", domain),   // basic-string key, what AddZoneToConfigFile writes
+		fmt.Sprintf("[zones.'%s']", domain), // literal-string key
+	} {
+		rest, ok := strings.CutPrefix(t, header)
+		if !ok {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "" || strings.HasPrefix(rest, "#") {
+			return true
+		}
+	}
+	return false
+}
 
 // isTOMLTableHeader reports whether a line is a TOML table header ("[...]" / "[[...]]").
 func isTOMLTableHeader(line string) bool {
