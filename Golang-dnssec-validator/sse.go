@@ -4,13 +4,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
+
+// defaultSSEEventWriteTimeout bounds how long a single SSE event's writes+flush may
+// block. It is applied as a SLIDING per-event deadline (reset before each event and
+// keep-alive), not one whole-stream deadline, so long-lived streams keep working
+// while a stuck client (full socket buffer) makes the next write return an error
+// instead of blocking the validation goroutine — and its held semaphore slot —
+// indefinitely (R-046).
+const defaultSSEEventWriteTimeout = 10 * time.Second
 
 // SSEWriter writes Server-Sent Events to an HTTP response
 type SSEWriter struct {
-	w        http.ResponseWriter
-	flusher  http.Flusher
-	streamID string
+	w            http.ResponseWriter
+	flusher      http.Flusher
+	rc           *http.ResponseController
+	writeTimeout time.Duration
+	streamID     string
 }
 
 // NewSSEWriter creates a new SSE writer
@@ -28,9 +39,21 @@ func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, error) {
 	setSecurityHeaders(w)
 
 	return &SSEWriter{
-		w:       w,
-		flusher: flusher,
+		w:            w,
+		flusher:      flusher,
+		rc:           http.NewResponseController(w),
+		writeTimeout: defaultSSEEventWriteTimeout,
 	}, nil
+}
+
+// armDeadline sets a fresh per-event write deadline (R-046). Writers that don't
+// support deadlines are left unbounded (best effort); the SetWriteDeadline error is
+// ignored so behavior is unchanged on such writers.
+func (s *SSEWriter) armDeadline() {
+	if s.rc == nil || s.writeTimeout <= 0 {
+		return
+	}
+	_ = s.rc.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 }
 
 // SetStreamID sets a per-stream SSE id that is emitted with every subsequent
@@ -44,6 +67,7 @@ func (s *SSEWriter) SetStreamID(id string) {
 
 // WriteEvent writes an SSE event with the given type and data
 func (s *SSEWriter) WriteEvent(eventType string, data interface{}) error {
+	s.armDeadline()
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal event data: %w", err)
@@ -73,6 +97,7 @@ func (s *SSEWriter) WriteEvent(eventType string, data interface{}) error {
 
 // WriteRawEvent writes a raw SSE event
 func (s *SSEWriter) WriteRawEvent(eventType, data string) error {
+	s.armDeadline()
 	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventType, data); err != nil {
 		return fmt.Errorf("failed to write raw event: %w", err)
 	}
@@ -82,6 +107,7 @@ func (s *SSEWriter) WriteRawEvent(eventType, data string) error {
 
 // WriteComment writes an SSE comment (for keep-alive)
 func (s *SSEWriter) WriteComment(comment string) error {
+	s.armDeadline()
 	if _, err := fmt.Fprintf(s.w, ": %s\n\n", comment); err != nil {
 		return fmt.Errorf("failed to write comment: %w", err)
 	}
@@ -91,6 +117,7 @@ func (s *SSEWriter) WriteComment(comment string) error {
 
 // WriteRetry sets the reconnection time in milliseconds
 func (s *SSEWriter) WriteRetry(ms int) error {
+	s.armDeadline()
 	if _, err := fmt.Fprintf(s.w, "retry: %d\n\n", ms); err != nil {
 		return fmt.Errorf("failed to write retry: %w", err)
 	}
@@ -100,6 +127,7 @@ func (s *SSEWriter) WriteRetry(ms int) error {
 
 // WriteID sets the event ID for reconnection
 func (s *SSEWriter) WriteID(id string) error {
+	s.armDeadline()
 	if _, err := fmt.Fprintf(s.w, "id: %s\n", id); err != nil {
 		return fmt.Errorf("failed to write ID: %w", err)
 	}
