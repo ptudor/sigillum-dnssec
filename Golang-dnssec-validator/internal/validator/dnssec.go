@@ -154,6 +154,21 @@ func FindRRSIGForType(rrtype uint16, rrsigs []dnspkg.RRSIGRecord) *dnspkg.RRSIGR
 	return nil
 }
 
+// FindRRSIGsForType returns every RRSIG covering the given type, in response
+// order. A zone mid-rollover (double-signature algorithm or KSK rollover) or
+// signed by legacy tooling legitimately serves several RRSIGs over one RRset,
+// and RFC 4035 §5.3.3 accepts the RRset if ANY of them validates — callers
+// verifying signatures must consider them all, not stop at the first.
+func FindRRSIGsForType(rrtype uint16, rrsigs []dnspkg.RRSIGRecord) []dnspkg.RRSIGRecord {
+	var covering []dnspkg.RRSIGRecord
+	for _, rrsig := range rrsigs {
+		if rrsig.TypeCovered == rrtype {
+			covering = append(covering, rrsig)
+		}
+	}
+	return covering
+}
+
 // FindDSByKeyTag finds a DS record with the given key tag
 func FindDSByKeyTag(keyTag uint16, dsRecords []dnspkg.DSRecord) *dnspkg.DSRecord {
 	for i, ds := range dsRecords {
@@ -287,22 +302,48 @@ func CollectAnchorMatchedKeys(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.An
 // set produced by CollectDSMatchedKeys (non-root) or CollectAnchorMatchedKeys (root).
 // This performs FULL cryptographic verification — the whole point of a diagnostic tool.
 func VerifyDNSKEYRRSIGByKeys(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecord, authenticatedKeys []dnspkg.DNSKEYRecord) error {
-	// Find RRSIG covering DNSKEY (type 48)
-	rrsigRecord := FindRRSIGForType(dns.TypeDNSKEY, rrsigs)
-	if rrsigRecord == nil {
+	// Find every RRSIG covering DNSKEY (type 48)
+	covering := FindRRSIGsForType(dns.TypeDNSKEY, rrsigs)
+	if len(covering) == 0 {
 		return fmt.Errorf("no RRSIG for DNSKEY RRset")
-	}
-
-	// Check time validity first (cheap check before expensive crypto)
-	if !VerifyRRSIGValid(*rrsigRecord) {
-		if rrsigRecord.IsExpired {
-			return fmt.Errorf("DNSKEY RRSIG expired at %s", rrsigRecord.Expiration.Format(time.RFC3339))
-		}
-		return fmt.Errorf("DNSKEY RRSIG not yet valid (inception: %s)", rrsigRecord.Inception.Format(time.RFC3339))
 	}
 
 	if len(authenticatedKeys) == 0 {
 		return fmt.Errorf("no parent-authenticated (DS/anchor-matched) key available to verify the DNSKEY RRset")
+	}
+
+	// RFC 4035 §5.3.3: the RRset is authenticated if ANY covering RRSIG verifies
+	// under an authenticated key. A zone mid-rollover serves several RRSIGs; only
+	// one needs to chain to the parent's DS.
+	var errs []error
+	for _, rrsigRecord := range covering {
+		err := verifyDNSKEYRRSIGOne(dnskeys, rrsigRecord, authenticatedKeys)
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, err)
+	}
+
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	parts := make([]string, len(errs))
+	for i, err := range errs {
+		parts[i] = fmt.Sprintf("key tag %d: %v", covering[i].KeyTag, err)
+	}
+	return fmt.Errorf("none of %d RRSIGs over the DNSKEY RRset verified under a parent-authenticated key: %s", len(errs), strings.Join(parts, "; "))
+}
+
+// verifyDNSKEYRRSIGOne checks a single RRSIG over the DNSKEY RRset: time
+// validity, membership of the signing key in the parent/anchor-authenticated
+// set (the RFC 4035 §5.2 binding — R-080), and full cryptographic verification.
+func verifyDNSKEYRRSIGOne(dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSIGRecord, authenticatedKeys []dnspkg.DNSKEYRecord) error {
+	// Check time validity first (cheap check before expensive crypto)
+	if !VerifyRRSIGValid(rrsigRecord) {
+		if rrsigRecord.IsExpired {
+			return fmt.Errorf("DNSKEY RRSIG expired at %s", rrsigRecord.Expiration.Format(time.RFC3339))
+		}
+		return fmt.Errorf("DNSKEY RRSIG not yet valid (inception: %s)", rrsigRecord.Inception.Format(time.RFC3339))
 	}
 
 	// The signing key MUST be one of the parent/anchor-authenticated keys. Requiring
@@ -326,7 +367,7 @@ func VerifyDNSKEYRRSIGByKeys(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSI
 	}
 
 	// Reconstruct the dns.RRSIG for verification
-	rrsig, err := reconstructRRSIG(rrsigRecord.SignerName, *rrsigRecord)
+	rrsig, err := reconstructRRSIG(rrsigRecord.SignerName, rrsigRecord)
 	if err != nil {
 		return fmt.Errorf("failed to reconstruct RRSIG: %w", err)
 	}

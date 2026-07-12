@@ -91,7 +91,13 @@ type QueryResult struct {
 	NSEC3         []NSEC3Record  `json:"nsec3,omitempty"`
 	NS            []NSRecord     `json:"ns,omitempty"`
 	CNAME         []CNAMERecord  `json:"cname,omitempty"`
-	RawResponse   []byte         `json:"raw_response,omitempty"`
+	// AnswerTypes lists the distinct RR types present in the ANSWER section, in
+	// response order. The per-type fields above merge all message sections, so
+	// this is what lets a caller tell a positive answer (which may carry
+	// NSEC/NSEC3 wildcard proofs in the authority section) apart from a NODATA
+	// denial (empty answer) without re-parsing RawResponse.
+	AnswerTypes []uint16 `json:"answer_types,omitempty"`
+	RawResponse []byte   `json:"raw_response,omitempty"`
 }
 
 // RootAnchors represents the root trust anchor file structure
