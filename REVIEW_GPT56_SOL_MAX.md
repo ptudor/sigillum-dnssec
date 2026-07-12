@@ -766,4 +766,88 @@ The review traces the signer and validator from configuration and process startu
 
 **Verification:** Construct servers both through `LoadConfig` and directly with valid, empty, mixed, and invalid lists. Invalid lists must never return metrics from any source IP; valid/empty semantics must remain unchanged. Add a regression test for any reload path found during investigation.
 
-<!-- Remaining low-severity findings and the required final summary/fix order are appended in the final review-only checkpoint. -->
+### R-055 — The root-anchor age metric is almost always zero or a stale sample
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/anchors_store.go:10-67`, `AnchorsStore.Load`/`Age`; `Golang-dnssec-validator/main.go:38-50` and `86-136`; `Golang-dnssec-validator/metrics.go:66-71` and `146-149`
+
+**Problem:** `dnssec_validator_root_anchors_age_seconds` is described as the current age of loaded anchors, but it is updated only after retry success and on the 24-hour refresh tick. A successful startup leaves the default zero; a successful refresh resets `loadedAt` and immediately records approximately zero; then the gauge remains frozen for another day. Alerts therefore cannot distinguish fresh, aging, or never-loaded state.
+
+**Evidence:** The initial-success branch never calls `SetRootAnchorsAge`. `Load` sets `loadedAt = time.Now()`, and each later metric update samples `Age()` immediately after `Load`; Prometheus scrapes only the last stored value rather than invoking `Age`. On failed refresh the one sampled age is also frozen until the next daily tick.
+
+**Fix specification:** Calculate age at scrape time from a concurrency-safe loaded timestamp (using an injected clock for tests), or update it at a suitably frequent cadence. Represent never-loaded state explicitly with a separate availability metric and/or NaN rather than zero, and do not reset age after a failed refresh. Coordinate with R-024/R-025/R-039 to expose authenticated document/source age separately from process load age. Preserve the existing metric name and units for load age.
+
+**Verification:** With a fake clock, cover never loaded, successful startup, time advance between scrapes, successful refresh, failed refresh, retry success, and concurrent load/scrape. Assert monotonic increase between successful loads, exact reset only on success, and unambiguous unavailable state.
+
+### R-056 — Request-ID entropy failure produces repeatable zero or partial identifiers
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/logging.go:12-20`, `GenerateRequestID`; request logging and validation handlers that use the ID
+
+**Problem:** If `crypto/rand.Read` fails, the stated timestamp fallback is not implemented; the function hex-encodes the same zero-filled or partially filled buffer. Repeated failures can assign identical IDs to unrelated requests, defeating log correlation precisely when the host has an entropy/runtime fault.
+
+**Evidence:** The error branch returns `fmt.Sprintf("%x", b)` and reads no clock or counter. A failure before writing bytes returns sixteen zero hex characters; a partial write preserves predictable zeros. The caller has no collision detection.
+
+**Fix specification:** Add a deterministic process-local fallback combining an atomic monotonic counter with time and/or a per-process seed, formatted to the same non-secret fixed-length identifier contract. Keep the cryptographic random fast path, never include client data or credentials, and make the entropy source injectable for tests. Log a rate-limited warning without exposing generated material.
+
+**Verification:** Inject full failure, partial-write failure, repeated failure, and concurrent generation; assert uniqueness, stable valid formatting, race freedom, bounded warning volume, and unchanged successful-random output length.
+
+### R-057 — Release binaries are built with a Go toolchain affected by GO-2026-5856
+
+**Severity:** Low — Needs investigation
+
+**Location:** `Golang-dnssec-validator/go.mod:3`; `Golang-tudor-dnssec-signer/go.mod:3`; both Makefiles/release build environments; reviewed binaries `/tmp/dnssec-validator-review` and `/tmp/dnssec-tudor-review`
+
+**Problem:** Both review builds use Go 1.26.4. Binary-mode `govulncheck` reports reachable `crypto/tls` symbols affected by GO-2026-5856, an Encrypted Client Hello PSK identity privacy leak fixed in Go 1.26.5. The applications do not visibly configure ECH, so practical exposure is not confirmed; future transport configuration or deployment wrappers could activate it.
+
+**Evidence:** `go version -m` reports `go1.26.4` for both binaries. `govulncheck -mode=binary` reports GO-2026-5856 and reachable `tls.Conn.Handshake`, `HandshakeContext`, `Read`, `Write`, and `tls.Dialer.DialContext` symbols for each. The module `go` directives set language floors, not a patched release toolchain, and no repository build file pins a minimum patch version. Investigation should inspect production binary metadata and any ECH-enabled `tls.Config` supplied outside this tree.
+
+**Fix specification:** Build and release both artifacts with Go 1.26.5 or a later supported patched version, pin/enforce that minimum in CI/release tooling, and rebuild from the same dependency locks. Do not disable TLS or ECH as a substitute. Keep module language-version compatibility unless a source requirement independently changes it.
+
+**Verification:** Check production and rebuilt artifacts with `go version -m`; rerun binary-mode `govulncheck` using a compatible current scanner/database and require GO-2026-5856 to be absent. Add a release gate and, if ECH is configured anywhere, an integration handshake test covering rejected/resumed ECH paths.
+
+### R-058 — Deployment and conformance documentation materially disagrees with the running code
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/QUICKSTART-FREEBSD.md:29-45`; `Golang-dnssec-validator/ANYSTATUS.md:20-73`; `Golang-dnssec-validator/docs/RFC_COMPLIANCE.md:13-149`; `Golang-dnssec-validator/CLAUDE.md:863-881`; `Golang-dnssec-validator/config.go:230-285` and `425-447`
+
+**Problem:** Operator instructions use unrecognized environment names, monitoring docs promise unwired events, and the RFC matrix asserts behaviors contradicted by current validation paths. Following these sources can silently retain timeout/heartbeat defaults and can lead engineers or auditors to rely on nonexistent trust-anchor freshness and DNSSEC guarantees.
+
+**Evidence:** The FreeBSD quickstart sets `QUERY_TIMEOUT=5s` and `TOTAL_TIMEOUT=30s`, while code reads integer `QUERY_TIMEOUT_SECONDS`/`TOTAL_TIMEOUT_SECONDS`. AnyStatus uses `HEARTBEAT_INTERVAL=5m` rather than `HEARTBEAT_INTERVAL_MINUTES` and claims the R-052 request events. The compliance matrix calls protocol-field handling, signature verification, chain walking, and trust-anchor rollover compliant despite R-024 through R-044, and incorrectly says RFC 6840 requires every algorithm. `CLAUDE.md` says stale local anchors fall back to the URL and fetched anchors are cached, but R-025 shows neither behavior exists.
+
+**Fix specification:** After the corresponding code findings are resolved, update all deployment examples to the exact accepted keys/value grammar and rewrite the conformance matrix from executable behavior, with each claim linked to a test and RFC section. Until then, mark affected guarantees as partial/noncompliant rather than aspirational. Preserve current runtime variable names and compatibility; documentation edits must not paper over unresolved findings.
+
+**Verification:** Add a docs/config check that extracts environment variables from maintained examples and rejects names absent from the loader, then execute the quickstart configuration and assert parsed non-default values. Mechanically map every compliance row and documented heartbeat/anchor behavior to a passing test or explicit open finding, and review RFC 6840 wording against the implementation.
+
+### R-059 — Security-critical orchestration is not integration-testable and remains uncovered
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/internal/validator/validator.go`, `Validator.Validate`/`validateWithCache`/`validateZone`/multi-server/CNAME paths; `Golang-dnssec-validator/internal/dns/query.go` and `resolver.go`; `Golang-dnssec-validator/internal/heartbeat/heartbeat.go`; signer filesystem/state/config transaction paths; both test suites
+
+**Problem:** Unit tests exercise many helpers, but the network, clock, filesystem, and orchestration layers are tightly coupled to concrete implementations. The actual path that combines DNS responses into a security verdict—and the crash/error interleavings that protect signer keys and state—cannot be tested deterministically. This allowed multiple high-severity cross-layer defects in this review to coexist with green tests.
+
+**Evidence:** Current coverage is 51.5% for the validator and 61.6% for the signer. In the validator profile, `Validate`, `validateWithCache`, `validateZone`, all DNS query/resolver methods, multi-server validation, CNAME following, and the entire heartbeat package are 0%; signer `ValidateZone` is 28%, its web mutation handlers are 0%, and transaction paths lack systematic sync/rename/crash fault injection. Both `go test -race -count=1 ./...` runs pass because these paths are not driven end to end.
+
+**Fix specification:** Introduce narrow internal interfaces for DNS exchange/resolution, wall clock, anchor/RDAP/heartbeat transports, and key/config/state filesystem operations, with production adapters retaining existing behavior. Build deterministic signed-response fixtures and a fault-injecting same-filesystem store. Do not change CLI flags, HTTP/JSON/SSE contracts, on-disk schemas, algorithms, or verdict semantics merely to increase a percentage; tests must target every fix and adversarial boundary identified here.
+
+**Verification:** Add hermetic integration suites for secure/insecure/bogus/indeterminate chains, wildcard and denial variants, collisions, multiple servers, CNAME loops, time transitions, cancellation/slow clients, anchor rollover, and every file-operation failure/crash point. Run them under race detection and verify each listed orchestration function executes; use mutation/fault tests to prove assertions fail when the guarded behavior is removed.
+
+### R-060 — Invalid registrar DS digest configuration silently changes to SHA-256
+
+**Severity:** Low
+
+**Location:** `Golang-tudor-dnssec-signer/config.go:38-51`, `RegistrarConfig.DigestType`; `Golang-tudor-dnssec-signer/config.go:337-468`, `Config.Validate`; `Golang-tudor-dnssec-signer/registrar.go:63-72`; `Golang-tudor-dnssec-signer/registrar_test.go:54-73`
+
+**Problem:** Any registrar `digest_type` other than 4 silently becomes 2, including typos and unsupported values. An operator can request the wrong digest, pass startup validation, and have a different DS representation automatically published to the parent. SHA-256 is valid, so this is not inherently insecure, but silent mutation of trust-publication configuration makes intent and change control unverifiable.
+
+**Evidence:** `DigestType` switches only on 4 and defaults everything else to 2. `Config.Validate` never checks `DigestTypeVal`, and the existing test explicitly requires unknown value 1 to default. The selected value feeds DS computation and registrar publication.
+
+**Fix specification:** Accept 0 as the backward-compatible unset/default value and explicitly accept 2 and 4; reject every other configured integer during startup/reload before any signing or registrar call. Keep the default SHA-256 behavior, TOML field name, DS JSON/schema, supported digest set, and already valid configurations unchanged. Errors must identify the field/value without secrets.
+
+**Verification:** Test absent/zero, 2, 4, negative, 1, 3, 255, and overflow/parse cases in TOML and reload. Valid values must generate/publish the requested digest; invalid values must fail before key, state, output, hook, or registrar mutation.
+
+<!-- The required final summary and dependency-aware fix order are appended in the final review-only checkpoint. -->
