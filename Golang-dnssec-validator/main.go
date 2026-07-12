@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/ptudor/dnssec-validator/internal/dns"
 	"github.com/ptudor/dnssec-validator/internal/heartbeat"
 )
 
@@ -37,6 +39,26 @@ func main() {
 
 	// Create anchors store and load trust anchors
 	anchorsStore := NewAnchorsStore(config.RootAnchorsPath, config.RootAnchorsURL)
+
+	// Root anchor freshness/availability are computed at scrape time so the gauges
+	// never freeze between refreshes or read zero before the first load (R-055).
+	RegisterRootAnchorMetrics(
+		func() float64 {
+			la := anchorsStore.LoadedAt()
+			if la.IsZero() {
+				return math.NaN() // never successfully loaded
+			}
+			return time.Since(la).Seconds()
+		},
+		func() float64 {
+			a := anchorsStore.Get()
+			if a == nil {
+				return 0
+			}
+			return float64(len(dns.GetActiveAnchors(a)))
+		},
+	)
+
 	initialLoadErr := anchorsStore.Load()
 	if initialLoadErr != nil {
 		LogWarn("main", "failed to load root anchors at startup; will retry with backoff", "error", initialLoadErr.Error())
@@ -111,7 +133,6 @@ func main() {
 				anchors := anchorsStore.Get()
 				LogInfo("main", "loaded root trust anchors after retry",
 					"count", len(anchors.Anchors), "loaded_from", anchors.LoadedFrom)
-				SetRootAnchorsAge(anchorsStore.Age().Seconds())
 				break
 			}
 		}
@@ -127,8 +148,6 @@ func main() {
 				} else {
 					LogInfo("main", "refreshed root trust anchors")
 				}
-				// Update metrics
-				SetRootAnchorsAge(anchorsStore.Age().Seconds())
 			case <-anchorDone:
 				return
 			}

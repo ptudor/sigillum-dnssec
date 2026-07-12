@@ -62,13 +62,6 @@ var (
 			Help: "Number of currently active SSE connections",
 		},
 	)
-
-	promRootAnchorsAge = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "dnssec_validator_root_anchors_age_seconds",
-			Help: "Age of loaded root anchors in seconds",
-		},
-	)
 )
 
 // expvar metrics for simple debugging
@@ -90,7 +83,25 @@ func init() {
 	prometheus.MustRegister(promRateLimitHits)
 	prometheus.MustRegister(promActiveValidations)
 	prometheus.MustRegister(promActiveSSEConnections)
-	prometheus.MustRegister(promRootAnchorsAge)
+}
+
+// RegisterRootAnchorMetrics installs scrape-time gauges for root anchor freshness
+// and availability. ageFn returns the age (seconds) of the last successfully
+// loaded anchor set, or NaN if none has ever loaded; activeFn returns the count
+// of currently-active anchors. Computing at scrape time (R-055) avoids the
+// frozen/zero-on-startup behavior of a Set()-at-load gauge and never resets age
+// after a failed refresh (the source timestamp only advances on success).
+func RegisterRootAnchorMetrics(ageFn func() float64, activeFn func() float64) {
+	prometheus.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "dnssec_validator_root_anchors_age_seconds",
+			Help: "Age in seconds of the last successfully loaded root anchor set (NaN if never loaded)",
+		}, ageFn))
+	prometheus.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "dnssec_validator_root_anchors_active",
+			Help: "Number of currently-active (validity window open) root trust anchors",
+		}, activeFn))
 }
 
 // RecordValidation records metrics for a DNSSEC validation
@@ -143,7 +154,3 @@ func DecrementActiveSSEConnections() {
 	expvarActiveSSEConnections.Add(-1)
 }
 
-// SetRootAnchorsAge sets the age of loaded root anchors
-func SetRootAnchorsAge(ageSec float64) {
-	promRootAnchorsAge.Set(ageSec)
-}
