@@ -2,6 +2,12 @@ module github.com/ptudor/dnssec-validator
 
 go 1.21.0
 
+// Enforce a minimum build toolchain patched against GO-2026-5856
+// (Encrypted Client Hello PSK identity leak, fixed in Go 1.26.5).
+// The go directive above remains the language floor; this pins the
+// release toolchain. See REVIEW_GPT56_SOL_MAX.md R-057.
+toolchain go1.26.5
+
 require (
 	github.com/miekg/dns v1.1.58
 	github.com/pelletier/go-toml/v2 v2.2.4
