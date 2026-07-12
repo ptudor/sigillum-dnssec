@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -425,9 +426,48 @@ func (z *ZoneState) AddWarning(msg string) {
 	z.Warnings = append(z.Warnings, msg)
 }
 
-// ClearWarnings removes all warnings from a zone
+// ClearWarnings removes all warnings from a zone.
 func (z *ZoneState) ClearWarnings() {
 	z.Warnings = nil
+}
+
+// stickyWarningPrefix marks a warning that a routine signer/rollover operation
+// must NOT clear — currently the registrar-critical "URGENT:" notices (e.g. a
+// registrar replacement that left the parent with ZERO DS). Such a warning
+// describes an external condition a successful sign does not resolve, and must
+// survive until the specific operation that fixes it clears it (R-017).
+const stickyWarningPrefix = "URGENT:"
+
+// ClearTransientWarnings removes only the signer-owned (transient) warnings —
+// expiry/rollover notices a successful sign or rollover completion actually
+// refreshes — while preserving sticky (registrar-critical) warnings (R-017).
+func (z *ZoneState) ClearTransientWarnings() {
+	if len(z.Warnings) == 0 {
+		return
+	}
+	kept := z.Warnings[:0:0]
+	for _, w := range z.Warnings {
+		if strings.HasPrefix(w, stickyWarningPrefix) {
+			kept = append(kept, w)
+		}
+	}
+	z.Warnings = kept
+}
+
+// ClearStickyWarnings removes the sticky (registrar-critical) warnings. Callers
+// invoke this only after the resolving operation succeeds — e.g. a registrar
+// read-back confirms the expected nonempty DS set (R-017).
+func (z *ZoneState) ClearStickyWarnings() {
+	if len(z.Warnings) == 0 {
+		return
+	}
+	kept := z.Warnings[:0:0]
+	for _, w := range z.Warnings {
+		if !strings.HasPrefix(w, stickyWarningPrefix) {
+			kept = append(kept, w)
+		}
+	}
+	z.Warnings = kept
 }
 
 // AddError adds an error to a zone

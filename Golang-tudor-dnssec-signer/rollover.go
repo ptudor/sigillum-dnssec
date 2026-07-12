@@ -121,7 +121,7 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string) error {
 	rm.state.Mutate(func() {
 		zoneState.Rollover = nil
 		zoneState.ForceResign = true
-		zoneState.ClearWarnings()
+		zoneState.ClearTransientWarnings()
 	})
 
 	// Old key files remain on disk but are no longer used
@@ -369,7 +369,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 		rm.state.Mutate(func() {
 			zoneState.Rollover = nil
 			zoneState.ForceResign = true
-			zoneState.ClearWarnings()
+			zoneState.ClearTransientWarnings()
 		})
 		RecordRolloverOperation(domain, "zsk", "complete")
 		slog.Info("[ROLLOVER] ZSK rollover completed automatically", "domain", domain)
@@ -576,7 +576,7 @@ func (rm *RolloverManager) CompleteAlgorithmRollover(domain string) error {
 	rm.state.Mutate(func() {
 		zoneState.Rollover = nil
 		zoneState.ForceResign = true
-		zoneState.ClearWarnings()
+		zoneState.ClearTransientWarnings()
 	})
 
 	slog.Info("[ROLLOVER] Algorithm rollover completed",
