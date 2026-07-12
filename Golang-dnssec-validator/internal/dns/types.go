@@ -3,6 +3,8 @@ package dns
 import (
 	"net"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 // Note: ValidationStatus is defined in internal/validator/result.go
@@ -191,26 +193,12 @@ func RCodeName(rcode int) string {
 	return "UNKNOWN"
 }
 
-// TypeName returns the human-readable RR type name
+// TypeName returns the human-readable RR type name. It uses miekg/dns's complete
+// type registry so every supported query type (PTR, SRV, NAPTR, SPF, …) maps to
+// its own name, and any unregistered numeric type maps to a unique "TYPE<decimal>"
+// string rather than a shared "UNKNOWN". This matters for NSEC/NSEC3 denial: the
+// type-bitmap comparison keys off these names, so distinct types must never
+// collapse to the same string (R-031).
 func TypeName(t uint16) string {
-	names := map[uint16]string{
-		1:   "A",
-		2:   "NS",
-		5:   "CNAME",
-		6:   "SOA",
-		15:  "MX",
-		16:  "TXT",
-		28:  "AAAA",
-		43:  "DS",
-		46:  "RRSIG",
-		47:  "NSEC",
-		48:  "DNSKEY",
-		50:  "NSEC3",
-		51:  "NSEC3PARAM",
-		257: "CAA",
-	}
-	if name, ok := names[t]; ok {
-		return name
-	}
-	return "UNKNOWN"
+	return dns.Type(t).String()
 }

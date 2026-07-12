@@ -4,11 +4,13 @@
 package validator
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/base32"
 	"fmt"
 	"strings"
 
+	"github.com/miekg/dns"
 	dnspkg "github.com/ptudor/dnssec-validator/internal/dns"
 )
 
@@ -478,40 +480,97 @@ func canonicalizeName(name string) string {
 	return name
 }
 
-// canonicallyBetween checks if name falls between start and end in DNS canonical order.
-// DNS canonical ordering: compare label by label from the rightmost label.
-// Per RFC 4034 Section 6.1.
-func canonicallyBetween(name, start, end string) bool {
-	nameLabels := splitLabels(name)
-	startLabels := splitLabels(start)
-	endLabels := splitLabels(end)
-
-	// Handle wrap-around: if start > end (alphabetically), we're at zone boundary
-	startCmp := compareCanonical(startLabels, endLabels)
-	if startCmp > 0 {
-		// Wrap-around case: name must be > start OR < end
-		return compareCanonical(nameLabels, startLabels) > 0 ||
-			compareCanonical(nameLabels, endLabels) < 0
+// canonicalLabelBytes returns the unescaped, lowercased octets of a single DNS
+// label. RFC 4034 §6.1 canonical ordering compares the raw label octets, so
+// escape sequences (\DDD decimal, \X single-char) must be resolved to the bytes
+// they denote and ASCII A–Z lowercased BEFORE comparison — comparing presentation
+// strings mis-orders names containing escaped octets relative to wire order (R-045).
+func canonicalLabelBytes(label string) []byte {
+	out := make([]byte, 0, len(label))
+	for i := 0; i < len(label); i++ {
+		b := label[i]
+		if b == '\\' && i+1 < len(label) {
+			if i+3 < len(label) &&
+				label[i+1] >= '0' && label[i+1] <= '9' &&
+				label[i+2] >= '0' && label[i+2] <= '9' &&
+				label[i+3] >= '0' && label[i+3] <= '9' {
+				b = byte(int(label[i+1]-'0')*100 + int(label[i+2]-'0')*10 + int(label[i+3]-'0'))
+				i += 3
+			} else {
+				b = label[i+1]
+				i++
+			}
+		}
+		if b >= 'A' && b <= 'Z' {
+			b += 32
+		}
+		out = append(out, b)
 	}
-
-	// Normal case: start < name < end
-	return compareCanonical(nameLabels, startLabels) > 0 &&
-		compareCanonical(nameLabels, endLabels) < 0
+	return out
 }
 
-// hashBetween checks if a hash falls between start and end in lexicographic order.
-// NSEC3 hashes are compared as simple strings (base32hex).
+// compareCanonicalNames compares two domain names in RFC 4034 §6.1 canonical
+// order: right-to-left, label by label, each label compared as unescaped,
+// lowercased wire octets. Returns -1, 0, or 1. (R-045)
+func compareCanonicalNames(a, b string) int {
+	aLabels := dns.SplitDomainName(a)
+	bLabels := dns.SplitDomainName(b)
+	for i := 0; ; i++ {
+		aIdx := len(aLabels) - 1 - i
+		bIdx := len(bLabels) - 1 - i
+		if aIdx < 0 && bIdx < 0 {
+			return 0
+		}
+		if aIdx < 0 {
+			return -1 // shorter name (fewer labels) sorts first
+		}
+		if bIdx < 0 {
+			return 1
+		}
+		switch bytes.Compare(canonicalLabelBytes(aLabels[aIdx]), canonicalLabelBytes(bLabels[bIdx])) {
+		case -1:
+			return -1
+		case 1:
+			return 1
+		}
+	}
+}
+
+// canonicallyBetween checks if name falls strictly between start and end in DNS
+// canonical order (RFC 4034 §6.1), with exclusive endpoints.
+func canonicallyBetween(name, start, end string) bool {
+	switch compareCanonicalNames(start, end) {
+	case -1:
+		// Normal interval: start < name < end.
+		return compareCanonicalNames(name, start) > 0 && compareCanonicalNames(name, end) < 0
+	case 1:
+		// Wrap-around at the zone's last owner: name > start OR name < end.
+		return compareCanonicalNames(name, start) > 0 || compareCanonicalNames(name, end) < 0
+	default:
+		// start == end: a single-record chain whose next owner is itself covers the
+		// entire namespace except the owner name (R-036).
+		return compareCanonicalNames(name, start) != 0
+	}
+}
+
+// hashBetween checks if a hash falls strictly between start and end in
+// lexicographic (base32hex) order. Endpoints are exclusive.
 func hashBetween(hash, start, end string) bool {
 	hash = strings.ToUpper(hash)
 	start = strings.ToUpper(start)
 	end = strings.ToUpper(end)
 
-	// Handle wrap-around at zone boundary
-	if start > end {
+	switch {
+	case start < end:
+		return hash > start && hash < end
+	case start > end:
+		// Wrap-around at zone boundary.
 		return hash > start || hash < end
+	default:
+		// start == end: a single NSEC3 record whose next hash is itself covers the
+		// whole hash space except its own hash (R-036).
+		return hash != start
 	}
-
-	return hash > start && hash < end
 }
 
 // splitLabels splits a domain name into labels (right to left order).

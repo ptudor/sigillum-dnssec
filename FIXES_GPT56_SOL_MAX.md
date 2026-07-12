@@ -64,4 +64,21 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 - **Files:** `metrics.go`, `main.go`, `metrics_r055_test.go` (new)
 - **Verification:** `TestR055_RootAnchorAgeSemantics` — age is NaN before any successful load, reflects ~2h after a simulated load, and a failed `Load()` (nonexistent file+url) does not reset `loadedAt`. Metric name/units for load age preserved. Full suite green under race; `go vet` clean.
 
+## Phase 3 — Correct authenticated authority and denial semantics
+
+### R-031 — Supported types become UNKNOWN in denial maps — FIXED
+- **Change:** `TypeName` (`internal/dns/types.go`) now returns `dns.Type(t).String()` (miekg's complete registry) instead of a hand-maintained map that fell back to a shared `"UNKNOWN"`. Every supported query type (PTR, SRV, NAPTR, SPF, plus SSHFP, etc.) now maps to its own name, and unregistered numerics map to a unique `TYPE<decimal>`. Because the NSEC/NSEC3 type-bitmap comparison keys off these strings, distinct types can no longer collapse to the same token and cause a false NODATA rejection.
+- **Files:** `internal/dns/types.go`, `internal/dns/types_test.go` (updated expectations for the intended new behavior)
+- **Verification:** `types_test.go` now asserts PTR/SRV/NAPTR/SPF map to their own names and `999 → TYPE999`, `0 → None`. Since `TypeName` is now injective over distinct types, the bitmap comparison's false-collision is structurally eliminated. Full suite green.
+
+### R-045 — NSEC order uses presentation strings — FIXED
+- **Change:** Ported the signer's canonical comparison into `internal/validator/nsec.go`: added `canonicalLabelBytes` (resolves `\DDD`/`\X` escapes to raw octets and lowercases ASCII) and `compareCanonicalNames` (RFC 4034 §6.1 right-to-left, label-by-label, `bytes.Compare` on unescaped octets via `dns.SplitDomainName`). Rewrote `canonicallyBetween` to use it instead of the old `strings.Split`/Go-string comparison, which mis-ordered escaped-octet owners.
+- **Files:** `internal/validator/nsec.go`, `internal/validator/nsec_ordering_r045_r036_test.go` (new)
+- **Verification:** `TestR045_CanonicalOrderingEscapedOctets` — case-insensitive equality, shorter-name-first, and `\065`(='A'→'a') equal to `a` and ordered before `z` by wire octet. Existing NSEC ordering tests still pass.
+
+### R-036 — Single-record denial ring covers nothing — FIXED
+- **Change:** `canonicallyBetween` and `hashBetween` now handle the `start == end` case explicitly: a single-record NSEC/NSEC3 chain whose next owner/hash equals its own owner covers the entire namespace except the owner itself (`compareCanonicalNames(name, start) != 0` / `hash != start`). Previously equality fell through to an impossible `name > start && name < end`, so a minimal one-record signed zone could prove no denial.
+- **Files:** `internal/validator/nsec.go`, `internal/validator/nsec_ordering_r045_r036_test.go` (new)
+- **Verification:** `TestR036_SingleRecordRingCoversAllButOwner` — a single NSEC (next==owner) covers absent names on both sides but not the owner; same for a single NSEC3 hash ring. Endpoints remain exclusive for normal/wrap intervals (existing tests pass).
+
 
