@@ -20,6 +20,26 @@ type DNSKEYRecord struct {
 	IsRevoked bool   `json:"is_revoked,omitempty"` // RFC 5011 REVOKE bit set
 }
 
+// EligibleForVerification reports whether this DNSKEY may be used to verify
+// RRSIGs. RFC 4034 §2.1.1–2.1.2 require the Protocol field to be 3 and the Zone
+// Key flag (0x0100) to be set before a key can authenticate zone data, and RFC
+// 5011 forbids using a revoked key. Invalid keys stay in the parsed DNSKEY set
+// for diagnostics/JSON, but this gate keeps them out of every authenticated
+// signing-key candidate list (R-043). SEP (0x0001) is deliberately not required
+// — a DS-authenticated zone key may sign without it.
+func (k DNSKEYRecord) EligibleForVerification() bool {
+	if k.Protocol != 3 {
+		return false
+	}
+	if k.Flags&0x0100 == 0 { // Zone Key flag must be set
+		return false
+	}
+	if k.IsRevoked || k.Flags&0x0080 != 0 { // RFC 5011 REVOKE
+		return false
+	}
+	return true
+}
+
 // DSRecord represents a DS record
 type DSRecord struct {
 	KeyTag     uint16 `json:"key_tag"`
