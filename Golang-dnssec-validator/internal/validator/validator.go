@@ -193,6 +193,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 	// Validate each zone in order
 	var lastStatus ValidationStatus = StatusSecure
 	var parentDNSKEY []dnspkg.DNSKEYRecord // Track parent's DNSKEY for DS RRSIG verification
+	ancestorInsecure := false              // sticky: once any ancestor is insecure, descendants cannot be secure (R-033)
 	for _, zone := range zones {
 		select {
 		case <-ctx.Done():
@@ -232,6 +233,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 				})
 				return result, nil
 			case StatusInsecure:
+				ancestorInsecure = true
 				if lastStatus == StatusSecure {
 					lastStatus = StatusInsecure
 				}
@@ -249,8 +251,9 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			Action: "validating",
 		})
 
-		// Validate this zone (pass parent DNSKEY for DS RRSIG verification)
-		zoneResult, err := v.validateZone(ctx, zone, zones, parentDNSKEY)
+		// Validate this zone (pass parent DNSKEY for DS RRSIG verification, and
+		// whether an ancestor is already insecure so a child below it stays insecure)
+		zoneResult, err := v.validateZone(ctx, zone, zones, parentDNSKEY, ancestorInsecure)
 		if err != nil {
 			// Zone validation error
 			zoneResult = NewZoneResult(zone)
@@ -290,6 +293,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			})
 			return result, nil
 		case StatusInsecure:
+			ancestorInsecure = true
 			if lastStatus == StatusSecure {
 				lastStatus = StatusInsecure
 			}
@@ -862,7 +866,7 @@ func isUnqueryableRecordError(errText string) bool {
 
 // validateZone validates a single zone
 // parentDNSKEY is used for DS RRSIG verification (nil for root zone)
-func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []string, parentDNSKEY []dnspkg.DNSKEYRecord) (*ZoneResult, error) {
+func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []string, parentDNSKEY []dnspkg.DNSKEYRecord, parentInsecure bool) (*ZoneResult, error) {
 	result := NewZoneResult(zone)
 	start := time.Now()
 
@@ -960,6 +964,19 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 	result.RRSIG = dnskeyResult.RRSIG
 	result.NSEC = dnskeyResult.NSEC
 	result.NSEC3 = dnskeyResult.NSEC3
+
+	// R-033: below an insecure (proven-unsigned) ancestor there is no authenticated
+	// chain back to the configured root, so any DS/DNSKEY observed at this child is
+	// unauthenticated and cannot make it secure — nor is it bogus. Keep the result
+	// insecure; the DNSKEY records above remain as diagnostics. (A nil parentDNSKEY
+	// alone is ambiguous — root vs insecure ancestor vs missing parent key — hence an
+	// explicit flag is threaded in rather than inferred from nil keys.)
+	if zone != "." && parentInsecure {
+		result.Status = StatusInsecure
+		result.Warnings = append(result.Warnings,
+			"delegation is below an insecure (unsigned) ancestor; no authenticated chain to the root — treated as insecure")
+		return result, nil
+	}
 
 	// Check if zone is signed
 	if len(result.DNSKEY) == 0 {
