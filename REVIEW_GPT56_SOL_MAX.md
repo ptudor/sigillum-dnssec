@@ -234,4 +234,172 @@ The review traces the signer and validator from configuration and process startu
 
 **Verification:** Add a handler seam that pauses immediately before `current()`, begin shutdown, then release the handler and assert both complete well before the context deadline. Run with the race detector and cover no-server, repeated/concurrent shutdown, a genuinely slow handler that times out, and watcher activity during shutdown.
 
+### R-017 — Successful signing and rollover erase unrelated persistent warnings
+
+**Severity:** Medium
+
+**Location:** `Golang-tudor-dnssec-signer/sign.go:183-200`, `SignZone`; `Golang-tudor-dnssec-signer/rollover.go:120-125`, `369-373`, and `575-580`; `Golang-tudor-dnssec-signer/registrar_cli.go:17-27`, `recordRegistrarWarning`; `Golang-tudor-dnssec-signer/state.go:406-419`
+
+**Problem:** Warnings have no category or ownership, and several unrelated success paths call `ClearWarnings()`. A normal sign or rollover completion can therefore erase an urgent persisted warning that a registrar replacement left the parent with zero DS records. The dashboard/health state becomes healthy-looking while the external outage remains. Conversely, a later successful registrar reconciliation has no targeted way to clear only the resolved registrar warning.
+
+**Evidence:** `recordRegistrarWarning` deliberately persists `URGENT: registrar left zone with ZERO DS...`. `SignZone` clears the entire slice after writing any valid signed file, and every rollover completion also clears it wholesale. `ClearWarnings` is simply `z.Warnings = nil`; it cannot distinguish rollover-due notices from registrar, ownership, or other future warnings.
+
+**Fix specification:** Give warnings stable source/code identity internally and remove only warnings whose condition the current operation actually resolved. Keep the public `warnings` string array and old-state decoding compatible; unknown legacy strings must remain until explicitly resolved, not disappear on sign. A registrar warning may clear only after a successful read-back confirms the expected nonempty DS set. Signing may refresh only signer-owned expiry/rollover notices, and rollover completion may clear only its own action notice.
+
+**Verification:** Persist an urgent zero-DS warning, run a successful sign and each rollover completion, and assert the warning survives state round-trip and remains visible in status/health. Then make registrar push/read-back confirm the intended DS set and assert only that warning clears. Cover duplicate suppression and legacy string-only state.
+
+### R-018 — Per-zone web validation bypasses the dashboard's cache and work bound
+
+**Severity:** Medium
+
+**Location:** `Golang-tudor-dnssec-signer/web.go:15-95`, shared validation cache; `Golang-tudor-dnssec-signer/web.go:299-318`, `apiValidateZoneHandler`
+
+**Problem:** The aggregate dashboard and `/api/validate` use a single-flight cache, but `/api/validate/{domain}` constructs a fresh validator and performs live DNS queries for every request. There is no request-level concurrency limit, per-zone cache, or cancellation propagation. When the unauthenticated dashboard is exposed through a reverse proxy, repeated requests can consume sockets, resolver capacity, goroutines, and the server's request budget despite the protection on the neighboring endpoint.
+
+**Evidence:** `apiValidateZoneHandler` calls `v.ValidateZone(domain)` directly. The only bounding logic (`validationCache.get`) is used by `cachedValidateAll`; the per-zone handler never enters it. `http.Server.WriteTimeout` bounds response writes, not already-started DNS work, and the validation API itself has no context parameter to cancel on disconnect.
+
+**Fix specification:** Route both validation endpoints through one bounded scheduler with a global concurrency cap, key-based single flight, short result TTL, and request cancellation. A cold request at capacity should return a deterministic 429/503 with `Retry-After`; stale-result behavior must be explicit. Preserve endpoint paths and JSON schemas and do not serialize routine signing behind dashboard validation. Keep loopback defaults and allow legitimate parallel validation up to the configured limit.
+
+**Verification:** Issue many simultaneous requests for the same and different zones against a blocking fake resolver. Assert one computation per key, a fixed global maximum, bounded goroutine count, prompt cancellation after client disconnect, and 429/503 at capacity. Verify cache expiry, stale/cold responses, and parity of aggregate/per-zone results.
+
+### R-019 — Zone registration appends directly to the live config and can leave it truncated
+
+**Severity:** Medium
+
+**Location:** `Golang-tudor-dnssec-signer/config.go:572-589`, `AddZoneToConfigFile`; `Golang-tudor-dnssec-signer/main.go`, successful `runAdd` and `runImport` commit order
+
+**Problem:** Adding/importing a zone writes TOML directly with `O_APPEND` and neither fsyncs nor checks the deferred close. A short I/O failure or crash can leave a partial table/header/path in the only config file. State and signed output are committed first, so the command can leave an un-loadable config plus a managed state entry, or report success before the append is durable. This is the write-side counterpart to the removal transaction problems in R-001/R-010.
+
+**Evidence:** `AddZoneToConfigFile` opens the live file and executes one `WriteString`, then returns without `Sync`; `defer f.Close()` discards close errors. It does not use `writeFileAtomicOwned`, which stages, fsyncs, renames, and syncs the parent directory. Both add and import persist state before calling this helper.
+
+**Fix specification:** Construct the complete new config from an exact snapshot, validate it with the strict TOML decoder, and commit through an atomic/durable writer that preserves bytes for unrelated tables/comments plus original mode/owner. Coordinate config, state, keys, and signed output using the transaction/recovery mechanism required by R-010 through R-013 so a crash resolves to a complete old or new generation. Preserve TOML schema, successful formatting conventions, and public CLI behavior.
+
+**Verification:** Inject short writes, file sync/close failure, rename failure, directory-sync failure, and process termination at every commit boundary. On restart, assert either the byte-identical old config/state/artifacts or a fully parseable new set containing exactly one zone. Exercise secrets-bearing 0640 config, comments, inline table comments, concurrent daemon access, add, and import.
+
+### R-020 — Signed-zone rename is not made durable before state can record success
+
+**Severity:** Medium
+
+**Location:** `Golang-tudor-dnssec-signer/sign.go:1370-1425`, `writeSignedZone`; `Golang-tudor-dnssec-signer/ownership.go:104-160`, durable atomic-write helper
+
+**Problem:** The signed file is fsynced and renamed, but its parent directory is not fsynced. A power loss can therefore lose or roll back the directory entry even after state is saved with a new serial, source metadata, and signature expiration. On restart `NeedsSign` can trust that state and decline to recreate the missing/old output until another trigger, leaving the authoritative deployment without the generation state claims is live.
+
+**Evidence:** `writeSignedZone` returns immediately after `os.Rename`. The repository's `writeFileAtomicOwned` explicitly calls `syncDir` after rename for this durability reason, but signed-zone publication does not. The signing state mutation follows the write and is later durably saved by CLI/daemon paths.
+
+**Fix specification:** Make signed-output publication use the same file-and-directory durability contract as state/config while retaining its unique-temp concurrency behavior and 0644 mode. A directory-sync failure must be surfaced/recorded so state is not silently treated as durably published; recovery must safely re-sign or reconcile the output on restart. Preserve output path/content, prior-output-on-signing-error behavior, and cross-platform support.
+
+**Verification:** Add filesystem seams for file sync, rename, and directory sync plus a crash-recovery test at each boundary. After simulated restart, state and output must agree on the published serial/generation, and a missing or older output must force regeneration. Re-run concurrent atomic-writer tests and assert mode/content remain unchanged.
+
+### R-021 — Rollover metrics retain stale active types after a type transition
+
+**Severity:** Low
+
+**Location:** `Golang-tudor-dnssec-signer/metrics.go:148-193`, `UpdateZoneMetrics`
+
+**Problem:** When a zone has a rollover, the collector sets only its current `{domain,type}` series to 1. It resets all types only when there is no rollover. If state changes directly from one rollover type to another between scrapes/restarts/tests, the old type remains 1 indefinitely, producing contradictory alerts and dashboards.
+
+**Evidence:** The non-nil branch calls `WithLabelValues(domain, zone.Rollover.Type).Set(1)` only. The three known labels are zeroed solely in the `else` branch. Prometheus gauge vectors retain earlier label values across scrapes.
+
+**Fix specification:** On every state-to-metrics refresh, zero all supported rollover-type labels for each current domain before setting the one current type. Handle unknown future types without leaving known types stale, and preserve metric names/labels and deletion behavior for removed domains.
+
+**Verification:** Scrape after `ksk -> algorithm -> zsk -> nil` transitions without an intervening nil state and assert exactly one type is 1 at each step, then all zero. Include an unknown type and removed domain.
+
+### R-022 — Key generation knowingly accepts a colliding key tag after ten retries
+
+**Severity:** Low
+
+**Location:** `Golang-tudor-dnssec-signer/keys.go:72-104`, key-generation collision loop
+
+**Problem:** The collision guard documents that equal 16-bit tags can overwrite backup identity and cause registrar upsert to replace the old DS, but after ten collisions it logs a warning and proceeds with exactly that unsafe key. Random occurrence is extraordinarily unlikely, yet a generator failure, deterministic entropy problem, or test/future implementation can turn the guard into silent integrity loss instead of a fail-closed error.
+
+**Evidence:** On `attempt >= maxTagAttempts`, lines 93-96 warn and `break`; `saveKeyFiles` then installs the colliding key and returned `KeyState.ID` is the already-used tag. Downstream backup filenames and rollover state use that tag as identity.
+
+**Fix specification:** Return a hard error after the bounded retries and leave every live/backup key and state entry unchanged. The error should name the domain/role/attempt count without secret material. Preserve the retry bound, random-generation algorithm, normal key formats, and public API except for failing this impossible-to-represent state.
+
+**Verification:** Inject a generator that returns a used tag for every attempt and assert a nonzero error with no filesystem/state changes. Then return a unique tag on the last allowed attempt and assert success; cover collisions with both live roles and backup files.
+
+### R-023 — Hook stderr capture is unbounded and can exhaust daemon memory
+
+**Severity:** Low
+
+**Location:** `Golang-tudor-dnssec-signer/hooks.go:46-109`, `executeHook`; `Golang-tudor-dnssec-signer/hooks.go:111-175`, `executeBatchHook`
+
+**Problem:** Asynchronous post-sign hooks capture all stderr in a `bytes.Buffer` for up to 30 seconds. A broken command that writes continuously can allocate until the daemon is killed, taking signing and monitoring down. The timeout bounds wall time but not output rate or memory, and multiple non-coalesced zone hooks can amplify the allocation.
+
+**Evidence:** Both functions assign an unconstrained `bytes.Buffer` to `command.Stderr`. There is no `io.LimitReader` equivalent, ring buffer, shared hook concurrency cap, or truncation marker. Per-zone hooks may run concurrently for every zone signed in a cycle.
+
+**Fix specification:** Capture a bounded tail/prefix (with an explicit truncation marker) or stream to a bounded logger, and cap concurrent hook processes independently of the signing loop. Continue draining the child pipe so a full pipe cannot deadlock it. Preserve the 30-second timeout, hook environment/API, stdout behavior, asynchronous daemon semantics, and synchronous CLI behavior.
+
+**Verification:** Run hooks that emit output far beyond the cap, block, fail, and run across many zones. Assert bounded process RSS/goroutines, timeout and shutdown completion, a useful truncated diagnostic, no child deadlock, and unchanged success metrics for normal hooks.
+
+### R-024 — Trust-anchor input is not authenticated and can create an attacker-controlled root of trust
+
+**Severity:** Critical
+
+**Location:** `Golang-dnssec-validator/internal/dns/anchors.go:12-145`, anchor loaders; `Golang-dnssec-validator/internal/validator/dnssec.go:630-668`, `VerifyRootTrustAnchor`; `Golang-dnssec-validator/config.go:407-411`
+
+**Problem:** The validator treats arbitrary local/remote JSON as root trust material. The only swap check is that *one* entry has key tag 20326 or 38696; that entry's digest need not be the real IANA digest, and arbitrary additional anchors are trusted. The HTTP client also follows redirects by default, including HTTPS-to-HTTP and cross-origin redirects, so validating only the configured URL's prefix does not protect the final fetch. An attacker who controls the file/fetch and DNS path can add their own anchor, serve a matching forged root key/chain, and make arbitrary data report `secure`.
+
+**Evidence:** `hasKnownRootTag` checks only an integer. A JSON array containing a dummy tag-20326 record plus an attacker anchor passes, regardless of zone, digest syntax/length, source, `GeneratedAt`, or signature. `LoadAnchorsFromURL` uses an `http.Client` with no `CheckRedirect`. `VerifyRootTrustAnchor` correctly trusts any loaded digest that matches a served root DNSKEY, which turns the unauthenticated loader directly into the security boundary rather than mitigating it.
+
+**Fix specification:** Bootstrap from authenticated IANA material: ship/pin the exact accepted root DS/public-key set and implement a standards-based update path (for example authenticated IANA `root-anchors.xml`/signature processing and RFC 5011 hold-down), treating custom JSON only as a cache derived from verified input. Validate zone `.`, algorithms, digest types/length/hex, validity intervals, duplicates, and exact authorized keys before replacement. Reject scheme downgrade and unapproved origin redirects. Commit updates atomically and retain last-known-good anchors on failure. Preserve the public `RootAnchors`/`/api/anchors` JSON shape and offline startup using an authenticated cache.
+
+**Verification:** Demonstrate the pre-fix exploit with dummy-known-tag-plus-malicious-anchor JSON and a forged root DNSKEY/RRSIG chain, then assert it is rejected. Add HTTPS-to-HTTP, cross-origin, tampered signature/XML/JSON, malformed digest/date/zone, unauthorized extra anchor, valid current+successor set, RFC 5011 timing, offline last-known-good, and atomic-update failure tests.
+
+### R-025 — A nonempty local anchor file permanently prevents remote refresh and can miss the 2026 root rollover
+
+**Severity:** High
+
+**Location:** `Golang-dnssec-validator/internal/dns/anchors.go:131-145`, `LoadAnchorsWithFallback`; `Golang-dnssec-validator/anchors_store.go:27-69`; `Golang-dnssec-validator/main.go:86-136`, refresh loop; `Golang-dnssec-validator/health.go:45-64`
+
+**Problem:** The 24-hour “refresh” always returns any nonempty local file before consulting the URL. Its content age and `GeneratedAt` are ignored, while `loadedAt` is reset on each reread, so health/metrics can call a years-old file fresh. A file containing only KSK-2017 tag 20326 will therefore never acquire successor tag 38696 and will reject the root when the successor takes over. IANA currently schedules that rollover for 2026-10-11, making this an imminent whole-service failure mode.
+
+**Evidence:** `LoadAnchorsWithFallback` immediately returns on successful file load. No code writes a verified remote result back, merges anchor sets, or compares `GeneratedAt`; `Age()` measures process load time only and health checks only `len(anchors)>0`. The project's operational docs describe the path as a cache, but code treats it as an immutable primary. See the current [IANA root-anchor files](https://www.iana.org/dnssec/files) and [ICANN rollover schedule](https://www.icann.org/resources/press-material/release-2026-05-20-en).
+
+**Fix specification:** After implementing R-024 authentication, refresh from the authoritative source on schedule and atomically update the local last-known-good cache; use the file only when the network refresh is unavailable or not yet due. Track source `GeneratedAt`, active key tags, last successful authenticated refresh, and next rollover/expiry, and degrade readiness before no usable active anchor remains. Preserve offline validation with a still-valid cached set and never discard a good set because a refresh is invalid/unreachable.
+
+**Verification:** Start with a valid stale file containing only 20326 and a remote authenticated set adding 38696; assert refresh installs/persists both and survives restart. Advance a fake clock through prepublication, activation, and old-key retirement. Cover network failure, malformed/older remote data, read-only cache, concurrent readers, health/metrics staleness, and rollback to last-known-good.
+
+### R-026 — A wildcard answer without an authenticated denial proof still returns `secure`
+
+**Severity:** High
+
+**Location:** `Golang-dnssec-validator/internal/validator/validator.go:301-329`, leaf-verdict integration; `Golang-dnssec-validator/internal/validator/validator.go:722-797`, `verifyWildcard` and `recordValidationVerdict`
+
+**Problem:** A valid RRSIG whose Labels field indicates wildcard synthesis is insufficient: the validator must also authenticate that no closer/exact name existed. The code detects a missing/invalid NSEC/NSEC3 proof and records an error, but `recordValidationVerdict` returns `secure` immediately whenever the data RRSIG verified. An attacker able to replay a wildcard-signed RRset without its denial proof can therefore obtain a false secure verdict.
+
+**Evidence:** `verifyWildcard` sets `Wildcard=true` and `Error` when the proof is absent or its RRSIG fails, while leaving `RRSIGVerified=true`. `recordValidationVerdict` begins `if rv == nil || rv.RRSIGVerified { return StatusSecure }`; its comment explicitly says incomplete wildcard proof stays secure. The call site adds only a warning. RFC 4035 section 5.3.4 requires the additional wildcard nonexistence validation before the answer is authenticated.
+
+**Fix specification:** A wildcard-synthesized positive answer may be `secure` only when both its answer RRset and the required NSEC/NSEC3 proof verify for the correct zone/name. Missing, expired, forged, or logically incomplete proof is `bogus`; an inability to fetch a complete response due solely to transport/timeout may be `indeterminate`. Preserve status enum and JSON fields, including detailed wildcard proof data, and do not require a closest-encloser NSEC3 exact match beyond RFC 5155 section 8.8's next-closer coverage rule.
+
+**Verification:** Update the existing test that enshrines secure-with-warning. Add valid signed wildcard data with no proof, forged/expired proof, wrong zone/parameters, valid NSEC proof, valid NSEC3 next-closer proof, and non-wildcard positive answers. Assert only the two fully verified wildcard cases remain secure.
+
+### R-027 — Leaf cryptographic verification is not bound to the queried owner or DNS section
+
+**Severity:** High
+
+**Location:** `Golang-dnssec-validator/internal/dns/query.go:95-208`, `parseResponse`; `Golang-dnssec-validator/internal/validator/dnssec.go:393-455`, `VerifyRRsetRRSIGFromResponse`; `Golang-dnssec-validator/internal/validator/validator.go:539-685`, `verifyActualRecord`
+
+**Problem:** Parsed records from Answer, Authority, and Additional are merged and most record models lose owner/section. The leaf verifier then accepts the first cryptographically valid RRset of the requested type/key tag anywhere in the message; it never requires that RRset to be the queried name (or the correctly derived wildcard owner). A forged target answer accompanied by a replayed valid A/CNAME RRset and RRSIG for another owner in the same zone can be labeled secure.
+
+**Evidence:** `parseResponse` appends all three sections. `FindRRSIGForType` filters only type. `VerifyRRsetRRSIGFromResponse` groups every section by owner, iterates every matching signature, and returns on any success without a requested-owner argument. The caller checks only `SignerName` against the zone, which an unrelated authentic RRset in that zone satisfies. CNAME selection likewise uses the first merged CNAME.
+
+**Fix specification:** Preserve owner and section internally and make every verifier accept an explicit query context. Positive leaf data/CNAME must come from the Answer section and cover the normalized QNAME, except that a wildcard signature must bind to the RFC-derived wildcard owner and pass R-026. DNSKEY must be the zone apex, DS the exact child owner in the parent response, and denial records only those relevant to the authenticated proof. Do not break existing public JSON; additive owner/section fields may be internal or optional.
+
+**Verification:** Craft wire responses containing an unsigned/forged target A plus a valid signed `other.example.` A in Additional/Authority and assert bogus; repeat for CNAME and same key tag. Cover mixed owners, sections, case, wildcard synthesis, legitimate answer RRSIGs, DS/DNSKEY owner binding, and replayed unrelated signed records.
+
+### R-028 — Cryptographic helpers can validate a different, expired RRSIG than the one whose time was checked
+
+**Severity:** High
+
+**Location:** `Golang-dnssec-validator/internal/validator/dnssec.go:393-539`, RRset/denial verification helpers; `Golang-dnssec-validator/internal/validator/nsec.go:35-103` and `215-290`; `Golang-dnssec-validator/internal/validator/validator.go:1104-1275`, DS and DS-absence verification
+
+**Problem:** `dns.RRSIG.Verify` verifies bytes, not inception/expiration. Both raw-response helpers omit time checks. Several callers pre-check only the first parsed signature, then the helper is free to succeed with another same-type/tag signature; DS-absence calls the denial helper without any time check at all. Expired authenticated denial can downgrade a currently secure delegation to `insecure`, and expired/replayed data or DS signatures can contribute to false secure chain/leaf results.
+
+**Evidence:** `VerifyDenialRRSIGFromResponse` accepts a candidate immediately after `sig.Verify`; `VerifyRRsetRRSIGFromResponse` does the same. NSEC/NSEC3 wrappers call `findRRSIGForType` once for time/key diagnostics but then verify all raw candidates independently. `verifyDSAbsence` directly calls the denial helper. A valid-time but bad first signature plus an expired cryptographically valid second signature passes the helper.
+
+**Fix specification:** Evaluate each signature as one indivisible candidate: correct owner/section/type, signer zone, algorithm and exact DNSKEY identity (not tag alone), validity with the configured skew policy, then crypto over the associated RRset. Accept only if the *same* candidate passes all checks; aggregate candidate errors without switching metadata. Apply this shared primitive consistently to leaf, DNSKEY, DS, NSEC, and NSEC3 paths while preserving accepted rollover multi-signature behavior and public result schemas.
+
+**Verification:** For every RRset class, test expired-only, not-yet-valid-only, valid-bad-plus-expired-good, expired-bad-plus-valid-good, same-tag different-key, wrong owner/signer, and one fully valid among multiple signatures. Specifically assert expired DS-absence proof cannot produce `insecure`. Run with a fake clock across skew and serial-time wrap cases.
+
 <!-- Additional findings and the required final summary/fix order are appended in later review-only checkpoints. -->
