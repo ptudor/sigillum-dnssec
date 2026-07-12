@@ -187,6 +187,14 @@ func verifyNSECNODATA(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 				return nil, fmt.Errorf("NSEC at %s has the CNAME bit set: a CNAME was expected, not NODATA for %s (RFC 6840 §4.3)", owner, typeName)
 			}
 
+			// R-030: an NSEC whose bitmap has NS but not SOA is a parent-side
+			// delegation point (a referral), not an authoritative NODATA from the
+			// child. Accepting it would let an unauthenticated zone-cut error turn a
+			// signed parent referral into a false secure NODATA. Reject it.
+			if HasTypeInBitmap("NS", nsec.TypeBitmap) && !HasTypeInBitmap("SOA", nsec.TypeBitmap) {
+				return nil, fmt.Errorf("NSEC at %s is a delegation point (NS set, SOA clear): a parent referral, not authoritative NODATA for %s (R-030)", owner, typeName)
+			}
+
 			// Check if the queried type is NOT in the type bitmap
 			typeFound := false
 			for _, t := range nsec.TypeBitmap {
@@ -432,6 +440,15 @@ func verifyNSEC3NODATA(hashedQname, qname string, qtype uint16, nsec3Records []d
 			// RFC 6840 §4.3: a NODATA proof is invalid if the NSEC3 has the CNAME bit set.
 			if HasTypeInBitmap("CNAME", nsec3.TypeBitmap) {
 				return nil, fmt.Errorf("NSEC3 at %s has the CNAME bit set: a CNAME was expected, not NODATA for %s (RFC 6840 §4.3)", nsec3.HashedOwner, typeName)
+			}
+
+			// R-030: an NSEC3 whose bitmap has NS but not SOA is a parent-side
+			// delegation point (a referral), not an authoritative NODATA from the
+			// child. Reject it so an unauthenticated zone-cut cannot become a false
+			// secure NODATA. (An opt-out/unsigned-delegation NSEC3 is handled by the
+			// NXDOMAIN/DS-absence paths, not here.)
+			if HasTypeInBitmap("NS", nsec3.TypeBitmap) && !HasTypeInBitmap("SOA", nsec3.TypeBitmap) {
+				return nil, fmt.Errorf("NSEC3 at %s is a delegation point (NS set, SOA clear): a parent referral, not authoritative NODATA for %s (R-030)", nsec3.HashedOwner, typeName)
 			}
 
 			// Check if qtype is NOT in type bitmap
