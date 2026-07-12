@@ -146,7 +146,10 @@ func DefaultConfig() *Config {
 		},
 		LogFormat: "json",
 		LogLevel:  "info",
-		StaticDir: "./static",
+		// R-050: static_dir is a deprecated no-op — the server always serves the
+		// embedded assets. Default to empty so a fresh config carries no value and
+		// the startup deprecation warning fires only when an operator supplies one.
+		StaticDir: "",
 		TrustedProxyCIDRs: []string{
 			"127.0.0.0/8",
 			"::1/128",

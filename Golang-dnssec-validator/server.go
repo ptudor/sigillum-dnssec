@@ -134,11 +134,17 @@ func (s *Server) registerRoutes() {
 	if basePath != "" {
 		stripBase := http.StripPrefix(basePath, staticHandler)
 		s.mux.Handle(basePath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == basePath {
-				staticHandler.ServeHTTP(w, requestWithPath(r, "/"))
-				return
+			// R-048: redirect the exact base path to its slash form BEFORE serving
+			// content. Serving the UI directly at "/dnssec" leaves the address bar
+			// without a trailing slash, so browser-relative URLs (style.css, app.js,
+			// validate, api/...) resolve against the parent and become root paths — a
+			// reverse proxy exposing only "/dnssec/" then serves a page with no assets.
+			// 308 preserves the request method; retain the query string.
+			target := basePath + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
 			}
-			stripBase.ServeHTTP(w, r)
+			http.Redirect(w, r, target, http.StatusPermanentRedirect)
 		}))
 		s.mux.Handle(basePath+"/", stripBase)
 	}
@@ -186,14 +192,6 @@ func joinWithBasePath(basePath, pattern string) string {
 		return basePath + "/"
 	}
 	return basePath + pattern
-}
-
-func requestWithPath(r *http.Request, path string) *http.Request {
-	cloned := r.Clone(r.Context())
-	clonedURL := *r.URL
-	clonedURL.Path = path
-	cloned.URL = &clonedURL
-	return cloned
 }
 
 func parseCIDRs(cidrs []string) ([]*net.IPNet, error) {

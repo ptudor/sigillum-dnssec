@@ -61,18 +61,18 @@ func TestComputeOverall(t *testing.T) {
 
 func TestResolverAddr(t *testing.T) {
 	t.Run("explicit resolver with port", func(t *testing.T) {
-		v := &Validator{resolver: "8.8.8.8:53", timeout: 5 * time.Second}
+		v := &Validator{resolver: "127.0.0.1:53", timeout: 5 * time.Second}
 		got := v.resolverAddr()
-		if got != "8.8.8.8:53" {
-			t.Errorf("resolverAddr() = %q, want %q", got, "8.8.8.8:53")
+		if got != "127.0.0.1:53" {
+			t.Errorf("resolverAddr() = %q, want %q", got, "127.0.0.1:53")
 		}
 	})
 
 	t.Run("explicit resolver without port", func(t *testing.T) {
-		v := &Validator{resolver: "8.8.4.4", timeout: 5 * time.Second}
+		v := &Validator{resolver: "127.0.0.1", timeout: 5 * time.Second}
 		got := v.resolverAddr()
-		if got != "8.8.4.4:53" {
-			t.Errorf("resolverAddr() = %q, want %q", got, "8.8.4.4:53")
+		if got != "127.0.0.1:53" {
+			t.Errorf("resolverAddr() = %q, want %q", got, "127.0.0.1:53")
 		}
 	})
 
@@ -406,7 +406,7 @@ func TestValidateZoneNotFound(t *testing.T) {
 	cfg := DefaultConfig()
 	state := NewState("/tmp/test-state.json")
 
-	v := NewValidator(cfg, state, "8.8.8.8:53", 5*time.Second)
+	v := NewValidator(cfg, state, "127.0.0.1:53", 5*time.Second)
 	result := v.ValidateZone("nonexistent.example.com")
 
 	if result.Overall != "error" {
