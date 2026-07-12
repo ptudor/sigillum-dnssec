@@ -92,6 +92,12 @@ func main() {
 		Interval:   config.HeartbeatInterval,
 	})
 
+	// R-052: let periodic heartbeat status reflect live request activity — the
+	// handlers increment/decrement the client's active-validation count, and the
+	// background ticker reports "running" while it is nonzero, "idle" otherwise.
+	// Wired even when disabled (the counter is a harmless no-op read).
+	server.SetActivityObserver(hbClient)
+
 	// Start background heartbeat if enabled
 	var cancelHeartbeat context.CancelFunc
 	if hbClient.Enabled() {

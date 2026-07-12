@@ -14,10 +14,19 @@ import (
 )
 
 // Handlers contains HTTP handlers for the validator
+// activityObserver is notified when a validation starts and finishes so an
+// external monitor (the heartbeat client) can report running/idle based on live
+// request activity (R-052). It is optional; handlers work with a nil observer.
+type activityObserver interface {
+	ValidationStarted()
+	ValidationFinished()
+}
+
 type Handlers struct {
 	anchorsStore *AnchorsStore
 	config       *Config
 	rdapClient   *rdap.Client
+	activity     activityObserver // optional (R-052)
 
 	// validationSem globally caps concurrent validations (R-086). Each extended
 	// validation fans out to every authoritative NS of every zone in the chain,
@@ -25,6 +34,10 @@ type Handlers struct {
 	// large volume of outbound DNS (an amplifier) and many goroutines.
 	validationSem chan struct{}
 }
+
+// SetActivityObserver installs an observer notified on validation start/finish
+// (R-052). Set once at startup before serving; a nil observer disables it.
+func (h *Handlers) SetActivityObserver(o activityObserver) { h.activity = o }
 
 // NewHandlers creates new HTTP handlers
 func NewHandlers(anchorsStore *AnchorsStore, config *Config) *Handlers {
@@ -51,6 +64,9 @@ func (h *Handlers) acquireValidationSlot() bool {
 	select {
 	case h.validationSem <- struct{}{}:
 		IncrementActiveValidations()
+		if h.activity != nil {
+			h.activity.ValidationStarted() // R-052
+		}
 		return true
 	default:
 		return false
@@ -61,6 +77,9 @@ func (h *Handlers) acquireValidationSlot() bool {
 func (h *Handlers) releaseValidationSlot() {
 	<-h.validationSem
 	DecrementActiveValidations()
+	if h.activity != nil {
+		h.activity.ValidationFinished() // R-052
+	}
 }
 
 // HandleValidateSSE handles SSE validation requests

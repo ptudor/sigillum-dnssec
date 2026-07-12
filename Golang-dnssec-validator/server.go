@@ -150,6 +150,13 @@ func (s *Server) registerRoutes() {
 	}
 }
 
+// SetActivityObserver wires an observer (e.g. the heartbeat client) that is
+// notified on validation start/finish so periodic status reflects live request
+// activity (R-052). Call once before Start.
+func (s *Server) SetActivityObserver(o activityObserver) {
+	s.handlers.SetActivityObserver(o)
+}
+
 // withWriteDeadline applies a bounded response write deadline for non-SSE handlers.
 // SSE routes are intentionally excluded because they are long-lived streams.
 func withWriteDeadline(timeout time.Duration, next http.Handler) http.Handler {
