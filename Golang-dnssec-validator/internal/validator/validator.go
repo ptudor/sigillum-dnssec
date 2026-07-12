@@ -618,23 +618,21 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 					}
 					return validation
 				}
-				// Find signing key
-				signingKey := FindZSKByKeyTag(rrsigCNAME.KeyTag, dnskeys)
-				if signingKey == nil {
-					signingKey = FindDNSKEYByKeyTag(rrsigCNAME.KeyTag, dnskeys)
-				}
+				// Find signing-key candidates: every eligible key sharing the tag
+				// (R-043 eligibility, R-044 collision-safe iteration).
+				candidates := EligibleKeysByKeyTag(rrsigCNAME.KeyTag, dnskeys)
 				switch {
-				case signingKey == nil:
+				case len(candidates) == 0:
 					validation.Error = fmt.Sprintf("CNAME signing key (tag %d) not found", rrsigCNAME.KeyTag)
 				case !leafSignerMatchesZone(rrsigCNAME.SignerName, zone):
 					// Defense-in-depth: the signature must be by a key in THIS
 					// zone, mirroring the A-record path's signer-name check (R-096).
 					validation.Error = fmt.Sprintf("CNAME RRSIG signer %s does not match zone %s", rrsigCNAME.SignerName, zone)
 				default:
-					count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, dns.TypeCNAME, *signingKey, rrsigCNAME.KeyTag)
+					count, err := VerifyRRsetRRSIGFromResponseAnyKey(queryResult.RawResponse, dns.TypeCNAME, candidates, rrsigCNAME.KeyTag)
 					if err == nil {
 						validation.RRSIGVerified = true
-						validation.SigningKeyTag = signingKey.KeyTag
+						validation.SigningKeyTag = rrsigCNAME.KeyTag
 						validation.RecordCount = count
 						v.verifyWildcard(validation, domain, *rrsigCNAME, queryResult, dnskeys)
 					} else {
@@ -658,21 +656,19 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		return validation
 	}
 
-	// Find signing key (should be a ZSK)
-	signingKey := FindZSKByKeyTag(rrsigA.KeyTag, dnskeys)
-	if signingKey == nil {
-		signingKey = FindDNSKEYByKeyTag(rrsigA.KeyTag, dnskeys)
-	}
-	if signingKey == nil {
+	// Find signing-key candidates: every eligible key sharing the tag
+	// (R-043 eligibility, R-044 collision-safe iteration).
+	candidates := EligibleKeysByKeyTag(rrsigA.KeyTag, dnskeys)
+	if len(candidates) == 0 {
 		validation.Error = fmt.Sprintf("A record signing key (tag %d) not found in zone DNSKEY", rrsigA.KeyTag)
 		return validation
 	}
 
 	if leafSignerMatchesZone(rrsigA.SignerName, zone) {
-		count, err := VerifyRRsetRRSIGFromResponse(queryResult.RawResponse, v.leafType(), *signingKey, rrsigA.KeyTag)
+		count, err := VerifyRRsetRRSIGFromResponseAnyKey(queryResult.RawResponse, v.leafType(), candidates, rrsigA.KeyTag)
 		if err == nil {
 			validation.RRSIGVerified = true
-			validation.SigningKeyTag = signingKey.KeyTag
+			validation.SigningKeyTag = rrsigA.KeyTag
 			validation.RecordCount = count
 			v.verifyWildcard(validation, domain, *rrsigA, queryResult, dnskeys)
 		} else {
@@ -1139,11 +1135,9 @@ func verifyDSRRSIGSet(validation *DSValidation, rrsigs []dnspkg.RRSIGRecord, par
 // authenticated DNSKEYs: signing-key lookup, time validity, and full
 // cryptographic verification. It returns the signing key's tag on success.
 func verifyDSRRSIGOne(dsRRSIG dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) (uint16, error) {
-	signingKey := FindZSKByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
-	if signingKey == nil {
-		signingKey = FindDNSKEYByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
-	}
-	if signingKey == nil {
+	// Every eligible parent key sharing the tag is a candidate (R-043/R-044).
+	candidates := EligibleKeysByKeyTag(dsRRSIG.KeyTag, parentDNSKEY)
+	if len(candidates) == 0 {
 		return 0, fmt.Errorf("DS signing key (tag %d) not found in parent DNSKEY", dsRRSIG.KeyTag)
 	}
 
@@ -1154,11 +1148,11 @@ func verifyDSRRSIGOne(dsRRSIG dnspkg.RRSIGRecord, parentDNSKEY []dnspkg.DNSKEYRe
 		return 0, fmt.Errorf("DS RRSIG not yet valid (inception: %s)", dsRRSIG.Inception.Format("2006-01-02T15:04:05Z"))
 	}
 
-	if _, err := VerifyRRsetRRSIGFromResponse(rawResponse, dns.TypeDS, *signingKey, dsRRSIG.KeyTag); err != nil {
+	if _, err := VerifyRRsetRRSIGFromResponseAnyKey(rawResponse, dns.TypeDS, candidates, dsRRSIG.KeyTag); err != nil {
 		return 0, fmt.Errorf("DS RRSIG cryptographic verification failed: %v", err)
 	}
 
-	return signingKey.KeyTag, nil
+	return dsRRSIG.KeyTag, nil
 }
 
 // verifyDSAbsence checks that the parent authenticatedly denies the existence of a DS

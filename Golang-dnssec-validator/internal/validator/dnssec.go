@@ -99,6 +99,40 @@ func ComputeDSDigestFromDNSKEY(zone string, dnskey dnspkg.DNSKEYRecord, digestTy
 	return strings.ToUpper(hex.EncodeToString(digest)), nil
 }
 
+// EligibleKeysByKeyTag returns every DNSKEY carrying keyTag that is eligible to
+// verify signatures (R-043 eligibility). A key tag is only a 16-bit hint that can
+// collide (RFC 4034 Appendix B / RFC 6840), so callers MUST try each returned
+// candidate cryptographically rather than trusting the first (R-044).
+func EligibleKeysByKeyTag(keyTag uint16, dnskeys []dnspkg.DNSKEYRecord) []dnspkg.DNSKEYRecord {
+	var out []dnspkg.DNSKEYRecord
+	for _, k := range dnskeys {
+		if k.KeyTag == keyTag && k.EligibleForVerification() {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// VerifyRRsetRRSIGFromResponseAnyKey tries each candidate signing key in turn and
+// returns as soon as one produces a valid signature over the RRset. This makes
+// verification robust to key-tag collisions (R-044): the RRSIG names a tag, but
+// several eligible keys may share it and only one actually signed. Candidates
+// must already be R-043-eligible.
+func VerifyRRsetRRSIGFromResponseAnyKey(rawResponse []byte, typeCovered uint16, candidates []dnspkg.DNSKEYRecord, keyTag uint16) (int, error) {
+	if len(candidates) == 0 {
+		return 0, fmt.Errorf("no eligible signing key (tag %d) available", keyTag)
+	}
+	var lastErr error
+	for _, key := range candidates {
+		count, err := VerifyRRsetRRSIGFromResponse(rawResponse, typeCovered, key, keyTag)
+		if err == nil {
+			return count, nil
+		}
+		lastErr = err
+	}
+	return 0, lastErr
+}
+
 // FindKSKByKeyTag finds a KSK with the given key tag
 func FindKSKByKeyTag(keyTag uint16, dnskeys []dnspkg.DNSKEYRecord) *dnspkg.DNSKEYRecord {
 	for i, key := range dnskeys {
@@ -208,16 +242,23 @@ func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRe
 		algValidated := false
 
 		for _, ds := range dsRecords {
-			// Find matching DNSKEY (prefer KSK, fall back to any key)
-			ksk := FindKSKByKeyTag(ds.KeyTag, childDNSKEY)
-			if ksk == nil {
-				ksk = FindDNSKEYByKeyTag(ds.KeyTag, childDNSKEY)
+			// Key tags collide (RFC 6840), so try EVERY eligible same-tag DNSKEY
+			// against this DS digest, not just the first (R-043/R-044).
+			var matched *dnspkg.DNSKEYRecord
+			for i := range childDNSKEY {
+				if childDNSKEY[i].KeyTag != ds.KeyTag || !childDNSKEY[i].EligibleForVerification() {
+					continue
+				}
+				if VerifyDSMatchesDNSKEY(ds, childDNSKEY[i], zone) {
+					matched = &childDNSKEY[i]
+					break
+				}
 			}
 
-			if ksk != nil && VerifyDSMatchesDNSKEY(ds, *ksk, zone) {
+			if matched != nil {
 				algValidated = true
 				if firstValidKSK == nil {
-					firstValidKSK = ksk
+					firstValidKSK = matched
 					link.Algorithm = dnspkg.AlgorithmName(ds.Algorithm)
 					link.DigestType = dnspkg.DigestTypeName(ds.DigestType)
 					link.KeyTag = ds.KeyTag
@@ -259,6 +300,10 @@ func CollectDSMatchedKeys(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKE
 			if childDNSKEY[i].KeyTag != ds.KeyTag {
 				continue
 			}
+			// R-043: a DS must not authenticate a non-zone/invalid-protocol key.
+			if !childDNSKEY[i].EligibleForVerification() {
+				continue
+			}
 			if VerifyDSMatchesDNSKEY(ds, childDNSKEY[i], zone) {
 				matched = append(matched, childDNSKEY[i])
 				seen[i] = true
@@ -280,6 +325,11 @@ func CollectAnchorMatchedKeys(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.An
 				continue
 			}
 			if dnskeys[i].KeyTag != uint16(anchor.KeyTag) || dnskeys[i].Algorithm != uint8(anchor.Algorithm) {
+				continue
+			}
+			// R-043: an anchor must not authenticate a non-zone/invalid-protocol
+			// or revoked key.
+			if !dnskeys[i].EligibleForVerification() {
 				continue
 			}
 			computedDigest, err := ComputeDSDigestFromDNSKEY(".", dnskeys[i], uint8(anchor.DigestType))
@@ -348,22 +398,16 @@ func verifyDNSKEYRRSIGOne(dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSI
 
 	// The signing key MUST be one of the parent/anchor-authenticated keys. Requiring
 	// membership here — rather than trusting the key named by the RRSIG — is what binds
-	// the DNSKEY RRset to the parent's DS (RFC 4035 §5.2).
-	var signingKeyRecord *dnspkg.DNSKEYRecord
+	// the DNSKEY RRset to the parent's DS (RFC 4035 §5.2). Key tags collide, so try
+	// EVERY authenticated key sharing the tag, not just the first (R-044).
+	var candidates []dnspkg.DNSKEYRecord
 	for i := range authenticatedKeys {
 		if authenticatedKeys[i].KeyTag == rrsigRecord.KeyTag {
-			signingKeyRecord = &authenticatedKeys[i]
-			break
+			candidates = append(candidates, authenticatedKeys[i])
 		}
 	}
-	if signingKeyRecord == nil {
+	if len(candidates) == 0 {
 		return fmt.Errorf("DNSKEY RRset is not signed by a parent-authenticated key (RRSIG key tag %d is not DS/anchor-matched)", rrsigRecord.KeyTag)
-	}
-
-	// Reconstruct the dns.DNSKEY for verification
-	signingKey, err := reconstructDNSKEY(rrsigRecord.SignerName, *signingKeyRecord)
-	if err != nil {
-		return fmt.Errorf("failed to reconstruct signing key: %w", err)
 	}
 
 	// Reconstruct the dns.RRSIG for verification
@@ -382,12 +426,21 @@ func verifyDNSKEYRRSIGOne(dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSI
 		rrset = append(rrset, dnskey)
 	}
 
-	// Perform cryptographic signature verification
-	if err := rrsig.Verify(signingKey, rrset); err != nil {
-		return fmt.Errorf("DNSKEY RRSIG cryptographic verification failed: %w", err)
+	// Perform cryptographic signature verification against each candidate key.
+	var lastErr error
+	for _, ck := range candidates {
+		signingKey, err := reconstructDNSKEY(rrsigRecord.SignerName, ck)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to reconstruct signing key: %w", err)
+			continue
+		}
+		if err := rrsig.Verify(signingKey, rrset); err != nil {
+			lastErr = fmt.Errorf("DNSKEY RRSIG cryptographic verification failed: %w", err)
+			continue
+		}
+		return nil
 	}
-
-	return nil
+	return lastErr
 }
 
 // VerifyRRsetRRSIGFromResponse performs full cryptographic verification of an RRset
@@ -511,22 +564,29 @@ func VerifyDenialRRSIGFromResponse(rawResponse []byte, typeCovered uint16, dnske
 		ok := false
 		var lastErr error
 		for _, sig := range sigs {
-			signingKeyRecord := FindDNSKEYByKeyTag(sig.KeyTag, dnskeys)
-			if signingKeyRecord == nil {
+			// Try every eligible key sharing the tag (R-043/R-044): tags collide,
+			// and only a zone key with protocol 3 (not revoked) may authenticate.
+			cands := EligibleKeysByKeyTag(sig.KeyTag, dnskeys)
+			if len(cands) == 0 {
 				lastErr = fmt.Errorf("signing key (tag %d) not found in zone DNSKEY", sig.KeyTag)
 				continue
 			}
-			signingKey, err := reconstructDNSKEY(sig.SignerName, *signingKeyRecord)
-			if err != nil {
-				lastErr = fmt.Errorf("failed to reconstruct signing key: %w", err)
-				continue
+			for i := range cands {
+				signingKey, err := reconstructDNSKEY(sig.SignerName, cands[i])
+				if err != nil {
+					lastErr = fmt.Errorf("failed to reconstruct signing key: %w", err)
+					continue
+				}
+				if err := sig.Verify(signingKey, rrset); err != nil {
+					lastErr = fmt.Errorf("cryptographic verification failed: %w", err)
+					continue
+				}
+				ok = true
+				break
 			}
-			if err := sig.Verify(signingKey, rrset); err != nil {
-				lastErr = fmt.Errorf("cryptographic verification failed: %w", err)
-				continue
+			if ok {
+				break
 			}
-			ok = true
-			break
 		}
 
 		if !ok {
