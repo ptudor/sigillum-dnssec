@@ -70,7 +70,7 @@ func TestUnwindAdd_PreservesPrivateOnlyOrphan(t *testing.T) {
 		t.Fatal("zskGenerated must be true with no ZSK files present")
 	}
 
-	unwindAdd(cfg, state, "example.com", kskGenerated, zskGenerated)
+	unwindAdd(cfg, state, "example.com", kskGenerated, zskGenerated, nil, false)
 
 	if !fileExists(orphan) {
 		t.Fatal("unwindAdd deleted the surviving .private orphan — the only recoverable copy of the key")

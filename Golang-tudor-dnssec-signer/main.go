@@ -432,14 +432,21 @@ func keyPairAbsent(keysDir, domain, role string) bool {
 // rollback, since a DS at the registrar may still reference them.
 // Best-effort — failures are logged but not returned, so the original error
 // from `add` surfaces unchanged.
-func unwindAdd(cfg *Config, state *State, domain string, removeKSK, removeZSK bool) {
+func unwindAdd(cfg *Config, state *State, domain string, removeKSK, removeZSK bool, origOutput []byte, outputExisted bool) {
 	state.RemoveZone(domain)
 	if err := state.Save(); err != nil {
 		slog.Warn("[CLI] Rollback: failed to save state", "domain", domain, "error", err)
 	}
 
 	signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
-	if err := os.Remove(signedPath); err != nil && !os.IsNotExist(err) {
+	if outputExisted {
+		// R-011: a signed output existed before this add (a re-add over a previous
+		// management period). Restore the exact previous bytes — a nameserver may
+		// still be serving them — rather than deleting the last known-good zone.
+		if err := writeFileOwned(signedPath, origOutput, 0644); err != nil {
+			slog.Warn("[CLI] Rollback: failed to restore previous signed zone", "path", signedPath, "error", err)
+		}
+	} else if err := os.Remove(signedPath); err != nil && !os.IsNotExist(err) {
 		slog.Warn("[CLI] Rollback: failed to remove signed zone", "path", signedPath, "error", err)
 	}
 
@@ -854,12 +861,26 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	kskGenerated := keyPairAbsent(keysDir, domain, "ksk")
 	zskGenerated := keyPairAbsent(keysDir, domain, "zsk")
 
+	// R-011: snapshot any pre-existing signed output BEFORE the sign step may
+	// overwrite it, so a failed add — especially a re-add that reuses keys from a
+	// previous management period — restores the last known-good signed zone a
+	// nameserver may still be serving, instead of deleting it.
+	signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
+	var origOutput []byte
+	outputExisted := false
+	if b, rerr := os.ReadFile(signedPath); rerr == nil {
+		origOutput = b
+		outputExisted = true
+	} else if !os.IsNotExist(rerr) {
+		return fmt.Errorf("reading existing signed output %s: %w", signedPath, rerr)
+	}
+
 	// From here on, any failure must roll back side effects — partial keys,
 	// signed zone, state entry — so a retry of `add` starts from a clean slate.
 	keyGen := NewKeyGenerator(cfg)
 	ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 	if err != nil {
-		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated, origOutput, outputExisted)
 		return fmt.Errorf("preparing keys: %w", err)
 	}
 
@@ -874,12 +895,12 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Sign the zone
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
-		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated, origOutput, outputExisted)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
 	if err := state.Save(); err != nil {
-		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated, origOutput, outputExisted)
 		return fmt.Errorf("saving state: %w", err)
 	}
 
@@ -887,7 +908,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// but if it still fails (race, disk full), unwind everything so state.json
 	// stays consistent with the config file.
 	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
-		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated)
+		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated, origOutput, outputExisted)
 		return fmt.Errorf("adding zone to config file: %w", err)
 	}
 	slog.Info("[CLI] Added zone to config file", "config", configPath)
@@ -938,8 +959,6 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	if zoneState == nil {
 		return fmt.Errorf("domain %q is not managed", domain)
 	}
-	zonePath := zoneState.Path
-
 	slog.Info("[CLI] Removing domain from management", "domain", domain)
 
 	// Transactional removal (R-008): preflight the config file is writable, remove the
@@ -947,8 +966,18 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	// clear state. On a state-save failure, restore the config entry so the two stay
 	// consistent. Keys are never deleted — a DS at the registrar may still reference them.
 	inConfig := false
+	// R-010: snapshot the EXACT original config bytes so a later state-save failure
+	// can restore the file verbatim. The prior rollback re-added the zone via
+	// AddZoneToConfigFile, which reconstructs only domain+path and silently loses the
+	// zone's algorithm/lifetimes/serial policy/registrar settings/comments/ordering.
+	var origConfig []byte
 	if _, ok := cfg.Zones[domain]; ok {
 		inConfig = true
+		var readErr error
+		origConfig, readErr = os.ReadFile(configPath)
+		if readErr != nil {
+			return fmt.Errorf("reading config before removal: %w", readErr)
+		}
 		if err := preflightConfigAppend(configPath); err != nil {
 			return fmt.Errorf("config file %s not writable (needed to remove the zone entry): %w", configPath, err)
 		}
@@ -969,8 +998,11 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	state.RemoveZone(domain)
 	if err := state.Save(); err != nil {
 		if inConfig {
-			if aerr := AddZoneToConfigFile(configPath, domain, zonePath); aerr != nil {
-				slog.Error("[CLI] Rollback: failed to restore config entry after state-save failure",
+			// Restore the exact original config bytes (all keys/comments/order),
+			// preserving ownership/mode, so the failed removal leaves config and
+			// state consistent and complete (R-010).
+			if aerr := writeConfigFileAtomic(configPath, origConfig); aerr != nil {
+				slog.Error("[CLI] Rollback: failed to restore original config after state-save failure",
 					"domain", domain, "error", aerr)
 			}
 		}
