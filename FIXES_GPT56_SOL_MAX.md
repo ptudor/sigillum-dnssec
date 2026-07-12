@@ -231,3 +231,20 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 
 ### R-008 — KSK trust path retired before cached DS — SKIPPED
 - **Reason:** The fix requires a NEW persisted post-DS-publication dwell phase in both KSK and algorithm rollover completion (and in both automatic-registrar and manual modes): record the first continuously-confirmed observation of the expected new DS, derive a deadline from the authoritative PARENT DS TTL (a new parent-DS-RRset TTL query) plus propagation margin, reset the observation if the expected DS disappears, and keep publishing both KSKs until the deadline. That is a new state-machine phase whose correctness (blocking premature completion without stalling a legitimate rollover, resetting on DS disappearance, preserving `--force`) can only be verified with the parent-DS-simulation harness R-059 would provide. A partial/approximated dwell (e.g. a fixed conservative wait without the real parent DS TTL, or without continuous-observation reset) risks either a permanently stuck rollover or a dwell that does not actually cover the cached old-DS lifetime — worse than the current behavior. The bounded timing foundations this finding builds on (R-006, R-007) are done; the dwell-phase state machine is deferred rather than shipped unverified. `--force` remains the operator override.
+
+## Phase 7 — Service availability & boundary gaps (bounded pieces)
+
+### R-053 — Repeated rate-limiter shutdown panics — FIXED
+- **Change:** `RateLimiter` gained a `sync.Once` (`stopOnce`); `Stop` now closes `stopCh` inside `stopOnce.Do(...)`, making it idempotent and concurrency-safe. A repeated or concurrent `Server.Shutdown` no longer panics with "close of closed channel". No-argument API and rate/bucket behavior unchanged; the bucket mutex is not held while stopping.
+- **Files:** `Golang-dnssec-validator/ratelimit.go`, `phase7_lowfindings_test.go` (new)
+- **Verification:** `TestR053_RateLimiterStopIdempotent` — sequential double-Stop and 32 concurrent Stops, no panic. Full validator module `go test -race` green.
+
+### R-054 — Invalid metrics allowlist fails open — FIXED
+- **Change:** In `Server.registerRoutes`, when `parseCIDRs` fails on a nonempty `metrics_allowed_cidrs`, the `/metrics` route now installs a **deny** handler (503 "invalid access restriction configured") and logs an error, instead of leaving the unwrapped Prometheus handler exposed to all source IPs. Fails closed even if a direct `NewServer` bypassed `Config.Validate`. Valid CIDR behavior, the public `/metrics` path, and the documented empty-list (unrestricted) semantics are unchanged; operator's invalid restriction is never silently replaced with defaults.
+- **Files:** `Golang-dnssec-validator/server.go`
+- **Verification:** Build clean; full validator module race suite green. The handler is an explicit fail-closed 503 for the invalid-CIDR path (a construction-level guarantee that no metrics are served from any IP when the restriction is unparseable).
+
+### R-056 — Failed entropy yields duplicate request IDs — FIXED
+- **Change:** `GenerateRequestID`'s `crypto/rand` failure path no longer hex-encodes the zero/partially-filled buffer (which repeats IDs). It now returns `formatFallbackRequestID(n)` — a deterministic, process-local, collision-free ID from a monotonic `atomic.Uint64` counter mixed with a per-process seed (PID) and the clock, in the same 16-hex-char shape, with a `sync.Once`-guarded warning (no client data/secrets). The counter guarantees uniqueness within the process regardless of clock resolution.
+- **Files:** `Golang-dnssec-validator/logging.go`, `phase7_lowfindings_test.go` (new)
+- **Verification:** `TestR056_FallbackRequestIDsUnique` — 1000 fallback IDs are all unique and exactly 16 chars. Full validator module race suite green.

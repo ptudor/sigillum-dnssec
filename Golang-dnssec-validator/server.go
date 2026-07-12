@@ -72,7 +72,15 @@ func (s *Server) registerRoutes() {
 	if len(s.config.MetricsAllowedCIDRs) > 0 {
 		nets, err := parseCIDRs(s.config.MetricsAllowedCIDRs)
 		if err != nil {
-			LogWarn("server", "invalid metrics_allowed_cidrs; metrics access unrestricted", "error", err.Error())
+			// R-054: fail CLOSED. An invalid restriction must never expose /metrics
+			// from any source IP — a defensive parse error must not silently become
+			// a disclosure, even if a direct NewServer bypassed Config.Validate. Deny
+			// rather than substitute defaults for the operator's invalid restriction.
+			LogError("server", err, "action", "parse_metrics_cidrs",
+				"effect", "metrics denied (invalid metrics_allowed_cidrs)")
+			metricsHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "metrics unavailable: invalid access restriction configured", http.StatusServiceUnavailable)
+			})
 		} else {
 			metricsHandler = allowCIDRs(metricsHandler, nets)
 		}
