@@ -182,14 +182,16 @@ func UpdateZoneMetrics(state *State) {
 			zskExpiryTimestamp.WithLabelValues(domain).Set(float64(zone.ZSK.Expires.Unix()))
 		}
 
-		// Rollover status
+		// Rollover status. R-021: zero ALL supported rollover-type series for this
+		// domain on every refresh, THEN set the single current type — otherwise a
+		// direct type→type transition (e.g. ksk → algorithm) between scrapes leaves
+		// the previous type's series stuck at 1 indefinitely, producing contradictory
+		// alerts/dashboards.
+		rolloversInProgress.WithLabelValues(domain, "ksk").Set(0)
+		rolloversInProgress.WithLabelValues(domain, "zsk").Set(0)
+		rolloversInProgress.WithLabelValues(domain, "algorithm").Set(0)
 		if zone.Rollover != nil {
 			rolloversInProgress.WithLabelValues(domain, zone.Rollover.Type).Set(1)
-		} else {
-			// Reset all rollover types to 0
-			rolloversInProgress.WithLabelValues(domain, "ksk").Set(0)
-			rolloversInProgress.WithLabelValues(domain, "zsk").Set(0)
-			rolloversInProgress.WithLabelValues(domain, "algorithm").Set(0)
 		}
 	}
 

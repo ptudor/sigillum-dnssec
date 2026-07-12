@@ -372,6 +372,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("nsec_version must be 'nsec' or 'nsec3', got %q", c.DNSSEC.NSECVersion)
 	}
 
+	// R-060: reject an unsupported registrar DS digest_type at startup rather than
+	// silently coercing it to SHA-256. 0 is the backward-compatible unset/default;
+	// 2 (SHA-256) and 4 (SHA-384) are the supported values. A typo or unsupported
+	// value must fail before any key/state/output/registrar mutation so an operator
+	// cannot unknowingly publish a different DS representation to the parent.
+	switch c.Registrar.DigestTypeVal {
+	case 0, 2, 4:
+		// ok
+	default:
+		return fmt.Errorf("registrar digest_type must be 2 (SHA-256) or 4 (SHA-384), got %d", c.Registrar.DigestTypeVal)
+	}
+
 	// Validate serial policy (global and per-zone)
 	validSerialPolicies := map[string]bool{"": true, "keep": true, "epoch": true}
 	if !validSerialPolicies[c.DNSSEC.SerialPolicy] {
