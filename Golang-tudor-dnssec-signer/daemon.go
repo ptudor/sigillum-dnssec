@@ -144,16 +144,24 @@ func (d *Daemon) Shutdown() {
 
 	d.cancel()
 
+	// R-016: snapshot the server pointer and timeout under the lock, then RELEASE the
+	// lock BEFORE the blocking server.Shutdown. That call waits for in-flight handlers
+	// to return, and those handlers still need d.current()'s RLock — holding d.mu
+	// across the wait would deadlock every graceful stop until the context expires.
 	d.mu.Lock()
+	server := d.server
 	shutdownTimeout := d.cfg.Health.ShutdownTimeout.Duration
-	if d.server != nil {
+	d.mu.Unlock()
+
+	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := d.server.Shutdown(ctx); err != nil {
+		// http.Server.Shutdown is itself idempotent, so a repeated/concurrent
+		// Shutdown is safe.
+		if err := server.Shutdown(ctx); err != nil {
 			slog.Warn("[DAEMON] Error during server shutdown", "error", err)
 		}
 	}
-	d.mu.Unlock()
 }
 
 // Reload updates the daemon's configuration and state

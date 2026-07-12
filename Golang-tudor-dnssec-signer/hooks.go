@@ -13,6 +13,45 @@ import (
 	"time"
 )
 
+// maxHookStderr bounds how many bytes of a hook's stderr are retained. A broken
+// hook that writes stderr continuously for up to the 30s timeout could otherwise
+// allocate an unbounded bytes.Buffer and OOM the daemon (R-023). 64 KiB is ample
+// for a diagnostic prefix.
+const maxHookStderr = 64 * 1024
+
+// cappedBuffer is an io.Writer that retains at most max bytes of what is written
+// (a prefix), discarding the rest, and always reports the full write length so the
+// child's stderr pipe keeps draining and cannot deadlock the hook (R-023).
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if remaining := c.max - c.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			c.buf.Write(p[:remaining])
+			c.truncated = true
+		} else {
+			c.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		c.truncated = true
+	}
+	return len(p), nil // always drain fully
+}
+
+// String returns the captured stderr prefix, with an explicit marker when the
+// output was truncated.
+func (c *cappedBuffer) String() string {
+	s := c.buf.String()
+	if c.truncated {
+		s += "\n[stderr truncated]"
+	}
+	return s
+}
+
 // HookEnv contains environment variables passed to hooks
 type HookEnv struct {
 	Domain     string // The domain that was signed
@@ -76,9 +115,10 @@ func executeHook(hooks *HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
 		command := exec.CommandContext(ctx, name, args...)
 		command.Stdout = io.Discard
 
-		// Capture stderr for error reporting
-		var stderrBuf bytes.Buffer
-		command.Stderr = &stderrBuf
+		// Capture a BOUNDED prefix of stderr for error reporting: a broken hook that
+		// writes continuously must not allocate until the daemon is killed (R-023).
+		stderrBuf := &cappedBuffer{max: maxHookStderr}
+		command.Stderr = stderrBuf
 
 		// Set environment variables for the hook
 		command.Env = append(os.Environ(),
@@ -142,8 +182,9 @@ func executeBatchHook(hooks *HooksConfig, domains []string, outputDir string, wg
 
 		command := exec.CommandContext(ctx, name, args...)
 		command.Stdout = io.Discard
-		var stderrBuf bytes.Buffer
-		command.Stderr = &stderrBuf
+		// Bounded stderr capture (R-023): a runaway batch hook must not exhaust memory.
+		stderrBuf := &cappedBuffer{max: maxHookStderr}
+		command.Stderr = stderrBuf
 
 		// DNSSEC_DOMAINS is the batched counterpart of DNSSEC_DOMAIN.
 		// Consumers that used $DNSSEC_DOMAIN in per-zone hooks need to
