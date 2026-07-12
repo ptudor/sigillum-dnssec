@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/ptudor/dnssec-validator/internal/dns"
 )
 
 // HealthStatus represents the health check response
@@ -42,13 +44,20 @@ func (h *HealthChecker) Check(ctx context.Context) *HealthStatus {
 
 	var degraded bool
 
-	// Check root anchors availability
+	// Check root anchors availability. Readiness must reflect whether a
+	// currently-ACTIVE anchor exists, not merely that the raw set is nonempty:
+	// a set consisting only of future-dated, expired, or invalid-date anchors
+	// cannot validate the root and must fail readiness (R-039).
 	if h.anchorsStore != nil {
 		anchors := h.anchorsStore.Get()
-		if anchors == nil || len(anchors.Anchors) == 0 {
+		switch {
+		case anchors == nil || len(anchors.Anchors) == 0:
 			status.Checks["root_anchors"] = "unavailable"
 			degraded = true
-		} else {
+		case len(dns.GetActiveAnchors(anchors)) == 0:
+			status.Checks["root_anchors"] = "no active anchor (all future/expired/invalid)"
+			degraded = true
+		default:
 			status.Checks["root_anchors"] = "available"
 		}
 	} else {
