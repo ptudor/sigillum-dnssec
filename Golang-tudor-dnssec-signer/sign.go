@@ -1422,6 +1422,13 @@ func (s *Signer) writeSignedZone(domain, path string, records []dns.RR) error {
 		return fmt.Errorf("renaming signed zone: %w", err)
 	}
 
+	// R-020: fsync the parent directory so the renamed signed zone survives a power
+	// loss, matching the file-and-directory durability contract used for state/config
+	// (writeFileAtomicOwned). Without this the directory entry can be lost after state
+	// was saved with a new serial, leaving NeedsSign to trust state and decline to
+	// recreate the missing output.
+	syncDir(filepath.Dir(path))
+
 	return nil
 }
 

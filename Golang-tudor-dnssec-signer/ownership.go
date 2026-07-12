@@ -147,6 +147,74 @@ func writeFileAtomicOwned(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
+// writeConfigFileAtomic atomically and durably replaces the configuration file at
+// path with data, preserving the DESTINATION file's existing owner (uid/gid) and
+// mode — it never inherits data_dir/daemon ownership the way writeFileAtomicOwned
+// does (R-002). The config holds registrar API keys and hook commands and must stay
+// owned as deployed (typically root, group-readable by the daemon, 0640); handing it
+// to the daemon account would let a compromised daemon rewrite those commands/
+// credentials. A failure to restore ownership aborts before replacing the original.
+func writeConfigFileAtomic(path string, data []byte) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat config file: %w", err)
+	}
+	perm := info.Mode().Perm()
+	dir := filepath.Dir(path)
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp config in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			tmp.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		return fmt.Errorf("chmod temp config: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("writing temp config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("syncing temp config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp config: %w", err)
+	}
+	// Preserve the destination's original owner on the temp file BEFORE the rename,
+	// so the config never changes hands. Abort (leaving the original intact) if it fails.
+	if err := preserveOwner(tmpPath, info); err != nil {
+		return fmt.Errorf("preserving config ownership: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("renaming temp config over %s: %w", path, err)
+	}
+	committed = true
+	syncDir(dir)
+	return nil
+}
+
+// preserveOwner chowns path to the uid/gid recorded in info (a prior os.Stat of the
+// replacement's destination). It is a no-op on non-Unix platforms and when not
+// running as root (a non-root process cannot chown, and the file already carries the
+// invoking user's ownership).
+func preserveOwner(path string, info os.FileInfo) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil // non-Unix: ownership model doesn't apply
+	}
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	return os.Chown(path, int(stat.Uid), int(stat.Gid))
+}
+
 // syncDir fsyncs a directory so a preceding rename is durable across a crash/power loss.
 // Best-effort: a failure is logged, not returned (the rename already succeeded).
 func syncDir(dir string) {

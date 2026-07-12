@@ -569,22 +569,32 @@ func (c *Config) StatePath() string {
 	return filepath.Join(c.DataDir, "state.json")
 }
 
-// AddZoneToConfigFile appends a new zone entry to the config file
-// This preserves existing formatting and comments by appending rather than rewriting
+// AddZoneToConfigFile appends a new zone entry to the config file. It reads the
+// existing bytes, appends the new [zones."<domain>"] table, and commits the whole
+// file atomically and durably (temp + fsync + rename + dir fsync) while preserving
+// the config's own owner/mode. The prior O_APPEND write was neither atomic nor
+// durable — a short write or crash could leave a truncated table/header/path in the
+// only config file after state/output were already committed (R-019). Existing
+// tables/comments are preserved verbatim (only appended to).
 func AddZoneToConfigFile(configPath, domain, zonePath string) error {
-	// Open config file for appending
-	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_WRONLY, 0644)
+	existing, err := os.ReadFile(configPath)
 	if err != nil {
-		return fmt.Errorf("opening config file: %w", err)
-	}
-	defer f.Close()
-
-	// Append new zone section
-	zoneEntry := fmt.Sprintf("\n[zones.%q]\npath = %q\n", domain, zonePath)
-	if _, err := f.WriteString(zoneEntry); err != nil {
-		return fmt.Errorf("writing zone entry: %w", err)
+		return fmt.Errorf("reading config file: %w", err)
 	}
 
+	// Append the new zone section, matching the previous formatting (a leading blank
+	// line before the table). Ensure exactly one separating newline regardless of
+	// whether the file already ends in one.
+	buf := make([]byte, 0, len(existing)+128)
+	buf = append(buf, existing...)
+	if len(buf) > 0 && buf[len(buf)-1] != '\n' {
+		buf = append(buf, '\n')
+	}
+	buf = append(buf, []byte(fmt.Sprintf("\n[zones.%q]\npath = %q\n", domain, zonePath))...)
+
+	if err := writeConfigFileAtomic(configPath, buf); err != nil {
+		return fmt.Errorf("writing config file: %w", err)
+	}
 	return nil
 }
 
@@ -594,10 +604,6 @@ func AddZoneToConfigFile(configPath, domain, zonePath string) error {
 // and keeps the file's existing mode so a secrets-bearing 0640 config is not loosened.
 // Returns errZoneNotInConfig if the table isn't present, so the caller can proceed.
 func RemoveZoneFromConfigFile(configPath, domain string) error {
-	info, err := os.Stat(configPath)
-	if err != nil {
-		return fmt.Errorf("stat config file: %w", err)
-	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("reading config file: %w", err)
@@ -635,7 +641,10 @@ func RemoveZoneFromConfigFile(configPath, domain string) error {
 	kept = append(kept, lines[:removeStart]...)
 	kept = append(kept, lines[end:]...)
 
-	if err := writeFileAtomicOwned(configPath, []byte(strings.Join(kept, "\n")), info.Mode().Perm()); err != nil {
+	// R-002: use the config-specific atomic writer, which preserves the config's
+	// OWN uid/gid/mode. writeFileAtomicOwned would chown the (root-owned, secrets-
+	// bearing) config to the daemon account.
+	if err := writeConfigFileAtomic(configPath, []byte(strings.Join(kept, "\n"))); err != nil {
 		return fmt.Errorf("writing config file: %w", err)
 	}
 	return nil
@@ -670,10 +679,65 @@ func isZoneTableHeader(line, domain string) bool {
 	return false
 }
 
-// isTOMLTableHeader reports whether a line is a TOML table header ("[...]" / "[[...]]").
+// isTOMLTableHeader reports whether a line is a TOML table header — a normal table
+// "[...]" or an array-of-tables "[[...]]" — allowing surrounding whitespace, quoted/
+// dotted keys (basic "..." or literal '...' strings that may themselves contain '#'
+// or ']'), and a trailing inline comment. The previous HasPrefix("[")+HasSuffix("]")
+// test wrongly rejected a valid header followed by a comment (e.g.
+// `[zones."next"] # x`), which made RemoveZoneFromConfigFile run past that boundary
+// and delete every following table/comment through EOF (R-001).
 func isTOMLTableHeader(line string) bool {
-	t := strings.TrimSpace(line)
-	return strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]")
+	t := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(t, "[") {
+		return false
+	}
+	array := strings.HasPrefix(t, "[[")
+	i := 1
+	if array {
+		i = 2
+	}
+	inBasic, inLiteral := false, false
+	for i < len(t) {
+		c := t[i]
+		switch {
+		case inBasic:
+			if c == '\\' && i+1 < len(t) {
+				i += 2
+				continue
+			}
+			if c == '"' {
+				inBasic = false
+			}
+		case inLiteral:
+			if c == '\'' {
+				inLiteral = false
+			}
+		default:
+			switch c {
+			case '"':
+				inBasic = true
+			case '\'':
+				inLiteral = true
+			case ']':
+				if array {
+					if i+1 < len(t) && t[i+1] == ']' {
+						return afterHeaderIsCommentOrBlank(t[i+2:])
+					}
+					return false // single ']' cannot close an array-of-tables header
+				}
+				return afterHeaderIsCommentOrBlank(t[i+1:])
+			}
+		}
+		i++
+	}
+	return false
+}
+
+// afterHeaderIsCommentOrBlank reports whether the text following a table header's
+// closing bracket(s) is only whitespace and an optional inline comment.
+func afterHeaderIsCommentOrBlank(rest string) bool {
+	rest = strings.TrimSpace(rest)
+	return rest == "" || strings.HasPrefix(rest, "#")
 }
 
 // ValidateDomainName checks that a domain name is safe for use in file paths.
