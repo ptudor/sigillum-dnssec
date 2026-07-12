@@ -92,8 +92,15 @@ func TestTypeName(t *testing.T) {
 		{50, "NSEC3"},
 		{51, "NSEC3PARAM"},
 		{257, "CAA"},
-		{0, "UNKNOWN"},
-		{999, "UNKNOWN"},
+		// R-031: unregistered numeric types now map to a unique "TYPE<decimal>"
+		// (or miekg's canonical name for reserved values) rather than a shared
+		// "UNKNOWN", so distinct types can never collapse in NSEC/NSEC3 bitmaps.
+		{12, "PTR"},
+		{33, "SRV"},
+		{35, "NAPTR"},
+		{99, "SPF"},
+		{0, "None"},
+		{999, "TYPE999"},
 	}
 
 	for _, tt := range tests {
