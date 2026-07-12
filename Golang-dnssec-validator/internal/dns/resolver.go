@@ -18,7 +18,7 @@ type Resolver struct {
 // NewResolver creates a new resolver
 func NewResolver(timeout time.Duration, recursiveServer string) *Resolver {
 	if recursiveServer == "" {
-		recursiveServer = "8.8.8.8" // Default to Google Public DNS
+		recursiveServer = "127.0.0.1" // Default to the local recursive resolver (loopback); never a public/ad DNS
 	}
 	return &Resolver{
 		querier:   NewQuerier(timeout),

@@ -13,7 +13,7 @@ root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
 query_timeout_seconds = 5       # Per-server query timeout
 total_timeout_seconds = 30      # Total validation timeout
 max_concurrent = 10             # Max concurrent DNS queries
-recursive_resolver = "8.8.8.8"  # Recursive resolver for NS lookups
+recursive_resolver = "127.0.0.1"  # Local recursive resolver for NS lookups (never a public/ad DNS)
 
 # Static files and URL base path
 static_dir = "./static"
