@@ -638,6 +638,13 @@ func VerifyRootTrustAnchor(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.Ancho
 
 	// For each anchor, find a DNSKEY and verify digest matches
 	for _, anchor := range anchors {
+		// R-024: only an authoritative pinned anchor may establish root trust.
+		// A loaded anchor whose digest an attacker controls must never be used
+		// as the root of trust, even if it cryptographically matches a served
+		// (possibly forged) root DNSKEY.
+		if !dnspkg.IsPinnedRootAnchor(anchor) {
+			continue
+		}
 		for i, key := range dnskeys {
 			// Quick filter by key tag and algorithm
 			if key.KeyTag != uint16(anchor.KeyTag) || key.Algorithm != uint8(anchor.Algorithm) {
