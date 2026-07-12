@@ -271,3 +271,15 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 - **Scope note:** A single GLOBAL concurrency cap across all zones with deterministic 429/503 + `Retry-After` at capacity (as the fix spec also describes) is NOT added — distinct zones still validate concurrently (bounded by the number of managed zones). The per-zone single-flight + TTL closes the "repeated requests trigger repeated unbounded live runs" DoS named in the Evidence; a global scheduler/429 is a further capacity-shaping refinement left out.
 - **Files:** `Golang-tudor-dnssec-signer/web.go`, `web_zonecache_r018_test.go` (new)
 - **Verification:** `TestR018_PerZoneSingleFlightAndCache` (race) — 20 concurrent same-zone requests coalesce to 1 compute, a within-TTL hit does not recompute, and a distinct zone computes independently. Full signer suite green.
+
+## Phase 8 — Diagnostics, UI, compatibility (bounded pieces)
+
+### R-048 — Exact base path breaks relative UI URLs — FIXED
+- **Change:** The exact `basePath` route now issues a permanent method-preserving redirect (308) to `basePath + "/"`, retaining the query string, instead of serving the UI directly at the no-trailing-slash URL. Serving at `/dnssec` left the address bar without a trailing slash, so browser-relative URLs (`style.css`, `app.js`, `validate`, `api/...`) resolved against the parent as root paths — a reverse proxy exposing only `/dnssec/` then served a page with no assets. The UI/APIs continue to be served under the slash form; root aliases and empty-base-path behavior are unchanged. Removed the now-dead `requestWithPath` helper.
+- **Files:** `Golang-dnssec-validator/server.go`, `server_basepath_r048_test.go` (new)
+- **Verification:** `TestR048_BasePathRedirectsToSlash` — `GET /dnssec?domain=…&mode=…` returns 308 with `Location: /dnssec/?domain=…&mode=…` (query preserved); HEAD is redirected too (method preserved). Full validator suite green.
+
+### R-050 — `static_dir` configuration is inert — FIXED
+- **Change:** Deprecated the no-op `static_dir` safely: its default is now empty (was `"./static"`) so a fresh config carries no value, and `main` emits a clear startup WARNING (not a failure) when a legacy value is supplied, noting the web UI is always served from embedded assets. The TOML field and `STATIC_DIR` env decoding are retained for backward compatibility (strict TOML decoding still accepts the key); embedded assets remain the only source, and a working-directory path is never trusted.
+- **Files:** `Golang-dnssec-validator/config.go`, `Golang-dnssec-validator/main.go`
+- **Verification:** Build clean; full validator suite green (strict TOML decode of `static_dir` still accepted — the field/tag are retained). A supplied value now logs a deprecation warning without failing startup; the default empty value is silent.

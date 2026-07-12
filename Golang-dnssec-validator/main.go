@@ -37,6 +37,13 @@ func main() {
 	// Log startup
 	LogStartup(Version, BuildTime, config)
 
+	// R-050: static_dir is a deprecated no-op — the web UI is always served from the
+	// embedded filesystem. Warn (don't fail) when a legacy value is supplied so the
+	// operator knows their override is ignored, without breaking a compatible startup.
+	if config.StaticDir != "" {
+		LogWarn("main", "static_dir is deprecated and ignored; the web UI is served from embedded assets", "static_dir", config.StaticDir)
+	}
+
 	// Create anchors store and load trust anchors
 	anchorsStore := NewAnchorsStore(config.RootAnchorsPath, config.RootAnchorsURL)
 
