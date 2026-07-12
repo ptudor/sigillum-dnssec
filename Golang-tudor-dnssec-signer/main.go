@@ -1423,11 +1423,16 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ZSK has wrong flags %d (expected 256 for ZSK)", zsk.Flags)
 	}
 
-	// Verify algorithms match (or warn if they don't)
+	// R-009: reject a mismatched-algorithm KSK/ZSK import BEFORE touching any live
+	// file. This signer signs the DNSKEY RRset with the KSK algorithm and ordinary
+	// RRsets with the ZSK algorithm only; if the two keys use different algorithms
+	// the published DNSKEY RRset signals both while no RRset is signed with every
+	// algorithm — an algorithm-incomplete zone that standards-conforming validators
+	// (RFC 6840 §5.11) may reject. Same-algorithm separate KSK/ZSK keys are fine; a
+	// genuine algorithm change must go through the dedicated algorithm-rollover flow.
 	if ksk.Algorithm != zsk.Algorithm {
-		slog.Warn("[CLI] KSK and ZSK have different algorithms",
-			"ksk_algorithm", AlgorithmName(ksk.Algorithm),
-			"zsk_algorithm", AlgorithmName(zsk.Algorithm))
+		return fmt.Errorf("refusing to import a KSK (%s) and ZSK (%s) with different algorithms: the result would be an algorithm-incomplete zone (RFC 6840 §5.11); import same-algorithm keys or use `rollover algorithm`",
+			AlgorithmName(ksk.Algorithm), AlgorithmName(zsk.Algorithm))
 	}
 
 	// Preflight the config append before writing any key material (R-023, mirroring add):
