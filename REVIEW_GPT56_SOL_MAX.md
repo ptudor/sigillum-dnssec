@@ -668,4 +668,102 @@ The review traces the signer and validator from configuration and process startu
 
 **Verification:** Test enabled with missing fields, malformed URL, HTTP, HTTPS->HTTP 307/308, cross-origin redirect, valid HTTPS, disabled incomplete config, and explicit loopback override if added. Capture requests to assert the API key never reaches an insecure/unapproved destination or logs.
 
-<!-- Additional low-severity findings and the required final summary/fix order are appended in the final review-only checkpoint. -->
+### R-048 — The exact base-path URL breaks relative UI assets and API calls
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/server.go:57-136`, `Server.registerRoutes`; `Golang-dnssec-validator/static/index.html:10`, `108-109`, and `117`; `Golang-dnssec-validator/static/app.js:74-111`
+
+**Problem:** When `base_path` is `/dnssec`, the server renders the UI directly at the exact URL `/dnssec` without redirecting to `/dnssec/`. Browser-relative URLs then resolve against the parent: `style.css`, `app.js`, `validate`, and `api/...` become root paths instead of `/dnssec/...`. The backend's duplicate root routes mask this during direct access, but a reverse proxy that exposes only the configured prefix serves a page with no assets and nonworking validation.
+
+**Evidence:** The exact `basePath` handler rewrites only the request passed to `staticHandler`; it leaves the address-bar URL unchanged. Every UI resource and request is relative rather than root- or base-prefixed. Because both `basePath` and `basePath+"/"` are explicitly registered, `http.ServeMux` cannot supply its usual trailing-slash redirect.
+
+**Fix specification:** Redirect the exact configured base path to `basePath + "/"` with a permanent method-preserving redirect before serving content, retaining the query string. Continue serving the UI and APIs under the slash form and preserve the existing root aliases and empty-base-path behavior. Do not hard-code `/dnssec` into assets or JavaScript.
+
+**Verification:** With empty and `/dnssec` base paths, test exact/slash URLs, query preservation, HEAD, and proxy requests that expose only `/dnssec/`. In a browser or URL-resolution test, assert all stylesheet, script, SSE, and API URLs remain under the prefix and that direct root deployments remain unchanged.
+
+### R-049 — The web UI cannot request the record types supported by the API
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/static/index.html:23-35`; `Golang-dnssec-validator/static/app.js:25-111`; `Golang-dnssec-validator/handlers.go:114-120` and `303-309`, query-type parsing
+
+**Problem:** The JSON and SSE APIs support twelve record types, but the only shipped user interface always omits `type`, so it can validate only the default A record. Operators cannot inspect AAAA, MX, TXT, NS, SOA, SRV, CAA, PTR, NAPTR, CNAME, or SPF through the UI, and copied result links cannot reproduce a non-A API validation.
+
+**Evidence:** The form has domain and mode controls only. `startValidation` builds `validate?domain=...&mode=...`; `init` and `updateURL` likewise read/write only domain and mode. Both handlers explicitly accept and validate a `type` parameter and default it to A when absent.
+
+**Fix specification:** Add an accessible record-type selector populated from the same supported set, defaulting to A; pass it through SSE requests, history/copy links, reload initialization, example actions, and displayed query state. Keep the API's current parameter name, accepted values, response schema, and absent-parameter A default. Invalid URL values must not silently select a different non-A type.
+
+**Verification:** Exercise every supported type from the form, reload/copy each URL, switch modes, and submit examples. Assert the outgoing SSE query and returned `record_type` agree, A-only links remain backward compatible, and unsupported URL types receive a visible validation error or a documented A fallback.
+
+### R-050 — `static_dir` is a documented but entirely inert configuration surface
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/config.go:64-65`, `149`, and `260-261`; `Golang-dnssec-validator/server.go:15-16` and `91-107`; `Golang-dnssec-validator/.env.example:41`; `Golang-dnssec-validator/CLAUDE.md:589`
+
+**Problem:** Configuration and deployment documentation promise a selectable web-UI directory, but the server always serves the embedded filesystem and never reads `Config.StaticDir`. An operator can point `STATIC_DIR` or `static_dir` at updated/emergency assets, receive no error or warning, and continue serving the compiled copy.
+
+**Evidence:** Repository-wide references to `StaticDir` are limited to its field, default, and environment assignment. `registerRoutes` unconditionally calls `fs.Sub(staticFiles, "static")`; no file operation consumes the configured value.
+
+**Fix specification:** Formally deprecate the no-op while preserving current single-binary behavior: remove it from active examples/default documentation, retain legacy TOML/environment decoding for a compatibility period, and emit a clear startup warning when a nonempty legacy value is supplied. Keep embedded assets as the only source during that period and do not unexpectedly begin trusting a working-directory path. If external overrides are desired later, introduce them as an explicit new opt-in with startup validation and documented filesystem trust semantics.
+
+**Verification:** Start with no setting and with TOML/environment legacy values pointing to valid, missing, and malicious-looking paths. Embedded assets must remain identical; configured legacy use must be observable in logs but not fail an otherwise compatible startup. Strict TOML decoding must continue accepting the legacy key until its announced removal.
+
+### R-051 — The RDAP registrable-domain test is wrong for public suffixes longer than one label
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/internal/validator/chain.go:140-170`, `IsRegistrableDomain`/`GetRegistrableDomain`; `Golang-dnssec-validator/internal/validator/validator.go:1004-1010`, RDAP invocation
+
+**Problem:** RDAP cross-checking assumes every registrable domain has exactly two labels. It therefore skips real registrants such as `example.co.uk` and can query public suffixes such as `co.uk` as though they were registrants. The DNSSEC verdict is not derived from RDAP, but diagnostic absence or mismatch warnings become inconsistent by TLD and can mislead an operator investigating DS publication.
+
+**Evidence:** `IsRegistrableDomain` returns `GetZoneLabels(zone) == 2`, and its comment acknowledges that `co.uk` is unsupported. `GetRegistrableDomain` independently takes the last two labels. `validateZone` gates the only RDAP lookup with this predicate.
+
+**Fix specification:** Determine the effective registrable domain with an up-to-date public-suffix implementation, including IDNA normalization, and run the RDAP check only when the validated zone itself equals that registrable domain. Treat unknown/private suffix policy explicitly and keep RDAP advisory: it must not change secure/insecure/bogus status or chain validation APIs.
+
+**Verification:** Table-test `example.com`, subdomains, `example.co.uk`, `co.uk`, `example.com.au`, IDNs, private suffixes, root, and single-label names. Use a fake RDAP client to assert exactly which normalized name is queried and confirm RDAP failures/mismatches remain warnings only.
+
+### R-052 — Heartbeat activity states are advertised but never wired to validation lifecycle
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/main.go:52-74` and `140-158`; `Golang-dnssec-validator/internal/heartbeat/heartbeat.go:141-178`, `Client.StartBackground`; `Golang-dnssec-validator/handlers.go`, all validation handlers; `Golang-dnssec-validator/ANYSTATUS.md:57-73`
+
+**Problem:** Documentation claims `running`, `validate:start`, and `validate:complete` actions describe live request activity, but request handlers have no heartbeat client and never send any of them. The background loop changes `lastAction` only through its own `starting`/`idle` sends, so it remains idle even during long or concurrent validations. Cancellation also provides no completion signal, allowing process exit before the synchronous `stopping` request finishes.
+
+**Evidence:** `hbClient` is local to `main` and is not injected into `Server` or `Handlers`; repository-wide send calls occur only inside the heartbeat package. The ticker tests for a `validate:` prefix that no caller can set. The returned function only cancels a context; `main` calls it and proceeds without joining the goroutine.
+
+**Fix specification:** Inject a narrow activity observer into handlers, maintain a concurrency-safe active-validation count, and emit start/complete transitions without blocking or failing validation. Periodic status must be `running` while the count is nonzero and `idle` otherwise. Give background shutdown a bounded join/result so `stopping` is attempted before exit. Preserve existing action strings/form fields, disabled behavior, request latency, and secret handling; coalesce or bound asynchronous sends under load.
+
+**Verification:** With a fake heartbeat transport and clock, run overlapping JSON/SSE validations, failures, cancellations, rate-limit rejections, idle ticks, and shutdown. Assert balanced activity, running until the last request finishes, no goroutine growth, validation independence from heartbeat errors, and bounded completion of the final stopping send.
+
+### R-053 — Rate-limiter shutdown panics when called more than once
+
+**Severity:** Low
+
+**Location:** `Golang-dnssec-validator/ratelimit.go:24`, `114-139`, `RateLimiter.Stop`; `Golang-dnssec-validator/server.go:264-278`, `Server.Shutdown`
+
+**Problem:** `Stop` closes an unguarded channel. A repeated or concurrent `Server.Shutdown`—a normal idempotency expectation for lifecycle APIs—panics with `close of closed channel` instead of safely returning the underlying server result.
+
+**Evidence:** `RateLimiter.Stop` consists only of `close(rl.stopCh)` and has no `sync.Once`, state flag, or recoverable result. `Server.Shutdown` invokes it every time. `http.Server.Shutdown` itself supports repeated calls, making the wrapper unexpectedly less robust.
+
+**Fix specification:** Make `RateLimiter.Stop` concurrency-safe and idempotent, preferably with `sync.Once`, and optionally join the cleanup loop with a done channel so shutdown does not leak work. Preserve its no-argument API and the limiter's rate/bucket behavior; do not hold the bucket mutex while waiting.
+
+**Verification:** Call `Stop` and `Server.Shutdown` sequentially and concurrently from many goroutines, before and after server start and cleanup ticks, under `go test -race`. Assert no panic, race, deadlock, or lingering cleanup goroutine and stable repeated shutdown errors.
+
+### R-054 — Invalid metrics allowlists fail open outside the normal configuration loader
+
+**Severity:** Low — Needs investigation
+
+**Location:** `Golang-dnssec-validator/config.go:391-400`, `Config.Validate`; `Golang-dnssec-validator/server.go:70-81`, metrics route construction; direct `NewServer` callers
+
+**Problem:** The normal loader rejects a malformed metrics CIDR, but `NewServer` independently reparses the list and deliberately exposes `/metrics` without any restriction if parsing fails. Any future construction/reload path that misses `Config.Validate`, or a partial-validation regression, turns a defensive error into a fail-open disclosure of service internals.
+
+**Evidence:** On `parseCIDRs` error, route construction logs `metrics access unrestricted` and leaves the unwrapped Prometheus handler installed. An explicit empty list is already the intentional unrestricted state, so invalid and deliberate-unrestricted configurations currently collapse to the same runtime policy. Investigation should enumerate all production construction/reload paths and determine whether direct construction can become externally reachable.
+
+**Fix specification:** Fail closed at route construction even if upstream validation was bypassed: install a denied/unavailable metrics handler or retain a previously validated allowlist, while logging a non-sensitive configuration error. Preserve valid CIDR behavior, the public `/metrics` path/schema, and the documented meaning of an explicitly empty list; do not silently substitute default CIDRs for an operator's invalid restriction.
+
+**Verification:** Construct servers both through `LoadConfig` and directly with valid, empty, mixed, and invalid lists. Invalid lists must never return metrics from any source IP; valid/empty semantics must remain unchanged. Add a regression test for any reload path found during investigation.
+
+<!-- Remaining low-severity findings and the required final summary/fix order are appended in the final review-only checkpoint. -->
