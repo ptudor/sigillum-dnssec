@@ -34,26 +34,63 @@ func registrarContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 60*time.Second)
 }
 
-// resolveRegistrar is a small helper used by all `registrar *` commands. It
-// loads config + state, ensures the zone is managed, and returns the
-// adapter. A missing adapter (no registrar configured for the zone) is an
-// error in this context — the user explicitly asked for a registrar op.
+// resolveRegistrar is a small helper used by the read-only `registrar *`
+// commands (get, verify). It loads config + state WITHOUT the cross-process
+// state lock — these commands never Save — ensures the zone is managed, and
+// returns the adapter. A missing adapter (no registrar configured for the
+// zone) is an error in this context — the user explicitly asked for a
+// registrar op.
 func resolveRegistrar(domain string) (*Config, *State, Registrar, error) {
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if state.GetZone(domain) == nil {
-		return nil, nil, nil, fmt.Errorf("domain %q is not managed", domain)
-	}
-	reg, err := RegistrarFor(cfg, domain)
+	reg, err := registrarForManagedZone(cfg, state, domain)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if reg == nil {
-		return nil, nil, nil, fmt.Errorf("zone %q has no registrar configured (set zones.%q.registrar in config)", domain, domain)
-	}
 	return cfg, state, reg, nil
+}
+
+// resolveRegistrarLocked is the mutating-command variant of resolveRegistrar,
+// used by `registrar push` and `registrar clear`: it loads state under the
+// cross-process state lock (R-007) and returns the unlock func for the caller
+// to defer. push persists registrar state (zone warnings) via state.Save() —
+// saving a snapshot loaded outside the lock can clobber a concurrent
+// daemon/CLI write, and the daemon's fresher-LastSigned merge then drops the
+// URGENT zero-DS warning (R-032); clear's destructive DS wipe must likewise
+// not interleave with a concurrent locked auto-publish. The lock is
+// deliberately held across the registrar network calls — the same accepted
+// pattern as maybeAutoPublishDS running under its caller's lock — with the
+// usual 30s acquisition timeout.
+func resolveRegistrarLocked(domain string) (*Config, *State, Registrar, func(), error) {
+	cfg, state, unlock, err := loadConfigStateLocked()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	reg, err := registrarForManagedZone(cfg, state, domain)
+	if err != nil {
+		unlock()
+		return nil, nil, nil, nil, err
+	}
+	return cfg, state, reg, unlock, nil
+}
+
+// registrarForManagedZone is the shared back half of resolveRegistrar and
+// resolveRegistrarLocked: it ensures the zone is managed and resolves its
+// configured registrar adapter.
+func registrarForManagedZone(cfg *Config, state *State, domain string) (Registrar, error) {
+	if state.GetZone(domain) == nil {
+		return nil, fmt.Errorf("domain %q is not managed", domain)
+	}
+	reg, err := RegistrarFor(cfg, domain)
+	if err != nil {
+		return nil, err
+	}
+	if reg == nil {
+		return nil, fmt.Errorf("zone %q has no registrar configured (set zones.%q.registrar in config)", domain, domain)
+	}
+	return reg, nil
 }
 
 // dsSummary is the JSON-friendly form of a DS record used by registrar CLI
@@ -115,10 +152,13 @@ func runRegistrarGet(cmd *cobra.Command, args []string) error {
 // needed, ReplaceDS if anything must be removed.
 func runRegistrarPush(cmd *cobra.Command, args []string) error {
 	domain := args[0]
-	cfg, state, reg, err := resolveRegistrar(domain)
+	// Locked: the ErrRegistrarDSEmpty branch persists a zone warning, and that
+	// Save must not run from a snapshot loaded outside the lock (R-032).
+	cfg, state, reg, unlock, err := resolveRegistrarLocked(domain)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	want, err := BuildDSSet(cfg, state, domain)
 	if err != nil {
@@ -220,10 +260,13 @@ func runRegistrarVerify(cmd *cobra.Command, args []string) error {
 // log loudly so the operator can find it in logs later.
 func runRegistrarClear(cmd *cobra.Command, args []string) error {
 	domain := args[0]
-	_, _, reg, err := resolveRegistrar(domain)
+	// Locked: the DS wipe must not interleave with a concurrent locked
+	// auto-publish or push for the same zone (R-007).
+	_, _, reg, unlock, err := resolveRegistrarLocked(domain)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 	slog.Warn("[REGISTRAR] clearing all DS records", "domain", domain, "registrar", reg.Name())
 
 	ctx, cancel := registrarContext()

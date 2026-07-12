@@ -823,7 +823,7 @@ func (s *Signer) verifySignedZone(domain string, signedRecords []dns.RR, keys *s
 	covered := make(map[rrsetKey]bool)
 	for _, sig := range rrsigs {
 		k := rrsetKey{strings.ToLower(sig.Hdr.Name), sig.TypeCovered}
-		rrset := rrsets[k]
+		rrset := rrsetForVerify(rrsets[k])
 		if len(rrset) == 0 {
 			return fmt.Errorf("RRSIG for %s %s covers no RRset in the signed zone", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered])
 		}
@@ -880,6 +880,39 @@ func (s *Signer) verifySignedZone(domain string, signedRecords []dns.RR, keys *s
 	}
 
 	return nil
+}
+
+// rrsetForVerify returns the RRset slice to hand to dns.RRSIG.Verify. miekg's
+// Verify rejects an RRset whose owner names differ in letter case (its IsRRset
+// compares Header().Name byte-for-byte), but DNSSEC canonical form (RFC 4034
+// §6.2) lowercases owner names before signing, so a signature over a
+// mixed-case RRset (`www` and `WWW` A records) is valid on the wire. When the
+// group's spellings diverge — the records were grouped by lowercased name, so
+// any divergence is case-only — verify against copies with the owner name
+// lowercased; the records that will be written are never mutated. Uniform-case
+// groups (the normal case) are returned as-is, uncopied.
+func rrsetForVerify(rrset []dns.RR) []dns.RR {
+	if len(rrset) == 0 {
+		return rrset
+	}
+	first := rrset[0].Header().Name
+	mixed := false
+	for _, rr := range rrset[1:] {
+		if rr.Header().Name != first {
+			mixed = true
+			break
+		}
+	}
+	if !mixed {
+		return rrset
+	}
+	lowered := make([]dns.RR, len(rrset))
+	for i, rr := range rrset {
+		cp := dns.Copy(rr)
+		cp.Header().Name = strings.ToLower(cp.Header().Name)
+		lowered[i] = cp
+	}
+	return lowered
 }
 
 // verifyNSECChainClosure asserts the NSEC Next pointers form one closed cycle.

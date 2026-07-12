@@ -79,3 +79,69 @@ path = "/zones/c.db"
 		t.Errorf("expected errZoneNotInConfig for absent zone, got %v", err)
 	}
 }
+
+// The header matcher must recognize TOML-equivalent header variants a
+// hand-edited config can carry — trailing inline comment, surrounding
+// whitespace, single-quoted key — or `remove` leaves the entry behind and a
+// SIGHUPed daemon re-adopts the zone. Siblings must survive each removal, and
+// a genuinely absent header must still report the sentinel.
+func TestRemoveZoneFromConfigFile_HeaderVariants(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+	}{
+		{"trailing_comment", `[zones."b.example.com"] # added by hand`},
+		{"surrounding_whitespace", `   [zones."b.example.com"]   `},
+		{"single_quoted_key", `[zones.'b.example.com']`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "config.toml")
+			content := `output_dir = "/var/signed"
+data_dir = "/var/lib"
+
+[zones."a.example.com"]
+path = "/zones/a.db"
+
+` + tc.header + `
+path = "/zones/b.db"
+
+[zones."c.example.com"]
+path = "/zones/c.db"
+`
+			if err := os.WriteFile(cfgPath, []byte(content), 0640); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := RemoveZoneFromConfigFile(cfgPath, "b.example.com"); err != nil {
+				t.Fatalf("remove with header %q: %v", tc.header, err)
+			}
+
+			out, err := os.ReadFile(cfgPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(out)
+			if strings.Contains(got, "b.example.com") || strings.Contains(got, "/zones/b.db") {
+				t.Errorf("removed zone b still present:\n%s", got)
+			}
+
+			var parsed Config
+			if err := toml.Unmarshal(out, &parsed); err != nil {
+				t.Fatalf("result is not valid TOML: %v", err)
+			}
+			if _, ok := parsed.Zones["a.example.com"]; !ok {
+				t.Error("a missing from parsed config")
+			}
+			if _, ok := parsed.Zones["c.example.com"]; !ok {
+				t.Error("c missing from parsed config")
+			}
+
+			// A header that genuinely is not present still reports the sentinel.
+			if err := RemoveZoneFromConfigFile(cfgPath, "z.example.com"); err != errZoneNotInConfig {
+				t.Errorf("expected errZoneNotInConfig for absent zone, got %v", err)
+			}
+		})
+	}
+}

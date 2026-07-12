@@ -444,11 +444,16 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// under the lock) rather than d.heartbeat, which Reload reassigns (R-018).
 	snap.heartbeat.SigningStart(domain)
 
-	// Initialize zone state if new — but first try to recover existing key
+	// Initialize a zone that is absent, or present only as a keyless
+	// placeholder from a prior failed init (e.g. written by a cron `sign` and
+	// merged in via ReloadFromDisk) — but first try to recover existing key
 	// files from disk. If key files already exist (e.g., state was lost but
 	// keys survive), reuse them to preserve the DS chain of trust. Generating
 	// new keys when a published DS still references the old key causes SERVFAIL.
-	if zoneState == nil {
+	// Re-running the init branch for a placeholder (nil KSK/ZSK) mirrors
+	// SignAll (R-033): the daemon heals it instead of erroring every cycle
+	// until a CLI `sign` runs.
+	if zoneState == nil || zoneState.KSK == nil || zoneState.ZSK == nil {
 		keyGen := NewKeyGenerator(snap.cfg)
 		ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 		if err != nil {

@@ -432,6 +432,13 @@ func evalRRSIGCover(answer []dns.RR, covered uint16, wantTag uint16, now time.Ti
 		if rrsig.ValidityPeriod(now) {
 			e.valid = true
 			e.validExp = exp
+			// RFC 4035 §5.3.3: resolvers accept an RRset when ANY one of its
+			// RRSIGs validates, so a valid signature supersedes any expired
+			// one seen earlier in the answer — keep the documented invariant
+			// that expired means "present but ALL out of window" regardless
+			// of RR order.
+			e.expired = false
+			e.expiredExp = time.Time{}
 			return e
 		}
 		e.expired = true

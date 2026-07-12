@@ -276,7 +276,11 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 		//  (2) the pre-published DNSKEY RRset was actually signed after the phase
 		//      began (LastSigned after phaseStart) — else the new ZSK was never
 		//      published;
-		//  (3) a DNSKEY-TTL floor has elapsed since that publish.
+		//  (3) a DNSKEY-TTL floor has elapsed since the phase's key set was FIRST
+		//      published (PhaseFirstSigned) — measured from the first in-phase
+		//      sign, not the most recent one, so a zone re-signed more often than
+		//      the floor (e.g. hourly edits vs the 24h fallback) still advances
+		//      instead of stalling in pre_publish forever.
 		phaseStart := rollover.Started
 		if now.Sub(phaseStart) < switchDuration {
 			return nil
@@ -285,7 +289,17 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 			slog.Debug("[ROLLOVER] ZSK pre_publish: waiting for the pre-published key set to be signed", "domain", domain)
 			return nil
 		}
-		if now.Sub(lastSigned) < ttlFloor {
+		if rollover.PhaseFirstSigned.IsZero() {
+			// First check that observes the phase's key set signed: stamp the
+			// publish time the TTL floor counts from and persist it. Old state
+			// files without the field pick it up here — at most one poll
+			// interval late, which is conservative.
+			rm.state.Mutate(func() { rollover.PhaseFirstSigned = lastSigned })
+			if err := rm.state.Save(); err != nil {
+				return err
+			}
+		}
+		if now.Sub(rollover.PhaseFirstSigned) < ttlFloor {
 			slog.Debug("[ROLLOVER] ZSK pre_publish: waiting DNSKEY-TTL floor after publish", "domain", domain, "floor", ttlFloor.String())
 			return nil
 		}
@@ -298,7 +312,8 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 		}
 		rm.state.Mutate(func() {
 			rollover.State = ZSKRolloverStateSigning
-			rollover.PhaseStarted = now // gate the signing phase from here (R-011)
+			rollover.PhaseStarted = now             // gate the signing phase from here (R-011)
+			rollover.PhaseFirstSigned = time.Time{} // the signing phase stamps its own first sign
 			rollover.Action = "Automatic: signing with new ZSK, old ZSK still published"
 			zoneState.ZSK = &KeyState{
 				ID: newZSK.KeyTag(),
@@ -316,8 +331,10 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 	case ZSKRolloverStateSigning:
 		// Complete only when ALL hold (R-011): the signing phase has dwelled long
 		// enough, the new ZSK's signatures were actually published after the
-		// switch, and the DNSKEY-TTL floor has elapsed — so resolvers no longer
-		// hold old-ZSK RRSIGs cached when the old ZSK is dropped.
+		// switch, and the DNSKEY-TTL floor has elapsed since they were FIRST
+		// published (PhaseFirstSigned, same rationale as pre_publish) — so
+		// resolvers no longer hold old-ZSK RRSIGs cached when the old ZSK is
+		// dropped.
 		phaseStart := rollover.PhaseStarted
 		if phaseStart.IsZero() {
 			phaseStart = rollover.Started // old state files predating phase_started
@@ -333,7 +350,15 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 			slog.Debug("[ROLLOVER] ZSK signing: waiting for the new ZSK's signatures to be published", "domain", domain)
 			return nil
 		}
-		if now.Sub(lastSigned) < ttlFloor {
+		if rollover.PhaseFirstSigned.IsZero() {
+			// First check that observes the new ZSK's signatures published:
+			// stamp the point the TTL floor counts from and persist it.
+			rm.state.Mutate(func() { rollover.PhaseFirstSigned = lastSigned })
+			if err := rm.state.Save(); err != nil {
+				return err
+			}
+		}
+		if now.Sub(rollover.PhaseFirstSigned) < ttlFloor {
 			slog.Debug("[ROLLOVER] ZSK signing: waiting DNSKEY-TTL floor before dropping old ZSK", "domain", domain, "floor", ttlFloor.String())
 			return nil
 		}
@@ -371,6 +396,18 @@ func (rm *RolloverManager) backupKey(domain, keyType string, keyID uint16) error
 		}
 		if !bytes.Equal(existing, src) {
 			return fmt.Errorf("backup %s already exists with different key material (key-tag collision?); refusing to overwrite", backupName+".key")
+		}
+		// The .key half matches — but a crash between the two copies below can
+		// leave the backup without its .private. Treating that artifact as
+		// "already backed up" would let the caller proceed to overwrite the live
+		// .private, destroying its only copy. Complete the pair from the live
+		// .private before declaring success.
+		if !fileExists(backupName + ".private") {
+			if err := copyFile(baseName+".private", backupName+".private"); err != nil {
+				return fmt.Errorf("completing half-written %s backup (.key present, .private missing): %w", keyType, err)
+			}
+			slog.Warn("[ROLLOVER] Completed a half-written key backup with the live private key",
+				"domain", domain, "type", keyType, "key_id", keyID, "backup", backupName)
 		}
 		return nil // already backed up with identical content
 	}

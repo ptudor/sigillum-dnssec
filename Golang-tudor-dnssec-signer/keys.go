@@ -305,6 +305,20 @@ func (kg *KeyGenerator) backupExistingKeyFiles(domain, keyType, baseName string)
 	if fileExists(backupBase + ".key") {
 		if existingBackup, err := kg.loadPublicKeyFromPath(backupBase); err == nil &&
 			existingBackup.PublicKey == existingKey.PublicKey {
+			// A crash after only the .key half of a prior backup landed leaves
+			// the tag-named backup without its .private. The caller is about to
+			// overwrite the live pair, so the live .private is the only copy of
+			// this key's private half — complete the backup pair from it before
+			// skipping. Copy rather than rename: the live pair must stay intact
+			// on disk for the caller's atomic overwrite, exactly as this skip
+			// path leaves it today.
+			if !fileExists(backupBase+".private") && fileExists(privFile) {
+				if err := copyFile(privFile, backupBase+".private"); err != nil {
+					return fmt.Errorf("completing half-written backup (.key present, .private missing): %w", err)
+				}
+				slog.Warn("[KEY] Completed a half-written key backup with the live private key",
+					"domain", domain, "type", keyType, "key_tag", existingTag, "backup", backupBase)
+			}
 			slog.Debug("[KEY] Backup already exists (same key), skipping",
 				"domain", domain, "type", keyType, "key_tag", existingTag)
 			return nil

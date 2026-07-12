@@ -107,7 +107,17 @@ type RolloverState struct {
 	// start; callers fall back to Started. Used to gate ZSK phase transitions on
 	// actual per-phase dwell time, not wall-time-since-start (R-011).
 	PhaseStarted time.Time `json:"phase_started,omitempty"`
-	Action       string    `json:"action"` // Human-readable next step
+	// PhaseFirstSigned records the first LastSigned observed after the current
+	// phase began — when the phase's DNSKEY RRset was first published. The
+	// DNSKEY-TTL floor gate measures from here rather than from the most recent
+	// sign: a zone re-signed more often than the floor (e.g. an hourly-edited
+	// dynamic zone against the default 24h floor) would otherwise never satisfy
+	// the gate and the rollover would stall in pre_publish/signing forever.
+	// Zero on old state files and at each phase start; stamped on the first
+	// rollover check that sees the phase signed (at most one poll interval
+	// late), and reset on the pre_publish→signing transition.
+	PhaseFirstSigned time.Time `json:"phase_first_signed,omitempty"`
+	Action           string    `json:"action"` // Human-readable next step
 }
 
 // ZSK rollover states (automatic)
