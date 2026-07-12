@@ -1,7 +1,7 @@
 # Deep Code Review — GPT-5.6 SOL MAX
 
-Date: 2026-07-11  
-Scope: entire tracked repository, including both Go modules, tests, embedded web assets, examples, packaging, and operational documentation  
+Date: 2026-07-11
+Scope: entire tracked repository, including both Go modules, tests, embedded web assets, examples, packaging, and operational documentation
 Mode: analysis only; no source changes
 
 ## Review method
