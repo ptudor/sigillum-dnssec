@@ -352,6 +352,21 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// R-029: DNS names are case-insensitive and an optional trailing root dot does
+	// not change identity, but zone map keys / key filenames / state keys use the
+	// operator's spelling verbatim. Reject a config where two entries collapse to the
+	// same canonical identity (e.g. "example.com", "Example.COM", "example.com.")
+	// before any signing or registrar action — otherwise they generate independent
+	// KSK/DS sets for one DNS zone and can oscillate the parent's DS.
+	seenCanonical := make(map[string]string, len(c.Zones))
+	for domain := range c.Zones {
+		id := canonicalZoneIdentity(domain)
+		if prev, dup := seenCanonical[id]; dup {
+			return fmt.Errorf("zones %q and %q refer to the same DNS zone %q; use a single canonical entry (lowercase, no trailing dot)", prev, domain, id)
+		}
+		seenCanonical[id] = domain
+	}
+
 	// Validate NSEC version
 	if c.DNSSEC.NSECVersion != "nsec" && c.DNSSEC.NSECVersion != "nsec3" {
 		return fmt.Errorf("nsec_version must be 'nsec' or 'nsec3', got %q", c.DNSSEC.NSECVersion)
@@ -738,6 +753,32 @@ func isTOMLTableHeader(line string) bool {
 func afterHeaderIsCommentOrBlank(rest string) bool {
 	rest = strings.TrimSpace(rest)
 	return rest == "" || strings.HasPrefix(rest, "#")
+}
+
+// canonicalZoneIdentity returns the case- and trailing-dot-normalized management
+// identity for a zone name: lowercase with any trailing root dot removed (R-029).
+// Two operator spellings that denote the same DNS zone map to the same identity.
+func canonicalZoneIdentity(domain string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+}
+
+// canonicalConflict reports whether domain canonically matches (case- and
+// trailing-dot-insensitively) any zone already present in the config or state,
+// other than an exact match (which callers check separately). Returns the
+// conflicting existing name (R-029).
+func canonicalConflict(cfg *Config, state *State, domain string) (string, bool) {
+	id := canonicalZoneIdentity(domain)
+	for existing := range cfg.Zones {
+		if existing != domain && canonicalZoneIdentity(existing) == id {
+			return existing, true
+		}
+	}
+	for _, existing := range state.ZoneNames() {
+		if existing != domain && canonicalZoneIdentity(existing) == id {
+			return existing, true
+		}
+	}
+	return "", false
 }
 
 // ValidateDomainName checks that a domain name is safe for use in file paths.
