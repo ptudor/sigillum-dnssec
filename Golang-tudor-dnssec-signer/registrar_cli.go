@@ -179,6 +179,7 @@ func runRegistrarPush(cmd *cobra.Command, args []string) error {
 	case len(missing) == 0 && len(extra) == 0:
 		slog.Info("[REGISTRAR] DS records already in sync", "domain", domain, "registrar", reg.Name())
 		fmt.Printf("DS records at %s are already in sync with %s — nothing to do.\n", reg.Name(), domain)
+		clearRegistrarStickyWarnings(state, domain, want)
 		return nil
 	case len(extra) == 0:
 		// Only additions needed — use additive call so any concurrent DS
@@ -209,7 +210,31 @@ func runRegistrarPush(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Replaced DS record set at %s for %s (%d removed, %d installed).\n",
 			reg.Name(), domain, len(extra), len(want))
 	}
+	clearRegistrarStickyWarnings(state, domain, want)
 	return nil
+}
+
+// clearRegistrarStickyWarnings clears the registrar-critical (sticky) warnings for
+// a zone once a push has left the expected NONEMPTY DS set at the parent — the
+// read-back that confirms the zero-DS condition is resolved (R-017). It is a no-op
+// when the expected DS set is empty or no sticky warning is present, and persists
+// state only when it actually removed a warning.
+func clearRegistrarStickyWarnings(state *State, domain string, want []*dns.DS) {
+	if len(want) == 0 {
+		return
+	}
+	cleared := false
+	state.UpdateZone(domain, func(z *ZoneState) {
+		before := len(z.Warnings)
+		z.ClearStickyWarnings()
+		cleared = len(z.Warnings) != before
+	})
+	if cleared {
+		if err := state.Save(); err != nil {
+			slog.Error("[REGISTRAR] failed to persist cleared warning after successful DS push",
+				"domain", domain, "error", err)
+		}
+	}
 }
 
 // runRegistrarVerify prints the diff between expected and actual DS records.

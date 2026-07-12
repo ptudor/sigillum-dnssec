@@ -193,7 +193,7 @@ func (s *Signer) SignZone(domain string) error {
 		}
 		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
 		zoneState.ForceResign = false
-		zoneState.ClearWarnings()
+		zoneState.ClearTransientWarnings()
 
 		// Check for upcoming rollovers
 		s.checkRolloverWarnings(domain, zoneState)

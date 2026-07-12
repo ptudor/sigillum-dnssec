@@ -10,15 +10,16 @@
 #
 # Optional overrides (defaults shown):
 # dnssec_validator_svcuser="dnssec-validator"
-# dnssec_validator_command="/usr/local/sbin/dnssec-validator.sh"
+# dnssec_validator_command="/usr/local/sbin/dnssec-validator"
 # dnssec_validator_logdir="/var/log/tudordns"
 #
 # Create the service user and log dir before starting:
 #   pw useradd -n dnssec-validator -d /nonexistent -s /usr/sbin/nologin -c "DNSSEC Validator Service"
 #   install -d -o dnssec-validator /var/log/tudordns
 #
-# The wrapper (dnssec-validator.sh) sources the env file and exec()s the
-# binary; see QUICKSTART-FREEBSD.md.
+# Configuration is a TOML file the binary auto-discovers at
+# /usr/local/etc/tudordns/dnssec-validator.toml -- no wrapper, no env file;
+# see QUICKSTART-FREEBSD.md.
 
 . /etc/rc.subr
 
@@ -29,15 +30,15 @@ load_rc_config $name
 
 : ${dnssec_validator_enable:="NO"}
 : ${dnssec_validator_svcuser:="dnssec-validator"}
-: ${dnssec_validator_command:="/usr/local/sbin/dnssec-validator.sh"}
+: ${dnssec_validator_command:="/usr/local/sbin/dnssec-validator"}
 : ${dnssec_validator_logdir:="/var/log/tudordns"}
 : ${dnssec_validator_pidfile:="/var/run/${name}.pid"}
 
 pidfile="${dnssec_validator_pidfile}"
 
 # Privilege drop is done by `daemon -u` (below), NOT an su(1) wrapper, so the
-# child pid daemon(8) records in ${pidfile} is the wrapper -> exec()'d binary
-# itself -- status/stop/restart therefore act on the real listener. The old
+# child pid daemon(8) records in ${pidfile} is the binary itself --
+# status/stop/restart therefore act on the real listener. The old
 # `daemon ... /usr/bin/su -m user -c wrapper` form recorded su's pid instead,
 # which made `status` report "not running" while the daemon was live and made
 # `stop` signal su rather than the binary (so a restart never cut over and a
