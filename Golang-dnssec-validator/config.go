@@ -410,6 +410,26 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("root_anchors_url must use https:// (got %q)", c.RootAnchorsURL)
 	}
 
+	// R-047: if heartbeat monitoring is enabled, fail startup on a misconfiguration
+	// rather than silently disabling it (NewClient returns a disabled client for
+	// missing key/app) or leaking the API key in cleartext. Require a nonempty API
+	// key and app, and an HTTPS URL — the API key is sent in the POST body, so an
+	// HTTP endpoint would transmit it in cleartext.
+	if c.HeartbeatEnabled {
+		if c.HeartbeatAPIKey == "" {
+			return fmt.Errorf("heartbeat is enabled but heartbeat api_key is empty")
+		}
+		if c.HeartbeatApp == "" {
+			return fmt.Errorf("heartbeat is enabled but heartbeat app is empty")
+		}
+		if c.HeartbeatURL == "" {
+			return fmt.Errorf("heartbeat is enabled but heartbeat url is empty")
+		}
+		if !strings.HasPrefix(strings.ToLower(c.HeartbeatURL), "https://") {
+			return fmt.Errorf("heartbeat url must use https:// (the api_key is sent in the request body); got %q", c.HeartbeatURL)
+		}
+	}
+
 	return nil
 }
 
