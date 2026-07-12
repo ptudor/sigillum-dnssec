@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,27 @@ type Client struct {
 	mu         sync.Mutex
 	lastAction string
 	lastSent   time.Time
+
+	// activeCount is the number of in-flight validations, maintained by request
+	// handlers via ValidationStarted/ValidationFinished. The background ticker
+	// reports "running" while it is nonzero (R-052).
+	activeCount atomic.Int64
+}
+
+// ValidationStarted records that a validation began. Safe to call on a disabled
+// client (it just increments the counter, which the disabled ticker never reads).
+func (c *Client) ValidationStarted() { c.activeCount.Add(1) }
+
+// ValidationFinished records that a validation completed.
+func (c *Client) ValidationFinished() { c.activeCount.Add(-1) }
+
+// periodicAction is the action the background ticker reports: "running" while any
+// validation is in flight, "idle" otherwise (R-052).
+func (c *Client) periodicAction() string {
+	if c.activeCount.Load() > 0 {
+		return "running"
+	}
+	return "idle"
 }
 
 // Config holds heartbeat configuration.
@@ -185,13 +207,13 @@ func (c *Client) StartBackground(ctx context.Context, interval time.Duration) co
 				lastAction := c.lastAction
 				c.mu.Unlock()
 
-				// If we're in the middle of validating, send "running"
-				// Otherwise send "idle"
-				action := "idle"
-				if strings.HasPrefix(lastAction, "validate:") {
-					action = "running"
-				}
-				c.Send(action)
+				// R-052: report "running" while any validation is in flight,
+				// "idle" otherwise, from the concurrency-safe active count that
+				// request handlers maintain. Previously this checked for a
+				// "validate:" lastAction prefix that no caller ever set, so the
+				// heartbeat read idle even during long/concurrent validations.
+				_ = lastAction
+				c.Send(c.periodicAction())
 			}
 		}
 	}()
