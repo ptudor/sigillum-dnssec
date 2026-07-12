@@ -119,16 +119,18 @@ func (v *Validator) emitEvent(eventType string, data interface{}) {
 
 // Validate performs DNSSEC validation for a domain
 func (v *Validator) Validate(ctx context.Context, domain string) (*ValidationResult, error) {
-	return v.validateWithCache(ctx, domain, 0, make(map[string]*ZoneResult))
+	return v.validateWithCache(ctx, domain, 0, make(map[string]bool), make(map[string]*ZoneResult))
 }
 
 // ValidateWithDepth performs DNSSEC validation with CNAME recursion depth tracking
 func (v *Validator) ValidateWithDepth(ctx context.Context, domain string, depth int) (*ValidationResult, error) {
-	return v.validateWithCache(ctx, domain, depth, make(map[string]*ZoneResult))
+	return v.validateWithCache(ctx, domain, depth, make(map[string]bool), make(map[string]*ZoneResult))
 }
 
-// validateWithCache performs DNSSEC validation with a cache of already-validated zones
-func (v *Validator) validateWithCache(ctx context.Context, domain string, depth int, validatedZones map[string]*ZoneResult) (*ValidationResult, error) {
+// validateWithCache performs DNSSEC validation with a cache of already-validated
+// zones. visited holds the canonical CNAME owner/target names seen so far on this
+// chain, so a loop is detected instead of silently terminating at the depth cap (R-034).
+func (v *Validator) validateWithCache(ctx context.Context, domain string, depth int, visited map[string]bool, validatedZones map[string]*ZoneResult) (*ValidationResult, error) {
 	const maxCNAMEDepth = 10
 
 	start := time.Now()
@@ -330,9 +332,10 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 		}
 	}
 
-	// Now check for CNAMEs at the target domain
-	if depth < maxCNAMEDepth {
-		cnameResult, err := v.checkAndFollowCNAME(ctx, domain, depth, validatedZones)
+	// Now check for CNAMEs at the target domain. checkAndFollowCNAME enforces the
+	// loop/depth guards internally (R-034), so it is always consulted.
+	{
+		cnameResult, err := v.checkAndFollowCNAME(ctx, domain, depth, maxCNAMEDepth, visited, validatedZones)
 		if err == nil && cnameResult != nil {
 			result.CNAMEChains = append(result.CNAMEChains, *cnameResult)
 
@@ -391,8 +394,37 @@ func nextParentDNSKEY(prev []dnspkg.DNSKEYRecord, zr *ZoneResult) []dnspkg.DNSKE
 	return prev
 }
 
-// checkAndFollowCNAME checks if the domain has a CNAME and validates the target
-func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, depth int, validatedZones map[string]*ZoneResult) (*CNAMEChainResult, error) {
+// cnameGuard decides whether following domain→target must terminate. It returns a
+// terminal CNAMEChainResult and true when the hop would loop (target already
+// visited → bogus) or exceed maxDepth (indeterminate); otherwise it marks target
+// visited and returns (nil, false) to proceed. (R-034)
+func cnameGuard(domain, target string, depth, maxDepth int, visited map[string]bool) (*CNAMEChainResult, bool) {
+	ct := canonicalizeName(target)
+	if visited[ct] {
+		return &CNAMEChainResult{
+			Source: domain, Target: target, Result: StatusBogus,
+			Error: fmt.Sprintf("CNAME loop detected: %s points back to an already-visited name %s", domain, target),
+		}, true
+	}
+	if depth+1 >= maxDepth {
+		return &CNAMEChainResult{
+			Source: domain, Target: target, Result: StatusIndeterminate,
+			Error: fmt.Sprintf("CNAME chain exceeded maximum depth (%d) at %s without resolving; terminal target not validated", maxDepth, target),
+		}, true
+	}
+	visited[ct] = true
+	return nil, false
+}
+
+// checkAndFollowCNAME checks if the domain has a CNAME and validates the target.
+// It carries the canonical-name visited set and enforces loop and depth limits
+// (R-034): a repeated owner/target is a CNAME loop (bogus), and a chain that would
+// exceed maxDepth without resolving is depth-limited (indeterminate) — neither is
+// silently reported as secure.
+func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, depth, maxDepth int, visited map[string]bool, validatedZones map[string]*ZoneResult) (*CNAMEChainResult, error) {
+	// Record this owner name so a later hop back to it is detected as a loop.
+	visited[canonicalizeName(domain)] = true
+
 	// First, find the authoritative zone for this domain
 	// The zone is the closest ancestor that has NS records
 	zones, err := v.resolver.DiscoverZoneCuts(ctx, domain)
@@ -446,13 +478,19 @@ func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, dept
 		Target: target,
 	})
 
+	// R-034: stop on a CNAME loop (bogus) or depth-limit (indeterminate) rather than
+	// looping to the cap and reading secure.
+	if term, stop := cnameGuard(domain, target, depth, maxDepth, visited); stop {
+		return term, nil
+	}
+
 	v.emitEvent("progress", ProgressEvent{
 		Zone:   target,
 		Action: "following CNAME (reusing validated zones)",
 	})
 
 	// Validate the CNAME target, reusing already-validated zones
-	targetResult, err := v.validateWithCache(ctx, target, depth+1, validatedZones)
+	targetResult, err := v.validateWithCache(ctx, target, depth+1, visited, validatedZones)
 	if err != nil {
 		return &CNAMEChainResult{
 			Source: domain,
@@ -770,11 +808,29 @@ func (v *Validator) verifyWildcard(validation *RecordValidation, qname string, r
 // recordValidationVerdict classifies a leaf RecordValidation into the verdict it should
 // contribute (R-082). A verified record signature or verified denial keeps the zone
 // secure; an unqueryable answer is indeterminate; a missing/expired/forged signature or
-// an unverifiable denial is bogus. A wildcard-synthesized answer whose record signature
-// verified but whose closest-encloser proof is incomplete stays secure here — it is
-// surfaced as a warning at the call site, matching the existing wildcard handling.
+// an unverifiable denial is bogus. A wildcard-synthesized answer is secure only when BOTH
+// its data RRSIG AND its required no-exact-match NSEC/NSEC3 proof verified (R-026,
+// RFC 4035 §5.3.4); a missing/forged/incomplete wildcard proof is bogus (or
+// indeterminate if the whole response could not be fetched).
 func recordValidationVerdict(rv *RecordValidation) (ValidationStatus, string) {
-	if rv == nil || rv.RRSIGVerified {
+	if rv == nil {
+		return StatusSecure, ""
+	}
+
+	// R-026: a wildcard-synthesized positive answer whose data signature verified but
+	// whose no-exact-match proof did NOT verify must not be reported secure.
+	if rv.Wildcard && rv.RRSIGVerified && !rv.WildcardProofVerified {
+		msg := rv.Error
+		if msg == "" {
+			msg = "wildcard answer lacks a verified no-exact-match (NSEC/NSEC3) proof"
+		}
+		if isUnqueryableRecordError(msg) {
+			return StatusIndeterminate, msg
+		}
+		return StatusBogus, msg
+	}
+
+	if rv.RRSIGVerified {
 		return StatusSecure, ""
 	}
 

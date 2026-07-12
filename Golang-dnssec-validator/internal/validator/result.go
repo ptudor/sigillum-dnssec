@@ -102,10 +102,11 @@ type ValidationResult struct {
 
 // CNAMEChainResult represents validation of a CNAME target
 type CNAMEChainResult struct {
-	Source string           `json:"source"` // The name that has the CNAME
-	Target string           `json:"target"` // The CNAME target
-	Result ValidationStatus `json:"result"` // Validation result for target's chain
-	Chain  []ZoneResult     `json:"chain"`  // The target's zone chain
+	Source string           `json:"source"`          // The name that has the CNAME
+	Target string           `json:"target"`          // The CNAME target
+	Result ValidationStatus `json:"result"`          // Validation result for target's chain
+	Chain  []ZoneResult     `json:"chain"`           // The target's zone chain
+	Error  string           `json:"error,omitempty"` // Loop/depth-limit diagnostic (R-034)
 }
 
 // SSEEvent represents a Server-Sent Event

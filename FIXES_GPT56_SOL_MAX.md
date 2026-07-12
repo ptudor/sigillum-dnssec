@@ -81,4 +81,19 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 - **Files:** `internal/validator/nsec.go`, `internal/validator/nsec_ordering_r045_r036_test.go` (new)
 - **Verification:** `TestR036_SingleRecordRingCoversAllButOwner` — a single NSEC (next==owner) covers absent names on both sides but not the owner; same for a single NSEC3 hash ring. Endpoints remain exclusive for normal/wrap intervals (existing tests pass).
 
+### R-026 — Wildcard without denial proof reports secure — FIXED
+- **Change:** `recordValidationVerdict` (`internal/validator/validator.go`) no longer returns `StatusSecure` merely because `RRSIGVerified` is set. A wildcard-synthesized positive answer (`rv.Wildcard`) whose data RRSIG verified but whose no-exact-match proof did NOT (`!rv.WildcardProofVerified`) is now `StatusBogus` (RFC 4035 §5.3.4), or `StatusIndeterminate` if the failure was an inability to fetch the response. `verifyWildcard` already sets `WildcardProofVerified` only on a fully verified NSEC/NSEC3 proof, so legitimate wildcards (proof verified) stay secure. The verdict feeds `lastStatus` at the call site, so the overall result moves, not just the per-zone detail.
+- **Files:** `internal/validator/validator.go`, `internal/validator/chain_enforce_test.go` (updated the case that enshrined secure-with-warning)
+- **Verification:** `TestRecordValidationVerdict` now asserts wildcard-without-verified-proof → bogus and wildcard-with-verified-proof → secure. Existing wildcard tests pass.
+
+### R-032 — Validator requires every DS algorithm — FIXED
+- **Change:** Rewrote `ValidateChainLink` to accept the delegation as soon as ANY single DS exactly matches an eligible DNSKEY (RFC 6840 §5.11 any-valid-path), instead of failing bogus when some DS algorithm group had no matching DNSKEY. It only errors when NO DS matches any DNSKEY. This keeps algorithm rollovers and heterogeneous validators working. (Candidate iteration + R-043 eligibility preserved.)
+- **Files:** `internal/validator/dnssec.go`, `internal/validator/dnssec_test.go` (updated the all-algorithm-failure case; added an all-paths-invalid case)
+- **Verification:** `TestValidateChainLinkMultiAlgorithm` — one valid path + one missing-DNSKEY algorithm now validates (was error), both-valid still validates, and a set whose only DS has no matching DNSKEY still errors. Full suite green.
+
+### R-034 — CNAME exhaustion silently ends secure — FIXED
+- **Change:** Threaded a canonical-name `visited` set through `validateWithCache`/`checkAndFollowCNAME` and added `cnameGuard`: a target already visited on the chain is a CNAME loop → `StatusBogus`; a hop that would exceed `maxCNAMEDepth` without resolving → `StatusIndeterminate`. Neither is silently reported secure. Added an optional `Error` field to `CNAMEChainResult` (JSON-compatible) for the diagnostic.
+- **Files:** `internal/validator/validator.go`, `internal/validator/result.go`, `internal/validator/cname_guard_r034_test.go` (new)
+- **Verification:** `TestR034_CNAMEGuard` — self-loop and A→B→A (incl. mixed-case) are bogus, depth-limit is indeterminate, a normal hop proceeds and marks the target visited. (The loop/depth decision was extracted into the pure `cnameGuard` helper because the surrounding resolver is a concrete type, not mockable — that end-to-end coupling is R-059's concern.) Full module race suite green.
+
 

@@ -455,14 +455,24 @@ func TestValidateChainLinkMultiAlgorithm(t *testing.T) {
 			wantError: false,
 		},
 		{
-			name: "two algorithms - one missing DNSKEY (RFC 6840 violation)",
+			// R-032: RFC 6840 §5.11 accepts ANY single valid DS→DNSKEY path; a
+			// second algorithm's DS lacking a matching DNSKEY (e.g. mid algorithm
+			// rollover, or a stale/unsupported path) is NOT bogus.
+			name: "two algorithms - one path valid, one missing DNSKEY (any-valid-path)",
 			ds: []dns.DSRecord{
 				{KeyTag: 11111, Algorithm: 13, DigestType: 2, Digest: digest13},
 				{KeyTag: 22222, Algorithm: 8, DigestType: 2, Digest: digest8},
 			},
-			dnskeys:   []dns.DNSKEYRecord{dnskey13}, // Missing alg 8 DNSKEY
+			dnskeys:   []dns.DNSKEYRecord{dnskey13}, // Missing alg 8 DNSKEY — still secure via alg 13
+			wantError: false,
+		},
+		{
+			name: "all DS paths invalid (no matching DNSKEY at all)",
+			ds: []dns.DSRecord{
+				{KeyTag: 22222, Algorithm: 8, DigestType: 2, Digest: digest8},
+			},
+			dnskeys:   []dns.DNSKEYRecord{dnskey13}, // no alg-8 key present
 			wantError: true,
-			errorMsg:  "algorithm 8",
 		},
 		{
 			name: "multiple DS same algorithm - one matches",
