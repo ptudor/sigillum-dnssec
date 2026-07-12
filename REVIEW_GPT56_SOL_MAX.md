@@ -850,4 +850,97 @@ The review traces the signer and validator from configuration and process startu
 
 **Verification:** Test absent/zero, 2, 4, negative, 1, 3, 255, and overflow/parse cases in TOML and reload. Valid values must generate/publish the requested digest; invalid values must fail before key, state, output, hook, or registrar mutation.
 
-<!-- The required final summary and dependency-aware fix order are appended in the final review-only checkpoint. -->
+## Summary by severity
+
+| Severity | Count | Finding IDs |
+|---|---:|---|
+| Critical | 1 | R-024 |
+| High | 19 | R-001–R-012, R-025–R-030, R-043 |
+| Medium | 24 | R-013–R-020, R-031–R-042, R-044–R-047 |
+| Low | 16 | R-021–R-023, R-048–R-060 |
+| **Total** | **60** | **R-001–R-060** |
+
+### Complete finding ledger
+
+| ID | Severity | Short description | Prerequisites / coordination |
+|---|---|---|---|
+| R-024 | Critical | Unauthenticated trust-anchor input | Start R-059 harness work immediately; foundation for R-025, R-039, R-055 |
+| R-001 | High | Commented TOML boundary deletes later tables | R-029 canonical identity; reuse R-019 config transaction |
+| R-002 | High | Removal chowns root secrets config to daemon | Coordinate ownership model with R-014 and config writer R-019 |
+| R-003 | High | Path reload signs old source file | Coordinate output/state commit with R-019/R-020 |
+| R-004 | High | ZSK rotation survives state-save failure | Requires R-013 and R-042 pair/backup transaction |
+| R-005 | High | Algorithm rollover commits only KSK | Requires R-013 and R-042 pair/backup transaction |
+| R-006 | High | Rollover guard shorter than published DNSKEY TTL | Establish shared rollover timing model first |
+| R-007 | High | Retiring ZSK signatures outlive key | Requires R-006 TTL model |
+| R-008 | High | KSK trust path retired before cached DS | Requires timing model from R-006/R-007 |
+| R-009 | High | Import accepts mismatched/incomplete key set | Requires R-013 atomic pairs; coordinate R-043 eligibility rules |
+| R-010 | High | Removal rollback reconstructs partial config | Requires R-001 and R-019 |
+| R-011 | High | Failed re-add deletes prior signed output | Requires R-019/R-020 transaction primitives |
+| R-012 | High | Import partially replaces live keys | Requires R-013 and R-042 |
+| R-025 | High | Local anchors prevent authenticated refresh/rollover | Requires R-024 authenticated source pipeline |
+| R-026 | High | Wildcard without denial proof reports secure | Requires R-027/R-028, R-036/R-037, R-043–R-045 |
+| R-027 | High | Leaf verification not bound to owner/section | Build on R-043/R-044 key-candidate rules |
+| R-028 | High | Time check and crypto can accept different signatures | Build on R-043/R-044 key-candidate rules |
+| R-029 | High | Equivalent zone names create conflicting identities | Foundation for every signer config/state mutation |
+| R-030 | High | Unauthenticated cut/referral yields false secure NODATA | Requires R-027/R-028 and R-043/R-044 |
+| R-043 | High | Invalid DNSKEY flags/protocol authenticate signatures | Core verifier primitive; implement with R-044 |
+| R-013 | Medium | Key pair replacement is non-atomic | Foundation for R-004/R-005/R-009/R-012/R-042 |
+| R-014 | Medium | Root initialization creates unusable service tree | Coordinate with R-002 ownership separation |
+| R-015 | Medium | Stale daemon state resurrects removed zone | Requires R-010/R-019 and R-029 identity model |
+| R-016 | Medium | Shutdown mutex deadlock | Coordinate lifecycle tests with R-053 |
+| R-017 | Medium | Success erases unrelated warnings | Apply after rollover/state transactions stabilize |
+| R-018 | Medium | Per-zone validation bypasses work bound/cache | Coordinate capacity accounting with R-046 |
+| R-019 | Medium | Config append is non-atomic/non-durable | Config transaction foundation for R-001/R-002/R-010/R-011/R-015 |
+| R-020 | Medium | Signed-zone rename lacks directory durability | Output/state transaction foundation for R-003/R-011 |
+| R-031 | Medium | Supported types become UNKNOWN in denial maps | Complete before exposing all types through R-049 |
+| R-032 | Medium | Validator requires every DS algorithm | Requires candidate model R-043/R-044 |
+| R-033 | Medium | Insecure-ancestor child is mislabeled bogus | Requires authenticated cut/absence work R-030 |
+| R-034 | Medium | CNAME exhaustion silently ends secure | Use R-059 resolver/orchestration seams |
+| R-035 | Medium | Multi-server response selection is input-order/tag-only | Requires R-027 and R-043/R-044 |
+| R-036 | Medium | Single-record denial ring covers nothing | Coordinate canonical ordering R-045 |
+| R-037 | Medium | Mixed NSEC3 parameters are combined | Complete before wildcard/denial consumers R-026/R-038 |
+| R-038 | Medium | Wildcard NODATA falsely reports bogus | Requires R-026 and R-037 |
+| R-039 | Medium | No active anchor is reported as bogus/healthy | Requires R-024/R-025 |
+| R-040 | Medium | Signer-name comparison is case-sensitive | Apply consistently with R-027 owner binding |
+| R-041 | Medium | Startup probe destroys fixed-name file | Independent filesystem safety fix |
+| R-042 | Medium | Backup/restore is non-atomic/non-durable | Build on R-013 pair transaction |
+| R-044 | Medium | Key-tag collision handling is slice-order dependent | Core verifier primitive; implement with R-043 |
+| R-045 | Medium | NSEC order uses presentation strings | Denial primitive for R-026/R-036 |
+| R-046 | Medium | Slow SSE clients exhaust validation capacity | Coordinate with R-018 and shutdown tests |
+| R-047 | Medium | Heartbeat can leak credentials or silently disable | Secure transport/config prerequisite for R-052 |
+| R-021 | Low | Rollover metrics keep stale active types | Apply after R-006–R-008/R-017 state semantics |
+| R-022 | Low | Key generation accepts tag collision after retries | Coordinate collision policy with R-044, pair work R-013 |
+| R-023 | Low | Hook stderr buffer is unbounded | Independent availability fix |
+| R-048 | Low | Exact base path breaks relative UI URLs | Independent; verify with deployed proxy shape |
+| R-049 | Low | UI cannot select supported record types | Apply after R-031/R-038 semantics are correct |
+| R-050 | Low | `static_dir` configuration is inert | Independent compatibility/deprecation work |
+| R-051 | Low | RDAP registrable-domain heuristic is incorrect | Independent advisory-diagnostic fix |
+| R-052 | Low | Heartbeat activity lifecycle is unwired | Requires secure configuration/transport R-047 |
+| R-053 | Low | Repeated rate-limiter shutdown panics | Coordinate with R-016 lifecycle repair |
+| R-054 | Low | Invalid metrics allowlist fails open | Independent defense-in-depth fix |
+| R-055 | Low | Anchor-age metric is frozen/misleading | Requires R-024/R-025/R-039 lifecycle semantics |
+| R-056 | Low | Failed entropy yields duplicate request IDs | Independent observability fix |
+| R-057 | Low | Release toolchain has GO-2026-5856 | Independent immediate release-hygiene fix |
+| R-058 | Low | Deployment/conformance docs contradict code | Last, after all behavior fixes they describe |
+| R-059 | Low | Critical orchestration lacks deterministic tests | Cross-cutting prerequisite/parallel work for all fixes |
+| R-060 | Low | Invalid DS digest silently defaults to SHA-256 | Complete before registrar/rollover publication changes |
+
+## Suggested dependency-aware fix order
+
+1. **Contain release risk and establish the safety harness.** Rebuild with a patched Go toolchain (R-057) immediately. In parallel, implement the internal transport/clock/filesystem seams and adversarial fixtures from R-059; this work must not delay emergency containment of R-024, but every following fix should land with a regression test through those seams.
+
+2. **Rebuild the validator's root of trust and cryptographic candidate model.** Fix anchor authenticity first (R-024). Then centralize DNSKEY eligibility and collision-safe candidate iteration (R-043, R-044), bind verification to the exact owner/section/signature/time tuple (R-027, R-028), and make signer-name comparison canonical (R-040). Build authenticated refresh/last-known-good handling on that foundation (R-025), then correct empty-active-anchor status and observability (R-039, R-055).
+
+3. **Correct authenticated authority and denial semantics.** Implement canonical NSEC ordering and ring behavior (R-045, R-036), isolate NSEC3 parameter sets (R-037), and complete supported-type mapping (R-031). Use those primitives to fix wildcard proofs and wildcard NODATA (R-026, R-038). Then repair authenticated zone-cut/DS-absence handling (R-030, R-033), any-valid-algorithm behavior (R-032), CNAME termination (R-034), and multi-server selection/comparison (R-035). Run the full secure/insecure/bogus/indeterminate matrix before exposing extra UI types.
+
+4. **Create signer identity and persistence primitives before touching workflows.** Canonicalize each zone to one identity (R-029). Separate configuration ownership from daemon data ownership (R-002, R-014), implement durable transactional config replacement (R-019), atomic validated key-pair generations (R-013), atomic/durable backup restoration (R-042), and durable signed-output publication (R-020). Fix the destructive table boundary (R-001) using the new config transaction rather than another bespoke writer.
+
+5. **Rebuild signer command and reload transactions on those primitives.** Fix automatic/algorithm rollover rollback (R-004, R-005), import validation and atomicity (R-009, R-012), removal/re-add rollback (R-010, R-011), stale-daemon resurrection (R-015), and source-path migration (R-003). Repair the startup probe independently in the same filesystem tranche (R-041). Each operation must leave either the complete old generation or complete new generation across injected failure and restart.
+
+6. **Correct rollover timing and publication policy.** Derive one TTL/dwell model from actually published DNSKEY/RRset data (R-006), retain retiring signing keys through their signatures and caches (R-007), and only then extend KSK/algorithm trust-path dwell through parent DS caches (R-008). Reject invalid registrar digest configuration before publication (R-060), stop deliberately accepting generated tag collisions (R-022), preserve independent warnings (R-017), and align metrics after final state transitions are stable (R-021).
+
+7. **Close service availability and boundary gaps.** Add bounded SSE write progress and capacity release (R-046) and apply equivalent work accounting/caching to per-zone validation (R-018). Bound hook output (R-023). Validate heartbeat credentials/HTTPS/redirects first (R-047), then wire lifecycle activity and joined shutdown (R-052). Remove the signer shutdown lock inversion and make validator limiter shutdown idempotent (R-016, R-053). Fail metrics closed on invalid policy (R-054) and make request-ID fallback unique (R-056).
+
+8. **Finish diagnostics, UI, compatibility, and documentation.** Redirect the exact base path (R-048), expose record types only after backend denial semantics are fixed (R-049), deprecate the inert static directory safely (R-050), and correct public-suffix-aware RDAP diagnostics (R-051). Finally update and mechanically validate every deployment/conformance document against the now-tested implementation (R-058).
+
+After each phase, run both module suites with race detection, the targeted fault/crash and signed-packet fixtures, `go vet`, binary vulnerability scanning, and the packaging/static checks. Do not close a finding based only on a helper-unit test: verify its stated cross-module condition and preserve the public/on-disk contracts listed in that finding.
