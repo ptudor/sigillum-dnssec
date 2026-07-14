@@ -462,31 +462,44 @@ After signing, the daemon runs the `post_sign` hook (e.g., `nsd-control reload`)
 
 ### Code Organization
 
+The domain logic lives in `internal/` packages; the root `package main` is the
+application/wiring layer (CLI, daemon loop, HTTP servers, CLI glue). The
+dependency graph is a strict DAG — `internal/` packages never import the root
+package, and no import cycles exist between them.
+
 ```
-cmd/
-    dnssec-tudor/
-        main.go           # CLI entry point (cobra or stdlib flag)
+main.go              # package main — cobra CLI entry point + all run* handlers
+daemon.go            # signing/watch loop, orchestration (holds Signer/Rollover/…)
+web.go, health.go    # HTTP servers (dashboard, /health, /metrics, /debug/vars)
+hooks.go             # post-sign hook execution
+heartbeat.go         # AnyStatus heartbeat client
+status.go            # status/output DTOs (sit above state + validate)
+zone_identity.go     # canonical-conflict check (bridges config + state)
+registrar_cli.go     # `registrar` subcommands — CLI glue over the registrar pkg
+filelock_*.go        # state-dir lock (build-tagged unix/windows)
+syslog_*.go          # syslog handler (build-tagged unix/windows)
+
 internal/
-    config/
-        config.go         # Config parsing
-    zone/
-        parse.go          # Zone file reading
-        sign.go           # DNSSEC signing operations
-    keys/
-        generate.go       # Key generation
-        storage.go        # Key file I/O
-        rollover.go       # Rollover state machine
-    state/
-        state.go          # JSON state file
-    daemon/
-        daemon.go         # Main loop, file watching
-        hooks.go          # Post-sign hooks
-    web/
-        server.go         # HTTP server
-        handlers.go       # API endpoints
-        ui/
-            index.html    # Embedded web UI
+    config/          # Config + all sub-config types, LoadConfig, zone-file edits
+    state/           # State/ZoneState/KeyState/RolloverState, JSON persistence
+    fsutil/          # ownership-aware atomic writes, CopyFile (leaf, no deps)
+    metrics/         # Prometheus + expvar collectors, Record*/UpdateZoneMetrics
+    signer/          # Signer, KeyGenerator, RolloverManager — signing/keys/rollover
+    registrar/       # Registrar interface, Dynadot adapter, rate limiter, DS diff
+    validate/        # internet DNSSEC Validator + result types
+    dnssectest/      # shared test fixtures (Config) — imported only by test files
 ```
+
+Dependency direction (leaves first): `fsutil` → `config` → `state` →
+`metrics`/`signer` → `registrar` → `validate` → root. The root package and
+`internal/signer` white-box tests share fixtures via `internal/dnssectest` to
+avoid a test import cycle. Test files live beside the code they exercise:
+white-box tests in the owning package, black-box/integration tests at root.
+
+**Naming note:** because the persistent-state package is named `state` and the
+signing package `signer`, the root package imports them aliased (`statepkg`,
+`signerpkg`) to avoid shadowing the pervasive local `state`/`signer` variables —
+the same convention the sibling `dnssec-validator` uses for its `dns` package.
 
 ### Error Handling Philosophy
 - Never delete a key file automatically
@@ -518,7 +531,7 @@ internal/
 
 ```bash
 # Build
-go build -o dnssec-tudor ./cmd/dnssec-tudor
+go build -o dnssec-tudor .   # main.go is at the repo root, not under cmd/
 
 # Run tests
 go test ./...
