@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/validate"
+
 	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
 
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
@@ -33,7 +35,7 @@ const (
 
 type validationCache struct {
 	mu       sync.Mutex
-	result   *ValidateOutput
+	result   *validate.ValidateOutput
 	computed time.Time
 	inflight chan struct{} // non-nil while a computation runs; closed on completion
 }
@@ -44,7 +46,7 @@ var dashboardValidationCache = &validationCache{}
 // immediately, runs at most one computation at a time, and never blocks the
 // caller longer than maxWait — on timeout it returns the last cached result
 // (which may be nil on a cold start) while the in-flight computation continues.
-func (c *validationCache) get(compute func() *ValidateOutput, ttl, maxWait time.Duration) *ValidateOutput {
+func (c *validationCache) get(compute func() *validate.ValidateOutput, ttl, maxWait time.Duration) *validate.ValidateOutput {
 	c.mu.Lock()
 	if c.result != nil && time.Since(c.computed) < ttl {
 		r := c.result
@@ -56,7 +58,7 @@ func (c *validationCache) get(compute func() *ValidateOutput, ttl, maxWait time.
 		done = make(chan struct{})
 		c.inflight = done
 		go func() {
-			var out *ValidateOutput
+			var out *validate.ValidateOutput
 			// The cleanup runs in a defer so it happens even if compute panics:
 			// cache the result (when there is one), clear inflight so a later
 			// get starts a fresh run, and close done so current waiters
@@ -96,7 +98,7 @@ func (c *validationCache) get(compute func() *ValidateOutput, ttl, maxWait time.
 
 // cachedValidateAll is the bounded entry point the web handlers use instead of
 // calling v.ValidateAll() directly.
-func cachedValidateAll(v *Validator) *ValidateOutput {
+func cachedValidateAll(v *validate.Validator) *validate.ValidateOutput {
 	return dashboardValidationCache.get(v.ValidateAll, validationCacheTTL, validationMaxWait)
 }
 
@@ -112,14 +114,14 @@ type zoneValidationCache struct {
 }
 
 type zoneValEntry struct {
-	result   *ValidationResult
+	result   *validate.ValidationResult
 	computed time.Time
 	inflight chan struct{}
 }
 
 var dashboardZoneValidationCache = &zoneValidationCache{byZone: map[string]*zoneValEntry{}}
 
-func (c *zoneValidationCache) get(domain string, compute func() *ValidationResult, ttl, maxWait time.Duration) *ValidationResult {
+func (c *zoneValidationCache) get(domain string, compute func() *validate.ValidationResult, ttl, maxWait time.Duration) *validate.ValidationResult {
 	c.mu.Lock()
 	e := c.byZone[domain]
 	if e == nil {
@@ -136,7 +138,7 @@ func (c *zoneValidationCache) get(domain string, compute func() *ValidationResul
 		done = make(chan struct{})
 		e.inflight = done
 		go func() {
-			var out *ValidationResult
+			var out *validate.ValidationResult
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("[WEB] Panic in per-zone dashboard validation (recovered)",
@@ -169,8 +171,8 @@ func (c *zoneValidationCache) get(domain string, compute func() *ValidationResul
 }
 
 // cachedValidateZone is the bounded entry point for per-zone validation.
-func cachedValidateZone(v *Validator, domain string) *ValidationResult {
-	return dashboardZoneValidationCache.get(domain, func() *ValidationResult {
+func cachedValidateZone(v *validate.Validator, domain string) *validate.ValidationResult {
+	return dashboardZoneValidationCache.get(domain, func() *validate.ValidationResult {
 		return v.ValidateZone(domain)
 	}, validationCacheTTL, validationMaxWait)
 }
@@ -274,9 +276,9 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config
 	}
 
 	// Run validation if requested via query parameter (bounded + cached, R-043).
-	var validation map[string]*ValidationResult
+	var validation map[string]*validate.ValidationResult
 	if r.URL.Query().Get("validate") == "true" {
-		v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+		v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 		if valOutput := cachedValidateAll(v); valOutput != nil {
 			validation = valOutput.Zones
 		}
@@ -289,7 +291,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config
 	data := struct {
 		Status     *StatusOutput
 		DSRecords  map[string]string
-		Validation map[string]*ValidationResult
+		Validation map[string]*validate.ValidationResult
 	}{
 		Status:     status,
 		DSRecords:  dsRecords,
@@ -361,7 +363,7 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 }
 
 func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *statepkg.State) {
-	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+	v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 	output := cachedValidateAll(v) // bounded + cached (R-043)
 	if output == nil {
 		// Cold start still running past the wait budget — tell the client to retry
@@ -391,7 +393,7 @@ func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.
 
 	w.Header().Set("Content-Type", "application/json")
 
-	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+	v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 	// R-018: route through the bounded per-zone single-flight cache instead of
 	// running a fresh live validation on every request.
 	result := cachedValidateZone(v, domain)

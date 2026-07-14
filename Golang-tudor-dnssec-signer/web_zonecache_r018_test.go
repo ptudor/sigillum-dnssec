@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/validate"
 )
 
 // R-018: concurrent and repeated per-zone validation requests must coalesce into a
@@ -14,10 +16,10 @@ import (
 func TestR018_PerZoneSingleFlightAndCache(t *testing.T) {
 	c := &zoneValidationCache{byZone: map[string]*zoneValEntry{}}
 	var calls int32
-	compute := func() *ValidationResult {
+	compute := func() *validate.ValidationResult {
 		atomic.AddInt32(&calls, 1)
 		time.Sleep(40 * time.Millisecond) // simulate a live validation
-		return &ValidationResult{}
+		return &validate.ValidationResult{}
 	}
 
 	var wg sync.WaitGroup

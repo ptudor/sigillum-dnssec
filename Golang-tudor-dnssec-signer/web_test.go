@@ -4,6 +4,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/validate"
 )
 
 // TestValidationCache_BoundedAndSingleFlight (R-043): the dashboard/API
@@ -12,10 +14,10 @@ import (
 func TestValidationCache_BoundedAndSingleFlight(t *testing.T) {
 	var computeCount int32
 	gate := make(chan struct{})
-	compute := func() *ValidateOutput {
+	compute := func() *validate.ValidateOutput {
 		atomic.AddInt32(&computeCount, 1)
 		<-gate // block, simulating a slow many-zone run
-		return &ValidateOutput{Zones: map[string]*ValidationResult{}}
+		return &validate.ValidateOutput{Zones: map[string]*validate.ValidationResult{}}
 	}
 	c := &validationCache{}
 
@@ -36,7 +38,7 @@ func TestValidationCache_BoundedAndSingleFlight(t *testing.T) {
 
 	close(gate) // let the single in-flight compute finish
 
-	var final *ValidateOutput
+	var final *validate.ValidateOutput
 	for i := 0; i < 200 && final == nil; i++ {
 		final = c.get(compute, time.Minute, 200*time.Millisecond)
 		if final == nil {
