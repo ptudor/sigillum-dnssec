@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ptudor/dnssec-validator/internal/metrics"
+
 	"github.com/ptudor/dnssec-validator/internal/config"
 	"github.com/ptudor/dnssec-validator/internal/dns"
 	"github.com/ptudor/dnssec-validator/internal/heartbeat"
@@ -50,7 +52,7 @@ func main() {
 
 	// Root anchor freshness/availability are computed at scrape time so the gauges
 	// never freeze between refreshes or read zero before the first load (R-055).
-	RegisterRootAnchorMetrics(
+	metrics.RegisterRootAnchorMetrics(
 		func() float64 {
 			la := anchorsStore.LoadedAt()
 			if la.IsZero() {

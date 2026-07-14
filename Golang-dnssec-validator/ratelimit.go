@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ptudor/dnssec-validator/internal/metrics"
 )
 
 // defaultMaxBuckets bounds the per-IP bucket map. Without a hard cap, an
@@ -150,7 +152,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		ip := extractClientIP(r)
 
 		if !rl.Allow(ip) {
-			RecordRateLimitHit()
+			metrics.RecordRateLimitHit()
 			w.Header().Set("Retry-After", "1")
 			writeProblemDetails(w, ErrTypeTooManyRequests, "Too Many Requests",
 				http.StatusTooManyRequests, "rate limit exceeded, please try again later", r.URL.Path)
