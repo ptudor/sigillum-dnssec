@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
-	"github.com/ptudor/dnssec-tudor/internal/fsutil"
+	"github.com/ptudor/dnssec-tudor/internal/metrics"
 )
 
 // maxHookStderr bounds how many bytes of a hook's stderr are retained. A broken
@@ -133,7 +133,7 @@ func executeHook(hooks *config.HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
 
 		if err := command.Run(); err != nil {
 			duration := time.Since(startTime).Seconds()
-			RecordHookExecution("post_sign", duration, false)
+			metrics.RecordHookExecution("post_sign", duration, false)
 			stderr := strings.TrimSpace(stderrBuf.String())
 			if ctx.Err() == context.DeadlineExceeded {
 				slog.Error("[HOOK] Hook timed out", "hook", identity, "domain", env.Domain)
@@ -146,7 +146,7 @@ func executeHook(hooks *config.HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
 		}
 
 		duration := time.Since(startTime).Seconds()
-		RecordHookExecution("post_sign", duration, true)
+		metrics.RecordHookExecution("post_sign", duration, true)
 		slog.Debug("[HOOK] Hook completed successfully", "hook", identity, "domain", env.Domain, "duration_ms", int64(duration*1000))
 	}()
 }
@@ -200,7 +200,7 @@ func executeBatchHook(hooks *config.HooksConfig, domains []string, outputDir str
 
 		if err := command.Run(); err != nil {
 			duration := time.Since(startTime).Seconds()
-			RecordHookExecution("post_sign_batch", duration, false)
+			metrics.RecordHookExecution("post_sign_batch", duration, false)
 			stderr := strings.TrimSpace(stderrBuf.String())
 			if ctx.Err() == context.DeadlineExceeded {
 				slog.Error("[HOOK] Batched hook timed out", "hook", identity, "batch_size", len(domains))
@@ -213,7 +213,7 @@ func executeBatchHook(hooks *config.HooksConfig, domains []string, outputDir str
 		}
 
 		duration := time.Since(startTime).Seconds()
-		RecordHookExecution("post_sign_batch", duration, true)
+		metrics.RecordHookExecution("post_sign_batch", duration, true)
 		slog.Debug("[HOOK] Batched hook completed", "hook", identity, "batch_size", len(domains), "duration_ms", int64(duration*1000))
 	}()
 }
@@ -250,33 +250,3 @@ func executeHookSync(hooks *config.HooksConfig, env *HookEnv) error {
 }
 
 // copyFile copies a file from src to dst, preserving permissions
-func copyFile(src, dst string) error {
-	srcInfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-
-	if err := out.Close(); err != nil {
-		return err
-	}
-	// Mirror the ownership helper so rollover backups written under a
-	// root CLI invocation stay readable by the daemon user.
-	fsutil.ChownToTarget(dst)
-	return nil
-}

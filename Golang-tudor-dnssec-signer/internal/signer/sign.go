@@ -1,4 +1,4 @@
-package main
+package signer
 
 import (
 	"bytes"
@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/metrics"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -56,7 +57,7 @@ func (s *Signer) SignAll() error {
 		// on so other zones keep signing.
 		if zoneState == nil || zoneState.KSK == nil || zoneState.ZSK == nil {
 			keyGen := NewKeyGenerator(s.cfg)
-			ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
+			ksk, zsk, err := RecoverOrGenerateKeys(keyGen, domain)
 			if err != nil {
 				slog.Error("[SIGN] Cannot initialize zone; skipping", "domain", domain, "error", err)
 				placeholder := &statepkg.ZoneState{Path: zoneCfg.Path}
@@ -227,7 +228,7 @@ func (s *Signer) SignZone(domain string) error {
 
 	// Record successful signing metrics
 	duration := time.Since(startTime).Seconds()
-	RecordSigningOperation(domain, duration, true)
+	metrics.RecordSigningOperation(domain, duration, true)
 
 	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", serial, "published_serial", published, "output", outputPath, "duration_ms", int64(duration*1000))
 	return nil
@@ -358,7 +359,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// during ds_add_wait the parent DS still references the old KSK, so publishing
 			// a DNSKEY RRset without it makes every resolver validating via the old DS go
 			// bogus. Failing keeps the previous good signed zone in place.
-			oldKSK, oldKSKPriv, err := keyGen.loadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
+			oldKSK, oldKSKPriv, err := keyGen.LoadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 			if err != nil {
 				return nil, fmt.Errorf("loading old KSK %d for rollover signing (if the rollover is complete and the old key is gone, run `dnssec-tudor rollover complete %s`): %w", zoneState.Rollover.OldKeyID, domain, err)
 			}
@@ -373,7 +374,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// ZSK pre-publish: publish BOTH old and new ZSK in the DNSKEY
 			// RRset, but continue signing every non-DNSKEY RRset with the OLD
 			// ZSK. The new ZSK is already in keys.dnskeys via the
-			// LoadKeyPair("zsk") call above (saveKeyFiles renamed the old
+			// LoadKeyPair("zsk") call above (SaveKeyFiles renamed the old
 			// key file aside when the rollover started, so the *.zsk.key
 			// path now resolves to the new key). Append the OLD ZSK so the
 			// signing key's keytag actually appears in the published RRset
@@ -385,7 +386,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// yet) and emit a structurally-different signed zone than the
 			// one operators are expecting from the rollover state. Returning
 			// an error keeps the previously-emitted signed zone in place.
-			oldZSK, oldZSKPriv, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldKeyID)
+			oldZSK, oldZSKPriv, err := keyGen.LoadKeyPairByID(domain, "zsk", zoneState.Rollover.OldKeyID)
 			if err != nil {
 				return nil, fmt.Errorf("loading old ZSK %d for pre-publish: %w", zoneState.Rollover.OldKeyID, err)
 			}
@@ -413,7 +414,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// Algorithm rollover: publish and sign with BOTH algorithms' keys. FATAL on
 			// failure (R-003): dropping an old-algorithm key mid-rollover leaves RRsets
 			// unsigned for a signaled algorithm, violating RFC 4035 §2.2 / RFC 6840 §5.11.
-			oldKSK, oldKSKPriv, err := keyGen.loadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
+			oldKSK, oldKSKPriv, err := keyGen.LoadKeyPairByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 			if err != nil {
 				return nil, fmt.Errorf("loading old-algorithm KSK %d for rollover (if the rollover is complete and the old key is gone, run `dnssec-tudor rollover complete %s`): %w", zoneState.Rollover.OldKeyID, domain, err)
 			}
@@ -422,7 +423,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			keys.signingKSKPs = append(keys.signingKSKPs, oldKSKPriv)
 
 			// Load old ZSK using stored ID
-			oldZSK, oldZSKPriv, err := keyGen.loadKeyPairByID(domain, "zsk", zoneState.Rollover.OldZSKID)
+			oldZSK, oldZSKPriv, err := keyGen.LoadKeyPairByID(domain, "zsk", zoneState.Rollover.OldZSKID)
 			if err != nil {
 				return nil, fmt.Errorf("loading old-algorithm ZSK %d for rollover (if the rollover is complete and the old key is gone, run `dnssec-tudor rollover complete %s`): %w", zoneState.Rollover.OldZSKID, domain, err)
 			}
@@ -1383,7 +1384,7 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL u
 
 func (s *Signer) writeSignedZone(domain, path string, records []dns.RR) error {
 	// Ensure output directory exists
-	if err := ensureDir(filepath.Dir(path)); err != nil {
+	if err := EnsureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 

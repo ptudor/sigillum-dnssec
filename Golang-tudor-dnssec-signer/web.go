@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
@@ -261,12 +263,12 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config
 	// Compute DS records for each zone to display inline. Only the public
 	// key halves are read — the dashboard must never touch .private files.
 	dsRecords := make(map[string]string)
-	keyGen := NewKeyGenerator(cfg)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	for domain, zone := range status.Zones {
 		if zone.KSK != nil {
 			ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 			if err == nil {
-				dsRecords[domain] = FormatDSRecordsFromKey(domain, ksk)
+				dsRecords[domain] = signerpkg.FormatDSRecordsFromKey(domain, ksk)
 			}
 		}
 	}
@@ -346,10 +348,10 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 
 	// Try to get DS records if KSK exists
 	if zoneState.KSK != nil {
-		keyGen := NewKeyGenerator(cfg)
+		keyGen := signerpkg.NewKeyGenerator(cfg)
 		ksk, err := keyGen.LoadPublicKey(domain, "ksk")
 		if err == nil {
-			response.DSRecords = FormatDSRecordsFromKey(domain, ksk)
+			response.DSRecords = signerpkg.FormatDSRecordsFromKey(domain, ksk)
 		}
 	}
 

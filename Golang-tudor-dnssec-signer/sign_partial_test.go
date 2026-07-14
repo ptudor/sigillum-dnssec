@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
@@ -17,8 +20,8 @@ import (
 // LastSigned comparison would miss it).
 func TestNeedsSign_UsesSourceModTimeNotLastSigned(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := signerpkg.EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
 	domain := "fidelity.example"
@@ -41,7 +44,7 @@ func TestNeedsSign_UsesSourceModTimeNotLastSigned(t *testing.T) {
 	}
 
 	state := statepkg.NewState(cfg.StatePath())
-	keyGen := NewKeyGenerator(cfg)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK(domain)
 	zsk, _ := keyGen.GenerateZSK(domain)
 	zs := &statepkg.ZoneState{
@@ -55,7 +58,7 @@ func TestNeedsSign_UsesSourceModTimeNotLastSigned(t *testing.T) {
 	}
 	state.SetZone(domain, zs)
 
-	need, reason := NewSigner(cfg, state).NeedsSign(domain, zonePath, zs)
+	need, reason := signerpkg.NewSigner(cfg, state).NeedsSign(domain, zonePath, zs)
 	if !need {
 		t.Errorf("NeedsSign must detect an edit whose mtime > SourceModTime even when < LastSigned; got need=%v reason=%q", need, reason)
 	}
@@ -66,8 +69,8 @@ func TestNeedsSign_UsesSourceModTimeNotLastSigned(t *testing.T) {
 // signed truncated.
 func TestNeedsSign_DefersStillSettlingFile(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := signerpkg.EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
 	domain := "settling.example"
@@ -96,7 +99,7 @@ func TestNeedsSign_DefersStillSettlingFile(t *testing.T) {
 	defer close(stop)
 
 	state := statepkg.NewState(cfg.StatePath())
-	keyGen := NewKeyGenerator(cfg)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK(domain)
 	zsk, _ := keyGen.GenerateZSK(domain)
 	zs := &statepkg.ZoneState{
@@ -108,7 +111,7 @@ func TestNeedsSign_DefersStillSettlingFile(t *testing.T) {
 	}
 	state.SetZone(domain, zs)
 
-	need, _ := NewSigner(cfg, state).NeedsSign(domain, zonePath, zs)
+	need, _ := signerpkg.NewSigner(cfg, state).NeedsSign(domain, zonePath, zs)
 	if need {
 		t.Error("a still-being-written file should be deferred (need=false), not signed mid-write")
 	}
@@ -128,11 +131,11 @@ func validZoneContent(domain string) string {
 // healthy zones are still signed and state is still saved.
 func TestSignAll_ReturnsErrorOnPartialFailure(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := signerpkg.EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := signerpkg.EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -148,7 +151,7 @@ func TestSignAll_ReturnsErrorOnPartialFailure(t *testing.T) {
 	cfg.Zones[bad] = config.ZoneConfig{Path: filepath.Join(dataDir, "missing.zone")}
 
 	state := statepkg.NewState(cfg.StatePath())
-	signer := NewSigner(cfg, state)
+	signer := signerpkg.NewSigner(cfg, state)
 
 	err := signer.SignAll()
 	if err == nil {
@@ -169,11 +172,11 @@ func TestSignAll_ReturnsErrorOnPartialFailure(t *testing.T) {
 // returns nil.
 func TestSignAll_AllHealthyExitsClean(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := signerpkg.EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := signerpkg.EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatal(err)
 	}
 	domain := "ok.example"
@@ -184,21 +187,21 @@ func TestSignAll_AllHealthyExitsClean(t *testing.T) {
 	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
 	state := statepkg.NewState(cfg.StatePath())
-	if err := NewSigner(cfg, state).SignAll(); err != nil {
+	if err := signerpkg.NewSigner(cfg, state).SignAll(); err != nil {
 		t.Fatalf("all-healthy SignAll must return nil, got: %v", err)
 	}
 }
 
 // TestSignAll_RetriesKeylessPlaceholder (R-033): a keyless placeholder left by a
 // prior failed init must not permanently disable key generation — the next
-// SignAll re-runs recoverOrGenerateKeys and the zone gets keys and signs.
+// SignAll re-runs RecoverOrGenerateKeys and the zone gets keys and signs.
 func TestSignAll_RetriesKeylessPlaceholder(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := signerpkg.EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := signerpkg.EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatal(err)
 	}
 	domain := "retry.example"
@@ -214,7 +217,7 @@ func TestSignAll_RetriesKeylessPlaceholder(t *testing.T) {
 	placeholder.AddError("keys dir was briefly unwritable")
 	state.SetZone(domain, placeholder)
 
-	if err := NewSigner(cfg, state).SignAll(); err != nil {
+	if err := signerpkg.NewSigner(cfg, state).SignAll(); err != nil {
 		t.Fatalf("SignAll: %v", err)
 	}
 
@@ -232,13 +235,13 @@ func TestSignAll_RetriesKeylessPlaceholder(t *testing.T) {
 // descriptive error, not panic on a nil KSK deref.
 func TestStartAlgorithmRollover_NilKeysNoPanic(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 	domain := "nokeys.example"
 
 	state := statepkg.NewState(cfg.StatePath())
 	state.SetZone(domain, &statepkg.ZoneState{Path: filepath.Join(dataDir, domain+".zone")}) // nil KSK/ZSK
 
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 	err := rm.StartAlgorithmRollover(domain, "ECDSAP256SHA256")
 	if err == nil {
 		t.Fatal("StartAlgorithmRollover must error on a keyless zone, not panic (R-025)")

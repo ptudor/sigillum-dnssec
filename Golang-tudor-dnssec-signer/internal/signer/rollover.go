@@ -1,4 +1,4 @@
-package main
+package signer
 
 import (
 	"bytes"
@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
+	"github.com/ptudor/dnssec-tudor/internal/metrics"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
@@ -51,7 +53,7 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 	// Save old KSK to backup file. A backup failure is FATAL (R-027): the rollover-signing
 	// path and DS recovery both depend on the old KSK's backup, so proceeding without it
 	// risks an unrecoverable SERVFAIL. Abort before generating the new key.
-	if err := rm.backupKey(domain, "ksk", oldKSK.ID); err != nil {
+	if err := rm.BackupKey(domain, "ksk", oldKSK.ID); err != nil {
 		return fmt.Errorf("backing up old KSK before rollover: %w", err)
 	}
 
@@ -77,7 +79,7 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 		zoneState.ForceResign = true
 	})
 
-	RecordRolloverOperation(domain, "ksk", "start")
+	metrics.RecordRolloverOperation(domain, "ksk", "start")
 	if err := rm.state.Save(); err != nil {
 		// R-038: the key files are already rotated (live = new KSK) but the state
 		// did not persist. Revert the in-memory rollover and restore the old KSK
@@ -133,7 +135,7 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string) error {
 		"domain", domain,
 		"note", "Old key files remain on disk for safety. You may delete them after removing the old DS from your registrar.")
 
-	RecordRolloverOperation(domain, "ksk", "complete")
+	metrics.RecordRolloverOperation(domain, "ksk", "complete")
 	return rm.state.Save()
 }
 
@@ -203,7 +205,7 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *statepkg.Z
 	// Backup old key. Fatal on failure (R-027): the pre-publish/signing phases load the
 	// old ZSK from this backup, and a missing backup would drop it from the published
 	// DNSKEY RRset while resolvers still hold its cached RRSIGs.
-	if err := rm.backupKey(domain, "zsk", oldZSK.ID); err != nil {
+	if err := rm.BackupKey(domain, "zsk", oldZSK.ID); err != nil {
 		return fmt.Errorf("backing up old ZSK before rollover: %w", err)
 	}
 
@@ -233,7 +235,7 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *statepkg.Z
 		// Don't update zoneState.ZSK yet - we keep signing with old key during pre-publish
 	})
 
-	RecordRolloverOperation(domain, "zsk", "start")
+	metrics.RecordRolloverOperation(domain, "zsk", "start")
 	return rm.state.Save()
 }
 
@@ -403,7 +405,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *stat
 			zoneState.ForceResign = true
 			zoneState.ClearTransientWarnings()
 		})
-		RecordRolloverOperation(domain, "zsk", "complete")
+		metrics.RecordRolloverOperation(domain, "zsk", "complete")
 		slog.Info("[ROLLOVER] ZSK rollover completed automatically", "domain", domain)
 		return rm.state.Save()
 	}
@@ -411,7 +413,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *stat
 	return nil
 }
 
-func (rm *RolloverManager) backupKey(domain, keyType string, keyID uint16) error {
+func (rm *RolloverManager) BackupKey(domain, keyType string, keyID uint16) error {
 	// Create backup by renaming with key ID suffix
 	keysDir := rm.cfg.KeysDir()
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
@@ -434,8 +436,8 @@ func (rm *RolloverManager) backupKey(domain, keyType string, keyID uint16) error
 		// "already backed up" would let the caller proceed to overwrite the live
 		// .private, destroying its only copy. Complete the pair from the live
 		// .private before declaring success.
-		if !fileExists(backupName + ".private") {
-			if err := copyFile(baseName+".private", backupName+".private"); err != nil {
+		if !FileExists(backupName + ".private") {
+			if err := fsutil.CopyFile(baseName+".private", backupName+".private"); err != nil {
 				return fmt.Errorf("completing half-written %s backup (.key present, .private missing): %w", keyType, err)
 			}
 			slog.Warn("[ROLLOVER] Completed a half-written key backup with the live private key",
@@ -445,10 +447,10 @@ func (rm *RolloverManager) backupKey(domain, keyType string, keyID uint16) error
 	}
 
 	// Copy key file to backup (don't move, in case rollover fails)
-	if err := copyFile(baseName+".key", backupName+".key"); err != nil {
+	if err := fsutil.CopyFile(baseName+".key", backupName+".key"); err != nil {
 		return err
 	}
-	if err := copyFile(baseName+".private", backupName+".private"); err != nil {
+	if err := fsutil.CopyFile(baseName+".private", backupName+".private"); err != nil {
 		return err
 	}
 
@@ -463,10 +465,10 @@ func (rm *RolloverManager) restoreKeyFromBackup(domain, keyType string, keyID ui
 	keysDir := rm.cfg.KeysDir()
 	base := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
 	backup := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
-	if err := copyFile(backup+".private", base+".private"); err != nil {
+	if err := fsutil.CopyFile(backup+".private", base+".private"); err != nil {
 		return err
 	}
-	if err := copyFile(backup+".key", base+".key"); err != nil {
+	if err := fsutil.CopyFile(backup+".key", base+".key"); err != nil {
 		return err
 	}
 	return nil
@@ -517,10 +519,10 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 	// Backup old keys. Fatal on failure (R-027): an algorithm rollover must sign with both
 	// old and new algorithm keys (RFC 6840 §5.11), so losing the old keys' backup would
 	// emit a zone missing signatures for a signaled algorithm.
-	if err := rm.backupKey(domain, "ksk", zoneState.KSK.ID); err != nil {
+	if err := rm.BackupKey(domain, "ksk", zoneState.KSK.ID); err != nil {
 		return fmt.Errorf("backing up old KSK before algorithm rollover: %w", err)
 	}
-	if err := rm.backupKey(domain, "zsk", zoneState.ZSK.ID); err != nil {
+	if err := rm.BackupKey(domain, "zsk", zoneState.ZSK.ID); err != nil {
 		return fmt.Errorf("backing up old ZSK before algorithm rollover: %w", err)
 	}
 
@@ -556,7 +558,7 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 		zoneState.ForceResign = true
 	})
 
-	RecordRolloverOperation(domain, "algorithm", "start")
+	metrics.RecordRolloverOperation(domain, "algorithm", "start")
 	if err := rm.state.Save(); err != nil {
 		// R-038: both key pairs are already rotated on disk but the state did not
 		// persist. Revert in-memory and restore the old KSK+ZSK files so the next
@@ -615,6 +617,6 @@ func (rm *RolloverManager) CompleteAlgorithmRollover(domain string) error {
 		"domain", domain,
 		"note", "Old key files remain on disk for safety. You may delete them after removing the old DS from your registrar.")
 
-	RecordRolloverOperation(domain, "algorithm", "complete")
+	metrics.RecordRolloverOperation(domain, "algorithm", "complete")
 	return rm.state.Save()
 }

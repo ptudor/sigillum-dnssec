@@ -1,4 +1,4 @@
-package main
+package signer
 
 import (
 	"fmt"
@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -15,37 +16,6 @@ import (
 )
 
 // Test configuration for fast rollover testing (1 second instead of days)
-func testConfig(t *testing.T, dataDir string) *config.Config {
-	t.Helper()
-	return &config.Config{
-		OutputDir:    filepath.Join(dataDir, "signed"),
-		DataDir:      dataDir,
-		PollInterval: config.Duration{Duration: 1 * time.Second},
-		DNSSEC: config.DNSSECConfig{
-			Algorithm:          "ED25519",
-			KSKLifetime:        config.Duration{Duration: 10 * time.Second},
-			ZSKLifetime:        config.Duration{Duration: 5 * time.Second},
-			SignatureValidity:  config.Duration{Duration: 3 * time.Second},
-			SignatureRefresh:   config.Duration{Duration: 1 * time.Second},
-			NSECVersion:        "nsec3",
-			NSEC3Iterations:    0,
-			NSEC3Salt:          "",
-			DNSKEYTtl:          3600,
-			RolloverPrepublish: config.Duration{Duration: 2 * time.Second},
-			RolloverSwitch:     config.Duration{Duration: 1 * time.Second},
-		},
-		Web: config.WebConfig{
-			Enabled: false,
-			Listen:  "127.0.0.1:8053",
-		},
-		Health: config.HealthConfig{
-			Listen: "127.0.0.1:8054",
-		},
-		Zones: make(map[string]config.ZoneConfig),
-		Hooks: config.HooksConfig{},
-	}
-}
-
 // TestKeyGeneration tests key generation for all supported algorithms
 func TestKeyGeneration(t *testing.T) {
 	algorithms := []string{"ED25519", "ECDSAP256SHA256", "ECDSAP384SHA384"}
@@ -53,7 +23,7 @@ func TestKeyGeneration(t *testing.T) {
 	for _, alg := range algorithms {
 		t.Run(alg, func(t *testing.T) {
 			dataDir := t.TempDir()
-			cfg := testConfig(t, dataDir)
+			cfg := dnssectest.Config(t, dataDir)
 			cfg.DNSSEC.Algorithm = alg
 
 			keyGen := NewKeyGenerator(cfg)
@@ -111,7 +81,7 @@ func TestKeyGeneration(t *testing.T) {
 // TestDSComputation tests DS record computation
 func TestDSComputation(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 	keyGen := NewKeyGenerator(cfg)
 
 	ksk, err := keyGen.GenerateKSK("example.com")
@@ -250,7 +220,7 @@ $TTL 3600
 // TestSigningRoundTrip tests complete zone signing and verification
 func TestSigningRoundTrip(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	// Create zone file
 	zoneContent := `$ORIGIN example.com.
@@ -279,10 +249,10 @@ mail	IN	A	192.0.2.30
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 
 	// Ensure directories
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -388,7 +358,7 @@ mail	IN	A	192.0.2.30
 // TestNSECChainGeneration tests NSEC chain generation
 func TestNSECChainGeneration(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 	cfg.DNSSEC.NSECVersion = "nsec" // Test NSEC instead of NSEC3
 
 	zoneContent := `$ORIGIN example.com.
@@ -404,10 +374,10 @@ www	IN	A	192.0.2.10
 	}
 
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -636,7 +606,7 @@ func TestConfigValidation(t *testing.T) {
 // TestRolloverStateTransitions tests the rollover state machine
 func TestRolloverStateTransitions(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	zoneContent := `$ORIGIN example.com.
 $TTL 3600
@@ -650,10 +620,10 @@ ns1	IN	A	192.0.2.1
 	}
 
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -712,7 +682,7 @@ ns1	IN	A	192.0.2.1
 // ZSK (which must, by transitive consequence, be in the published RRset).
 func TestSignZone_ZSKPrePublish_PublishesBothKeys(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	zoneContent := `$ORIGIN example.com.
 $TTL 3600
@@ -727,11 +697,11 @@ www	IN	A	192.0.2.20
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
-		t.Fatalf("ensureDir keys: %v", err)
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("EnsureDir keys: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
-		t.Fatalf("ensureDir output: %v", err)
+	if err := EnsureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("EnsureDir output: %v", err)
 	}
 
 	state := statepkg.NewState(cfg.StatePath())
@@ -754,7 +724,7 @@ www	IN	A	192.0.2.20
 
 	// Drive the rollover through the production code path: the rollover
 	// manager generates the new ZSK, renames the old key file to the
-	// keytagged backup name (via saveKeyFiles → backupExistingKeyFiles),
+	// keytagged backup name (via SaveKeyFiles → backupExistingKeyFiles),
 	// and records the rollover state with the old key id retained.
 	rolloverMgr := NewRolloverManager(cfg, state)
 	zoneState := state.GetZone("example.com")
@@ -983,7 +953,7 @@ func TestStateFilePersistence(t *testing.T) {
 // TestSignatureVerification tests that generated signatures can be verified
 func TestSignatureVerification(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	zoneContent := `$ORIGIN example.com.
 $TTL 3600
@@ -998,10 +968,10 @@ www	IN	A	192.0.2.10
 	}
 
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -1083,7 +1053,7 @@ www	IN	A	192.0.2.10
 // are NOT signed, and glue records are NOT signed, per RFC 4035 §2.2.
 func TestDelegationPointSigning(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	zoneContent := `$ORIGIN example.com.
 $TTL 3600
@@ -1106,10 +1076,10 @@ www	IN	A	192.0.2.20
 
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	cfg.DNSSEC.NSECVersion = "nsec" // Use NSEC for simpler verification
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -1172,7 +1142,7 @@ www	IN	A	192.0.2.20
 // per RFC 4035 §5.3.1 (Labels excludes the wildcard label).
 func TestWildcardSigning(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	zoneContent := `$ORIGIN example.com.
 $TTL 3600
@@ -1187,10 +1157,10 @@ ns1	IN	A	192.0.2.1
 	}
 
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -1226,7 +1196,7 @@ ns1	IN	A	192.0.2.1
 // TestNeedsSign tests the change detection logic
 func TestNeedsSign(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	zoneContent := `$ORIGIN example.com.
 $TTL 3600
@@ -1350,7 +1320,7 @@ func TestMultipleAlgorithms(t *testing.T) {
 	for _, alg := range algorithms {
 		t.Run(alg, func(t *testing.T) {
 			dataDir := t.TempDir()
-			cfg := testConfig(t, dataDir)
+			cfg := dnssectest.Config(t, dataDir)
 			cfg.DNSSEC.Algorithm = alg
 
 			zoneContent := `$ORIGIN example.com.
@@ -1365,10 +1335,10 @@ ns1	IN	A	192.0.2.1
 			}
 
 			cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-			if err := ensureDir(cfg.KeysDir()); err != nil {
+			if err := EnsureDir(cfg.KeysDir()); err != nil {
 				t.Fatalf("Failed to create keys dir: %v", err)
 			}
-			if err := ensureDir(cfg.OutputDir); err != nil {
+			if err := EnsureDir(cfg.OutputDir); err != nil {
 				t.Fatalf("Failed to create output dir: %v", err)
 			}
 
@@ -1418,9 +1388,9 @@ ns1	IN	A	192.0.2.1
 // regenerated when zone state is missing.
 func TestRecoverKeyState(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
 
@@ -1467,9 +1437,9 @@ func TestRecoverKeyState(t *testing.T) {
 // key files exist, allowing the caller to generate new keys.
 func TestRecoverKeyStateNoFiles(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
 
@@ -1489,9 +1459,9 @@ func TestRecoverKeyStateNoFiles(t *testing.T) {
 // when key files exist but are corrupt.
 func TestRecoverKeyStateCorruptFiles(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
 
@@ -1507,16 +1477,16 @@ func TestRecoverKeyStateCorruptFiles(t *testing.T) {
 	}
 }
 
-// TestRecoverOrGenerateKeysPreservesExisting tests the full recoverOrGenerateKeys
+// TestRecoverOrGenerateKeysPreservesExisting tests the full RecoverOrGenerateKeys
 // flow: when key files exist on disk, they are reused and NOT overwritten.
 func TestRecoverOrGenerateKeysPreservesExisting(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -1532,42 +1502,42 @@ func TestRecoverOrGenerateKeysPreservesExisting(t *testing.T) {
 		t.Fatalf("GenerateZSK failed: %v", err)
 	}
 
-	// Now call recoverOrGenerateKeys (simulates daemon finding zone with no state)
-	ksk, zsk, err := recoverOrGenerateKeys(keyGen, "example.com")
+	// Now call RecoverOrGenerateKeys (simulates daemon finding zone with no state)
+	ksk, zsk, err := RecoverOrGenerateKeys(keyGen, "example.com")
 	if err != nil {
-		t.Fatalf("recoverOrGenerateKeys failed: %v", err)
+		t.Fatalf("RecoverOrGenerateKeys failed: %v", err)
 	}
 
 	// Key tags must match originals — NOT be new keys
 	if ksk.ID != origKSK.ID {
-		t.Errorf("recoverOrGenerateKeys generated new KSK (tag %d) instead of recovering existing (tag %d)",
+		t.Errorf("RecoverOrGenerateKeys generated new KSK (tag %d) instead of recovering existing (tag %d)",
 			ksk.ID, origKSK.ID)
 	}
 	if zsk.ID != origZSK.ID {
-		t.Errorf("recoverOrGenerateKeys generated new ZSK (tag %d) instead of recovering existing (tag %d)",
+		t.Errorf("RecoverOrGenerateKeys generated new ZSK (tag %d) instead of recovering existing (tag %d)",
 			zsk.ID, origZSK.ID)
 	}
 }
 
-// TestRecoverOrGenerateKeysNewDomain tests that recoverOrGenerateKeys generates
+// TestRecoverOrGenerateKeysNewDomain tests that RecoverOrGenerateKeys generates
 // new keys when no key files exist (truly new domain).
 func TestRecoverOrGenerateKeysNewDomain(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
 
 	keyGen := NewKeyGenerator(cfg)
 
 	// No pre-existing keys — should generate fresh ones
-	ksk, zsk, err := recoverOrGenerateKeys(keyGen, "brand-new.com")
+	ksk, zsk, err := RecoverOrGenerateKeys(keyGen, "brand-new.com")
 	if err != nil {
-		t.Fatalf("recoverOrGenerateKeys failed: %v", err)
+		t.Fatalf("RecoverOrGenerateKeys failed: %v", err)
 	}
 	if ksk == nil || zsk == nil {
-		t.Fatal("recoverOrGenerateKeys should return non-nil keys for new domain")
+		t.Fatal("RecoverOrGenerateKeys should return non-nil keys for new domain")
 	}
 	if ksk.ID == 0 {
 		t.Error("Generated KSK should have non-zero key tag")
@@ -1588,8 +1558,8 @@ func TestRecoverOrGenerateKeys_UnreadablePrivateKey(t *testing.T) {
 		t.Skip("test requires non-root euid to exercise permission denial")
 	}
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("create keys dir: %v", err)
 	}
 	keyGen := NewKeyGenerator(cfg)
@@ -1615,16 +1585,16 @@ func TestRecoverOrGenerateKeys_UnreadablePrivateKey(t *testing.T) {
 	beforeKey, _, err := keyGen.LoadKeyPair("locked.example.", "ksk")
 	// We can't load private (chmod 0), but public should still be readable
 	// because it's mode 0644. If that errors too we still have a valid test —
-	// the critical invariant is that recoverOrGenerateKeys fails.
+	// the critical invariant is that RecoverOrGenerateKeys fails.
 	_ = beforeKey
 	_ = err
 
-	ksk, zsk, err := recoverOrGenerateKeys(keyGen, "locked.example.")
+	ksk, zsk, err := RecoverOrGenerateKeys(keyGen, "locked.example.")
 	if err == nil {
 		t.Fatalf("expected error on unreadable key, got ksk=%v zsk=%v", ksk, zsk)
 	}
 	if ksk != nil || zsk != nil {
-		t.Errorf("recoverOrGenerateKeys returned non-nil keys on error: ksk=%v zsk=%v", ksk, zsk)
+		t.Errorf("RecoverOrGenerateKeys returned non-nil keys on error: ksk=%v zsk=%v", ksk, zsk)
 	}
 }
 
@@ -1632,9 +1602,9 @@ func TestRecoverOrGenerateKeys_UnreadablePrivateKey(t *testing.T) {
 // the key tag in the filename before being overwritten by new key generation.
 func TestBackupExistingKeyFiles(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
 
@@ -1669,7 +1639,7 @@ func TestBackupExistingKeyFiles(t *testing.T) {
 	}
 
 	// Verify the backup contains the original key (load it and check tag)
-	backupKey, _, err := keyGen.loadKeyPairByID("example.com", "ksk", origTag)
+	backupKey, _, err := keyGen.LoadKeyPairByID("example.com", "ksk", origTag)
 	if err != nil {
 		t.Fatalf("Failed to load backup key: %v", err)
 	}
@@ -1682,9 +1652,9 @@ func TestBackupExistingKeyFiles(t *testing.T) {
 // parsed from the key file comment header.
 func TestRecoverKeyStateCreatedDate(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
-	if err := ensureDirSecure(cfg.KeysDir()); err != nil {
+	if err := EnsureDirSecure(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
 
@@ -1719,10 +1689,10 @@ func signAndParseZone(t *testing.T, cfg *config.Config, domain, zoneContent stri
 	}
 
 	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
@@ -1791,7 +1761,7 @@ func bitmapContains(types []uint16, t uint16) bool {
 // rules: no NSEC at occluded names or empty non-terminals, and delegation
 // point bitmaps limited to NS, DS (if present), NSEC, RRSIG.
 func TestNSECChain_DelegationsOccludedAndENTs(t *testing.T) {
-	cfg := testConfig(t, t.TempDir())
+	cfg := dnssectest.Config(t, t.TempDir())
 	cfg.DNSSEC.NSECVersion = "nsec"
 
 	records := signAndParseZone(t, cfg, "example.com", delegationTestZone)
@@ -1882,7 +1852,7 @@ func TestNSECChain_DelegationsOccludedAndENTs(t *testing.T) {
 // delegation bitmaps limited to NS (+DS/RRSIG when secure), and NSEC3PARAM
 // listed in the apex bitmap.
 func TestNSEC3Chain_DelegationsOccludedAndApexBitmap(t *testing.T) {
-	cfg := testConfig(t, t.TempDir())
+	cfg := dnssectest.Config(t, t.TempDir())
 	cfg.DNSSEC.NSECVersion = "nsec3"
 
 	records := signAndParseZone(t, cfg, "example.com", delegationTestZone)
@@ -1949,9 +1919,9 @@ func TestNSEC3Chain_DelegationsOccludedAndApexBitmap(t *testing.T) {
 // where a ZSK that had sailed past its expiry (daemon down across the
 // window) never rolled because of a `daysUntilExpiry > 0` guard.
 func TestCheckZSKRollover_StartsWhenAlreadyExpired(t *testing.T) {
-	cfg := testConfig(t, t.TempDir())
-	if err := ensureDir(cfg.KeysDir()); err != nil {
-		t.Fatalf("ensureDir: %v", err)
+	cfg := dnssectest.Config(t, t.TempDir())
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
 	}
 
 	keyGen := NewKeyGenerator(cfg)
@@ -1991,7 +1961,7 @@ func TestCheckZSKRollover_StartsWhenAlreadyExpired(t *testing.T) {
 // and a successful sign clears it — the mechanism that replaced "re-sign
 // every poll cycle while a rollover is in progress".
 func TestForceResignLifecycle(t *testing.T) {
-	cfg := testConfig(t, t.TempDir())
+	cfg := dnssectest.Config(t, t.TempDir())
 
 	zoneContent := `$ORIGIN example.com.
 $TTL 3600
@@ -2004,11 +1974,11 @@ ns1	IN	A	192.0.2.1
 		t.Fatalf("write zone: %v", err)
 	}
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
-		t.Fatalf("ensureDir: %v", err)
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
-		t.Fatalf("ensureDir: %v", err)
+	if err := EnsureDir(cfg.OutputDir); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
 	}
 
 	keyGen := NewKeyGenerator(cfg)
@@ -2092,32 +2062,6 @@ func TestZoneStateClone(t *testing.T) {
 	}
 }
 
-// TestExecuteHookSync_Env verifies the CLI hook path exports the same
-// DNSSEC_* environment the daemon's async hook provides.
-func TestExecuteHookSync_Env(t *testing.T) {
-	outFile := filepath.Join(t.TempDir(), "hook.out")
-	hooks := &config.HooksConfig{
-		PostSignCmd: []string{"/bin/sh", "-c", "echo \"$DNSSEC_DOMAIN $DNSSEC_SIGNED_PATH\" > " + outFile},
-	}
-	env := &HookEnv{
-		Domain:     "example.com",
-		ZonePath:   "/tmp/zone",
-		SignedPath: "/tmp/signed",
-		OutputDir:  "/tmp",
-	}
-	if err := executeHookSync(hooks, env); err != nil {
-		t.Fatalf("executeHookSync: %v", err)
-	}
-	data, err := os.ReadFile(outFile)
-	if err != nil {
-		t.Fatalf("hook output not written: %v", err)
-	}
-	got := strings.TrimSpace(string(data))
-	if got != "example.com /tmp/signed" {
-		t.Errorf("hook env = %q, want %q", got, "example.com /tmp/signed")
-	}
-}
-
 // TestSerialGt exercises RFC 1982 serial number comparison, including
 // wraparound.
 func TestSerialGt(t *testing.T) {
@@ -2172,7 +2116,7 @@ func signedSOASerial(t *testing.T, cfg *config.Config, domain string) uint32 {
 // at least the current time, strictly increases on every signing event, and
 // leaves the unsigned file's serial tracked separately for change detection.
 func TestSerialPolicy_Epoch(t *testing.T) {
-	cfg := testConfig(t, t.TempDir())
+	cfg := dnssectest.Config(t, t.TempDir())
 	cfg.DNSSEC.SerialPolicy = "epoch"
 
 	unsigned := uint32(time.Now().Unix() - 3600) // epoch serial set an hour ago
@@ -2232,7 +2176,7 @@ func TestSerialPolicy_EpochRejectsNonEpochSerials(t *testing.T) {
 		{"sequential", 7},           // < 2000-01-01 epoch floor
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := testConfig(t, t.TempDir())
+			cfg := dnssectest.Config(t, t.TempDir())
 			cfg.DNSSEC.SerialPolicy = "epoch"
 
 			zonePath := filepath.Join(cfg.DataDir, "example.com.zone")
@@ -2240,10 +2184,10 @@ func TestSerialPolicy_EpochRejectsNonEpochSerials(t *testing.T) {
 				t.Fatalf("write zone: %v", err)
 			}
 			cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-			if err := ensureDir(cfg.KeysDir()); err != nil {
+			if err := EnsureDir(cfg.KeysDir()); err != nil {
 				t.Fatal(err)
 			}
-			if err := ensureDir(cfg.OutputDir); err != nil {
+			if err := EnsureDir(cfg.OutputDir); err != nil {
 				t.Fatal(err)
 			}
 
@@ -2271,8 +2215,8 @@ func TestSerialPolicy_EpochRejectsNonEpochSerials(t *testing.T) {
 // TestSerialPolicy_KeepPassesThrough verifies the default policy leaves the
 // serial untouched in the signed output.
 func TestSerialPolicy_KeepPassesThrough(t *testing.T) {
-	cfg := testConfig(t, t.TempDir())
-	// testConfig leaves SerialPolicy empty — defaults to "keep"
+	cfg := dnssectest.Config(t, t.TempDir())
+	// dnssectest.Config leaves SerialPolicy empty — defaults to "keep"
 
 	signAndParseZone(t, cfg, "example.com", epochSerialZone(1700000000))
 	if got := signedSOASerial(t, cfg, "example.com"); got != 1700000000 {
@@ -2283,7 +2227,7 @@ func TestSerialPolicy_KeepPassesThrough(t *testing.T) {
 // TestSerialPolicy_PerZoneOverride verifies a per-zone serial_policy wins
 // over the global default.
 func TestSerialPolicy_PerZoneOverride(t *testing.T) {
-	cfg := testConfig(t, t.TempDir())
+	cfg := dnssectest.Config(t, t.TempDir())
 	cfg.DNSSEC.SerialPolicy = "keep"
 	cfg.Zones["example.com"] = config.ZoneConfig{SerialPolicy: "epoch"}
 	if got := cfg.GetZoneSerialPolicy("example.com"); got != "epoch" {

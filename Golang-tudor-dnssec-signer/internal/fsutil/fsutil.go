@@ -2,6 +2,7 @@ package fsutil
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -227,4 +228,36 @@ func SyncDir(dir string) {
 	if err := d.Sync(); err != nil {
 		slog.Debug("[FS] Directory fsync failed", "dir", dir, "error", err)
 	}
+}
+
+// CopyFile copies src to dst, preserving src's mode and applying daemon
+// ownership to the destination so files written under a root CLI invocation
+// (e.g. rollover key backups) stay readable by the daemon user.
+func CopyFile(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+
+	if err := out.Close(); err != nil {
+		return err
+	}
+	ChownToTarget(dst)
+	return nil
 }
