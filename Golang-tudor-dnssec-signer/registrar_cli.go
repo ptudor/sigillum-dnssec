@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/registrar"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -43,7 +44,7 @@ func registrarContext() (context.Context, context.CancelFunc) {
 // returns the adapter. A missing adapter (no registrar configured for the
 // zone) is an error in this context — the user explicitly asked for a
 // registrar op.
-func resolveRegistrar(domain string) (*config.Config, *statepkg.State, Registrar, error) {
+func resolveRegistrar(domain string) (*config.Config, *statepkg.State, registrar.Registrar, error) {
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
 		return nil, nil, nil, err
@@ -64,9 +65,9 @@ func resolveRegistrar(domain string) (*config.Config, *statepkg.State, Registrar
 // URGENT zero-DS warning (R-032); clear's destructive DS wipe must likewise
 // not interleave with a concurrent locked auto-publish. The lock is
 // deliberately held across the registrar network calls — the same accepted
-// pattern as maybeAutoPublishDS running under its caller's lock — with the
+// pattern as MaybeAutoPublishDS running under its caller's lock — with the
 // usual 30s acquisition timeout.
-func resolveRegistrarLocked(domain string) (*config.Config, *statepkg.State, Registrar, func(), error) {
+func resolveRegistrarLocked(domain string) (*config.Config, *statepkg.State, registrar.Registrar, func(), error) {
 	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -82,11 +83,11 @@ func resolveRegistrarLocked(domain string) (*config.Config, *statepkg.State, Reg
 // registrarForManagedZone is the shared back half of resolveRegistrar and
 // resolveRegistrarLocked: it ensures the zone is managed and resolves its
 // configured registrar adapter.
-func registrarForManagedZone(cfg *config.Config, state *statepkg.State, domain string) (Registrar, error) {
+func registrarForManagedZone(cfg *config.Config, state *statepkg.State, domain string) (registrar.Registrar, error) {
 	if state.GetZone(domain) == nil {
 		return nil, fmt.Errorf("domain %q is not managed", domain)
 	}
-	reg, err := RegistrarFor(cfg, domain)
+	reg, err := registrar.RegistrarFor(cfg, domain)
 	if err != nil {
 		return nil, err
 	}
@@ -125,8 +126,8 @@ func summarizeDSList(list []*dns.DS) []dsSummary {
 	return out
 }
 
-// runRegistrarGet prints the DS records currently at the registrar.
-func runRegistrarGet(cmd *cobra.Command, args []string) error {
+// RunRegistrarGet prints the DS records currently at the registrar.
+func RunRegistrarGet(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 	_, _, reg, err := resolveRegistrar(domain)
 	if err != nil {
@@ -149,11 +150,11 @@ func runRegistrarGet(cmd *cobra.Command, args []string) error {
 	return printJSON(out)
 }
 
-// runRegistrarPush ensures the registrar holds exactly the DS set that the
+// RunRegistrarPush ensures the registrar holds exactly the DS set that the
 // signer expects. It computes the current vs desired diff and picks the
 // least-disruptive operation: no-op if in sync, AddDS if only additions are
 // needed, ReplaceDS if anything must be removed.
-func runRegistrarPush(cmd *cobra.Command, args []string) error {
+func RunRegistrarPush(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 	// Locked: the ErrRegistrarDSEmpty branch persists a zone warning, and that
 	// Save must not run from a snapshot loaded outside the lock (R-032).
@@ -163,7 +164,7 @@ func runRegistrarPush(cmd *cobra.Command, args []string) error {
 	}
 	defer unlock()
 
-	want, err := BuildDSSet(cfg, state, domain)
+	want, err := registrar.BuildDSSet(cfg, state, domain)
 	if err != nil {
 		return fmt.Errorf("building expected DS set: %w", err)
 	}
@@ -176,7 +177,7 @@ func runRegistrarPush(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("registrar get_dnssec: %w", err)
 	}
 
-	missing, extra := CompareDSSets(want, have)
+	missing, extra := registrar.CompareDSSets(want, have)
 
 	switch {
 	case len(missing) == 0 && len(extra) == 0:
@@ -197,7 +198,7 @@ func runRegistrarPush(cmd *cobra.Command, args []string) error {
 		slog.Warn("[REGISTRAR] replacing DS set — brief window with no DS at parent",
 			"domain", domain, "removing", len(extra), "adding", len(missing))
 		if err := reg.ReplaceDS(ctx, domain, want); err != nil {
-			if errors.Is(err, ErrRegistrarDSEmpty) {
+			if errors.Is(err, registrar.ErrRegistrarDSEmpty) {
 				// Restore failed after the DELETE: the parent now holds zero DS.
 				// Persist a zone warning and log remediation in addition to the
 				// non-zero exit, so status/dashboard surface the outage (R-004).
@@ -240,16 +241,16 @@ func clearRegistrarStickyWarnings(state *statepkg.State, domain string, want []*
 	}
 }
 
-// runRegistrarVerify prints the diff between expected and actual DS records.
+// RunRegistrarVerify prints the diff between expected and actual DS records.
 // Exits non-zero on drift so cron jobs can detect misconfiguration.
-func runRegistrarVerify(cmd *cobra.Command, args []string) error {
+func RunRegistrarVerify(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 	cfg, state, reg, err := resolveRegistrar(domain)
 	if err != nil {
 		return err
 	}
 
-	want, err := BuildDSSet(cfg, state, domain)
+	want, err := registrar.BuildDSSet(cfg, state, domain)
 	if err != nil {
 		return fmt.Errorf("building expected DS set: %w", err)
 	}
@@ -262,7 +263,7 @@ func runRegistrarVerify(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("registrar get_dnssec: %w", err)
 	}
 
-	missing, extra := CompareDSSets(want, have)
+	missing, extra := registrar.CompareDSSets(want, have)
 
 	out := map[string]any{
 		"domain":    domain,
@@ -282,11 +283,11 @@ func runRegistrarVerify(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runRegistrarClear wipes all DS records at the registrar. Useful when
+// RunRegistrarClear wipes all DS records at the registrar. Useful when
 // retiring DNSSEC on a zone or recovering from a bad push. We require the
 // user to type the command on purpose (no confirmation prompt here), but we
 // log loudly so the operator can find it in logs later.
-func runRegistrarClear(cmd *cobra.Command, args []string) error {
+func RunRegistrarClear(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 	// Locked: the DS wipe must not interleave with a concurrent locked
 	// auto-publish or push for the same zone (R-007).
@@ -316,13 +317,13 @@ func printJSON(v any) error {
 	return nil
 }
 
-// maybeAutoPublishDS is called from runAdd / runRollover* commands when the
+// MaybeAutoPublishDS is called from runAdd / runRollover* commands when the
 // operator has enabled auto_publish on the configured registrar. Failures
 // are surfaced to the user as warnings but never turned into command errors
 // — the signer's source-of-truth work (signing) already succeeded, and the
 // operator can retry via `registrar push`.
-func maybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string, op string) {
-	reg, err := RegistrarFor(cfg, domain)
+func MaybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string, op string) {
+	reg, err := registrar.RegistrarFor(cfg, domain)
 	if err != nil {
 		msg := fmt.Sprintf("registrar auto-publish failed: registrar lookup failed: %v", err)
 		fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
@@ -337,7 +338,7 @@ func maybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string
 		return
 	}
 
-	want, err := BuildDSSet(cfg, state, domain)
+	want, err := registrar.BuildDSSet(cfg, state, domain)
 	if err != nil {
 		msg := fmt.Sprintf("registrar auto-publish failed: cannot build DS set: %v", err)
 		fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
@@ -374,7 +375,7 @@ func maybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string
 		// remediation, since the zone is actively going bogus (R-004 + R-032).
 		slog.Info("[REGISTRAR] auto-publishing DS (replace)", "domain", domain, "registrar", reg.Name(), "op", op)
 		if err := reg.ReplaceDS(ctx, domain, want); err != nil {
-			if errors.Is(err, ErrRegistrarDSEmpty) {
+			if errors.Is(err, registrar.ErrRegistrarDSEmpty) {
 				slog.Error("[REGISTRAR] DS restore failed — parent left with ZERO DS; zone will go bogus until republished",
 					"domain", domain, "registrar", reg.Name(),
 					"remediation", fmt.Sprintf("run `dnssec-tudor registrar push %s` to republish the DS set immediately", domain),

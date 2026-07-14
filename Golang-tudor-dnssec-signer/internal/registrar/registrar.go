@@ -1,4 +1,4 @@
-package main
+package registrar
 
 import (
 	"context"
@@ -134,3 +134,8 @@ func CompareDSSets(want, have []*dns.DS) (missing, extra []*dns.DS) {
 	sort.Slice(extra, func(i, j int) bool { return dsKey(extra[i]) < dsKey(extra[j]) })
 	return
 }
+
+// Version is the build identifier used in the default Dynadot User-Agent. The
+// root package sets it from its ldflags-injected main.Version at startup; it
+// defaults to "dev" for tests and un-stamped builds.
+var Version = "dev"
