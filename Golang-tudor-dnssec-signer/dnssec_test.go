@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -285,7 +287,7 @@ mail	IN	A	192.0.2.30
 	}
 
 	// Create state
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 
 	// Generate keys
 	keyGen := NewKeyGenerator(cfg)
@@ -299,7 +301,7 @@ mail	IN	A	192.0.2.30
 	}
 
 	// Set up zone state
-	state.SetZone("example.com", &ZoneState{
+	state.SetZone("example.com", &statepkg.ZoneState{
 		Path: zonePath,
 		KSK:  ksk,
 		ZSK:  zsk,
@@ -409,12 +411,12 @@ www	IN	A	192.0.2.10
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 
 	ksk, _ := keyGen.GenerateKSK("example.com")
 	zsk, _ := keyGen.GenerateZSK("example.com")
-	state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone("example.com"); err != nil {
@@ -655,12 +657,12 @@ ns1	IN	A	192.0.2.1
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 
 	ksk, _ := keyGen.GenerateKSK("example.com")
 	zsk, _ := keyGen.GenerateZSK("example.com")
-	state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 	rolloverMgr := NewRolloverManager(cfg, state)
 
@@ -677,8 +679,8 @@ ns1	IN	A	192.0.2.1
 	if zoneState.Rollover.Type != "ksk" {
 		t.Errorf("Rollover type should be 'ksk', got %q", zoneState.Rollover.Type)
 	}
-	if zoneState.Rollover.State != KSKRolloverStateDSAddWait {
-		t.Errorf("Rollover state should be %q, got %q", KSKRolloverStateDSAddWait, zoneState.Rollover.State)
+	if zoneState.Rollover.State != statepkg.KSKRolloverStateDSAddWait {
+		t.Errorf("Rollover state should be %q, got %q", statepkg.KSKRolloverStateDSAddWait, zoneState.Rollover.State)
 	}
 
 	// Cannot start another rollover while one is in progress
@@ -732,7 +734,7 @@ www	IN	A	192.0.2.20
 		t.Fatalf("ensureDir output: %v", err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 
 	ksk, err := keyGen.GenerateKSK("example.com")
@@ -744,7 +746,7 @@ www	IN	A	192.0.2.20
 		t.Fatalf("GenerateZSK (old): %v", err)
 	}
 
-	state.SetZone("example.com", &ZoneState{
+	state.SetZone("example.com", &statepkg.ZoneState{
 		Path: zonePath,
 		KSK:  ksk,
 		ZSK:  oldZSK,
@@ -759,7 +761,7 @@ www	IN	A	192.0.2.20
 	if err := rolloverMgr.startZSKRollover("example.com", zoneState); err != nil {
 		t.Fatalf("startZSKRollover: %v", err)
 	}
-	if zoneState.Rollover == nil || zoneState.Rollover.State != ZSKRolloverStatePrePublish {
+	if zoneState.Rollover == nil || zoneState.Rollover.State != statepkg.ZSKRolloverStatePrePublish {
 		t.Fatalf("expected pre_publish rollover state, got %+v", zoneState.Rollover)
 	}
 	newZSKID := zoneState.Rollover.NewKeyID
@@ -928,17 +930,17 @@ func TestStateFilePersistence(t *testing.T) {
 	statePath := filepath.Join(dataDir, "state.json")
 
 	// Create and populate state
-	state := NewState(statePath)
-	state.SetZone("example.com", &ZoneState{
+	state := statepkg.NewState(statePath)
+	state.SetZone("example.com", &statepkg.ZoneState{
 		Path:   "/etc/nsd/zones/example.com.zone",
 		Serial: 2024011501,
-		KSK: &KeyState{
+		KSK: &statepkg.KeyState{
 			ID:        12345,
 			Algorithm: "ED25519",
 			Created:   time.Now().UTC(),
 			Expires:   time.Now().UTC().Add(3 * 365 * 24 * time.Hour),
 		},
-		ZSK: &KeyState{
+		ZSK: &statepkg.KeyState{
 			ID:        54321,
 			Algorithm: "ED25519",
 			Created:   time.Now().UTC(),
@@ -957,7 +959,7 @@ func TestStateFilePersistence(t *testing.T) {
 	}
 
 	// Load state in new instance
-	loadedState, err := LoadState(statePath)
+	loadedState, err := statepkg.LoadState(statePath)
 	if err != nil {
 		t.Fatalf("LoadState failed: %v", err)
 	}
@@ -1003,12 +1005,12 @@ www	IN	A	192.0.2.10
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 
 	ksk, _ := keyGen.GenerateKSK("example.com")
 	zsk, _ := keyGen.GenerateZSK("example.com")
-	state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone("example.com"); err != nil {
@@ -1111,11 +1113,11 @@ www	IN	A	192.0.2.20
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK("example.com")
 	zsk, _ := keyGen.GenerateZSK("example.com")
-	state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone("example.com"); err != nil {
@@ -1192,11 +1194,11 @@ ns1	IN	A	192.0.2.1
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK("example.com")
 	zsk, _ := keyGen.GenerateZSK("example.com")
-	state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone("example.com"); err != nil {
@@ -1238,7 +1240,7 @@ ns1	IN	A	192.0.2.1
 	}
 
 	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
-	signer := NewSigner(cfg, NewState(cfg.StatePath()))
+	signer := NewSigner(cfg, statepkg.NewState(cfg.StatePath()))
 
 	// New zone (nil state) always needs signing
 	needs, reason := signer.NeedsSign("example.com", zonePath, nil)
@@ -1248,7 +1250,7 @@ ns1	IN	A	192.0.2.1
 
 	// Zone with recent signing and matching serial should NOT need signing
 	now := time.Now().UTC()
-	zoneState := &ZoneState{
+	zoneState := &statepkg.ZoneState{
 		Serial:        2024011501,
 		LastSigned:    now,
 		SignaturesExp: now.Add(14 * 24 * time.Hour),
@@ -1284,7 +1286,7 @@ ns1	IN	A	192.0.2.1
 	zoneState.ForceResign = false
 
 	// Zone with a rollover started after the last signing SHOULD need signing
-	zoneState.Rollover = &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait, Started: now.Add(time.Minute)}
+	zoneState.Rollover = &statepkg.RolloverState{Type: "ksk", State: statepkg.KSKRolloverStateDSAddWait, Started: now.Add(time.Minute)}
 	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
 	if !needs || reason != "rollover in progress" {
 		t.Errorf("Zone with unreflected rollover should need signing, got needs=%v reason=%q", needs, reason)
@@ -1370,7 +1372,7 @@ ns1	IN	A	192.0.2.1
 				t.Fatalf("Failed to create output dir: %v", err)
 			}
 
-			state := NewState(cfg.StatePath())
+			state := statepkg.NewState(cfg.StatePath())
 			keyGen := NewKeyGenerator(cfg)
 
 			ksk, err := keyGen.GenerateKSK("example.com")
@@ -1382,7 +1384,7 @@ ns1	IN	A	192.0.2.1
 				t.Fatalf("GenerateZSK failed for %s: %v", alg, err)
 			}
 
-			state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+			state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 			signer := NewSigner(cfg, state)
 			if err := signer.SignZone("example.com"); err != nil {
@@ -1724,7 +1726,7 @@ func signAndParseZone(t *testing.T, cfg *config.Config, domain, zoneContent stri
 		t.Fatalf("Failed to create output dir: %v", err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 	ksk, err := keyGen.GenerateKSK(domain)
 	if err != nil {
@@ -1734,7 +1736,7 @@ func signAndParseZone(t *testing.T, cfg *config.Config, domain, zoneContent stri
 	if err != nil {
 		t.Fatalf("GenerateZSK: %v", err)
 	}
-	state.SetZone(domain, &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone(domain, &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 	signer := NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
@@ -1965,8 +1967,8 @@ func TestCheckZSKRollover_StartsWhenAlreadyExpired(t *testing.T) {
 	// Simulate a ZSK already past expiry
 	zsk.Expires = time.Now().UTC().Add(-24 * time.Hour)
 
-	state := NewState(cfg.StatePath())
-	zoneState := &ZoneState{Path: "unused", KSK: ksk, ZSK: zsk}
+	state := statepkg.NewState(cfg.StatePath())
+	zoneState := &statepkg.ZoneState{Path: "unused", KSK: ksk, ZSK: zsk}
 	state.SetZone("example.com", zoneState)
 
 	rm := NewRolloverManager(cfg, state)
@@ -1977,7 +1979,7 @@ func TestCheckZSKRollover_StartsWhenAlreadyExpired(t *testing.T) {
 	if zoneState.Rollover == nil || zoneState.Rollover.Type != "zsk" {
 		t.Fatalf("expected ZSK rollover to start for an expired ZSK, got %+v", zoneState.Rollover)
 	}
-	if zoneState.Rollover.State != ZSKRolloverStatePrePublish {
+	if zoneState.Rollover.State != statepkg.ZSKRolloverStatePrePublish {
 		t.Errorf("expected pre_publish state, got %q", zoneState.Rollover.State)
 	}
 	if !zoneState.ForceResign {
@@ -2018,8 +2020,8 @@ ns1	IN	A	192.0.2.1
 	if err != nil {
 		t.Fatalf("GenerateZSK: %v", err)
 	}
-	state := NewState(cfg.StatePath())
-	zoneState := &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk}
+	state := statepkg.NewState(cfg.StatePath())
+	zoneState := &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk}
 	state.SetZone("example.com", zoneState)
 
 	rm := NewRolloverManager(cfg, state)
@@ -2049,17 +2051,17 @@ ns1	IN	A	192.0.2.1
 // TestZoneStateClone verifies the deep copy handed to concurrent readers
 // shares nothing mutable with the live state.
 func TestZoneStateClone(t *testing.T) {
-	orig := &ZoneState{
+	orig := &statepkg.ZoneState{
 		Path:     "/tmp/zone",
 		Serial:   42,
-		KSK:      &KeyState{ID: 1, Algorithm: "ED25519"},
-		ZSK:      &KeyState{ID: 2, Algorithm: "ED25519"},
-		Rollover: &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait},
+		KSK:      &statepkg.KeyState{ID: 1, Algorithm: "ED25519"},
+		ZSK:      &statepkg.KeyState{ID: 2, Algorithm: "ED25519"},
+		Rollover: &statepkg.RolloverState{Type: "ksk", State: statepkg.KSKRolloverStateDSAddWait},
 		Warnings: []string{"w1"},
 		Errors:   []string{"e1"},
 	}
 
-	c := orig.clone()
+	c := orig.Clone()
 
 	orig.KSK.ID = 99
 	orig.Rollover.State = "mutated"
@@ -2069,7 +2071,7 @@ func TestZoneStateClone(t *testing.T) {
 	if c.KSK.ID != 1 {
 		t.Error("clone shares KSK pointer with original")
 	}
-	if c.Rollover.State != KSKRolloverStateDSAddWait {
+	if c.Rollover.State != statepkg.KSKRolloverStateDSAddWait {
 		t.Error("clone shares Rollover pointer with original")
 	}
 	if c.Warnings[0] != "w1" {
@@ -2079,12 +2081,12 @@ func TestZoneStateClone(t *testing.T) {
 		t.Error("clone shares Errors slice with original")
 	}
 
-	var nilZone *ZoneState
-	if nilZone.clone() != nil {
+	var nilZone *statepkg.ZoneState
+	if nilZone.Clone() != nil {
 		t.Error("clone of nil must be nil")
 	}
 
-	state := NewState("/tmp/state.json")
+	state := statepkg.NewState("/tmp/state.json")
 	if state.GetZoneCopy("missing") != nil {
 		t.Error("GetZoneCopy of unknown zone must be nil")
 	}
@@ -2177,13 +2179,13 @@ func TestSerialPolicy_Epoch(t *testing.T) {
 	records := signAndParseZone(t, cfg, "example.com", epochSerialZone(unsigned))
 	_ = records
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	// signAndParseZone uses its own state; re-create the scenario directly
 	// for the double-sign assertion.
 	keyGen := NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK("example.com")
 	zsk, _ := keyGen.GenerateZSK("example.com")
-	zoneState := &ZoneState{Path: cfg.Zones["example.com"].Path, KSK: ksk, ZSK: zsk}
+	zoneState := &statepkg.ZoneState{Path: cfg.Zones["example.com"].Path, KSK: ksk, ZSK: zsk}
 	state.SetZone("example.com", zoneState)
 	signer := NewSigner(cfg, state)
 
@@ -2245,11 +2247,11 @@ func TestSerialPolicy_EpochRejectsNonEpochSerials(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			state := NewState(cfg.StatePath())
+			state := statepkg.NewState(cfg.StatePath())
 			keyGen := NewKeyGenerator(cfg)
 			ksk, _ := keyGen.GenerateKSK("example.com")
 			zsk, _ := keyGen.GenerateZSK("example.com")
-			state.SetZone("example.com", &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+			state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 			signer := NewSigner(cfg, state)
 			err := signer.SignZone("example.com")

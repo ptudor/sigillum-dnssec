@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -248,13 +250,13 @@ func NewWebServer(d *Daemon) *http.Server {
 	}
 }
 
-func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
+func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *statepkg.State) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
 
-	status := state.ToStatusOutput()
+	status := buildStatusOutput(state)
 
 	// Compute DS records for each zone to display inline. Only the public
 	// key halves are read — the dashboard must never touch .private files.
@@ -298,10 +300,10 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config
 	}
 }
 
-func apiStatusHandler(w http.ResponseWriter, r *http.Request, state *State) {
+func apiStatusHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State) {
 	w.Header().Set("Content-Type", "application/json")
 
-	data, err := state.ToJSON()
+	data, err := statusJSON(state)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -312,7 +314,7 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request, state *State) {
 	}
 }
 
-func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
+func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *statepkg.State) {
 	// Extract domain from path: /api/zone/{domain}
 	domain := strings.TrimPrefix(r.URL.Path, "/api/zone/")
 	if domain == "" {
@@ -332,10 +334,10 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 
 	// Build detailed zone response
 	response := struct {
-		Domain    string     `json:"domain"`
-		Status    string     `json:"status"`
-		Zone      *ZoneState `json:"zone"`
-		DSRecords string     `json:"ds_records,omitempty"`
+		Domain    string              `json:"domain"`
+		Status    string              `json:"status"`
+		Zone      *statepkg.ZoneState `json:"zone"`
+		DSRecords string              `json:"ds_records,omitempty"`
 	}{
 		Domain: domain,
 		Status: zoneState.Status(),
@@ -356,7 +358,7 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 	}
 }
 
-func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
+func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *statepkg.State) {
 	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 	output := cachedValidateAll(v) // bounded + cached (R-043)
 	if output == nil {
@@ -373,7 +375,7 @@ func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *config.Conf
 	}
 }
 
-func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
+func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *statepkg.State) {
 	domain := strings.TrimPrefix(r.URL.Path, "/api/validate/")
 	if domain == "" {
 		http.Error(w, "Domain required", http.StatusBadRequest)

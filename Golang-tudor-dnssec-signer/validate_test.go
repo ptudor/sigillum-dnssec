@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -405,7 +407,7 @@ func TestQueryDirectDOBit(t *testing.T) {
 
 func TestValidateZoneNotFound(t *testing.T) {
 	cfg := config.DefaultConfig()
-	state := NewState("/tmp/test-state.json")
+	state := statepkg.NewState("/tmp/test-state.json")
 
 	v := NewValidator(cfg, state, "127.0.0.1:53", 5*time.Second)
 	result := v.ValidateZone("nonexistent.example.com")

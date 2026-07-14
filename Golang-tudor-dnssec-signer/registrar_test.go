@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -540,8 +542,8 @@ func TestDynadotReplaceDS_RestoreSurvivesParentCancel(t *testing.T) {
 // `status`/the dashboard reflect it. Also verifies dedup.
 func TestRecordRegistrarWarning(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	state := NewState(path)
-	state.SetZone("example.com", &ZoneState{Path: "/tmp/example.com.zone"})
+	state := statepkg.NewState(path)
+	state.SetZone("example.com", &statepkg.ZoneState{Path: "/tmp/example.com.zone"})
 
 	const msg = "registrar auto-publish failed: boom"
 	recordRegistrarWarning(state, "example.com", msg)
@@ -556,7 +558,7 @@ func TestRecordRegistrarWarning(t *testing.T) {
 	}
 
 	// The warning must survive a reload (it was persisted to disk).
-	reloaded, err := LoadState(path)
+	reloaded, err := statepkg.LoadState(path)
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
 	}

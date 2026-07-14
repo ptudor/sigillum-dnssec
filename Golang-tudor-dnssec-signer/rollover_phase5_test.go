@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -53,8 +55,8 @@ func TestZSKRollover_PhaseGating(t *testing.T) {
 
 	zs := state.GetZone(domain)
 	past := time.Now().UTC().Add(-30 * 24 * time.Hour)
-	zs.Rollover = &RolloverState{
-		Type: "zsk", State: ZSKRolloverStatePrePublish,
+	zs.Rollover = &statepkg.RolloverState{
+		Type: "zsk", State: statepkg.ZSKRolloverStatePrePublish,
 		OldKeyID: zs.ZSK.ID, NewKeyID: zs.ZSK.ID, Started: past,
 	}
 	// Not signed since the phase began (LastSigned older than Started).
@@ -63,7 +65,7 @@ func TestZSKRollover_PhaseGating(t *testing.T) {
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover: %v", err)
 	}
-	if got := state.GetZone(domain).Rollover.State; got != ZSKRolloverStatePrePublish {
+	if got := state.GetZone(domain).Rollover.State; got != statepkg.ZSKRolloverStatePrePublish {
 		t.Fatalf("must NOT advance before the pre-published set was signed; state=%q (R-011)", got)
 	}
 
@@ -72,7 +74,7 @@ func TestZSKRollover_PhaseGating(t *testing.T) {
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover (2): %v", err)
 	}
-	if got := state.GetZone(domain).Rollover.State; got != ZSKRolloverStateSigning {
+	if got := state.GetZone(domain).Rollover.State; got != statepkg.ZSKRolloverStateSigning {
 		t.Fatalf("should advance to signing once published + TTL floor elapsed; state=%q (R-011)", got)
 	}
 	if state.GetZone(domain).Rollover.PhaseStarted.IsZero() {
@@ -88,7 +90,7 @@ func TestCheckZSKRollover_BlockedByKSKRolloverWarns(t *testing.T) {
 
 	zs := state.GetZone(domain)
 	// A KSK rollover occupies the single Rollover slot...
-	zs.Rollover = &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait, OldKeyID: zs.KSK.ID, NewKeyID: 1, Started: time.Now().UTC()}
+	zs.Rollover = &statepkg.RolloverState{Type: "ksk", State: statepkg.KSKRolloverStateDSAddWait, OldKeyID: zs.KSK.ID, NewKeyID: 1, Started: time.Now().UTC()}
 	// ...and the ZSK is due.
 	zs.ZSK.Expires = time.Now().UTC().Add(-time.Hour)
 
@@ -119,7 +121,7 @@ func TestStartKSKRollover_RollsBackOnSaveFailure(t *testing.T) {
 	oldKSKID := state.GetZone(domain).KSK.ID
 
 	// Force Save() to fail by pointing the state path into a nonexistent dir.
-	state.path = filepath.Join(t.TempDir(), "missing-subdir", "state.json")
+	state.SetPath(filepath.Join(t.TempDir(), "missing-subdir", "state.json"))
 
 	rm := NewRolloverManager(cfg, state)
 	if err := rm.StartKSKRollover(domain); err == nil {

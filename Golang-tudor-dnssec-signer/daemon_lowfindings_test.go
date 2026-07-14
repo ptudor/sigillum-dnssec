@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -19,7 +21,7 @@ func TestReload_TickerResetLatestWins(t *testing.T) {
 	cfg := testConfig(t, dir)
 	cfg.Heartbeat.Enabled = false
 	cfg.PollInterval = config.Duration{Duration: 5 * time.Minute}
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	d := NewDaemon(cfg, state)
 
 	cfg1 := *cfg

@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
 // R-011: a failed re-add must RESTORE the pre-existing signed output (a
@@ -24,8 +26,8 @@ func TestR011_UnwindRestoresPreExistingOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state := NewState(cfg.StatePath())
-	state.SetZone("example.com", &ZoneState{Path: "/zones/example.com.db"})
+	state := statepkg.NewState(cfg.StatePath())
+	state.SetZone("example.com", &statepkg.ZoneState{Path: "/zones/example.com.db"})
 
 	// origOutput was snapshotted BEFORE the overwrite; outputExisted=true.
 	unwindAdd(cfg, state, "example.com", false, false, []byte(prev), true)
@@ -51,8 +53,8 @@ func TestR011_UnwindRemovesNewlyCreatedOutput(t *testing.T) {
 	if err := os.WriteFile(signedPath, []byte("output this add created"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	state := NewState(cfg.StatePath())
-	state.SetZone("new.example", &ZoneState{Path: "/zones/new.example.db"})
+	state := statepkg.NewState(cfg.StatePath())
+	state.SetZone("new.example", &statepkg.ZoneState{Path: "/zones/new.example.db"})
 
 	unwindAdd(cfg, state, "new.example", false, false, nil, false)
 

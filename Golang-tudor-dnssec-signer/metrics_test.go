@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -56,9 +58,9 @@ func signatureExpirySeriesExists(t *testing.T, domain string) bool {
 // counted in its own gauge so the summary balances (total == healthy +
 // action_required + warning + errors), instead of vanishing.
 func TestUpdateZoneMetrics_WarningCounted(t *testing.T) {
-	state := NewState(t.TempDir() + "/state.json")
-	state.SetZone("healthy.example.", &ZoneState{Path: "/z/healthy"})
-	state.SetZone("warn.example.", &ZoneState{Path: "/z/warn", Warnings: []string{"ZSK expires soon"}})
+	state := statepkg.NewState(t.TempDir() + "/state.json")
+	state.SetZone("healthy.example.", &statepkg.ZoneState{Path: "/z/healthy"})
+	state.SetZone("warn.example.", &statepkg.ZoneState{Path: "/z/warn", Warnings: []string{"ZSK expires soon"}})
 
 	UpdateZoneMetrics(state)
 
@@ -79,8 +81,8 @@ func TestUpdateZoneMetrics_WarningCounted(t *testing.T) {
 // "expired" alert.
 func TestUpdateZoneMetrics_RemovedZoneSeriesDeleted(t *testing.T) {
 	const domain = "r042-delete-me.example."
-	state := NewState(t.TempDir() + "/state.json")
-	state.SetZone(domain, &ZoneState{Path: "/z/x", SignaturesExp: time.Now().Add(24 * time.Hour)})
+	state := statepkg.NewState(t.TempDir() + "/state.json")
+	state.SetZone(domain, &statepkg.ZoneState{Path: "/z/x", SignaturesExp: time.Now().Add(24 * time.Hour)})
 
 	UpdateZoneMetrics(state)
 	if !signatureExpirySeriesExists(t, domain) {

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -43,14 +45,14 @@ func TestDaemonReload_HandlersReflectNewState(t *testing.T) {
 	// Initial state: one zone whose signatures already expired -> /health 503.
 	cfg1 := newCfg()
 	cfg1.Zones["old.example."] = config.ZoneConfig{Path: "/zones/old.db"}
-	state1 := NewState(cfg1.StatePath())
-	state1.SetZone("old.example.", &ZoneState{Serial: 1, SignaturesExp: time.Now().Add(-24 * time.Hour)})
+	state1 := statepkg.NewState(cfg1.StatePath())
+	state1.SetZone("old.example.", &statepkg.ZoneState{Serial: 1, SignaturesExp: time.Now().Add(-24 * time.Hour)})
 
 	// Post-reload state: a different zone with fresh (future) signatures.
 	cfg2 := newCfg()
 	cfg2.Zones["new.example."] = config.ZoneConfig{Path: "/zones/new.db"}
-	state2 := NewState(cfg2.StatePath())
-	state2.SetZone("new.example.", &ZoneState{Serial: 2, SignaturesExp: time.Now().Add(14 * 24 * time.Hour)})
+	state2 := statepkg.NewState(cfg2.StatePath())
+	state2.SetZone("new.example.", &statepkg.ZoneState{Serial: 2, SignaturesExp: time.Now().Add(14 * 24 * time.Hour)})
 
 	d := NewDaemon(cfg1, state1)
 	// One server handler instance, constructed once — exactly the startup wiring.

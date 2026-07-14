@@ -8,17 +8,19 @@ import (
 	"path/filepath"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // RolloverManager handles key rollover operations
 type RolloverManager struct {
 	cfg   *config.Config
-	state *State
+	state *statepkg.State
 }
 
 // NewRolloverManager creates a new rollover manager
-func NewRolloverManager(cfg *config.Config, state *State) *RolloverManager {
+func NewRolloverManager(cfg *config.Config, state *statepkg.State) *RolloverManager {
 	return &RolloverManager{
 		cfg:   cfg,
 		state: state,
@@ -61,9 +63,9 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 
 	// Set up rollover state
 	rm.state.Mutate(func() {
-		zoneState.Rollover = &RolloverState{
+		zoneState.Rollover = &statepkg.RolloverState{
 			Type:     "ksk",
-			State:    KSKRolloverStateDSAddWait,
+			State:    statepkg.KSKRolloverStateDSAddWait,
 			OldKeyID: oldKSK.ID,
 			NewKeyID: newKSK.ID,
 			Started:  time.Now().UTC(),
@@ -110,7 +112,7 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string) error {
 		return fmt.Errorf("current rollover is not KSK type")
 	}
 
-	if zoneState.Rollover.State != KSKRolloverStateDSAddWait {
+	if zoneState.Rollover.State != statepkg.KSKRolloverStateDSAddWait {
 		return fmt.Errorf("rollover not in ds_add_wait state")
 	}
 
@@ -189,7 +191,7 @@ func (rm *RolloverManager) CheckZSKRollover(domain string) error {
 	return nil
 }
 
-func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState) error {
+func (rm *RolloverManager) startZSKRollover(domain string, zoneState *statepkg.ZoneState) error {
 	// Don't start if there's already a rollover in progress
 	if zoneState.Rollover != nil {
 		return nil
@@ -218,9 +220,9 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *ZoneState)
 
 	// Set up rollover state
 	rm.state.Mutate(func() {
-		zoneState.Rollover = &RolloverState{
+		zoneState.Rollover = &statepkg.RolloverState{
 			Type:     "zsk",
-			State:    ZSKRolloverStatePrePublish,
+			State:    statepkg.ZSKRolloverStatePrePublish,
 			OldKeyID: oldZSK.ID,
 			NewKeyID: newZSK.ID,
 			Started:  time.Now().UTC(),
@@ -254,7 +256,7 @@ func humanizeRolloverDelay(d time.Duration) string {
 // whose SOA TTL exceeds 24h is not advanced early against a hardcoded floor
 // (R-006). Falls back to the configured TTL, then a conservative 24h, for old
 // state that predates the recorded field.
-func (rm *RolloverManager) dnskeyTTLFloor(zoneState *ZoneState) time.Duration {
+func (rm *RolloverManager) dnskeyTTLFloor(zoneState *statepkg.ZoneState) time.Duration {
 	var ttl time.Duration
 	if zoneState != nil && zoneState.PublishedDNSKEYTTL > 0 {
 		ttl = time.Duration(zoneState.PublishedDNSKEYTTL) * time.Second
@@ -272,7 +274,7 @@ func (rm *RolloverManager) dnskeyTTLFloor(zoneState *ZoneState) time.Duration {
 // in the signing phase before the old ZSK may be dropped: the larger of the
 // DNSKEY-TTL floor (R-006) and the largest signed RRset TTL (R-007), since a data
 // RRSIG by the retiring key stays cached for its RRset's TTL.
-func (rm *RolloverManager) zskRetireFloor(zoneState *ZoneState) time.Duration {
+func (rm *RolloverManager) zskRetireFloor(zoneState *statepkg.ZoneState) time.Duration {
 	floor := rm.dnskeyTTLFloor(zoneState)
 	if zoneState != nil {
 		if rrsig := time.Duration(zoneState.PublishedMaxRRSIGTTL) * time.Second; rrsig > floor {
@@ -282,7 +284,7 @@ func (rm *RolloverManager) zskRetireFloor(zoneState *ZoneState) time.Duration {
 	return floor
 }
 
-func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *ZoneState) error {
+func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *statepkg.ZoneState) error {
 	rollover := zoneState.Rollover
 	now := time.Now().UTC()
 
@@ -292,7 +294,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 	lastSigned := zoneState.LastSigned
 
 	switch rollover.State {
-	case ZSKRolloverStatePrePublish:
+	case statepkg.ZSKRolloverStatePrePublish:
 		// Advance to "signing" only when ALL of the following hold (R-011), rather
 		// than on wall-time-since-start alone — otherwise a daemon that was down or
 		// failing across the window collapses both transitions into consecutive
@@ -336,11 +338,11 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 			return fmt.Errorf("loading new ZSK: %w", err)
 		}
 		rm.state.Mutate(func() {
-			rollover.State = ZSKRolloverStateSigning
+			rollover.State = statepkg.ZSKRolloverStateSigning
 			rollover.PhaseStarted = now             // gate the signing phase from here (R-011)
 			rollover.PhaseFirstSigned = time.Time{} // the signing phase stamps its own first sign
 			rollover.Action = "Automatic: signing with new ZSK, old ZSK still published"
-			zoneState.ZSK = &KeyState{
+			zoneState.ZSK = &statepkg.KeyState{
 				ID: newZSK.KeyTag(),
 				// Algorithm comes from the key itself — the config may
 				// have changed since this key was generated.
@@ -353,7 +355,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *Zone
 		})
 		return rm.state.Save()
 
-	case ZSKRolloverStateSigning:
+	case statepkg.ZSKRolloverStateSigning:
 		// Complete only when ALL hold (R-011): the signing phase has dwelled long
 		// enough, the new ZSK's signatures were actually published after the
 		// switch, and the DNSKEY-TTL floor has elapsed since they were FIRST
@@ -471,7 +473,7 @@ func (rm *RolloverManager) restoreKeyFromBackup(domain, keyType string, keyID ui
 }
 
 // GetRolloverStatus returns the current rollover status for a domain
-func (rm *RolloverManager) GetRolloverStatus(domain string) *RolloverState {
+func (rm *RolloverManager) GetRolloverStatus(domain string) *statepkg.RolloverState {
 	zoneState := rm.state.GetZone(domain)
 	if zoneState == nil {
 		return nil
@@ -535,9 +537,9 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 
 	// Set up rollover state
 	rm.state.Mutate(func() {
-		zoneState.Rollover = &RolloverState{
+		zoneState.Rollover = &statepkg.RolloverState{
 			Type:         "algorithm",
-			State:        AlgoRolloverStateDSAddWait,
+			State:        statepkg.AlgoRolloverStateDSAddWait,
 			OldKeyID:     zoneState.KSK.ID,
 			NewKeyID:     newKSK.ID,
 			OldZSKID:     zoneState.ZSK.ID,

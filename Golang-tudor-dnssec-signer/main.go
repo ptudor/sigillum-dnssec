@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 	"github.com/ptudor/dnssec-tudor/internal/fsutil"
@@ -337,7 +339,7 @@ func getEnvOrDefault(key, defaultVal string) string {
 	return defaultVal
 }
 
-func loadConfigAndState() (*config.Config, *State, error) {
+func loadConfigAndState() (*config.Config, *statepkg.State, error) {
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
@@ -347,7 +349,7 @@ func loadConfigAndState() (*config.Config, *State, error) {
 	// root will chown what they create. No-op for non-root invocations.
 	fsutil.InitOwnershipTarget(cfg.DataDir)
 
-	state, err := LoadState(cfg.StatePath())
+	state, err := statepkg.LoadState(cfg.StatePath())
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading state: %w", err)
 	}
@@ -361,7 +363,7 @@ func loadConfigAndState() (*config.Config, *State, error) {
 // commands (R-007) — otherwise a rollover/add/remove landing mid-cycle is clobbered by the
 // daemon's end-of-cycle Save. Read-only commands (status/ds/dnskey/validate/rollover
 // status) keep loadConfigAndState and take no lock.
-func loadConfigStateLocked() (cfg *config.Config, state *State, unlock func(), err error) {
+func loadConfigStateLocked() (cfg *config.Config, state *statepkg.State, unlock func(), err error) {
 	cfg, err = config.LoadConfig(configPath)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("loading config: %w", err)
@@ -374,7 +376,7 @@ func loadConfigStateLocked() (cfg *config.Config, state *State, unlock func(), e
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("acquiring state lock: %w", err)
 	}
-	state, err = LoadState(cfg.StatePath())
+	state, err = statepkg.LoadState(cfg.StatePath())
 	if err != nil {
 		lock.release()
 		return nil, nil, nil, fmt.Errorf("loading state: %w", err)
@@ -434,7 +436,7 @@ func keyPairAbsent(keysDir, domain, role string) bool {
 // rollback, since a DS at the registrar may still reference them.
 // Best-effort — failures are logged but not returned, so the original error
 // from `add` surfaces unchanged.
-func unwindAdd(cfg *config.Config, state *State, domain string, removeKSK, removeZSK bool, origOutput []byte, outputExisted bool) {
+func unwindAdd(cfg *config.Config, state *statepkg.State, domain string, removeKSK, removeZSK bool, origOutput []byte, outputExisted bool) {
 	state.RemoveZone(domain)
 	if err := state.Save(); err != nil {
 		slog.Warn("[CLI] Rollback: failed to save state", "domain", domain, "error", err)
@@ -541,7 +543,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 					slog.Error("[DAEMON] Reload rejected: --web override fails the loopback guard", "error", err)
 					continue
 				}
-				newState, err := LoadState(newCfg.StatePath())
+				newState, err := statepkg.LoadState(newCfg.StatePath())
 				if err != nil {
 					slog.Error("[DAEMON] Failed to reload state", "error", err)
 					continue
@@ -625,7 +627,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 	}
 
 	// Output status
-	jsonData, err := state.ToJSON()
+	jsonData, err := statusJSON(state)
 	if err != nil {
 		return fmt.Errorf("generating status: %w", err)
 	}
@@ -720,7 +722,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	// Show status for all zones
-	output := state.ToStatusOutput()
+	output := buildStatusOutput(state)
 	if doValidate {
 		v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 		valOutput := v.ValidateAll()
@@ -876,7 +878,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create zone state
-	zoneState := &ZoneState{
+	zoneState := &statepkg.ZoneState{
 		Path: zonePath,
 		KSK:  ksk,
 		ZSK:  zsk,
@@ -1093,7 +1095,7 @@ func runRolloverStatus(cmd *cobra.Command, args []string) error {
 // completion so the old KSK isn't retired before the new DS is live (R-037). The
 // parent's live DS is the ground truth resolvers see, so this works for both
 // registrar-automated and manual zones.
-func verifyNewKSKDSAtParent(cfg *config.Config, state *State, domain string) (bool, string) {
+func verifyNewKSKDSAtParent(cfg *config.Config, state *statepkg.State, domain string) (bool, string) {
 	keyGen := NewKeyGenerator(cfg)
 	newKSK, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
@@ -1479,16 +1481,16 @@ func runImport(cmd *cobra.Command, args []string) error {
 	kskLifetime := cfg.GetZoneKSKLifetime(domain)
 	zskLifetime := cfg.GetZoneZSKLifetime(domain)
 
-	zoneState := &ZoneState{
+	zoneState := &statepkg.ZoneState{
 		Path: zonePath,
-		KSK: &KeyState{
+		KSK: &statepkg.KeyState{
 			ID:          ksk.KeyTag(),
 			Algorithm:   AlgorithmName(ksk.Algorithm),
 			Created:     now, // We don't know the original creation time
 			Expires:     now.Add(kskLifetime),
 			RolloverDue: now.Add(time.Duration(float64(kskLifetime) * 0.75)),
 		},
-		ZSK: &KeyState{
+		ZSK: &statepkg.KeyState{
 			ID:          zsk.KeyTag(),
 			Algorithm:   AlgorithmName(zsk.Algorithm),
 			Created:     now,

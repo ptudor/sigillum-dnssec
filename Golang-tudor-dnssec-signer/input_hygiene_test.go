@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -92,11 +94,11 @@ evil.org.	IN	A	192.0.2.99
 		t.Fatal(err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK(domain)
 	zsk, _ := keyGen.GenerateZSK(domain)
-	state.SetZone(domain, &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone(domain, &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 
 	signer := NewSigner(cfg, state)
 	err := signer.SignZone(domain)

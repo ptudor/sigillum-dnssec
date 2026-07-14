@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 	"github.com/ptudor/dnssec-tudor/internal/fsutil"
@@ -22,11 +24,11 @@ import (
 // Signer handles DNSSEC signing operations
 type Signer struct {
 	cfg   *config.Config
-	state *State
+	state *statepkg.State
 }
 
 // NewSigner creates a new signer
-func NewSigner(cfg *config.Config, state *State) *Signer {
+func NewSigner(cfg *config.Config, state *statepkg.State) *Signer {
 	return &Signer{
 		cfg:   cfg,
 		state: state,
@@ -57,13 +59,13 @@ func (s *Signer) SignAll() error {
 			ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
 			if err != nil {
 				slog.Error("[SIGN] Cannot initialize zone; skipping", "domain", domain, "error", err)
-				placeholder := &ZoneState{Path: zoneCfg.Path}
+				placeholder := &statepkg.ZoneState{Path: zoneCfg.Path}
 				placeholder.AddError(err.Error())
 				s.state.SetZone(domain, placeholder)
 				failed++
 				continue
 			}
-			zoneState = &ZoneState{
+			zoneState = &statepkg.ZoneState{
 				Path: zoneCfg.Path,
 				KSK:  ksk,
 				ZSK:  zsk,
@@ -254,7 +256,7 @@ const epochSerialFloor = 946684800
 // epoch policy MUST carry a unix epoch serial in the unsigned file (e.g.
 // from `date +%s`); anything else is rejected here, which fails this zone's
 // signing while the previously signed output keeps serving.
-func (s *Signer) publishedSerial(domain string, serial uint32, zoneState *ZoneState) (uint32, error) {
+func (s *Signer) publishedSerial(domain string, serial uint32, zoneState *statepkg.ZoneState) (uint32, error) {
 	if s.cfg.GetZoneSerialPolicy(domain) != "epoch" {
 		return serial, nil
 	}
@@ -327,7 +329,7 @@ func (k *signingKeys) validateConsistency() error {
 }
 
 // loadKeysForSigning loads all keys needed, handling rollover scenarios
-func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneState *ZoneState) (*signingKeys, error) {
+func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneState *statepkg.ZoneState) (*signingKeys, error) {
 	keys := &signingKeys{}
 
 	// Load current KSK
@@ -351,7 +353,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 	// Handle rollover scenarios
 	if zoneState.Rollover != nil {
 		switch {
-		case zoneState.Rollover.Type == "ksk" && zoneState.Rollover.State == KSKRolloverStateDSAddWait:
+		case zoneState.Rollover.Type == "ksk" && zoneState.Rollover.State == statepkg.KSKRolloverStateDSAddWait:
 			// KSK rollover: load old KSK too, sign with both. FATAL on failure (R-003):
 			// during ds_add_wait the parent DS still references the old KSK, so publishing
 			// a DNSKEY RRset without it makes every resolver validating via the old DS go
@@ -367,7 +369,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 				"old_key_id", zoneState.Rollover.OldKeyID,
 				"new_key_id", zoneState.Rollover.NewKeyID)
 
-		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == ZSKRolloverStatePrePublish:
+		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == statepkg.ZSKRolloverStatePrePublish:
 			// ZSK pre-publish: publish BOTH old and new ZSK in the DNSKEY
 			// RRset, but continue signing every non-DNSKEY RRset with the OLD
 			// ZSK. The new ZSK is already in keys.dnskeys via the
@@ -394,7 +396,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 				"old_key_id", zoneState.Rollover.OldKeyID,
 				"new_key_id", zoneState.Rollover.NewKeyID)
 
-		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == ZSKRolloverStateSigning:
+		case zoneState.Rollover.Type == "zsk" && zoneState.Rollover.State == statepkg.ZSKRolloverStateSigning:
 			// ZSK signing phase: publish the old ZSK (only the public half is needed) while
 			// signing with the new one. FATAL on failure (R-003): dropping the old ZSK from
 			// the published RRset while resolvers still hold its cached RRSIGs is bogus.
@@ -407,7 +409,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 				"old_key_id", zoneState.Rollover.OldKeyID,
 				"new_key_id", zoneState.Rollover.NewKeyID)
 
-		case zoneState.Rollover.Type == "algorithm" && zoneState.Rollover.State == AlgoRolloverStateDSAddWait:
+		case zoneState.Rollover.Type == "algorithm" && zoneState.Rollover.State == statepkg.AlgoRolloverStateDSAddWait:
 			// Algorithm rollover: publish and sign with BOTH algorithms' keys. FATAL on
 			// failure (R-003): dropping an old-algorithm key mid-rollover leaves RRsets
 			// unsigned for a signaled algorithm, violating RFC 4035 §2.2 / RFC 6840 §5.11.
@@ -449,7 +451,7 @@ const (
 )
 
 // NeedsSign checks if a zone needs to be signed
-func (s *Signer) NeedsSign(domain, zonePath string, zoneState *ZoneState) (bool, string) {
+func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneState) (bool, string) {
 	// New zone - always sign
 	if zoneState == nil {
 		return true, "new zone"
@@ -1519,7 +1521,7 @@ func sortZoneRecords(domain string, records []dns.RR) []dns.RR {
 	return result
 }
 
-func (s *Signer) checkRolloverWarnings(domain string, zoneState *ZoneState) {
+func (s *Signer) checkRolloverWarnings(domain string, zoneState *statepkg.ZoneState) {
 	now := time.Now().UTC()
 
 	// Check KSK rollover due

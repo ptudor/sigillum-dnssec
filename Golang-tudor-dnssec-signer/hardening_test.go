@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -295,8 +297,8 @@ func TestStateSave_RestrictedPermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	statePath := filepath.Join(tmpDir, "state.json")
 
-	state := NewState(statePath)
-	state.SetZone("example.com", &ZoneState{Serial: 1})
+	state := statepkg.NewState(statePath)
+	state.SetZone("example.com", &statepkg.ZoneState{Serial: 1})
 
 	if err := state.Save(); err != nil {
 		t.Fatalf("Save failed: %v", err)
@@ -317,10 +319,10 @@ func TestStateSave_RestrictedPermissions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestUpdateZone_MutatesUnderLock(t *testing.T) {
-	state := NewState("")
-	state.SetZone("example.com", &ZoneState{Serial: 1})
+	state := statepkg.NewState("")
+	state.SetZone("example.com", &statepkg.ZoneState{Serial: 1})
 
-	state.UpdateZone("example.com", func(z *ZoneState) {
+	state.UpdateZone("example.com", func(z *statepkg.ZoneState) {
 		z.Serial = 42
 	})
 
@@ -331,10 +333,10 @@ func TestUpdateZone_MutatesUnderLock(t *testing.T) {
 }
 
 func TestUpdateZone_NoopForMissingZone(t *testing.T) {
-	state := NewState("")
+	state := statepkg.NewState("")
 
 	// Should not panic for missing zone
-	state.UpdateZone("nonexistent.com", func(z *ZoneState) {
+	state.UpdateZone("nonexistent.com", func(z *statepkg.ZoneState) {
 		z.Serial = 99
 	})
 }
@@ -479,7 +481,7 @@ func TestSecurityHeaders_Present(t *testing.T) {
 }
 
 func TestHealthEndpoints_MethodRestriction(t *testing.T) {
-	state := NewState("")
+	state := statepkg.NewState("")
 	cfg := &config.Config{
 		OutputDir: "/tmp",
 		DataDir:   "/tmp",
@@ -512,7 +514,7 @@ func TestHealthEndpoints_MethodRestriction(t *testing.T) {
 }
 
 func TestHealthEndpoints_SecurityHeaders(t *testing.T) {
-	state := NewState("")
+	state := statepkg.NewState("")
 	cfg := &config.Config{
 		OutputDir: "/tmp",
 		DataDir:   "/tmp",
@@ -614,7 +616,7 @@ func TestWebServer_NoDebugVarsPath(t *testing.T) {
 		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
 		Zones:     make(map[string]config.ZoneConfig),
 	}
-	state := NewState("")
+	state := statepkg.NewState("")
 	srv := NewWebServer(NewDaemon(cfg, state))
 
 	rr := httptest.NewRecorder()
@@ -638,7 +640,7 @@ func TestDashboardHandler_PathRouting(t *testing.T) {
 		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
 		Zones:     make(map[string]config.ZoneConfig),
 	}
-	state := NewState("")
+	state := statepkg.NewState("")
 	srv := NewWebServer(NewDaemon(cfg, state))
 
 	t.Run("root path returns 200", func(t *testing.T) {
@@ -672,7 +674,7 @@ func TestAPIEndpoints_MethodAndContentType(t *testing.T) {
 		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
 		Zones:     make(map[string]config.ZoneConfig),
 	}
-	state := NewState("")
+	state := statepkg.NewState("")
 	srv := NewWebServer(NewDaemon(cfg, state))
 
 	t.Run("POST /api/status rejected", func(t *testing.T) {
@@ -711,29 +713,29 @@ func TestAPIEndpoints_MethodAndContentType(t *testing.T) {
 func TestZoneState_StatusTransitions(t *testing.T) {
 	tests := []struct {
 		name   string
-		zone   ZoneState
+		zone   statepkg.ZoneState
 		expect string
 	}{
 		{
 			name:   "healthy zone",
-			zone:   ZoneState{Serial: 1},
+			zone:   statepkg.ZoneState{Serial: 1},
 			expect: "healthy",
 		},
 		{
 			name:   "zone with errors",
-			zone:   ZoneState{Serial: 1, Errors: []string{"signing failed"}},
+			zone:   statepkg.ZoneState{Serial: 1, Errors: []string{"signing failed"}},
 			expect: "error",
 		},
 		{
 			name:   "zone with warnings",
-			zone:   ZoneState{Serial: 1, Warnings: []string{"approaching expiry"}},
+			zone:   statepkg.ZoneState{Serial: 1, Warnings: []string{"approaching expiry"}},
 			expect: "warning",
 		},
 		{
 			name: "zone with rollover",
-			zone: ZoneState{
+			zone: statepkg.ZoneState{
 				Serial:   1,
-				Rollover: &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait},
+				Rollover: &statepkg.RolloverState{Type: "ksk", State: statepkg.KSKRolloverStateDSAddWait},
 			},
 			expect: "action_required",
 		},
@@ -741,18 +743,18 @@ func TestZoneState_StatusTransitions(t *testing.T) {
 			// ZSK rollovers are fully automatic — no DS update, no operator
 			// action — so they must not page anyone via action_required.
 			name: "automatic zsk rollover stays healthy",
-			zone: ZoneState{
+			zone: statepkg.ZoneState{
 				Serial:   1,
-				Rollover: &RolloverState{Type: "zsk", State: ZSKRolloverStatePrePublish},
+				Rollover: &statepkg.RolloverState{Type: "zsk", State: statepkg.ZSKRolloverStatePrePublish},
 			},
 			expect: "healthy",
 		},
 		{
 			name: "errors take priority over rollover",
-			zone: ZoneState{
+			zone: statepkg.ZoneState{
 				Serial:   1,
 				Errors:   []string{"broken"},
-				Rollover: &RolloverState{Type: "ksk", State: KSKRolloverStateDSAddWait},
+				Rollover: &statepkg.RolloverState{Type: "ksk", State: statepkg.KSKRolloverStateDSAddWait},
 			},
 			expect: "error",
 		},
@@ -773,7 +775,7 @@ func TestZoneState_StatusTransitions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHealthz_ReturnsOK(t *testing.T) {
-	state := NewState("")
+	state := statepkg.NewState("")
 	cfg := &config.Config{
 		OutputDir: t.TempDir(),
 		DataDir:   t.TempDir(),

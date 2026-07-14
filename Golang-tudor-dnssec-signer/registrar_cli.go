@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 	"github.com/spf13/cobra"
@@ -21,8 +23,8 @@ import (
 // stderr — honoring the documented "added to the zone's warnings array"
 // contract (R-032). Mutation and Save each take the state write lock
 // separately (Mutate's fn must not re-enter State methods).
-func recordRegistrarWarning(state *State, domain, msg string) {
-	state.UpdateZone(domain, func(z *ZoneState) { z.AddWarning(msg) })
+func recordRegistrarWarning(state *statepkg.State, domain, msg string) {
+	state.UpdateZone(domain, func(z *statepkg.ZoneState) { z.AddWarning(msg) })
 	if err := state.Save(); err != nil {
 		slog.Error("[REGISTRAR] failed to persist zone warning", "domain", domain, "warning", msg, "error", err)
 	}
@@ -41,7 +43,7 @@ func registrarContext() (context.Context, context.CancelFunc) {
 // returns the adapter. A missing adapter (no registrar configured for the
 // zone) is an error in this context — the user explicitly asked for a
 // registrar op.
-func resolveRegistrar(domain string) (*config.Config, *State, Registrar, error) {
+func resolveRegistrar(domain string) (*config.Config, *statepkg.State, Registrar, error) {
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
 		return nil, nil, nil, err
@@ -64,7 +66,7 @@ func resolveRegistrar(domain string) (*config.Config, *State, Registrar, error) 
 // deliberately held across the registrar network calls — the same accepted
 // pattern as maybeAutoPublishDS running under its caller's lock — with the
 // usual 30s acquisition timeout.
-func resolveRegistrarLocked(domain string) (*config.Config, *State, Registrar, func(), error) {
+func resolveRegistrarLocked(domain string) (*config.Config, *statepkg.State, Registrar, func(), error) {
 	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -80,7 +82,7 @@ func resolveRegistrarLocked(domain string) (*config.Config, *State, Registrar, f
 // registrarForManagedZone is the shared back half of resolveRegistrar and
 // resolveRegistrarLocked: it ensures the zone is managed and resolves its
 // configured registrar adapter.
-func registrarForManagedZone(cfg *config.Config, state *State, domain string) (Registrar, error) {
+func registrarForManagedZone(cfg *config.Config, state *statepkg.State, domain string) (Registrar, error) {
 	if state.GetZone(domain) == nil {
 		return nil, fmt.Errorf("domain %q is not managed", domain)
 	}
@@ -220,12 +222,12 @@ func runRegistrarPush(cmd *cobra.Command, args []string) error {
 // read-back that confirms the zero-DS condition is resolved (R-017). It is a no-op
 // when the expected DS set is empty or no sticky warning is present, and persists
 // state only when it actually removed a warning.
-func clearRegistrarStickyWarnings(state *State, domain string, want []*dns.DS) {
+func clearRegistrarStickyWarnings(state *statepkg.State, domain string, want []*dns.DS) {
 	if len(want) == 0 {
 		return
 	}
 	cleared := false
-	state.UpdateZone(domain, func(z *ZoneState) {
+	state.UpdateZone(domain, func(z *statepkg.ZoneState) {
 		before := len(z.Warnings)
 		z.ClearStickyWarnings()
 		cleared = len(z.Warnings) != before
@@ -319,7 +321,7 @@ func printJSON(v any) error {
 // are surfaced to the user as warnings but never turned into command errors
 // — the signer's source-of-truth work (signing) already succeeded, and the
 // operator can retry via `registrar push`.
-func maybeAutoPublishDS(cfg *config.Config, state *State, domain string, op string) {
+func maybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string, op string) {
 	reg, err := RegistrarFor(cfg, domain)
 	if err != nil {
 		msg := fmt.Sprintf("registrar auto-publish failed: registrar lookup failed: %v", err)
