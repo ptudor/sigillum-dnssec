@@ -4,6 +4,8 @@ DNSSEC tooling: a zone-signing daemon and a browser-based validation/troubleshoo
 
 Split out of TudorDNS-Golang on 2026-07-09 with filtered history. The full pre-split history remains frozen at `git@ptudor.net:/git/TudorDNS-Golang`.
 
+**Package layout standard:** `GO-LAYOUT-STANDARD.md` (this dir) is the reusable recipe + prompt for decomposing a flat `package main` Go daemon into `internal/` packages. `Golang-tudor-dnssec-signer` is the worked exemplar; apply the same to other daemons (mail, dns, …).
+
 ## Projects
 
 ### Golang-tudor-dnssec-signer (dnssec-tudor)
