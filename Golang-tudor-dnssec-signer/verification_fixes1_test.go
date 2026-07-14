@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // --- Item 1: unwindAdd must never delete a surviving orphan key half ---
@@ -246,7 +248,7 @@ func TestIsZoneTableHeader(t *testing.T) {
 		{``, false},
 	}
 	for _, tc := range cases {
-		if got := isZoneTableHeader(tc.line, domain); got != tc.want {
+		if got := config.IsZoneTableHeader(tc.line, domain); got != tc.want {
 			t.Errorf("isZoneTableHeader(%q) = %v, want %v", tc.line, got, tc.want)
 		}
 	}
@@ -282,7 +284,7 @@ path = %q
 
 	// Sanity: the exotic header parses as the zone, so runRemove takes the
 	// in-config branch — the exact combination that used to print success.
-	cfg, err := LoadConfig(cfgPath)
+	cfg, err := config.LoadConfig(cfgPath)
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}

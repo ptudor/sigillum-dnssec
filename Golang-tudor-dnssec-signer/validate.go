@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // ValidationResult holds the results of all DNSSEC validation checks for a zone.
@@ -78,14 +79,14 @@ type ValidateSummary struct {
 
 // Validator performs internet DNSSEC validation checks against live DNS.
 type Validator struct {
-	cfg      *Config
+	cfg      *config.Config
 	state    *State
 	resolver string
 	timeout  time.Duration
 }
 
 // NewValidator creates a Validator with the given configuration.
-func NewValidator(cfg *Config, state *State, resolver string, timeout time.Duration) *Validator {
+func NewValidator(cfg *config.Config, state *State, resolver string, timeout time.Duration) *Validator {
 	return &Validator{
 		cfg:      cfg,
 		state:    state,

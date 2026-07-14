@@ -1,4 +1,4 @@
-package main
+package config
 
 import "testing"
 
@@ -10,11 +10,11 @@ func TestR029_CanonicalZoneIdentity(t *testing.T) {
 		{"EXAMPLE.COM.", "example.com"},
 	}
 	for _, p := range same {
-		if canonicalZoneIdentity(p[0]) != canonicalZoneIdentity(p[1]) {
+		if CanonicalZoneIdentity(p[0]) != CanonicalZoneIdentity(p[1]) {
 			t.Errorf("%q and %q should share a canonical identity", p[0], p[1])
 		}
 	}
-	if canonicalZoneIdentity("a.example.com") == canonicalZoneIdentity("b.example.com") {
+	if CanonicalZoneIdentity("a.example.com") == CanonicalZoneIdentity("b.example.com") {
 		t.Error("distinct zones must not share an identity")
 	}
 }

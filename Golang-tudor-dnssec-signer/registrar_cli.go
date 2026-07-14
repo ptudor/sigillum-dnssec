@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -40,7 +41,7 @@ func registrarContext() (context.Context, context.CancelFunc) {
 // returns the adapter. A missing adapter (no registrar configured for the
 // zone) is an error in this context — the user explicitly asked for a
 // registrar op.
-func resolveRegistrar(domain string) (*Config, *State, Registrar, error) {
+func resolveRegistrar(domain string) (*config.Config, *State, Registrar, error) {
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
 		return nil, nil, nil, err
@@ -63,7 +64,7 @@ func resolveRegistrar(domain string) (*Config, *State, Registrar, error) {
 // deliberately held across the registrar network calls — the same accepted
 // pattern as maybeAutoPublishDS running under its caller's lock — with the
 // usual 30s acquisition timeout.
-func resolveRegistrarLocked(domain string) (*Config, *State, Registrar, func(), error) {
+func resolveRegistrarLocked(domain string) (*config.Config, *State, Registrar, func(), error) {
 	cfg, state, unlock, err := loadConfigStateLocked()
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -79,7 +80,7 @@ func resolveRegistrarLocked(domain string) (*Config, *State, Registrar, func(), 
 // registrarForManagedZone is the shared back half of resolveRegistrar and
 // resolveRegistrarLocked: it ensures the zone is managed and resolves its
 // configured registrar adapter.
-func registrarForManagedZone(cfg *Config, state *State, domain string) (Registrar, error) {
+func registrarForManagedZone(cfg *config.Config, state *State, domain string) (Registrar, error) {
 	if state.GetZone(domain) == nil {
 		return nil, fmt.Errorf("domain %q is not managed", domain)
 	}
@@ -318,7 +319,7 @@ func printJSON(v any) error {
 // are surfaced to the user as warnings but never turned into command errors
 // — the signer's source-of-truth work (signing) already succeeded, and the
 // operator can retry via `registrar push`.
-func maybeAutoPublishDS(cfg *Config, state *State, domain string, op string) {
+func maybeAutoPublishDS(cfg *config.Config, state *State, domain string, op string) {
 	reg, err := RegistrarFor(cfg, domain)
 	if err != nil {
 		msg := fmt.Sprintf("registrar auto-publish failed: registrar lookup failed: %v", err)
@@ -393,7 +394,7 @@ func maybeAutoPublishDS(cfg *Config, state *State, domain string, op string) {
 }
 
 // registrarAutoPublish returns the auto_publish flag for the named adapter.
-func registrarAutoPublish(cfg *Config, name string) bool {
+func registrarAutoPublish(cfg *config.Config, name string) bool {
 	switch strings.ToLower(name) {
 	case "dynadot":
 		return cfg.Registrar.Dynadot.AutoPublish

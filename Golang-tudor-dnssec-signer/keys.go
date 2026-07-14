@@ -16,15 +16,17 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
 
 // KeyGenerator handles DNSSEC key generation and storage
 type KeyGenerator struct {
-	cfg *Config
+	cfg *config.Config
 }
 
 // NewKeyGenerator creates a new key generator
-func NewKeyGenerator(cfg *Config) *KeyGenerator {
+func NewKeyGenerator(cfg *config.Config) *KeyGenerator {
 	return &KeyGenerator{cfg: cfg}
 }
 
@@ -256,10 +258,10 @@ func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 	// first: if a crash lands between the two, the correspondence check in
 	// loadKeyPairFromPath rejects the resulting pair and the prior signed zone keeps
 	// serving, rather than a half-written file being read.
-	if err := writeFileAtomicOwned(privFile, []byte(privContent), 0600); err != nil {
+	if err := fsutil.WriteFileAtomicOwned(privFile, []byte(privContent), 0600); err != nil {
 		return fmt.Errorf("writing private key file: %w", err)
 	}
-	if err := writeFileAtomicOwned(keyFile, []byte(keyContent), 0644); err != nil {
+	if err := fsutil.WriteFileAtomicOwned(keyFile, []byte(keyContent), 0644); err != nil {
 		return fmt.Errorf("writing public key file: %w", err)
 	}
 

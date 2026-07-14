@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // mkDS is a test helper that builds a DS record from primitive fields.
@@ -64,7 +65,7 @@ func TestRegistrarConfig_DigestType_Defaults(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rc := RegistrarConfig{DigestTypeVal: tc.in}
+			rc := config.RegistrarConfig{DigestTypeVal: tc.in}
 			if got := rc.DigestType(); got != tc.want {
 				t.Fatalf("DigestType(%d) = %d, want %d", tc.in, got, tc.want)
 			}
@@ -75,8 +76,8 @@ func TestRegistrarConfig_DigestType_Defaults(t *testing.T) {
 // TestRegistrarFor_NotOptedIn confirms that zones without a registrar field
 // behave exactly as before (nil adapter, no error).
 func TestRegistrarFor_NotOptedIn(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Zones["example.com"] = ZoneConfig{Path: "/nonexistent"}
+	cfg := config.DefaultConfig()
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: "/nonexistent"}
 	reg, err := RegistrarFor(cfg, "example.com")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -88,8 +89,8 @@ func TestRegistrarFor_NotOptedIn(t *testing.T) {
 
 // TestRegistrarFor_UnknownAdapter confirms misconfiguration is surfaced.
 func TestRegistrarFor_UnknownAdapter(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Zones["example.com"] = ZoneConfig{Path: "/nonexistent", Registrar: "geocities"}
+	cfg := config.DefaultConfig()
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: "/nonexistent", Registrar: "geocities"}
 	if _, err := RegistrarFor(cfg, "example.com"); err == nil {
 		t.Fatal("expected error for unknown registrar, got nil")
 	}

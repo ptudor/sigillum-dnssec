@@ -5,20 +5,21 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // R-060: an unsupported registrar digest_type is rejected at validation, not
 // silently coerced to SHA-256.
 func TestR060_ValidateRejectsInvalidDigestType(t *testing.T) {
 	for _, dt := range []int{1, 3, 5, 255, -1} {
-		c := DefaultConfig()
+		c := config.DefaultConfig()
 		c.Registrar.DigestTypeVal = dt
 		if err := c.Validate(); err == nil {
 			t.Errorf("digest_type=%d must be rejected", dt)
 		}
 	}
 	for _, dt := range []int{0, 2, 4} {
-		c := DefaultConfig()
+		c := config.DefaultConfig()
 		c.Registrar.DigestTypeVal = dt
 		if err := c.Validate(); err != nil {
 			t.Errorf("digest_type=%d must be accepted: %v", dt, err)

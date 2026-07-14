@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // R-034: DNSSEC records present in the input (a stale RRSIG, NSEC3PARAM, apex
@@ -83,7 +84,7 @@ evil.org.	IN	A	192.0.2.99
 	if err := os.WriteFile(zonePath, []byte(zone), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}

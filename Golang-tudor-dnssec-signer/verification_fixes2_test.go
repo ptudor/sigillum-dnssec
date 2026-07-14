@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // --- Item 4: ZSK rollover must not stall on frequently-edited zones ---
@@ -171,9 +172,9 @@ func TestRolloverState_OldSchemaNoPhaseFirstSigned(t *testing.T) {
 // old ZSK dropped from the published DNSKEY RRset on the next sign.
 func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 	_, cfg, state, domain := signableZoneDaemon(t)
-	cfg.DNSSEC.DNSKEYTtl = 1                                   // 1s TTL floor (fast for the test)
-	cfg.DNSSEC.RolloverPrepublish = Duration{61 * time.Second} // signing dwell =
-	cfg.DNSSEC.RolloverSwitch = Duration{1 * time.Second}      // prepublish - switch = 60s
+	cfg.DNSSEC.DNSKEYTtl = 1                                                    // 1s TTL floor (fast for the test)
+	cfg.DNSSEC.RolloverPrepublish = config.Duration{Duration: 61 * time.Second} // signing dwell =
+	cfg.DNSSEC.RolloverSwitch = config.Duration{Duration: 1 * time.Second}      // prepublish - switch = 60s
 	rm := NewRolloverManager(cfg, state)
 
 	now := time.Now().UTC()

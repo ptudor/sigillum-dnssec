@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // RegisterHealthHandlersWithDaemon registers health check endpoints with daemon
@@ -44,7 +46,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 }
 
 // healthHandler returns detailed health status
-func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Config, daemon *Daemon) {
+func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *config.Config, daemon *Daemon) {
 	status := state.ToStatusOutput()
 
 	// Check if any zones have errors
@@ -127,7 +129,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Co
 }
 
 // healthzHandler returns simple OK for kubernetes probes
-func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *Config, daemon *Daemon) {
+func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *config.Config, daemon *Daemon) {
 	status := state.ToStatusOutput()
 	healthy := status.Summary.Errors == 0
 

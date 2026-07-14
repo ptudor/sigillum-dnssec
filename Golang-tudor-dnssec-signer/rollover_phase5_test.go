@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // R-039: an automatic ZSK rollover mints the new ZSK with the EXISTING ZSK's
@@ -150,7 +152,7 @@ func TestVerifyNewKSKDSAtParent_UnreachableIsNotPresent(t *testing.T) {
 	_, cfg, state, domain := signableZoneDaemon(t)
 	// TEST-NET-1, guaranteed unroutable → the DS can't be confirmed.
 	cfg.Validation.Resolver = "192.0.2.1:53"
-	cfg.Validation.Timeout = Duration{500 * time.Millisecond}
+	cfg.Validation.Timeout = config.Duration{Duration: 500 * time.Millisecond}
 
 	present, _ := verifyNewKSKDSAtParent(cfg, state, domain)
 	if present {

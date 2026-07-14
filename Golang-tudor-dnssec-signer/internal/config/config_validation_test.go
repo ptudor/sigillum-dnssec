@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -75,20 +75,6 @@ func TestConfigValidate_RolloverDurations(t *testing.T) {
 			t.Errorf("defaults should pass: %v", err)
 		}
 	})
-}
-
-// R-014: the pre-publish Action message is built from the configured switch
-// duration, not a hardcoded "7 days".
-func TestHumanizeRolloverDelay(t *testing.T) {
-	if got := humanizeRolloverDelay(7 * 24 * time.Hour); got != "7 day(s)" {
-		t.Errorf("7d = %q, want \"7 day(s)\"", got)
-	}
-	if got := humanizeRolloverDelay(10 * 24 * time.Hour); got != "10 day(s)" {
-		t.Errorf("10d = %q, want \"10 day(s)\"", got)
-	}
-	if got := humanizeRolloverDelay(1 * time.Second); got != "1s" {
-		t.Errorf("1s = %q, want \"1s\"", got)
-	}
 }
 
 // R-015: unknown/misspelled TOML keys are rejected instead of silently ignored.
@@ -179,7 +165,7 @@ func TestCheckWebFlagListen(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Web.Enabled = true
 		cfg.Web.Listen = ":8053" // all interfaces
-		if err := checkWebFlagListen(cfg); err == nil {
+		if err := cfg.CheckWebFlagListen(); err == nil {
 			t.Fatal("expected error binding the unauthenticated dashboard to all interfaces")
 		}
 	})
@@ -188,7 +174,7 @@ func TestCheckWebFlagListen(t *testing.T) {
 		cfg.Web.Enabled = true
 		cfg.Web.Listen = ":8053"
 		cfg.Web.AllowRemote = true
-		if err := checkWebFlagListen(cfg); err != nil {
+		if err := cfg.CheckWebFlagListen(); err != nil {
 			t.Errorf("allow_remote should permit non-loopback: %v", err)
 		}
 	})
@@ -196,7 +182,7 @@ func TestCheckWebFlagListen(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Web.Enabled = true
 		cfg.Web.Listen = "127.0.0.1:8053"
-		if err := checkWebFlagListen(cfg); err != nil {
+		if err := cfg.CheckWebFlagListen(); err != nil {
 			t.Errorf("loopback listen should be allowed: %v", err)
 		}
 	})
@@ -204,7 +190,7 @@ func TestCheckWebFlagListen(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Web.Enabled = false
 		cfg.Web.Listen = ":8053"
-		if err := checkWebFlagListen(cfg); err != nil {
+		if err := cfg.CheckWebFlagListen(); err != nil {
 			t.Errorf("disabled web should skip the guard: %v", err)
 		}
 	})

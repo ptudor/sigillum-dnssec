@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // heartbeatEventQueueSize bounds the async per-event heartbeat queue. When a
@@ -19,7 +21,7 @@ const heartbeatEventQueueSize = 64
 
 // HeartbeatClient sends periodic heartbeats to AnyStatus monitoring service
 type HeartbeatClient struct {
-	cfg *HeartbeatConfig
+	cfg *config.HeartbeatConfig
 
 	mu         sync.RWMutex
 	lastAction string
@@ -38,7 +40,7 @@ type HeartbeatClient struct {
 }
 
 // NewHeartbeatClient creates a new heartbeat client
-func NewHeartbeatClient(cfg *HeartbeatConfig) *HeartbeatClient {
+func NewHeartbeatClient(cfg *config.HeartbeatConfig) *HeartbeatClient {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Set instance_id to hostname if not specified

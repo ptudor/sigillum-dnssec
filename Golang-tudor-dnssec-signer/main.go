@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 	"github.com/spf13/cobra"
 )
 
@@ -335,15 +337,15 @@ func getEnvOrDefault(key, defaultVal string) string {
 	return defaultVal
 }
 
-func loadConfigAndState() (*Config, *State, error) {
-	cfg, err := LoadConfig(configPath)
+func loadConfigAndState() (*config.Config, *State, error) {
+	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
 
 	// Capture the data_dir owner before any writes so CLI commands run as
 	// root will chown what they create. No-op for non-root invocations.
-	InitOwnershipTarget(cfg.DataDir)
+	fsutil.InitOwnershipTarget(cfg.DataDir)
 
 	state, err := LoadState(cfg.StatePath())
 	if err != nil {
@@ -359,12 +361,12 @@ func loadConfigAndState() (*Config, *State, error) {
 // commands (R-007) — otherwise a rollover/add/remove landing mid-cycle is clobbered by the
 // daemon's end-of-cycle Save. Read-only commands (status/ds/dnskey/validate/rollover
 // status) keep loadConfigAndState and take no lock.
-func loadConfigStateLocked() (cfg *Config, state *State, unlock func(), err error) {
-	cfg, err = LoadConfig(configPath)
+func loadConfigStateLocked() (cfg *config.Config, state *State, unlock func(), err error) {
+	cfg, err = config.LoadConfig(configPath)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("loading config: %w", err)
 	}
-	InitOwnershipTarget(cfg.DataDir)
+	fsutil.InitOwnershipTarget(cfg.DataDir)
 	if err := ensureDir(cfg.DataDir); err != nil {
 		return nil, nil, nil, fmt.Errorf("ensuring data_dir for state lock: %w", err)
 	}
@@ -397,7 +399,7 @@ func preflightConfigAppend(path string) error {
 // they must run it at all: without this, `rollover complete` would write a
 // new signed zone that NSD doesn't load until the next natural re-sign.
 // Hook failures are logged, never fatal — the signing itself succeeded.
-func runPostSignHook(cfg *Config, domain, zonePath string) {
+func runPostSignHook(cfg *config.Config, domain, zonePath string) {
 	if cfg.Hooks.PostSign == "" && len(cfg.Hooks.PostSignCmd) == 0 {
 		return
 	}
@@ -432,7 +434,7 @@ func keyPairAbsent(keysDir, domain, role string) bool {
 // rollback, since a DS at the registrar may still reference them.
 // Best-effort — failures are logged but not returned, so the original error
 // from `add` surfaces unchanged.
-func unwindAdd(cfg *Config, state *State, domain string, removeKSK, removeZSK bool, origOutput []byte, outputExisted bool) {
+func unwindAdd(cfg *config.Config, state *State, domain string, removeKSK, removeZSK bool, origOutput []byte, outputExisted bool) {
 	state.RemoveZone(domain)
 	if err := state.Save(); err != nil {
 		slog.Warn("[CLI] Rollback: failed to save state", "domain", domain, "error", err)
@@ -443,7 +445,7 @@ func unwindAdd(cfg *Config, state *State, domain string, removeKSK, removeZSK bo
 		// R-011: a signed output existed before this add (a re-add over a previous
 		// management period). Restore the exact previous bytes — a nameserver may
 		// still be serving them — rather than deleting the last known-good zone.
-		if err := writeFileOwned(signedPath, origOutput, 0644); err != nil {
+		if err := fsutil.WriteFileOwned(signedPath, origOutput, 0644); err != nil {
 			slog.Warn("[CLI] Rollback: failed to restore previous signed zone", "path", signedPath, "error", err)
 		}
 	} else if err := os.Remove(signedPath); err != nil && !os.IsNotExist(err) {
@@ -470,17 +472,6 @@ func unwindAdd(cfg *Config, state *State, domain string, removeKSK, removeZSK bo
 }
 
 // runServe runs the daemon
-// checkWebFlagListen re-enforces the loopback guard on the web dashboard after
-// the `--web` flag override, which is applied after Config.Validate() already
-// ran. The dashboard has no authentication, so a non-loopback listen is only
-// allowed when web.allow_remote is explicitly set in config (R-005).
-func checkWebFlagListen(cfg *Config) error {
-	if cfg.Web.Enabled && !cfg.Web.AllowRemote {
-		return validateLoopbackAddr(cfg.Web.Listen, "--web")
-	}
-	return nil
-}
-
 func runServe(cmd *cobra.Command, args []string) error {
 	cfg, state, err := loadConfigAndState()
 	if err != nil {
@@ -499,7 +490,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// used to recommend) would otherwise bind all interfaces with no auth. The
 	// dashboard is unauthenticated; keep it loopback-only unless allow_remote is
 	// explicitly set in config (R-005).
-	if err := checkWebFlagListen(cfg); err != nil {
+	if err := cfg.CheckWebFlagListen(); err != nil {
 		return err
 	}
 
@@ -533,7 +524,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 				// level/format/output; only the underlying handle is refreshed (R-056).
 				setupLogging()
 				slog.Info("[DAEMON] Received SIGHUP, reloading configuration and state")
-				newCfg, err := LoadConfig(configPath)
+				newCfg, err := config.LoadConfig(configPath)
 				if err != nil {
 					slog.Error("[DAEMON] Failed to reload config", "error", err)
 					continue
@@ -546,7 +537,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 					newCfg.Web.Enabled = true
 					newCfg.Web.Listen = webAddr
 				}
-				if err := checkWebFlagListen(newCfg); err != nil {
+				if err := newCfg.CheckWebFlagListen(); err != nil {
 					slog.Error("[DAEMON] Reload rejected: --web override fails the loopback guard", "error", err)
 					continue
 				}
@@ -797,7 +788,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving zone path %q: %w", args[1], err)
 	}
 
-	if err := ValidateDomainName(domain); err != nil {
+	if err := config.ValidateDomainName(domain); err != nil {
 		return fmt.Errorf("invalid domain name: %w", err)
 	}
 
@@ -847,7 +838,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Add to in-memory config so signing works
-	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
 	// Key files may already exist on disk from a previous management period
 	// (zone removed and re-added). Reusing them preserves the DS chain of
@@ -907,7 +898,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Config append happens last. The pre-flight makes failure here unlikely,
 	// but if it still fails (race, disk full), unwind everything so state.json
 	// stays consistent with the config file.
-	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+	if err := config.AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
 		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated, origOutput, outputExisted)
 		return fmt.Errorf("adding zone to config file: %w", err)
 	}
@@ -981,8 +972,8 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		if err := preflightConfigAppend(configPath); err != nil {
 			return fmt.Errorf("config file %s not writable (needed to remove the zone entry): %w", configPath, err)
 		}
-		if err := RemoveZoneFromConfigFile(configPath, domain); err != nil {
-			if err == errZoneNotInConfig {
+		if err := config.RemoveZoneFromConfigFile(configPath, domain); err != nil {
+			if err == config.ErrZoneNotInConfig {
 				// The parsed config confirmed the zone IS present, yet the
 				// rewriter could not locate its table header (a hand-edited
 				// form the line matcher doesn't recognize). Printing success
@@ -1001,7 +992,7 @@ func runRemove(cmd *cobra.Command, args []string) error {
 			// Restore the exact original config bytes (all keys/comments/order),
 			// preserving ownership/mode, so the failed removal leaves config and
 			// state consistent and complete (R-010).
-			if aerr := writeConfigFileAtomic(configPath, origConfig); aerr != nil {
+			if aerr := fsutil.WriteConfigFileAtomic(configPath, origConfig); aerr != nil {
 				slog.Error("[CLI] Rollback: failed to restore original config after state-save failure",
 					"domain", domain, "error", aerr)
 			}
@@ -1102,7 +1093,7 @@ func runRolloverStatus(cmd *cobra.Command, args []string) error {
 // completion so the old KSK isn't retired before the new DS is live (R-037). The
 // parent's live DS is the ground truth resolvers see, so this works for both
 // registrar-automated and manual zones.
-func verifyNewKSKDSAtParent(cfg *Config, state *State, domain string) (bool, string) {
+func verifyNewKSKDSAtParent(cfg *config.Config, state *State, domain string) (bool, string) {
 	keyGen := NewKeyGenerator(cfg)
 	newKSK, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
@@ -1403,7 +1394,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	kskPath, _ := cmd.Flags().GetString("ksk")
 	zskPath, _ := cmd.Flags().GetString("zsk")
 
-	if err := ValidateDomainName(domain); err != nil {
+	if err := config.ValidateDomainName(domain); err != nil {
 		return fmt.Errorf("invalid domain name: %w", err)
 	}
 
@@ -1508,7 +1499,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	state.SetZone(domain, zoneState)
 
 	// Add to in-memory config
-	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
 	// Sign the zone
 	signer := NewSigner(cfg, state)
@@ -1526,7 +1517,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	// preflight (e.g. a race), unwind the state so it doesn't diverge from config and a
 	// retry isn't blocked at "already managed". Converted key files are left in place (a
 	// registrar DS may reference them) with a note (R-023).
-	if err := AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+	if err := config.AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
 		state.RemoveZone(domain)
 		if serr := state.Save(); serr != nil {
 			slog.Error("[CLI] Rollback: failed to remove zone from state after config-append failure",

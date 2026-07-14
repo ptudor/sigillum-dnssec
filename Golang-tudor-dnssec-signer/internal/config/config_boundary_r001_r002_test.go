@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -17,8 +17,8 @@ func TestR001_IsTOMLTableHeader(t *testing.T) {
 		`  [zones."next"]   # comment`,
 		`[[some.array]]`,
 		`[[some.array]] # comment`,
-		`[zones."a#b"]`,   // '#' inside a quoted key is not a comment
-		`[zones."a]b"]`,   // ']' inside a quoted key does not close early
+		`[zones."a#b"]`,     // '#' inside a quoted key is not a comment
+		`[zones."a]b"]`,     // ']' inside a quoted key does not close early
 		`[zones.'lit#key']`, // literal-string key with '#'
 	}
 	for _, l := range yes {

@@ -1,4 +1,4 @@
-package main
+package fsutil
 
 import (
 	"fmt"
@@ -62,12 +62,12 @@ func InitOwnershipTarget(refPath string) {
 	})
 }
 
-// chownToTarget applies the captured uid/gid to path if ownership-matching
+// ChownToTarget applies the captured uid/gid to path if ownership-matching
 // is active. Silent no-op otherwise. Chown errors are logged but not
 // returned — the write already succeeded, and a chown failure at worst
 // recreates the original permission-denied problem on the daemon side
 // (which the operator will see in logs just as before).
-func chownToTarget(path string) {
+func ChownToTarget(path string) {
 	if !ownership.active {
 		return
 	}
@@ -77,19 +77,19 @@ func chownToTarget(path string) {
 	}
 }
 
-// writeFileOwned wraps os.WriteFile with the chown step. Used for both
+// WriteFileOwned wraps os.WriteFile with the chown step. Used for both
 // state.json and key files. Returns the os.WriteFile error verbatim so
 // callers' error wrapping stays consistent.
-func writeFileOwned(path string, data []byte, perm os.FileMode) error {
+func WriteFileOwned(path string, data []byte, perm os.FileMode) error {
 	if err := os.WriteFile(path, data, perm); err != nil {
 		return err
 	}
-	chownToTarget(path)
+	ChownToTarget(path)
 	return nil
 }
 
 // renameOwned wraps os.Rename with a post-rename chown. The source temp
-// file may already have the right owner from writeFileOwned, but rename
+// file may already have the right owner from WriteFileOwned, but rename
 // across the same directory preserves ownership only on Unix — an explicit
 // chown on the destination is a safety belt for the case where the source
 // was created without the helper (e.g. a future code path that forgets).
@@ -97,17 +97,17 @@ func renameOwned(src, dst string) error {
 	if err := os.Rename(src, dst); err != nil {
 		return err
 	}
-	chownToTarget(dst)
+	ChownToTarget(dst)
 	return nil
 }
 
-// writeFileAtomicOwned writes data to path atomically and durably: it writes to a unique
+// WriteFileAtomicOwned writes data to path atomically and durably: it writes to a unique
 // temp file in the same directory, applies the mode, fsyncs, applies daemon ownership,
 // renames over the destination, then fsyncs the directory. A crash leaves either the old
 // file or the complete new one — never a truncated or half-written file (R-009). The
 // unique temp name also avoids the fixed-".tmp" collision between a concurrent daemon and
 // CLI writing the same path (R-002). On any error the temp file is removed.
-func writeFileAtomicOwned(path string, data []byte, perm os.FileMode) error {
+func WriteFileAtomicOwned(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
@@ -137,24 +137,24 @@ func writeFileAtomicOwned(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("closing temp file: %w", err)
 	}
-	chownToTarget(tmpPath)
+	ChownToTarget(tmpPath)
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("renaming temp file over %s: %w", path, err)
 	}
 	committed = true
-	chownToTarget(path)
-	syncDir(dir)
+	ChownToTarget(path)
+	SyncDir(dir)
 	return nil
 }
 
-// writeConfigFileAtomic atomically and durably replaces the configuration file at
+// WriteConfigFileAtomic atomically and durably replaces the configuration file at
 // path with data, preserving the DESTINATION file's existing owner (uid/gid) and
-// mode — it never inherits data_dir/daemon ownership the way writeFileAtomicOwned
+// mode — it never inherits data_dir/daemon ownership the way WriteFileAtomicOwned
 // does (R-002). The config holds registrar API keys and hook commands and must stay
 // owned as deployed (typically root, group-readable by the daemon, 0640); handing it
 // to the daemon account would let a compromised daemon rewrite those commands/
 // credentials. A failure to restore ownership aborts before replacing the original.
-func writeConfigFileAtomic(path string, data []byte) error {
+func WriteConfigFileAtomic(path string, data []byte) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("stat config file: %w", err)
@@ -196,7 +196,7 @@ func writeConfigFileAtomic(path string, data []byte) error {
 		return fmt.Errorf("renaming temp config over %s: %w", path, err)
 	}
 	committed = true
-	syncDir(dir)
+	SyncDir(dir)
 	return nil
 }
 
@@ -215,9 +215,9 @@ func preserveOwner(path string, info os.FileInfo) error {
 	return os.Chown(path, int(stat.Uid), int(stat.Gid))
 }
 
-// syncDir fsyncs a directory so a preceding rename is durable across a crash/power loss.
+// SyncDir fsyncs a directory so a preceding rename is durable across a crash/power loss.
 // Best-effort: a failure is logged, not returned (the rename already succeeded).
-func syncDir(dir string) {
+func SyncDir(dir string) {
 	d, err := os.Open(dir)
 	if err != nil {
 		slog.Debug("[FS] Cannot open directory for fsync", "dir", dir, "error", err)

@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
 
 // maxHookStderr bounds how many bytes of a hook's stderr are retained. A broken
@@ -64,7 +67,7 @@ type HookEnv struct {
 // log-safe identity string. When PostSignCmd is set, it is used directly as
 // exec-style. When PostSign is set and Shell is true, it is wrapped in sh -c.
 // When PostSign is set and Shell is false, it is split on whitespace.
-func hookCmd(hooks *HooksConfig) (name string, args []string, identity string, ok bool) {
+func hookCmd(hooks *config.HooksConfig) (name string, args []string, identity string, ok bool) {
 	if len(hooks.PostSignCmd) > 0 {
 		return hooks.PostSignCmd[0], hooks.PostSignCmd[1:], "post_sign", true
 	}
@@ -87,7 +90,7 @@ func hookCmd(hooks *HooksConfig) (name string, args []string, identity string, o
 // raw command strings are never logged. When wg is non-nil (the daemon path) the
 // goroutine is tracked on it so shutdown can wait for the hook to finish before
 // the process exits (R-026); CLI callers pass nil.
-func executeHook(hooks *HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
+func executeHook(hooks *config.HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
 	name, args, identity, ok := hookCmd(hooks)
 	if !ok {
 		return
@@ -155,7 +158,7 @@ func executeHook(hooks *HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
 // of the per-zone `DNSSEC_DOMAIN` — consumers like `nsd-control reload`
 // don't need per-zone paths, and a full reload is cheaper than N
 // targeted reloads at scale. A zero-length domains slice is a no-op.
-func executeBatchHook(hooks *HooksConfig, domains []string, outputDir string, wg *sync.WaitGroup) {
+func executeBatchHook(hooks *config.HooksConfig, domains []string, outputDir string, wg *sync.WaitGroup) {
 	name, args, identity, ok := hookCmd(hooks)
 	if !ok || len(domains) == 0 {
 		return
@@ -220,7 +223,7 @@ func executeBatchHook(hooks *HooksConfig, domains []string, outputDir string, wg
 // spawned from a CLI command would be killed when the process exits.
 // env may be nil; when set, the same DNSSEC_* variables the daemon's
 // per-zone hook receives are exported.
-func executeHookSync(hooks *HooksConfig, env *HookEnv) error {
+func executeHookSync(hooks *config.HooksConfig, env *HookEnv) error {
 	name, args, identity, ok := hookCmd(hooks)
 	if !ok {
 		return nil
@@ -274,6 +277,6 @@ func copyFile(src, dst string) error {
 	}
 	// Mirror the ownership helper so rollover backups written under a
 	// root CLI invocation stay readable by the daemon user.
-	chownToTarget(dst)
+	fsutil.ChownToTarget(dst)
 	return nil
 }

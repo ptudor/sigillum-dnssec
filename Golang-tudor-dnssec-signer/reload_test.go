@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // R-006 / R-078: after a SIGHUP reload, the web UI and health endpoints must
@@ -27,26 +29,26 @@ func TestDaemonReload_HandlersReflectNewState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newCfg := func() *Config {
-		return &Config{
+	newCfg := func() *config.Config {
+		return &config.Config{
 			OutputDir:    outDir,
 			DataDir:      dataDir,
-			PollInterval: Duration{5 * time.Minute},
-			Web:          WebConfig{Enabled: true, Listen: "127.0.0.1:0"},
-			Health:       HealthConfig{Listen: "127.0.0.1:0", ShutdownTimeout: Duration{5 * time.Second}},
-			Zones:        make(map[string]ZoneConfig),
+			PollInterval: config.Duration{Duration: 5 * time.Minute},
+			Web:          config.WebConfig{Enabled: true, Listen: "127.0.0.1:0"},
+			Health:       config.HealthConfig{Listen: "127.0.0.1:0", ShutdownTimeout: config.Duration{Duration: 5 * time.Second}},
+			Zones:        make(map[string]config.ZoneConfig),
 		}
 	}
 
 	// Initial state: one zone whose signatures already expired -> /health 503.
 	cfg1 := newCfg()
-	cfg1.Zones["old.example."] = ZoneConfig{Path: "/zones/old.db"}
+	cfg1.Zones["old.example."] = config.ZoneConfig{Path: "/zones/old.db"}
 	state1 := NewState(cfg1.StatePath())
 	state1.SetZone("old.example.", &ZoneState{Serial: 1, SignaturesExp: time.Now().Add(-24 * time.Hour)})
 
 	// Post-reload state: a different zone with fresh (future) signatures.
 	cfg2 := newCfg()
-	cfg2.Zones["new.example."] = ZoneConfig{Path: "/zones/new.db"}
+	cfg2.Zones["new.example."] = config.ZoneConfig{Path: "/zones/new.db"}
 	state2 := NewState(cfg2.StatePath())
 	state2.SetZone("new.example.", &ZoneState{Serial: 2, SignaturesExp: time.Now().Add(14 * 24 * time.Hour)})
 

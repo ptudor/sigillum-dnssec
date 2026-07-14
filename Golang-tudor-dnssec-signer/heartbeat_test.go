@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // TestHeartbeat_EventSendsAreAsync (R-044): per-event heartbeats must not block
@@ -18,7 +20,7 @@ func TestHeartbeat_EventSendsAreAsync(t *testing.T) {
 	defer srv.Close()
 	defer close(block)
 
-	c := NewHeartbeatClient(&HeartbeatConfig{Enabled: true, URL: srv.URL, App: "test", IntervalMinutes: 60})
+	c := NewHeartbeatClient(&config.HeartbeatConfig{Enabled: true, URL: srv.URL, App: "test", IntervalMinutes: 60})
 
 	// Enqueue many events without a running worker: enqueue is non-blocking and
 	// drops the oldest on backpressure, so this returns essentially instantly
@@ -44,7 +46,7 @@ func TestHeartbeat_EventDelivered(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHeartbeatClient(&HeartbeatConfig{Enabled: true, URL: srv.URL, App: "test", IntervalMinutes: 60})
+	c := NewHeartbeatClient(&config.HeartbeatConfig{Enabled: true, URL: srv.URL, App: "test", IntervalMinutes: 60})
 	c.Start() // sends "starting" synchronously and starts the workers
 	defer c.Stop()
 

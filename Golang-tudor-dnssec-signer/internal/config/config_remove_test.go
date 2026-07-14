@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -75,8 +75,8 @@ path = "/zones/c.db"
 	}
 
 	// Removing an absent zone reports the sentinel (so `remove` can proceed).
-	if err := RemoveZoneFromConfigFile(cfgPath, "z.example.com"); err != errZoneNotInConfig {
-		t.Errorf("expected errZoneNotInConfig for absent zone, got %v", err)
+	if err := RemoveZoneFromConfigFile(cfgPath, "z.example.com"); err != ErrZoneNotInConfig {
+		t.Errorf("expected ErrZoneNotInConfig for absent zone, got %v", err)
 	}
 }
 
@@ -139,8 +139,8 @@ path = "/zones/c.db"
 			}
 
 			// A header that genuinely is not present still reports the sentinel.
-			if err := RemoveZoneFromConfigFile(cfgPath, "z.example.com"); err != errZoneNotInConfig {
-				t.Errorf("expected errZoneNotInConfig for absent zone, got %v", err)
+			if err := RemoveZoneFromConfigFile(cfgPath, "z.example.com"); err != ErrZoneNotInConfig {
+				t.Errorf("expected ErrZoneNotInConfig for absent zone, got %v", err)
 			}
 		})
 	}

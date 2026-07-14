@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // TestReload_TickerResetLatestWins (R-057): two rapid reloads that both change
@@ -16,14 +18,14 @@ func TestReload_TickerResetLatestWins(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(t, dir)
 	cfg.Heartbeat.Enabled = false
-	cfg.PollInterval = Duration{5 * time.Minute}
+	cfg.PollInterval = config.Duration{Duration: 5 * time.Minute}
 	state := NewState(cfg.StatePath())
 	d := NewDaemon(cfg, state)
 
 	cfg1 := *cfg
-	cfg1.PollInterval = Duration{1 * time.Minute}
+	cfg1.PollInterval = config.Duration{Duration: 1 * time.Minute}
 	cfg2 := *cfg
-	cfg2.PollInterval = Duration{2 * time.Minute}
+	cfg2.PollInterval = config.Duration{Duration: 2 * time.Minute}
 
 	// Nobody drains tickerReset between these two reloads.
 	d.Reload(&cfg1, state)
