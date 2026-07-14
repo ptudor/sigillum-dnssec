@@ -4,13 +4,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/ptudor/dnssec-validator/internal/config"
 )
 
 // R-048: the exact configured base path must redirect to its slash form (so
 // browser-relative asset/API URLs resolve under the prefix), preserving the query
 // string and the request method.
 func TestR048_BasePathRedirectsToSlash(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.BasePath = "/dnssec"
 	store := NewAnchorsStore("/nonexistent", "http://nonexistent")
 	s := NewServer(cfg, store)

@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-validator/internal/config"
 )
 
 func TestWithWriteDeadlinePassthrough(t *testing.T) {
@@ -136,7 +138,7 @@ func TestAllowCIDRs(t *testing.T) {
 // a loopback client gets through. This is the end-to-end proof that the
 // loopback-only default is actually wired into the route, not just the config.
 func TestMetricsDefaultLoopbackOnly(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	store := NewAnchorsStore("/nonexistent", "http://nonexistent")
 	s := NewServer(cfg, store)
 

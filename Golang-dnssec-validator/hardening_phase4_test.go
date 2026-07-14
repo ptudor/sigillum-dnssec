@@ -7,13 +7,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-validator/internal/config"
 )
 
 // R-086: a global cap bounds concurrent validations. The N+1th request is
 // rejected with 503 + Retry-After before any work starts.
 func TestValidationConcurrencyCap_RejectsWhenFull(t *testing.T) {
 	store := NewAnchorsStore("/nonexistent", "https://nonexistent.invalid")
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.MaxConcurrentValidations = 1
 	h := NewHandlers(store, cfg)
 
@@ -45,7 +47,7 @@ func TestValidationConcurrencyCap_RejectsWhenFull(t *testing.T) {
 
 // R-086: the slot semaphore holds exactly MaxConcurrentValidations tokens.
 func TestAcquireValidationSlot_HardCap(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.MaxConcurrentValidations = 3
 	h := NewHandlers(NewAnchorsStore("/x", "https://x.invalid"), cfg)
 
@@ -65,7 +67,7 @@ func TestAcquireValidationSlot_HardCap(t *testing.T) {
 
 // R-087: a cleartext root_anchors_url is rejected at config validation.
 func TestValidate_RootAnchorsURLRequiresHTTPS(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.RootAnchorsURL = "http://internet.any53.com/dns/anchors/root-anchors.json"
 	err := cfg.Validate()
 	if err == nil {
@@ -88,7 +90,7 @@ func TestValidate_RootAnchorsURLRequiresHTTPS(t *testing.T) {
 
 // R-087: max_concurrent_validations must be positive.
 func TestValidate_MaxConcurrentValidationsPositive(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.MaxConcurrentValidations = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for non-positive max_concurrent_validations")

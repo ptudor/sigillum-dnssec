@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ptudor/dnssec-validator/internal/config"
 )
 
 var (
@@ -52,7 +54,7 @@ func formatFallbackRequestID(n uint64) string {
 var logFile *os.File
 
 // SetupLogging configures the global slog logger based on configuration
-func SetupLogging(cfg *Config) error {
+func SetupLogging(cfg *config.Config) error {
 	level := parseLogLevel(cfg.LogLevel)
 
 	opts := &slog.HandlerOptions{
@@ -103,7 +105,7 @@ func parseLogLevel(level string) slog.Level {
 }
 
 // LogStartup logs application startup
-func LogStartup(version, buildTime string, cfg *Config) {
+func LogStartup(version, buildTime string, cfg *config.Config) {
 	slog.Info("[STARTUP]",
 		"version", version,
 		"build_time", buildTime,

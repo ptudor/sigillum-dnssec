@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ptudor/dnssec-validator/internal/config"
 	"github.com/ptudor/dnssec-validator/internal/rdap"
 	"github.com/ptudor/dnssec-validator/internal/validator"
 )
@@ -24,7 +25,7 @@ type activityObserver interface {
 
 type Handlers struct {
 	anchorsStore *AnchorsStore
-	config       *Config
+	config       *config.Config
 	rdapClient   *rdap.Client
 	activity     activityObserver // optional (R-052)
 
@@ -40,7 +41,7 @@ type Handlers struct {
 func (h *Handlers) SetActivityObserver(o activityObserver) { h.activity = o }
 
 // NewHandlers creates new HTTP handlers
-func NewHandlers(anchorsStore *AnchorsStore, config *Config) *Handlers {
+func NewHandlers(anchorsStore *AnchorsStore, config *config.Config) *Handlers {
 	var rdapClient *rdap.Client
 	if config.RDAPBaseURL != "" {
 		rdapClient = rdap.NewClient(config.RDAPBaseURL, config.QueryTimeout)

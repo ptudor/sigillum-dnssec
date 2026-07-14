@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ptudor/dnssec-validator/internal/config"
 	"github.com/ptudor/dnssec-validator/internal/dns"
 )
 
@@ -117,7 +118,7 @@ func newTestHandlers(withAnchors bool) *Handlers {
 		}
 		store.loadedAt = time.Now()
 	}
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	return NewHandlers(store, cfg)
 }
 

@@ -153,4 +153,3 @@ func DecrementActiveSSEConnections() {
 	promActiveSSEConnections.Dec()
 	expvarActiveSSEConnections.Add(-1)
 }
-
