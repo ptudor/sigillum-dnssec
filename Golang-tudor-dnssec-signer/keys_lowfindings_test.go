@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 )
 
@@ -66,7 +68,7 @@ func TestBackupKey_RefusesDifferingBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rm := NewRolloverManager(cfg, NewState(cfg.StatePath()))
+	rm := NewRolloverManager(cfg, statepkg.NewState(cfg.StatePath()))
 
 	backupBase := filepath.Join(cfg.KeysDir(), fmt.Sprintf("example.com.ksk.%d", ksk.ID))
 

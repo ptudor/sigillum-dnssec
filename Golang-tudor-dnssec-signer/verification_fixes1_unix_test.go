@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
 // registrarLockFixture writes a config (dynadot enabled, one opted-in zone)
@@ -34,8 +36,8 @@ registrar = "dynadot"
 		t.Fatal(err)
 	}
 
-	state := NewState(filepath.Join(dir, "state.json"))
-	state.SetZone("example.com", &ZoneState{Path: zonePath})
+	state := statepkg.NewState(filepath.Join(dir, "state.json"))
+	state.SetZone("example.com", &statepkg.ZoneState{Path: zonePath})
 	if err := state.Save(); err != nil {
 		t.Fatal(err)
 	}

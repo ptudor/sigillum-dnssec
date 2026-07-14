@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -38,11 +40,11 @@ func TestNeedsSign_UsesSourceModTimeNotLastSigned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK(domain)
 	zsk, _ := keyGen.GenerateZSK(domain)
-	zs := &ZoneState{
+	zs := &statepkg.ZoneState{
 		Path:          zonePath,
 		KSK:           ksk,
 		ZSK:           zsk,
@@ -93,11 +95,11 @@ func TestNeedsSign_DefersStillSettlingFile(t *testing.T) {
 	}()
 	defer close(stop)
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 	ksk, _ := keyGen.GenerateKSK(domain)
 	zsk, _ := keyGen.GenerateZSK(domain)
-	zs := &ZoneState{
+	zs := &statepkg.ZoneState{
 		Path:          zonePath,
 		KSK:           ksk,
 		ZSK:           zsk,
@@ -145,7 +147,7 @@ func TestSignAll_ReturnsErrorOnPartialFailure(t *testing.T) {
 	bad := "bad.example"
 	cfg.Zones[bad] = config.ZoneConfig{Path: filepath.Join(dataDir, "missing.zone")}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	signer := NewSigner(cfg, state)
 
 	err := signer.SignAll()
@@ -181,7 +183,7 @@ func TestSignAll_AllHealthyExitsClean(t *testing.T) {
 	}
 	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	if err := NewSigner(cfg, state).SignAll(); err != nil {
 		t.Fatalf("all-healthy SignAll must return nil, got: %v", err)
 	}
@@ -206,9 +208,9 @@ func TestSignAll_RetriesKeylessPlaceholder(t *testing.T) {
 	}
 	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	// Simulate a prior failed init: a keyless placeholder is in state.
-	placeholder := &ZoneState{Path: zonePath}
+	placeholder := &statepkg.ZoneState{Path: zonePath}
 	placeholder.AddError("keys dir was briefly unwritable")
 	state.SetZone(domain, placeholder)
 
@@ -233,8 +235,8 @@ func TestStartAlgorithmRollover_NilKeysNoPanic(t *testing.T) {
 	cfg := testConfig(t, dataDir)
 	domain := "nokeys.example"
 
-	state := NewState(cfg.StatePath())
-	state.SetZone(domain, &ZoneState{Path: filepath.Join(dataDir, domain+".zone")}) // nil KSK/ZSK
+	state := statepkg.NewState(cfg.StatePath())
+	state.SetZone(domain, &statepkg.ZoneState{Path: filepath.Join(dataDir, domain+".zone")}) // nil KSK/ZSK
 
 	rm := NewRolloverManager(cfg, state)
 	err := rm.StartAlgorithmRollover(domain, "ECDSAP256SHA256")

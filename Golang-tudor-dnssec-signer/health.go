@@ -8,6 +8,8 @@ import (
 	"os"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -46,8 +48,8 @@ func setSecurityHeaders(w http.ResponseWriter) {
 }
 
 // healthHandler returns detailed health status
-func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *config.Config, daemon *Daemon) {
-	status := state.ToStatusOutput()
+func healthHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State, cfg *config.Config, daemon *Daemon) {
+	status := buildStatusOutput(state)
 
 	// Check if any zones have errors
 	healthy := status.Summary.Errors == 0
@@ -129,8 +131,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *co
 }
 
 // healthzHandler returns simple OK for kubernetes probes
-func healthzHandler(w http.ResponseWriter, r *http.Request, state *State, cfg *config.Config, daemon *Daemon) {
-	status := state.ToStatusOutput()
+func healthzHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State, cfg *config.Config, daemon *Daemon) {
+	status := buildStatusOutput(state)
 	healthy := status.Summary.Errors == 0
 
 	// Check directory dependencies

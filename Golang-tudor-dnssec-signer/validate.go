@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -80,13 +82,13 @@ type ValidateSummary struct {
 // Validator performs internet DNSSEC validation checks against live DNS.
 type Validator struct {
 	cfg      *config.Config
-	state    *State
+	state    *statepkg.State
 	resolver string
 	timeout  time.Duration
 }
 
 // NewValidator creates a Validator with the given configuration.
-func NewValidator(cfg *config.Config, state *State, resolver string, timeout time.Duration) *Validator {
+func NewValidator(cfg *config.Config, state *statepkg.State, resolver string, timeout time.Duration) *Validator {
 	return &Validator{
 		cfg:      cfg,
 		state:    state,
@@ -102,12 +104,7 @@ func (v *Validator) ValidateAll() *ValidateOutput {
 		Zones:     make(map[string]*ValidationResult),
 	}
 
-	v.state.mu.RLock()
-	domains := make([]string, 0, len(v.state.Zones))
-	for d := range v.state.Zones {
-		domains = append(domains, d)
-	}
-	v.state.mu.RUnlock()
+	domains := v.state.ZoneNames()
 
 	for _, domain := range domains {
 		result := v.ValidateZone(domain)

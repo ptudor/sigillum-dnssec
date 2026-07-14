@@ -1,4 +1,4 @@
-package main
+package state
 
 import (
 	"encoding/json"
@@ -67,7 +67,7 @@ type ZoneState struct {
 // clone returns a deep copy of the zone state. Readers outside the signing
 // goroutine must work on a clone taken under the state lock — handing out
 // the live pointer lets JSON encoders race against in-place mutation.
-func (z *ZoneState) clone() *ZoneState {
+func (z *ZoneState) Clone() *ZoneState {
 	if z == nil {
 		return nil
 	}
@@ -292,13 +292,13 @@ func (s *State) ZoneNames() []string {
 func (s *State) GetZoneCopy(domain string) *ZoneState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.Zones[domain].clone()
+	return s.Zones[domain].Clone()
 }
 
 // Mutate runs fn while holding the state write lock. The signing goroutine
 // and the rollover manager mutate ZoneState fields through pointers obtained
 // from GetZone; bracketing those writes here is what makes the deep-copying
-// readers (GetZoneCopy, ToStatusOutput) actually race-free. fn must not call
+// readers (GetZoneCopy, SnapshotZones) actually race-free. fn must not call
 // other State methods — that would self-deadlock.
 func (s *State) Mutate(fn func()) {
 	s.mu.Lock()
@@ -330,6 +330,16 @@ func (s *State) RemoveZone(domain string) {
 	delete(s.Zones, domain)
 }
 
+// SetPath overrides the filesystem path this State persists to on Save.
+// Production code sets the path once via NewState/LoadState; this lets a
+// caller (notably the save-failure rollback tests) retarget a populated State
+// at a different — possibly unwritable — location.
+func (s *State) SetPath(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.path = path
+}
+
 // Status returns the overall status for a zone.
 //
 // ZSK rollovers are fully automatic (pre-publish, no registrar interaction),
@@ -349,85 +359,20 @@ func (z *ZoneState) Status() string {
 	return "healthy"
 }
 
-// StatusOutput represents the JSON output for the status command
-type StatusOutput struct {
-	Timestamp time.Time                    `json:"timestamp"`
-	Zones     map[string]*ZoneStatusOutput `json:"zones"`
-	Summary   StatusSummary                `json:"summary"`
-}
-
-// ZoneStatusOutput represents per-zone status in the output
-type ZoneStatusOutput struct {
-	Status          string            `json:"status"`
-	Serial          uint32            `json:"serial,omitempty"`
-	PublishedSerial uint32            `json:"published_serial,omitempty"`
-	LastSigned      time.Time         `json:"last_signed,omitempty"`
-	SignaturesExp   time.Time         `json:"signatures_expire,omitempty"`
-	KSK             *KeyState         `json:"ksk,omitempty"`
-	ZSK             *KeyState         `json:"zsk,omitempty"`
-	Rollover        *RolloverState    `json:"rollover,omitempty"`
-	Warnings        []string          `json:"warnings,omitempty"`
-	Errors          []string          `json:"errors,omitempty"`
-	Validation      *ValidationResult `json:"validation,omitempty"`
-}
-
-// StatusSummary provides a summary of all zones
-type StatusSummary struct {
-	Total          int `json:"total"`
-	Healthy        int `json:"healthy"`
-	ActionRequired int `json:"action_required"`
-	Warning        int `json:"warning"`
-	Errors         int `json:"errors"`
-}
-
-// ToStatusOutput converts the state to status output format
-func (s *State) ToStatusOutput() *StatusOutput {
+// SnapshotZones returns a deep-copied, point-in-time view of every zone's
+// state under a single read lock, so a status reader never tears across the
+// signing goroutine's concurrent mutations. Keys are zone names; values are
+// clones safe to read and serialize from any goroutine. The presentation
+// layer (the status/output DTOs) lives in the root package, above both state
+// and the validator, and builds its output from this snapshot.
+func (s *State) SnapshotZones() map[string]*ZoneState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	output := &StatusOutput{
-		Timestamp: time.Now().UTC(),
-		Zones:     make(map[string]*ZoneStatusOutput),
-	}
-
+	out := make(map[string]*ZoneState, len(s.Zones))
 	for domain, zone := range s.Zones {
-		status := zone.Status()
-		// Deep-copy so callers (web handlers, health checks) never hold
-		// references into live state the signing goroutine mutates.
-		zc := zone.clone()
-		output.Zones[domain] = &ZoneStatusOutput{
-			Status:          status,
-			Serial:          zc.Serial,
-			PublishedSerial: zc.PublishedSerial,
-			LastSigned:      zc.LastSigned,
-			SignaturesExp:   zc.SignaturesExp,
-			KSK:             zc.KSK,
-			ZSK:             zc.ZSK,
-			Rollover:        zc.Rollover,
-			Warnings:        zc.Warnings,
-			Errors:          zc.Errors,
-		}
-
-		output.Summary.Total++
-		switch status {
-		case "healthy":
-			output.Summary.Healthy++
-		case "action_required":
-			output.Summary.ActionRequired++
-		case "warning":
-			output.Summary.Warning++
-		case "error":
-			output.Summary.Errors++
-		}
+		out[domain] = zone.Clone()
 	}
-
-	return output
-}
-
-// ToJSON returns the status output as JSON
-func (s *State) ToJSON() ([]byte, error) {
-	output := s.ToStatusOutput()
-	return json.MarshalIndent(output, "", "  ")
+	return out
 }
 
 // AddWarning adds a warning to a zone

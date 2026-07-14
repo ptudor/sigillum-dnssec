@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // signableZoneDaemon builds a daemon with one real, key-backed, signable zone.
-func signableZoneDaemon(t *testing.T) (*Daemon, *config.Config, *State, string) {
+func signableZoneDaemon(t *testing.T) (*Daemon, *config.Config, *statepkg.State, string) {
 	t.Helper()
 	dataDir := t.TempDir()
 	cfg := testConfig(t, dataDir)
@@ -37,7 +39,7 @@ www	IN	A	192.0.2.10
 	if err := ensureDir(cfg.OutputDir); err != nil {
 		t.Fatal(err)
 	}
-	state := NewState(cfg.StatePath())
+	state := statepkg.NewState(cfg.StatePath())
 	keyGen := NewKeyGenerator(cfg)
 	ksk, err := keyGen.GenerateKSK(domain)
 	if err != nil {
@@ -47,7 +49,7 @@ www	IN	A	192.0.2.10
 	if err != nil {
 		t.Fatal(err)
 	}
-	state.SetZone(domain, &ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
+	state.SetZone(domain, &statepkg.ZoneState{Path: zonePath, KSK: ksk, ZSK: zsk})
 	return NewDaemon(cfg, state), cfg, state, domain
 }
 
@@ -68,8 +70,8 @@ func TestDaemon_SignReloadRace(t *testing.T) {
 		close(done)
 	}()
 	for i := 0; i < 25; i++ {
-		ns := NewState(cfg.StatePath())
-		ns.SetZone(domain, zoneState.clone())
+		ns := statepkg.NewState(cfg.StatePath())
+		ns.SetZone(domain, zoneState.Clone())
 		d.Reload(cfg, ns)
 	}
 	<-done
@@ -100,7 +102,7 @@ func TestDaemon_ShutdownBeforeRun(t *testing.T) {
 	cfg.Web.Listen = "127.0.0.1:0"
 	cfg.Health.Listen = "127.0.0.1:0"
 	cfg.Health.ShutdownTimeout = config.Duration{Duration: 2 * time.Second}
-	d := NewDaemon(cfg, NewState(cfg.StatePath()))
+	d := NewDaemon(cfg, statepkg.NewState(cfg.StatePath()))
 
 	// Cancel the daemon context before Run starts serving.
 	d.Shutdown()
@@ -128,7 +130,7 @@ func TestDaemon_HealthBindFatal(t *testing.T) {
 
 	cfg := testConfig(t, t.TempDir())
 	cfg.Health.Listen = occupied.Addr().String() // already in use
-	d := NewDaemon(cfg, NewState(cfg.StatePath()))
+	d := NewDaemon(cfg, statepkg.NewState(cfg.StatePath()))
 
 	err = d.Run()
 	if err == nil {
@@ -151,7 +153,7 @@ func TestDaemon_WebBindFatal(t *testing.T) {
 	cfg.Health.Listen = "127.0.0.1:0" // free
 	cfg.Web.Enabled = true
 	cfg.Web.Listen = occupied.Addr().String() // already in use
-	d := NewDaemon(cfg, NewState(cfg.StatePath()))
+	d := NewDaemon(cfg, statepkg.NewState(cfg.StatePath()))
 
 	err = d.Run()
 	if err == nil {

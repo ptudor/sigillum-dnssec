@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -27,8 +29,8 @@ func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 
 	now := time.Now().UTC()
 	zs := state.GetZone(domain)
-	zs.Rollover = &RolloverState{
-		Type: "zsk", State: ZSKRolloverStatePrePublish,
+	zs.Rollover = &statepkg.RolloverState{
+		Type: "zsk", State: statepkg.ZSKRolloverStatePrePublish,
 		OldKeyID: zs.ZSK.ID, NewKeyID: zs.ZSK.ID,
 		Started: now.Add(-3 * time.Hour),
 	}
@@ -42,7 +44,7 @@ func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 		t.Fatalf("CheckZSKRollover: %v", err)
 	}
 	zs = state.GetZone(domain)
-	if got := zs.Rollover.State; got != ZSKRolloverStatePrePublish {
+	if got := zs.Rollover.State; got != statepkg.ZSKRolloverStatePrePublish {
 		t.Fatalf("must not advance before the floor elapses from first publish; state=%q", got)
 	}
 	if !zs.Rollover.PhaseFirstSigned.Equal(firstSign) {
@@ -57,7 +59,7 @@ func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 		if err := rm.CheckZSKRollover(domain); err != nil {
 			t.Fatalf("CheckZSKRollover (re-sign %s ago): %v", age, err)
 		}
-		if got := state.GetZone(domain).Rollover.State; got != ZSKRolloverStatePrePublish {
+		if got := state.GetZone(domain).Rollover.State; got != statepkg.ZSKRolloverStatePrePublish {
 			t.Fatalf("must not advance before the floor elapses; state=%q", got)
 		}
 		if !state.GetZone(domain).Rollover.PhaseFirstSigned.Equal(firstSign) {
@@ -74,7 +76,7 @@ func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 		t.Fatalf("CheckZSKRollover (floor elapsed): %v", err)
 	}
 	zs = state.GetZone(domain)
-	if got := zs.Rollover.State; got != ZSKRolloverStateSigning {
+	if got := zs.Rollover.State; got != statepkg.ZSKRolloverStateSigning {
 		t.Fatalf("rollover stalled in pre_publish despite floor elapsed since first publish (Item 4); state=%q", got)
 	}
 	if zs.Rollover.PhaseStarted.IsZero() {
@@ -91,11 +93,11 @@ func TestRolloverState_PhaseFirstSignedRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	now := time.Now().UTC()
 
-	orig := NewState(path)
-	orig.SetZone("example.com", &ZoneState{
+	orig := statepkg.NewState(path)
+	orig.SetZone("example.com", &statepkg.ZoneState{
 		Path: "/z/example.zone",
-		Rollover: &RolloverState{
-			Type: "zsk", State: ZSKRolloverStatePrePublish,
+		Rollover: &statepkg.RolloverState{
+			Type: "zsk", State: statepkg.ZSKRolloverStatePrePublish,
 			OldKeyID: 222, NewKeyID: 333,
 			Started:          now,
 			PhaseStarted:     now.Add(time.Minute),
@@ -107,7 +109,7 @@ func TestRolloverState_PhaseFirstSignedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	loaded, err := LoadState(path)
+	loaded, err := statepkg.LoadState(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +149,7 @@ func TestRolloverState_OldSchemaNoPhaseFirstSigned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	loaded, err := LoadState(path)
+	loaded, err := statepkg.LoadState(path)
 	if err != nil {
 		t.Fatalf("old-schema state must load without error: %v", err)
 	}
@@ -155,7 +157,7 @@ func TestRolloverState_OldSchemaNoPhaseFirstSigned(t *testing.T) {
 	if z == nil || z.Rollover == nil {
 		t.Fatal("zone/rollover missing")
 	}
-	if z.Rollover.State != ZSKRolloverStatePrePublish || z.Rollover.NewKeyID != 333 {
+	if z.Rollover.State != statepkg.ZSKRolloverStatePrePublish || z.Rollover.NewKeyID != 333 {
 		t.Errorf("existing rollover fields not loaded: %+v", z.Rollover)
 	}
 	if !z.Rollover.PhaseFirstSigned.IsZero() {
@@ -179,8 +181,8 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 
 	now := time.Now().UTC()
 	zs := state.GetZone(domain)
-	zs.Rollover = &RolloverState{
-		Type: "zsk", State: ZSKRolloverStateSigning,
+	zs.Rollover = &statepkg.RolloverState{
+		Type: "zsk", State: statepkg.ZSKRolloverStateSigning,
 		OldKeyID: 11111, NewKeyID: zs.ZSK.ID,
 		Started:      now.Add(-30 * 24 * time.Hour),
 		PhaseStarted: now.Add(-time.Second), // switched just now: dwell (60s) NOT elapsed
@@ -193,7 +195,7 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover (dwell gate): %v", err)
 	}
-	if r := state.GetZone(domain).Rollover; r == nil || r.State != ZSKRolloverStateSigning {
+	if r := state.GetZone(domain).Rollover; r == nil || r.State != statepkg.ZSKRolloverStateSigning {
 		t.Fatalf("must NOT complete before the signing-phase dwell elapses; rollover=%+v", r)
 	}
 
@@ -206,7 +208,7 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover (unsigned gate): %v", err)
 	}
-	if r := state.GetZone(domain).Rollover; r == nil || r.State != ZSKRolloverStateSigning {
+	if r := state.GetZone(domain).Rollover; r == nil || r.State != statepkg.ZSKRolloverStateSigning {
 		t.Fatalf("must NOT complete when the zone wasn't signed after the switch; rollover=%+v", r)
 	}
 	if !state.GetZone(domain).Rollover.PhaseFirstSigned.IsZero() {
@@ -279,7 +281,7 @@ func TestBackupKey_CompletesHalfWrittenBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rm := NewRolloverManager(cfg, NewState(cfg.StatePath()))
+	rm := NewRolloverManager(cfg, statepkg.NewState(cfg.StatePath()))
 
 	base := filepath.Join(cfg.KeysDir(), "example.com.ksk")
 	backupBase := filepath.Join(cfg.KeysDir(), fmt.Sprintf("example.com.ksk.%d", ksk.ID))
@@ -385,7 +387,7 @@ func TestDaemon_ReinitializesKeylessPlaceholder(t *testing.T) {
 
 	// Replace the healthy zone state with a keyless placeholder, as a prior
 	// failed init would have left it.
-	placeholder := &ZoneState{Path: cfg.Zones[domain].Path}
+	placeholder := &statepkg.ZoneState{Path: cfg.Zones[domain].Path}
 	placeholder.AddError("keys dir was briefly unwritable")
 	state.SetZone(domain, placeholder)
 

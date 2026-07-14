@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 	"github.com/ptudor/dnssec-tudor/internal/fsutil"
@@ -31,26 +33,26 @@ func NewKeyGenerator(cfg *config.Config) *KeyGenerator {
 }
 
 // GenerateKSK generates a new Key Signing Key
-func (kg *KeyGenerator) GenerateKSK(domain string) (*KeyState, error) {
+func (kg *KeyGenerator) GenerateKSK(domain string) (*statepkg.KeyState, error) {
 	return kg.generateKey(domain, true, "")
 }
 
 // GenerateZSK generates a new Zone Signing Key
-func (kg *KeyGenerator) GenerateZSK(domain string) (*KeyState, error) {
+func (kg *KeyGenerator) GenerateZSK(domain string) (*statepkg.KeyState, error) {
 	return kg.generateKey(domain, false, "")
 }
 
 // GenerateKSKWithAlgorithm generates a new Key Signing Key with a specific algorithm
-func (kg *KeyGenerator) GenerateKSKWithAlgorithm(domain, algorithm string) (*KeyState, error) {
+func (kg *KeyGenerator) GenerateKSKWithAlgorithm(domain, algorithm string) (*statepkg.KeyState, error) {
 	return kg.generateKey(domain, true, algorithm)
 }
 
 // GenerateZSKWithAlgorithm generates a new Zone Signing Key with a specific algorithm
-func (kg *KeyGenerator) GenerateZSKWithAlgorithm(domain, algorithm string) (*KeyState, error) {
+func (kg *KeyGenerator) GenerateZSKWithAlgorithm(domain, algorithm string) (*statepkg.KeyState, error) {
 	return kg.generateKey(domain, false, algorithm)
 }
 
-func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride string) (*KeyState, error) {
+func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride string) (*statepkg.KeyState, error) {
 	algorithm := algorithmOverride
 	if algorithm == "" {
 		algorithm = kg.cfg.GetZoneAlgorithm(domain)
@@ -111,7 +113,7 @@ func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride
 	}
 
 	now := time.Now().UTC()
-	return &KeyState{
+	return &statepkg.KeyState{
 		ID:          keyTag,
 		Algorithm:   algorithm,
 		Created:     now,
@@ -394,7 +396,7 @@ Created: %s
 //
 // Returns nil (no error) if key files don't exist — the caller should generate
 // new keys in that case. Returns an error only if files exist but are corrupt.
-func (kg *KeyGenerator) RecoverKeyState(domain string, isKSK bool) (*KeyState, error) {
+func (kg *KeyGenerator) RecoverKeyState(domain string, isKSK bool) (*statepkg.KeyState, error) {
 	var keyType string
 	var lifetime time.Duration
 	if isKSK {
@@ -449,7 +451,7 @@ func (kg *KeyGenerator) RecoverKeyState(domain string, isKSK bool) (*KeyState, e
 	created := kg.parseKeyFileCreatedDate(keyFile)
 
 	// Reconstruct KeyState with recovered metadata
-	state := &KeyState{
+	state := &statepkg.KeyState{
 		ID:          keyTag,
 		Algorithm:   AlgorithmName(dnskey.Algorithm),
 		Created:     created,
@@ -503,7 +505,7 @@ func (kg *KeyGenerator) keyFileMtime(path string) time.Time {
 // causes SERVFAIL until the operator notices. Regeneration is reserved for
 // the "no key files present" case only. An operator who truly wants new
 // keys should `dnssec-tudor remove <domain>` + re-add.
-func recoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *KeyState, zsk *KeyState, err error) {
+func recoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *statepkg.KeyState, zsk *statepkg.KeyState, err error) {
 	ksk, err = keyGen.RecoverKeyState(domain, true)
 	if err != nil {
 		slog.Error("[KEY] Existing KSK files present but unreadable; refusing to regenerate",

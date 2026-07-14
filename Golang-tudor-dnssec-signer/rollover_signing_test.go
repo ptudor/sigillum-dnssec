@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
 // R-003: every rollover signing branch must be FATAL when the old key it depends on can't
@@ -13,26 +15,26 @@ import (
 func TestLoadKeysForSigning_MissingOldKeyIsFatal(t *testing.T) {
 	cases := []struct {
 		name     string
-		rollover *RolloverState
+		rollover *statepkg.RolloverState
 	}{
 		{
 			name: "ksk ds_add_wait",
-			rollover: &RolloverState{
-				Type: "ksk", State: KSKRolloverStateDSAddWait,
+			rollover: &statepkg.RolloverState{
+				Type: "ksk", State: statepkg.KSKRolloverStateDSAddWait,
 				OldKeyID: 9999, NewKeyID: 1, Started: time.Now().UTC(),
 			},
 		},
 		{
 			name: "zsk signing phase",
-			rollover: &RolloverState{
-				Type: "zsk", State: ZSKRolloverStateSigning,
+			rollover: &statepkg.RolloverState{
+				Type: "zsk", State: statepkg.ZSKRolloverStateSigning,
 				OldKeyID: 9999, NewKeyID: 1, Started: time.Now().UTC(),
 			},
 		},
 		{
 			name: "algorithm ds_add_wait",
-			rollover: &RolloverState{
-				Type: "algorithm", State: AlgoRolloverStateDSAddWait,
+			rollover: &statepkg.RolloverState{
+				Type: "algorithm", State: statepkg.AlgoRolloverStateDSAddWait,
 				OldKeyID: 9999, NewKeyID: 1, OldZSKID: 8888, NewZSKID: 2,
 				OldAlgorithm: "ECDSAP256SHA256", NewAlgorithm: "ED25519", Started: time.Now().UTC(),
 			},
@@ -53,8 +55,8 @@ func TestLoadKeysForSigning_MissingOldKeyIsFatal(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			state := NewState(filepath.Join(dataDir, "state.json"))
-			zoneState := &ZoneState{
+			state := statepkg.NewState(filepath.Join(dataDir, "state.json"))
+			zoneState := &statepkg.ZoneState{
 				Path:     filepath.Join(dataDir, "zone.db"),
 				KSK:      ksk,
 				ZSK:      zsk,

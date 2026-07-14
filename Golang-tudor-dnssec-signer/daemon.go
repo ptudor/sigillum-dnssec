@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -20,7 +22,7 @@ import (
 // Daemon manages the signing loop and optional web server
 type Daemon struct {
 	cfg       *config.Config
-	state     *State
+	state     *statepkg.State
 	signer    *Signer
 	rollover  *RolloverManager
 	heartbeat *HeartbeatClient
@@ -38,7 +40,7 @@ type Daemon struct {
 }
 
 // NewDaemon creates a new daemon instance
-func NewDaemon(cfg *config.Config, state *State) *Daemon {
+func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Daemon{
 		cfg:         cfg,
@@ -166,7 +168,7 @@ func (d *Daemon) Shutdown() {
 }
 
 // Reload updates the daemon's configuration and state
-func (d *Daemon) Reload(cfg *config.Config, state *State) {
+func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 	d.mu.Lock()
 	oldCfg := d.cfg
 	oldHeartbeat := d.heartbeat
@@ -312,7 +314,7 @@ func (d *Daemon) signAllZonesSafe() {
 // This prevents races where a SIGHUP reload swaps pointers mid-cycle.
 type snapshot struct {
 	cfg       *config.Config
-	state     *State
+	state     *statepkg.State
 	signer    *Signer
 	rollover  *RolloverManager
 	heartbeat *HeartbeatClient
@@ -333,7 +335,7 @@ func (d *Daemon) takeSnapshot() snapshot {
 // current returns the daemon's live config and state under the read lock. HTTP
 // handlers call this per request so the web UI and health endpoints reflect a
 // SIGHUP reload instead of serving the pointers captured at startup (R-006).
-func (d *Daemon) current() (*config.Config, *State) {
+func (d *Daemon) current() (*config.Config, *statepkg.State) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.cfg, d.state
@@ -476,7 +478,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		zoneState = &ZoneState{
+		zoneState = &statepkg.ZoneState{
 			Path: zoneCfg.Path,
 			KSK:  ksk,
 			ZSK:  zsk,
@@ -494,7 +496,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	if zoneState.Path != zoneCfg.Path {
 		slog.Info("[DAEMON] Zone source path changed in config; signing the new path",
 			"domain", domain, "old_path", zoneState.Path, "new_path", zoneCfg.Path)
-		snap.state.UpdateZone(domain, func(zs *ZoneState) { zs.Path = zoneCfg.Path })
+		snap.state.UpdateZone(domain, func(zs *statepkg.ZoneState) { zs.Path = zoneCfg.Path })
 	}
 
 	// Sign the zone

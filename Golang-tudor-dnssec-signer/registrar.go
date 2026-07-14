@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
@@ -56,7 +58,7 @@ func RegistrarFor(cfg *config.Config, domain string) (Registrar, error) {
 // BuildDSSet computes the DS record set the registrar should hold for a zone,
 // given the KSK(s) currently in use. During a KSK or algorithm rollover, both
 // old and new KSK belong in the set; otherwise just the active KSK.
-func BuildDSSet(cfg *config.Config, state *State, domain string) ([]*dns.DS, error) {
+func BuildDSSet(cfg *config.Config, state *statepkg.State, domain string) ([]*dns.DS, error) {
 	zoneState := state.GetZone(domain)
 	if zoneState == nil {
 		return nil, fmt.Errorf("zone %s not managed", domain)

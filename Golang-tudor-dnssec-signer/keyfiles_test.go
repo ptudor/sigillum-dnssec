@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
 // R-028: exactly one half of a key pair present must refuse recovery (not silently
@@ -126,8 +128,8 @@ func TestStartKSKRollover_BackupFailureFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state := NewState(filepath.Join(dataDir, "state.json"))
-	state.SetZone("example.com", &ZoneState{Path: filepath.Join(dataDir, "zone.db"), KSK: ksk, ZSK: zsk})
+	state := statepkg.NewState(filepath.Join(dataDir, "state.json"))
+	state.SetZone("example.com", &statepkg.ZoneState{Path: filepath.Join(dataDir, "zone.db"), KSK: ksk, ZSK: zsk})
 	rm := NewRolloverManager(cfg, state)
 
 	if err := os.Chmod(cfg.KeysDir(), 0500); err != nil {

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -57,8 +59,8 @@ func TestUnwindAdd_PreservesPrivateOnlyOrphan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state := NewState(cfg.StatePath())
-	state.SetZone("example.com", &ZoneState{Path: "/zones/example.com.db"})
+	state := statepkg.NewState(cfg.StatePath())
+	state.SetZone("example.com", &statepkg.ZoneState{Path: "/zones/example.com.db"})
 
 	// Exactly what runAdd computes before recoverOrGenerateKeys fails on the
 	// incomplete pair: the KSK slot is NOT empty (orphan half present), the
@@ -127,7 +129,7 @@ func TestRunAdd_FailedAddPreservesPrivateOnlyOrphan(t *testing.T) {
 
 	// Rollback left no half-added zone behind: state has no entry and the
 	// config file was not appended.
-	reloaded, lerr := LoadState(filepath.Join(dir, "state.json"))
+	reloaded, lerr := statepkg.LoadState(filepath.Join(dir, "state.json"))
 	if lerr != nil {
 		t.Fatalf("LoadState: %v", lerr)
 	}
@@ -272,8 +274,8 @@ path = %q
 		t.Fatal(err)
 	}
 
-	state := NewState(filepath.Join(dir, "state.json"))
-	state.SetZone("gone.example.com", &ZoneState{Path: zonePath})
+	state := statepkg.NewState(filepath.Join(dir, "state.json"))
+	state.SetZone("gone.example.com", &statepkg.ZoneState{Path: zonePath})
 	if err := state.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +311,7 @@ path = %q
 	if !strings.Contains(string(out), `[ zones . "gone.example.com" ]`) {
 		t.Errorf("config entry must be left intact on failure:\n%s", out)
 	}
-	reloaded, lerr := LoadState(filepath.Join(dir, "state.json"))
+	reloaded, lerr := statepkg.LoadState(filepath.Join(dir, "state.json"))
 	if lerr != nil {
 		t.Fatalf("LoadState: %v", lerr)
 	}

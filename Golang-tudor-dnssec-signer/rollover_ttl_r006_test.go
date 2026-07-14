@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
@@ -16,13 +18,13 @@ func TestR006_DNSKEYTTLFloorUsesPublishedTTL(t *testing.T) {
 	rm := &RolloverManager{cfg: cfg}
 
 	// A zone last signed with a 48h SOA-derived DNSKEY TTL.
-	zs := &ZoneState{PublishedDNSKEYTTL: 172800}
+	zs := &statepkg.ZoneState{PublishedDNSKEYTTL: 172800}
 	if got := rm.dnskeyTTLFloor(zs); got != 48*time.Hour {
 		t.Fatalf("floor = %v, want 48h (published TTL), not the 24h hardcoded fallback", got)
 	}
 
 	// Old state without the recorded field falls back to the conservative 24h.
-	if got := rm.dnskeyTTLFloor(&ZoneState{}); got != 24*time.Hour {
+	if got := rm.dnskeyTTLFloor(&statepkg.ZoneState{}); got != 24*time.Hour {
 		t.Fatalf("floor = %v, want 24h fallback for old state", got)
 	}
 
@@ -43,13 +45,13 @@ func TestR007_ZSKRetireFloorUsesMaxRRSIGTTL(t *testing.T) {
 	rm := &RolloverManager{cfg: cfg}
 
 	// A 7-day A record RRSIG outlives the 1h DNSKEY TTL.
-	zs := &ZoneState{PublishedDNSKEYTTL: 3600, PublishedMaxRRSIGTTL: 604800}
+	zs := &statepkg.ZoneState{PublishedDNSKEYTTL: 3600, PublishedMaxRRSIGTTL: 604800}
 	if got := rm.zskRetireFloor(zs); got != 604800*time.Second {
 		t.Fatalf("retire floor = %v, want 7d (max signed RRset TTL), not the 1h DNSKEY TTL", got)
 	}
 
 	// When the DNSKEY TTL is the largest, it wins.
-	zs2 := &ZoneState{PublishedDNSKEYTTL: 172800, PublishedMaxRRSIGTTL: 3600}
+	zs2 := &statepkg.ZoneState{PublishedDNSKEYTTL: 172800, PublishedMaxRRSIGTTL: 3600}
 	if got := rm.zskRetireFloor(zs2); got != 172800*time.Second {
 		t.Fatalf("retire floor = %v, want 48h (DNSKEY TTL is largest)", got)
 	}

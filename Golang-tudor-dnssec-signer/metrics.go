@@ -4,6 +4,8 @@ import (
 	"expvar"
 	"sync"
 
+	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -146,14 +148,16 @@ func deleteZoneMetrics(domain string) {
 }
 
 // UpdateZoneMetrics updates all zone-related metrics from state
-func UpdateZoneMetrics(state *State) {
-	state.mu.RLock()
-	defer state.mu.RUnlock()
+func UpdateZoneMetrics(state *statepkg.State) {
+	// Operate on a consistent deep-copied snapshot so we never read live zone
+	// state while the signing goroutine mutates it, and never hold the state
+	// lock across the Prometheus gauge updates below.
+	zones := state.SnapshotZones()
 
 	var total, healthy, actionRequired, warning, errors int
-	current := make(map[string]struct{}, len(state.Zones))
+	current := make(map[string]struct{}, len(zones))
 
-	for domain, zone := range state.Zones {
+	for domain, zone := range zones {
 		total++
 		current[domain] = struct{}{}
 		status := zone.Status()
