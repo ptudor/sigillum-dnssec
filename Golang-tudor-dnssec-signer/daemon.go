@@ -14,11 +14,12 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // Daemon manages the signing loop and optional web server
 type Daemon struct {
-	cfg       *Config
+	cfg       *config.Config
 	state     *State
 	signer    *Signer
 	rollover  *RolloverManager
@@ -37,7 +38,7 @@ type Daemon struct {
 }
 
 // NewDaemon creates a new daemon instance
-func NewDaemon(cfg *Config, state *State) *Daemon {
+func NewDaemon(cfg *config.Config, state *State) *Daemon {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Daemon{
 		cfg:         cfg,
@@ -165,7 +166,7 @@ func (d *Daemon) Shutdown() {
 }
 
 // Reload updates the daemon's configuration and state
-func (d *Daemon) Reload(cfg *Config, state *State) {
+func (d *Daemon) Reload(cfg *config.Config, state *State) {
 	d.mu.Lock()
 	oldCfg := d.cfg
 	oldHeartbeat := d.heartbeat
@@ -310,7 +311,7 @@ func (d *Daemon) signAllZonesSafe() {
 // snapshot captures all daemon references under a single lock for a signing cycle.
 // This prevents races where a SIGHUP reload swaps pointers mid-cycle.
 type snapshot struct {
-	cfg       *Config
+	cfg       *config.Config
 	state     *State
 	signer    *Signer
 	rollover  *RolloverManager
@@ -332,7 +333,7 @@ func (d *Daemon) takeSnapshot() snapshot {
 // current returns the daemon's live config and state under the read lock. HTTP
 // handlers call this per request so the web UI and health endpoints reflect a
 // SIGHUP reload instead of serving the pointers captured at startup (R-006).
-func (d *Daemon) current() (*Config, *State) {
+func (d *Daemon) current() (*config.Config, *State) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.cfg, d.state

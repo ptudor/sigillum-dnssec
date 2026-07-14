@@ -3,13 +3,15 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // R-006: the rollover DNSKEY-TTL floor must reflect the DNSKEY TTL actually
 // published (recorded per zone), not a hardcoded 24h, so a zone with dnskey_ttl=0
 // and a large SOA TTL is not advanced early.
 func TestR006_DNSKEYTTLFloorUsesPublishedTTL(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.DNSSEC.DNSKEYTtl = 0 // "use the SOA TTL"
 	rm := &RolloverManager{cfg: cfg}
 
@@ -36,7 +38,7 @@ func TestR006_DNSKEYTTLFloorUsesPublishedTTL(t *testing.T) {
 // R-007: ZSK retirement waits max(DNSKEY-TTL floor, largest signed RRset TTL) so an
 // old-ZSK signature (which inherits its RRset's TTL) is never dropped while still cached.
 func TestR007_ZSKRetireFloorUsesMaxRRSIGTTL(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.DNSSEC.DNSKEYTtl = 3600 // 1h DNSKEY TTL
 	rm := &RolloverManager{cfg: cfg}
 

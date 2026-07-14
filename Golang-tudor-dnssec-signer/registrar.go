@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // ErrRegistrarDSEmpty is returned when a ReplaceDS sequence has already wiped
@@ -36,7 +37,7 @@ type Registrar interface {
 // or nil if the zone has no registrar field set or the named registrar is
 // disabled/unconfigured. Errors indicate misconfiguration (name set but not
 // resolvable); a nil registrar with nil error means "not opted in".
-func RegistrarFor(cfg *Config, domain string) (Registrar, error) {
+func RegistrarFor(cfg *config.Config, domain string) (Registrar, error) {
 	zc, ok := cfg.Zones[domain]
 	if !ok || zc.Registrar == "" {
 		return nil, nil
@@ -55,7 +56,7 @@ func RegistrarFor(cfg *Config, domain string) (Registrar, error) {
 // BuildDSSet computes the DS record set the registrar should hold for a zone,
 // given the KSK(s) currently in use. During a KSK or algorithm rollover, both
 // old and new KSK belong in the set; otherwise just the active KSK.
-func BuildDSSet(cfg *Config, state *State, domain string) ([]*dns.DS, error) {
+func BuildDSSet(cfg *config.Config, state *State, domain string) ([]*dns.DS, error) {
 	zoneState := state.GetZone(domain)
 	if zoneState == nil {
 		return nil, fmt.Errorf("zone %s not managed", domain)

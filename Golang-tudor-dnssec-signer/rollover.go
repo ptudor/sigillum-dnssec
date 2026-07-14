@@ -7,16 +7,18 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // RolloverManager handles key rollover operations
 type RolloverManager struct {
-	cfg   *Config
+	cfg   *config.Config
 	state *State
 }
 
 // NewRolloverManager creates a new rollover manager
-func NewRolloverManager(cfg *Config, state *State) *RolloverManager {
+func NewRolloverManager(cfg *config.Config, state *State) *RolloverManager {
 	return &RolloverManager{
 		cfg:   cfg,
 		state: state,

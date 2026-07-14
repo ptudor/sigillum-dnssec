@@ -8,10 +8,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // signableZoneDaemon builds a daemon with one real, key-backed, signable zone.
-func signableZoneDaemon(t *testing.T) (*Daemon, *Config, *State, string) {
+func signableZoneDaemon(t *testing.T) (*Daemon, *config.Config, *State, string) {
 	t.Helper()
 	dataDir := t.TempDir()
 	cfg := testConfig(t, dataDir)
@@ -28,7 +30,7 @@ www	IN	A	192.0.2.10
 	if err := os.WriteFile(zonePath, []byte(zone), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +99,7 @@ func TestDaemon_ShutdownBeforeRun(t *testing.T) {
 	cfg.Web.Enabled = true
 	cfg.Web.Listen = "127.0.0.1:0"
 	cfg.Health.Listen = "127.0.0.1:0"
-	cfg.Health.ShutdownTimeout = Duration{2 * time.Second}
+	cfg.Health.ShutdownTimeout = config.Duration{Duration: 2 * time.Second}
 	d := NewDaemon(cfg, NewState(cfg.StatePath()))
 
 	// Cancel the daemon context before Run starts serving.
@@ -166,7 +168,7 @@ func TestDaemon_WebBindFatal(t *testing.T) {
 func TestExecuteHook_WaitGroupTracked(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "hook-ran")
-	hooks := &HooksConfig{PostSign: "touch " + marker, Shell: true}
+	hooks := &config.HooksConfig{PostSign: "touch " + marker, Shell: true}
 
 	var wg sync.WaitGroup
 	executeHook(hooks, &HookEnv{Domain: "x."}, &wg)
@@ -181,7 +183,7 @@ func TestExecuteHook_WaitGroupTracked(t *testing.T) {
 func TestExecuteBatchHook_WaitGroupTracked(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "batch-hook-ran")
-	hooks := &HooksConfig{PostSign: "touch " + marker, Shell: true}
+	hooks := &config.HooksConfig{PostSign: "touch " + marker, Shell: true}
 
 	var wg sync.WaitGroup
 	executeBatchHook(hooks, []string{"a.", "b."}, dir, &wg)

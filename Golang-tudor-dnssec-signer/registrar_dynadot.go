@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // sharedDynadotLimiter is the process-wide Dynadot rate limiter. Shared by
@@ -61,7 +62,7 @@ func defaultUserAgent() string {
 // requires both api_key and api_secret in the config file; there is no env
 // fallback because the config file (mode 0640) is the stricter surface than
 // rc.d / systemd unit files.
-func NewDynadotClient(cfg *RegistrarDynadotConfig) (*DynadotClient, error) {
+func NewDynadotClient(cfg *config.RegistrarDynadotConfig) (*DynadotClient, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, fmt.Errorf("dynadot registrar is not enabled")
 	}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 func TestFindParentZone(t *testing.T) {
@@ -403,7 +404,7 @@ func TestQueryDirectDOBit(t *testing.T) {
 }
 
 func TestValidateZoneNotFound(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := config.DefaultConfig()
 	state := NewState("/tmp/test-state.json")
 
 	v := NewValidator(cfg, state, "127.0.0.1:53", 5*time.Second)

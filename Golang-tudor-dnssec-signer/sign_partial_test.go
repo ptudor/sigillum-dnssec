@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // TestNeedsSign_UsesSourceModTimeNotLastSigned (R-022 fidelity): change
@@ -137,11 +139,11 @@ func TestSignAll_ReturnsErrorOnPartialFailure(t *testing.T) {
 	if err := os.WriteFile(goodPath, []byte(validZoneContent(good)), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Zones[good] = ZoneConfig{Path: goodPath}
+	cfg.Zones[good] = config.ZoneConfig{Path: goodPath}
 
 	// A zone whose file does not exist: key init succeeds but SignZone fails.
 	bad := "bad.example"
-	cfg.Zones[bad] = ZoneConfig{Path: filepath.Join(dataDir, "missing.zone")}
+	cfg.Zones[bad] = config.ZoneConfig{Path: filepath.Join(dataDir, "missing.zone")}
 
 	state := NewState(cfg.StatePath())
 	signer := NewSigner(cfg, state)
@@ -177,7 +179,7 @@ func TestSignAll_AllHealthyExitsClean(t *testing.T) {
 	if err := os.WriteFile(zonePath, []byte(validZoneContent(domain)), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
 	state := NewState(cfg.StatePath())
 	if err := NewSigner(cfg, state).SignAll(); err != nil {
@@ -202,7 +204,7 @@ func TestSignAll_RetriesKeylessPlaceholder(t *testing.T) {
 	if err := os.WriteFile(zonePath, []byte(validZoneContent(domain)), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
 	state := NewState(cfg.StatePath())
 	// Simulate a prior failed init: a keyless placeholder is in state.

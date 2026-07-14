@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
 
 // State represents the daemon's persistent state
@@ -253,7 +255,7 @@ func (s *State) Save() error {
 	// helper preserves the target directory's uid/gid so `dnssec-tudor add` run as root
 	// leaves a state.json the daemon user can still read, and fsyncs so a crash/power loss
 	// can't leave a truncated file (R-040).
-	if err := writeFileAtomicOwned(s.path, data, 0600); err != nil {
+	if err := fsutil.WriteFileAtomicOwned(s.path, data, 0600); err != nil {
 		return fmt.Errorf("writing state file: %w", err)
 	}
 

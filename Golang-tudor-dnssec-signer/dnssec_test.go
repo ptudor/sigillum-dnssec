@@ -9,37 +9,38 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // Test configuration for fast rollover testing (1 second instead of days)
-func testConfig(t *testing.T, dataDir string) *Config {
+func testConfig(t *testing.T, dataDir string) *config.Config {
 	t.Helper()
-	return &Config{
+	return &config.Config{
 		OutputDir:    filepath.Join(dataDir, "signed"),
 		DataDir:      dataDir,
-		PollInterval: Duration{1 * time.Second},
-		DNSSEC: DNSSECConfig{
+		PollInterval: config.Duration{Duration: 1 * time.Second},
+		DNSSEC: config.DNSSECConfig{
 			Algorithm:          "ED25519",
-			KSKLifetime:        Duration{10 * time.Second}, // Very short for testing
-			ZSKLifetime:        Duration{5 * time.Second},  // Very short for testing
-			SignatureValidity:  Duration{3 * time.Second},
-			SignatureRefresh:   Duration{1 * time.Second},
+			KSKLifetime:        config.Duration{Duration: 10 * time.Second},
+			ZSKLifetime:        config.Duration{Duration: 5 * time.Second},
+			SignatureValidity:  config.Duration{Duration: 3 * time.Second},
+			SignatureRefresh:   config.Duration{Duration: 1 * time.Second},
 			NSECVersion:        "nsec3",
 			NSEC3Iterations:    0,
 			NSEC3Salt:          "",
 			DNSKEYTtl:          3600,
-			RolloverPrepublish: Duration{2 * time.Second},
-			RolloverSwitch:     Duration{1 * time.Second},
+			RolloverPrepublish: config.Duration{Duration: 2 * time.Second},
+			RolloverSwitch:     config.Duration{Duration: 1 * time.Second},
 		},
-		Web: WebConfig{
+		Web: config.WebConfig{
 			Enabled: false,
 			Listen:  "127.0.0.1:8053",
 		},
-		Health: HealthConfig{
+		Health: config.HealthConfig{
 			Listen: "127.0.0.1:8054",
 		},
-		Zones: make(map[string]ZoneConfig),
-		Hooks: HooksConfig{},
+		Zones: make(map[string]config.ZoneConfig),
+		Hooks: config.HooksConfig{},
 	}
 }
 
@@ -273,7 +274,7 @@ mail	IN	A	192.0.2.30
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 
 	// Ensure directories
 	if err := ensureDir(cfg.KeysDir()); err != nil {
@@ -400,7 +401,7 @@ www	IN	A	192.0.2.10
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
@@ -519,7 +520,7 @@ func TestDurationParsing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			var d Duration
+			var d config.Duration
 			if err := d.UnmarshalText([]byte(tt.input)); err != nil {
 				t.Fatalf("UnmarshalText(%q) failed: %v", tt.input, err)
 			}
@@ -534,18 +535,18 @@ func TestDurationParsing(t *testing.T) {
 func TestConfigValidation(t *testing.T) {
 	tests := []struct {
 		name      string
-		modify    func(*Config)
+		modify    func(*config.Config)
 		expectErr bool
 		errMsg    string
 	}{
 		{
 			name:      "valid config",
-			modify:    func(c *Config) {},
+			modify:    func(c *config.Config) {},
 			expectErr: false,
 		},
 		{
 			name: "invalid algorithm",
-			modify: func(c *Config) {
+			modify: func(c *config.Config) {
 				c.DNSSEC.Algorithm = "INVALID"
 			},
 			expectErr: true,
@@ -553,7 +554,7 @@ func TestConfigValidation(t *testing.T) {
 		},
 		{
 			name: "invalid nsec version",
-			modify: func(c *Config) {
+			modify: func(c *config.Config) {
 				c.DNSSEC.NSECVersion = "nsec4"
 			},
 			expectErr: true,
@@ -561,16 +562,16 @@ func TestConfigValidation(t *testing.T) {
 		},
 		{
 			name: "refresh >= validity",
-			modify: func(c *Config) {
-				c.DNSSEC.SignatureRefresh = Duration{15 * 24 * time.Hour}
-				c.DNSSEC.SignatureValidity = Duration{14 * 24 * time.Hour}
+			modify: func(c *config.Config) {
+				c.DNSSEC.SignatureRefresh = config.Duration{Duration: 15 * 24 * time.Hour}
+				c.DNSSEC.SignatureValidity = config.Duration{Duration: 14 * 24 * time.Hour}
 			},
 			expectErr: true,
 			errMsg:    "signature_refresh",
 		},
 		{
 			name: "nsec3 iterations too high",
-			modify: func(c *Config) {
+			modify: func(c *config.Config) {
 				c.DNSSEC.NSEC3Iterations = 200
 			},
 			expectErr: true,
@@ -578,7 +579,7 @@ func TestConfigValidation(t *testing.T) {
 		},
 		{
 			name: "invalid nsec3 salt",
-			modify: func(c *Config) {
+			modify: func(c *config.Config) {
 				c.DNSSEC.NSEC3Salt = "not-hex"
 			},
 			expectErr: true,
@@ -588,29 +589,29 @@ func TestConfigValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{
+			cfg := &config.Config{
 				OutputDir:    "/tmp/test",
 				DataDir:      "/tmp/test",
-				PollInterval: Duration{5 * time.Minute},
-				DNSSEC: DNSSECConfig{
+				PollInterval: config.Duration{Duration: 5 * time.Minute},
+				DNSSEC: config.DNSSECConfig{
 					Algorithm:          "ED25519",
-					KSKLifetime:        Duration{3 * 365 * 24 * time.Hour},
-					ZSKLifetime:        Duration{90 * 24 * time.Hour},
-					SignatureValidity:  Duration{14 * 24 * time.Hour},
-					SignatureRefresh:   Duration{3 * 24 * time.Hour},
+					KSKLifetime:        config.Duration{Duration: 3 * 365 * 24 * time.Hour},
+					ZSKLifetime:        config.Duration{Duration: 90 * 24 * time.Hour},
+					SignatureValidity:  config.Duration{Duration: 14 * 24 * time.Hour},
+					SignatureRefresh:   config.Duration{Duration: 3 * 24 * time.Hour},
 					NSECVersion:        "nsec3",
 					NSEC3Iterations:    0,
 					NSEC3Salt:          "",
-					RolloverPrepublish: Duration{14 * 24 * time.Hour},
-					RolloverSwitch:     Duration{7 * 24 * time.Hour},
+					RolloverPrepublish: config.Duration{Duration: 14 * 24 * time.Hour},
+					RolloverSwitch:     config.Duration{Duration: 7 * 24 * time.Hour},
 				},
-				Health: HealthConfig{
+				Health: config.HealthConfig{
 					Listen:          "127.0.0.1:8054",
-					ShutdownTimeout: Duration{30 * time.Second},
+					ShutdownTimeout: config.Duration{Duration: 30 * time.Second},
 				},
-				Validation: ValidateConfig{Timeout: Duration{5 * time.Second}},
-				Registrar:  RegistrarConfig{Dynadot: RegistrarDynadotConfig{Timeout: Duration{30 * time.Second}}},
-				Zones:      make(map[string]ZoneConfig),
+				Validation: config.ValidateConfig{Timeout: config.Duration{Duration: 5 * time.Second}},
+				Registrar:  config.RegistrarConfig{Dynadot: config.RegistrarDynadotConfig{Timeout: config.Duration{Duration: 30 * time.Second}}},
+				Zones:      make(map[string]config.ZoneConfig),
 			}
 			tt.modify(cfg)
 
@@ -646,7 +647,7 @@ ns1	IN	A	192.0.2.1
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
@@ -723,7 +724,7 @@ www	IN	A	192.0.2.20
 	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("ensureDir keys: %v", err)
 	}
@@ -994,7 +995,7 @@ www	IN	A	192.0.2.10
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
@@ -1101,7 +1102,7 @@ www	IN	A	192.0.2.20
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	cfg.DNSSEC.NSECVersion = "nsec" // Use NSEC for simpler verification
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
@@ -1183,7 +1184,7 @@ ns1	IN	A	192.0.2.1
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
@@ -1236,7 +1237,7 @@ ns1	IN	A	192.0.2.1
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	signer := NewSigner(cfg, NewState(cfg.StatePath()))
 
 	// New zone (nil state) always needs signing
@@ -1329,7 +1330,7 @@ func TestValidateDomainName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.domain, func(t *testing.T) {
-			err := ValidateDomainName(tt.domain)
+			err := config.ValidateDomainName(tt.domain)
 			if tt.expectErr && err == nil {
 				t.Errorf("Expected error for %q, got nil", tt.domain)
 			}
@@ -1361,7 +1362,7 @@ ns1	IN	A	192.0.2.1
 				t.Fatalf("Failed to write zone file: %v", err)
 			}
 
-			cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+			cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 			if err := ensureDir(cfg.KeysDir()); err != nil {
 				t.Fatalf("Failed to create keys dir: %v", err)
 			}
@@ -1707,7 +1708,7 @@ func TestRecoverKeyStateCreatedDate(t *testing.T) {
 
 // signAndParseZone is a helper that writes zoneContent, generates keys, signs
 // the zone, and returns the parsed records of the signed output.
-func signAndParseZone(t *testing.T, cfg *Config, domain, zoneContent string) []dns.RR {
+func signAndParseZone(t *testing.T, cfg *config.Config, domain, zoneContent string) []dns.RR {
 	t.Helper()
 
 	zonePath := filepath.Join(cfg.DataDir, domain+".zone")
@@ -1715,7 +1716,7 @@ func signAndParseZone(t *testing.T, cfg *Config, domain, zoneContent string) []d
 		t.Fatalf("Failed to write zone file: %v", err)
 	}
 
-	cfg.Zones[domain] = ZoneConfig{Path: zonePath}
+	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("Failed to create keys dir: %v", err)
 	}
@@ -2000,7 +2001,7 @@ ns1	IN	A	192.0.2.1
 	if err := os.WriteFile(zonePath, []byte(zoneContent), 0644); err != nil {
 		t.Fatalf("write zone: %v", err)
 	}
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 	if err := ensureDir(cfg.KeysDir()); err != nil {
 		t.Fatalf("ensureDir: %v", err)
 	}
@@ -2093,7 +2094,7 @@ func TestZoneStateClone(t *testing.T) {
 // DNSSEC_* environment the daemon's async hook provides.
 func TestExecuteHookSync_Env(t *testing.T) {
 	outFile := filepath.Join(t.TempDir(), "hook.out")
-	hooks := &HooksConfig{
+	hooks := &config.HooksConfig{
 		PostSignCmd: []string{"/bin/sh", "-c", "echo \"$DNSSEC_DOMAIN $DNSSEC_SIGNED_PATH\" > " + outFile},
 	}
 	env := &HookEnv{
@@ -2148,7 +2149,7 @@ ns1	IN	A	192.0.2.1
 }
 
 // signedSOASerial parses the signed output for a zone and returns its SOA serial.
-func signedSOASerial(t *testing.T, cfg *Config, domain string) uint32 {
+func signedSOASerial(t *testing.T, cfg *config.Config, domain string) uint32 {
 	t.Helper()
 	signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
 	data, err := os.ReadFile(signedPath)
@@ -2236,7 +2237,7 @@ func TestSerialPolicy_EpochRejectsNonEpochSerials(t *testing.T) {
 			if err := os.WriteFile(zonePath, []byte(epochSerialZone(tt.serial)), 0644); err != nil {
 				t.Fatalf("write zone: %v", err)
 			}
-			cfg.Zones["example.com"] = ZoneConfig{Path: zonePath}
+			cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath}
 			if err := ensureDir(cfg.KeysDir()); err != nil {
 				t.Fatal(err)
 			}
@@ -2282,7 +2283,7 @@ func TestSerialPolicy_KeepPassesThrough(t *testing.T) {
 func TestSerialPolicy_PerZoneOverride(t *testing.T) {
 	cfg := testConfig(t, t.TempDir())
 	cfg.DNSSEC.SerialPolicy = "keep"
-	cfg.Zones["example.com"] = ZoneConfig{SerialPolicy: "epoch"}
+	cfg.Zones["example.com"] = config.ZoneConfig{SerialPolicy: "epoch"}
 	if got := cfg.GetZoneSerialPolicy("example.com"); got != "epoch" {
 		t.Errorf("per-zone override: got %q, want epoch", got)
 	}
@@ -2299,8 +2300,8 @@ func TestConfigValidation_SerialPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mkConfig := func() *Config {
-		cfg := DefaultConfig()
+	mkConfig := func() *config.Config {
+		cfg := config.DefaultConfig()
 		cfg.OutputDir = dataDir
 		cfg.DataDir = dataDir
 		return cfg
@@ -2313,14 +2314,14 @@ func TestConfigValidation_SerialPolicy(t *testing.T) {
 	}
 
 	cfg = mkConfig()
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath, SerialPolicy: "unixtime"}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath, SerialPolicy: "unixtime"}
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected validation error for unknown per-zone serial_policy")
 	}
 
 	cfg = mkConfig()
 	cfg.DNSSEC.SerialPolicy = "epoch"
-	cfg.Zones["example.com"] = ZoneConfig{Path: zonePath, SerialPolicy: "keep"}
+	cfg.Zones["example.com"] = config.ZoneConfig{Path: zonePath, SerialPolicy: "keep"}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("valid serial policies should pass validation: %v", err)
 	}

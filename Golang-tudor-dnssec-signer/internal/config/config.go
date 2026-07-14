@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"bytes"
@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
 
 // Config represents the main configuration structure
@@ -360,7 +361,7 @@ func (c *Config) Validate() error {
 	// KSK/DS sets for one DNS zone and can oscillate the parent's DS.
 	seenCanonical := make(map[string]string, len(c.Zones))
 	for domain := range c.Zones {
-		id := canonicalZoneIdentity(domain)
+		id := CanonicalZoneIdentity(domain)
 		if prev, dup := seenCanonical[id]; dup {
 			return fmt.Errorf("zones %q and %q refer to the same DNS zone %q; use a single canonical entry (lowercase, no trailing dot)", prev, domain, id)
 		}
@@ -510,12 +511,12 @@ func (c *Config) Validate() error {
 
 	// Validate listen addresses are loopback unless allow_remote is set
 	if c.Web.Enabled && !c.Web.AllowRemote {
-		if err := validateLoopbackAddr(c.Web.Listen, "web.listen"); err != nil {
+		if err := ValidateLoopbackAddr(c.Web.Listen, "web.listen"); err != nil {
 			return err
 		}
 	}
 	if !c.Health.AllowRemote {
-		if err := validateLoopbackAddr(c.Health.Listen, "health.listen"); err != nil {
+		if err := ValidateLoopbackAddr(c.Health.Listen, "health.listen"); err != nil {
 			return err
 		}
 	}
@@ -523,9 +524,9 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// isLoopbackAddr returns true if the host part of an address is a loopback address.
+// IsLoopbackAddr returns true if the host part of an address is a loopback address.
 // Accepts "host:port", ":port" (all interfaces — NOT loopback), or "host" forms.
-func isLoopbackAddr(addr string) bool {
+func IsLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr // No port, treat whole string as host
@@ -542,9 +543,20 @@ func isLoopbackAddr(addr string) bool {
 	return ip.IsLoopback()
 }
 
-// validateLoopbackAddr returns an error if the listen address is not loopback
-func validateLoopbackAddr(addr, fieldName string) error {
-	if !isLoopbackAddr(addr) {
+// CheckWebFlagListen re-enforces the loopback guard on the web dashboard after
+// the `--web` flag override, which is applied after Config.Validate() already
+// ran. The dashboard has no authentication, so a non-loopback listen is only
+// allowed when web.allow_remote is explicitly set in config (R-005).
+func (c *Config) CheckWebFlagListen() error {
+	if c.Web.Enabled && !c.Web.AllowRemote {
+		return ValidateLoopbackAddr(c.Web.Listen, "--web")
+	}
+	return nil
+}
+
+// ValidateLoopbackAddr returns an error if the listen address is not loopback
+func ValidateLoopbackAddr(addr, fieldName string) error {
+	if !IsLoopbackAddr(addr) {
 		return fmt.Errorf("%s %q binds to a non-loopback address; set allow_remote = true to allow this", fieldName, addr)
 	}
 	return nil
@@ -619,7 +631,7 @@ func AddZoneToConfigFile(configPath, domain, zonePath string) error {
 	}
 	buf = append(buf, []byte(fmt.Sprintf("\n[zones.%q]\npath = %q\n", domain, zonePath))...)
 
-	if err := writeConfigFileAtomic(configPath, buf); err != nil {
+	if err := fsutil.WriteConfigFileAtomic(configPath, buf); err != nil {
 		return fmt.Errorf("writing config file: %w", err)
 	}
 	return nil
@@ -629,7 +641,7 @@ func AddZoneToConfigFile(configPath, domain, zonePath string) error {
 // AddZoneToConfigFile plus every key line under it) from the config file, preserving all
 // other content and comments. It writes atomically (temp + rename, ownership preserved)
 // and keeps the file's existing mode so a secrets-bearing 0640 config is not loosened.
-// Returns errZoneNotInConfig if the table isn't present, so the caller can proceed.
+// Returns ErrZoneNotInConfig if the table isn't present, so the caller can proceed.
 func RemoveZoneFromConfigFile(configPath, domain string) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -639,13 +651,13 @@ func RemoveZoneFromConfigFile(configPath, domain string) error {
 
 	start := -1
 	for i, line := range lines {
-		if isZoneTableHeader(line, domain) {
+		if IsZoneTableHeader(line, domain) {
 			start = i
 			break
 		}
 	}
 	if start == -1 {
-		return errZoneNotInConfig
+		return ErrZoneNotInConfig
 	}
 
 	// The table runs until the next TOML table header or EOF.
@@ -671,16 +683,16 @@ func RemoveZoneFromConfigFile(configPath, domain string) error {
 	// R-002: use the config-specific atomic writer, which preserves the config's
 	// OWN uid/gid/mode. writeFileAtomicOwned would chown the (root-owned, secrets-
 	// bearing) config to the daemon account.
-	if err := writeConfigFileAtomic(configPath, []byte(strings.Join(kept, "\n"))); err != nil {
+	if err := fsutil.WriteConfigFileAtomic(configPath, []byte(strings.Join(kept, "\n"))); err != nil {
 		return fmt.Errorf("writing config file: %w", err)
 	}
 	return nil
 }
 
-// errZoneNotInConfig is returned by RemoveZoneFromConfigFile when the zone table is absent.
-var errZoneNotInConfig = fmt.Errorf("zone table not found in config file")
+// ErrZoneNotInConfig is returned by RemoveZoneFromConfigFile when the zone table is absent.
+var ErrZoneNotInConfig = fmt.Errorf("zone table not found in config file")
 
-// isZoneTableHeader reports whether a config line is the [zones."<domain>"]
+// IsZoneTableHeader reports whether a config line is the [zones."<domain>"]
 // table header for the given domain. AddZoneToConfigFile writes exactly
 // `[zones."<domain>"]`, but hand-edited configs carry TOML-equivalent variants
 // an exact match would miss: surrounding whitespace, a trailing `# comment`,
@@ -688,7 +700,7 @@ var errZoneNotInConfig = fmt.Errorf("zone table not found in config file")
 // `remove` leave the entry behind so the zone is re-adopted on SIGHUP
 // (runRemove escalates that to an error rather than claiming success). This is
 // deliberately anchored to the two quote forms — not a general TOML parser.
-func isZoneTableHeader(line, domain string) bool {
+func IsZoneTableHeader(line, domain string) bool {
 	t := strings.TrimSpace(line)
 	for _, header := range []string{
 		fmt.Sprintf("[zones.%q]", domain),   // basic-string key, what AddZoneToConfigFile writes
@@ -767,30 +779,11 @@ func afterHeaderIsCommentOrBlank(rest string) bool {
 	return rest == "" || strings.HasPrefix(rest, "#")
 }
 
-// canonicalZoneIdentity returns the case- and trailing-dot-normalized management
+// CanonicalZoneIdentity returns the case- and trailing-dot-normalized management
 // identity for a zone name: lowercase with any trailing root dot removed (R-029).
 // Two operator spellings that denote the same DNS zone map to the same identity.
-func canonicalZoneIdentity(domain string) string {
+func CanonicalZoneIdentity(domain string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-}
-
-// canonicalConflict reports whether domain canonically matches (case- and
-// trailing-dot-insensitively) any zone already present in the config or state,
-// other than an exact match (which callers check separately). Returns the
-// conflicting existing name (R-029).
-func canonicalConflict(cfg *Config, state *State, domain string) (string, bool) {
-	id := canonicalZoneIdentity(domain)
-	for existing := range cfg.Zones {
-		if existing != domain && canonicalZoneIdentity(existing) == id {
-			return existing, true
-		}
-	}
-	for _, existing := range state.ZoneNames() {
-		if existing != domain && canonicalZoneIdentity(existing) == id {
-			return existing, true
-		}
-	}
-	return "", false
 }
 
 // ValidateDomainName checks that a domain name is safe for use in file paths.

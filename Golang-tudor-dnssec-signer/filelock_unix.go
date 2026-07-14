@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
 
 // stateLock is an advisory cross-process lock over state.json, held via flock on a sidecar
@@ -27,7 +29,7 @@ func acquireStateLock(dataDir string, timeout time.Duration) (*stateLock, error)
 	if err != nil {
 		return nil, fmt.Errorf("opening lock file %s: %w", lockPath, err)
 	}
-	chownToTarget(lockPath)
+	fsutil.ChownToTarget(lockPath)
 
 	deadline := time.Now().Add(timeout)
 	for {

@@ -15,16 +15,18 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/config"
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
 
 // Signer handles DNSSEC signing operations
 type Signer struct {
-	cfg   *Config
+	cfg   *config.Config
 	state *State
 }
 
 // NewSigner creates a new signer
-func NewSigner(cfg *Config, state *State) *Signer {
+func NewSigner(cfg *config.Config, state *State) *Signer {
 	return &Signer{
 		cfg:   cfg,
 		state: state,
@@ -1449,7 +1451,7 @@ func (s *Signer) writeSignedZone(domain, path string, records []dns.RR) error {
 	// (writeFileAtomicOwned). Without this the directory entry can be lost after state
 	// was saved with a new serial, leaving NeedsSign to trust state and decline to
 	// recreate the missing output.
-	syncDir(filepath.Dir(path))
+	fsutil.SyncDir(filepath.Dir(path))
 
 	return nil
 }

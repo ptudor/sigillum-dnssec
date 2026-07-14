@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // Live-DNS validation of every zone is expensive (NS + DS/DNSKEY/SOA queries
@@ -246,7 +248,7 @@ func NewWebServer(d *Daemon) *http.Server {
 	}
 }
 
-func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
+func dashboardHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -310,7 +312,7 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request, state *State) {
 	}
 }
 
-func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
+func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
 	// Extract domain from path: /api/zone/{domain}
 	domain := strings.TrimPrefix(r.URL.Path, "/api/zone/")
 	if domain == "" {
@@ -354,7 +356,7 @@ func apiZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *
 	}
 }
 
-func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
+func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
 	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 	output := cachedValidateAll(v) // bounded + cached (R-043)
 	if output == nil {
@@ -371,7 +373,7 @@ func apiValidateHandler(w http.ResponseWriter, r *http.Request, cfg *Config, sta
 	}
 }
 
-func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *Config, state *State) {
+func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.Config, state *State) {
 	domain := strings.TrimPrefix(r.URL.Path, "/api/validate/")
 	if domain == "" {
 		http.Error(w, "Domain required", http.StatusBadRequest)

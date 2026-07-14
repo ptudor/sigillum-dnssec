@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ptudor/dnssec-tudor/internal/config"
 )
 
 // ---------------------------------------------------------------------------
@@ -32,7 +34,7 @@ func TestIsLoopbackAddr(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.addr, func(t *testing.T) {
-			got := isLoopbackAddr(tt.addr)
+			got := config.IsLoopbackAddr(tt.addr)
 			if got != tt.loopback {
 				t.Errorf("isLoopbackAddr(%q) = %v, want %v", tt.addr, got, tt.loopback)
 			}
@@ -41,26 +43,26 @@ func TestIsLoopbackAddr(t *testing.T) {
 }
 
 func TestConfigValidation_LoopbackEnforcement(t *testing.T) {
-	base := func() *Config {
-		return &Config{
+	base := func() *config.Config {
+		return &config.Config{
 			OutputDir:    "/tmp/test",
 			DataDir:      "/tmp/test",
-			PollInterval: Duration{5 * time.Minute},
-			DNSSEC: DNSSECConfig{
+			PollInterval: config.Duration{Duration: 5 * time.Minute},
+			DNSSEC: config.DNSSECConfig{
 				Algorithm:          "ED25519",
-				KSKLifetime:        Duration{3 * 365 * 24 * time.Hour},
-				ZSKLifetime:        Duration{90 * 24 * time.Hour},
-				SignatureValidity:  Duration{14 * 24 * time.Hour},
-				SignatureRefresh:   Duration{3 * 24 * time.Hour},
+				KSKLifetime:        config.Duration{Duration: 3 * 365 * 24 * time.Hour},
+				ZSKLifetime:        config.Duration{Duration: 90 * 24 * time.Hour},
+				SignatureValidity:  config.Duration{Duration: 14 * 24 * time.Hour},
+				SignatureRefresh:   config.Duration{Duration: 3 * 24 * time.Hour},
 				NSECVersion:        "nsec3",
-				RolloverPrepublish: Duration{14 * 24 * time.Hour},
-				RolloverSwitch:     Duration{7 * 24 * time.Hour},
+				RolloverPrepublish: config.Duration{Duration: 14 * 24 * time.Hour},
+				RolloverSwitch:     config.Duration{Duration: 7 * 24 * time.Hour},
 			},
-			Web:        WebConfig{Enabled: false, Listen: "127.0.0.1:8053"},
-			Health:     HealthConfig{Listen: "127.0.0.1:8054", ShutdownTimeout: Duration{30 * time.Second}},
-			Validation: ValidateConfig{Timeout: Duration{5 * time.Second}},
-			Registrar:  RegistrarConfig{Dynadot: RegistrarDynadotConfig{Timeout: Duration{30 * time.Second}}},
-			Zones:      make(map[string]ZoneConfig),
+			Web:        config.WebConfig{Enabled: false, Listen: "127.0.0.1:8053"},
+			Health:     config.HealthConfig{Listen: "127.0.0.1:8054", ShutdownTimeout: config.Duration{Duration: 30 * time.Second}},
+			Validation: config.ValidateConfig{Timeout: config.Duration{Duration: 5 * time.Second}},
+			Registrar:  config.RegistrarConfig{Dynadot: config.RegistrarDynadotConfig{Timeout: config.Duration{Duration: 30 * time.Second}}},
+			Zones:      make(map[string]config.ZoneConfig),
 		}
 	}
 
@@ -121,7 +123,7 @@ func TestConfigValidation_LoopbackEnforcement(t *testing.T) {
 
 func TestHookCmd(t *testing.T) {
 	t.Run("PostSignCmd exec-style", func(t *testing.T) {
-		hooks := &HooksConfig{PostSignCmd: []string{"/usr/bin/nsd-control", "reload"}}
+		hooks := &config.HooksConfig{PostSignCmd: []string{"/usr/bin/nsd-control", "reload"}}
 		name, args, identity, ok := hookCmd(hooks)
 		if !ok {
 			t.Fatal("expected ok=true")
@@ -138,7 +140,7 @@ func TestHookCmd(t *testing.T) {
 	})
 
 	t.Run("PostSign with shell", func(t *testing.T) {
-		hooks := &HooksConfig{PostSign: "systemctl reload nsd", Shell: true}
+		hooks := &config.HooksConfig{PostSign: "systemctl reload nsd", Shell: true}
 		name, args, identity, ok := hookCmd(hooks)
 		if !ok {
 			t.Fatal("expected ok=true")
@@ -155,7 +157,7 @@ func TestHookCmd(t *testing.T) {
 	})
 
 	t.Run("PostSign without shell splits on whitespace", func(t *testing.T) {
-		hooks := &HooksConfig{PostSign: "systemctl reload nsd"}
+		hooks := &config.HooksConfig{PostSign: "systemctl reload nsd"}
 		name, args, identity, ok := hookCmd(hooks)
 		if !ok {
 			t.Fatal("expected ok=true")
@@ -172,7 +174,7 @@ func TestHookCmd(t *testing.T) {
 	})
 
 	t.Run("PostSignCmd takes priority over PostSign", func(t *testing.T) {
-		hooks := &HooksConfig{
+		hooks := &config.HooksConfig{
 			PostSignCmd: []string{"/usr/bin/nsd-control", "reload"},
 			PostSign:    "systemctl reload nsd",
 			Shell:       true,
@@ -184,7 +186,7 @@ func TestHookCmd(t *testing.T) {
 	})
 
 	t.Run("empty hooks return ok=false", func(t *testing.T) {
-		hooks := &HooksConfig{}
+		hooks := &config.HooksConfig{}
 		_, _, _, ok := hookCmd(hooks)
 		if ok {
 			t.Error("expected ok=false for empty hooks")
@@ -192,7 +194,7 @@ func TestHookCmd(t *testing.T) {
 	})
 
 	t.Run("empty PostSign returns ok=false", func(t *testing.T) {
-		hooks := &HooksConfig{PostSign: ""}
+		hooks := &config.HooksConfig{PostSign: ""}
 		_, _, _, ok := hookCmd(hooks)
 		if ok {
 			t.Error("expected ok=false for empty PostSign")
@@ -200,7 +202,7 @@ func TestHookCmd(t *testing.T) {
 	})
 
 	t.Run("whitespace-only PostSign returns ok=false", func(t *testing.T) {
-		hooks := &HooksConfig{PostSign: "   "}
+		hooks := &config.HooksConfig{PostSign: "   "}
 		_, _, _, ok := hookCmd(hooks)
 		if ok {
 			t.Error("expected ok=false for whitespace-only PostSign")
@@ -342,25 +344,25 @@ func TestUpdateZone_NoopForMissingZone(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConfigValidation_HeartbeatHTTPS(t *testing.T) {
-	base := func() *Config {
-		return &Config{
+	base := func() *config.Config {
+		return &config.Config{
 			OutputDir:    "/tmp/test",
 			DataDir:      "/tmp/test",
-			PollInterval: Duration{5 * time.Minute},
-			DNSSEC: DNSSECConfig{
+			PollInterval: config.Duration{Duration: 5 * time.Minute},
+			DNSSEC: config.DNSSECConfig{
 				Algorithm:          "ED25519",
-				KSKLifetime:        Duration{3 * 365 * 24 * time.Hour},
-				ZSKLifetime:        Duration{90 * 24 * time.Hour},
-				SignatureValidity:  Duration{14 * 24 * time.Hour},
-				SignatureRefresh:   Duration{3 * 24 * time.Hour},
+				KSKLifetime:        config.Duration{Duration: 3 * 365 * 24 * time.Hour},
+				ZSKLifetime:        config.Duration{Duration: 90 * 24 * time.Hour},
+				SignatureValidity:  config.Duration{Duration: 14 * 24 * time.Hour},
+				SignatureRefresh:   config.Duration{Duration: 3 * 24 * time.Hour},
 				NSECVersion:        "nsec3",
-				RolloverPrepublish: Duration{14 * 24 * time.Hour},
-				RolloverSwitch:     Duration{7 * 24 * time.Hour},
+				RolloverPrepublish: config.Duration{Duration: 14 * 24 * time.Hour},
+				RolloverSwitch:     config.Duration{Duration: 7 * 24 * time.Hour},
 			},
-			Health:     HealthConfig{Listen: "127.0.0.1:8054", ShutdownTimeout: Duration{30 * time.Second}},
-			Validation: ValidateConfig{Timeout: Duration{5 * time.Second}},
-			Registrar:  RegistrarConfig{Dynadot: RegistrarDynadotConfig{Timeout: Duration{30 * time.Second}}},
-			Zones:      make(map[string]ZoneConfig),
+			Health:     config.HealthConfig{Listen: "127.0.0.1:8054", ShutdownTimeout: config.Duration{Duration: 30 * time.Second}},
+			Validation: config.ValidateConfig{Timeout: config.Duration{Duration: 5 * time.Second}},
+			Registrar:  config.RegistrarConfig{Dynadot: config.RegistrarDynadotConfig{Timeout: config.Duration{Duration: 30 * time.Second}}},
+			Zones:      make(map[string]config.ZoneConfig),
 		}
 	}
 
@@ -478,10 +480,10 @@ func TestSecurityHeaders_Present(t *testing.T) {
 
 func TestHealthEndpoints_MethodRestriction(t *testing.T) {
 	state := NewState("")
-	cfg := &Config{
+	cfg := &config.Config{
 		OutputDir: "/tmp",
 		DataDir:   "/tmp",
-		Health:    HealthConfig{Listen: "127.0.0.1:8054"},
+		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
 	}
 
 	mux := http.NewServeMux()
@@ -511,10 +513,10 @@ func TestHealthEndpoints_MethodRestriction(t *testing.T) {
 
 func TestHealthEndpoints_SecurityHeaders(t *testing.T) {
 	state := NewState("")
-	cfg := &Config{
+	cfg := &config.Config{
 		OutputDir: "/tmp",
 		DataDir:   "/tmp",
-		Health:    HealthConfig{Listen: "127.0.0.1:8054"},
+		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
 	}
 
 	mux := http.NewServeMux()
@@ -605,12 +607,12 @@ func TestDashboardTemplate_Cached(t *testing.T) {
 
 func TestWebServer_NoDebugVarsPath(t *testing.T) {
 	// The web mux does not register /debug/vars. Verify 404.
-	cfg := &Config{
+	cfg := &config.Config{
 		OutputDir: "/tmp",
 		DataDir:   "/tmp",
-		Web:       WebConfig{Enabled: true, Listen: "127.0.0.1:8053"},
-		Health:    HealthConfig{Listen: "127.0.0.1:8054"},
-		Zones:     make(map[string]ZoneConfig),
+		Web:       config.WebConfig{Enabled: true, Listen: "127.0.0.1:8053"},
+		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
+		Zones:     make(map[string]config.ZoneConfig),
 	}
 	state := NewState("")
 	srv := NewWebServer(NewDaemon(cfg, state))
@@ -629,12 +631,12 @@ func TestWebServer_NoDebugVarsPath(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDashboardHandler_PathRouting(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		OutputDir: "/tmp",
 		DataDir:   "/tmp",
-		Web:       WebConfig{Enabled: true, Listen: "127.0.0.1:8053"},
-		Health:    HealthConfig{Listen: "127.0.0.1:8054"},
-		Zones:     make(map[string]ZoneConfig),
+		Web:       config.WebConfig{Enabled: true, Listen: "127.0.0.1:8053"},
+		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
+		Zones:     make(map[string]config.ZoneConfig),
 	}
 	state := NewState("")
 	srv := NewWebServer(NewDaemon(cfg, state))
@@ -663,12 +665,12 @@ func TestDashboardHandler_PathRouting(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAPIEndpoints_MethodAndContentType(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		OutputDir: "/tmp",
 		DataDir:   "/tmp",
-		Web:       WebConfig{Enabled: true, Listen: "127.0.0.1:8053"},
-		Health:    HealthConfig{Listen: "127.0.0.1:8054"},
-		Zones:     make(map[string]ZoneConfig),
+		Web:       config.WebConfig{Enabled: true, Listen: "127.0.0.1:8053"},
+		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
+		Zones:     make(map[string]config.ZoneConfig),
 	}
 	state := NewState("")
 	srv := NewWebServer(NewDaemon(cfg, state))
@@ -772,10 +774,10 @@ func TestZoneState_StatusTransitions(t *testing.T) {
 
 func TestHealthz_ReturnsOK(t *testing.T) {
 	state := NewState("")
-	cfg := &Config{
+	cfg := &config.Config{
 		OutputDir: t.TempDir(),
 		DataDir:   t.TempDir(),
-		Health:    HealthConfig{Listen: "127.0.0.1:8054"},
+		Health:    config.HealthConfig{Listen: "127.0.0.1:8054"},
 	}
 
 	mux := http.NewServeMux()
@@ -811,7 +813,7 @@ func TestValidateDomainName_PathTraversal(t *testing.T) {
 	}
 	for _, name := range malicious {
 		t.Run(fmt.Sprintf("reject_%s", name), func(t *testing.T) {
-			if err := ValidateDomainName(name); err == nil {
+			if err := config.ValidateDomainName(name); err == nil {
 				t.Errorf("ValidateDomainName(%q) should return error", name)
 			}
 		})
