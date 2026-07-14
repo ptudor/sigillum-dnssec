@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ptudor/dnssec-validator/internal/config"
 	"github.com/ptudor/dnssec-validator/internal/dns"
 	"github.com/ptudor/dnssec-validator/internal/heartbeat"
 )
@@ -21,7 +22,7 @@ var (
 
 func main() {
 	// Load configuration
-	config, err := LoadConfig()
+	config, err := config.LoadConfig()
 	if err != nil {
 		LogError("main", err, "action", "load_config")
 		os.Exit(1)

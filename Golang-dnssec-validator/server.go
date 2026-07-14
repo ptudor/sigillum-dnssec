@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/ptudor/dnssec-validator/internal/config"
 )
 
 //go:embed static/*
@@ -18,7 +19,7 @@ var staticFiles embed.FS
 
 // Server is the HTTP server for the DNSSEC validator
 type Server struct {
-	config        *Config
+	config        *config.Config
 	anchorsStore  *AnchorsStore
 	healthChecker *HealthChecker
 	rateLimiter   *RateLimiter
@@ -30,7 +31,7 @@ type Server struct {
 const nonSSEWriteTimeout = 30 * time.Second
 
 // NewServer creates a new HTTP server
-func NewServer(config *Config, anchorsStore *AnchorsStore) *Server {
+func NewServer(config *config.Config, anchorsStore *AnchorsStore) *Server {
 	s := &Server{
 		config:       config,
 		anchorsStore: anchorsStore,
