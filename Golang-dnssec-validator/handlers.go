@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ptudor/dnssec-validator/internal/metrics"
+
 	"github.com/ptudor/dnssec-validator/internal/config"
 	"github.com/ptudor/dnssec-validator/internal/rdap"
 	"github.com/ptudor/dnssec-validator/internal/validator"
@@ -64,7 +66,7 @@ func NewHandlers(anchorsStore *AnchorsStore, config *config.Config) *Handlers {
 func (h *Handlers) acquireValidationSlot() bool {
 	select {
 	case h.validationSem <- struct{}{}:
-		IncrementActiveValidations()
+		metrics.IncrementActiveValidations()
 		if h.activity != nil {
 			h.activity.ValidationStarted() // R-052
 		}
@@ -77,7 +79,7 @@ func (h *Handlers) acquireValidationSlot() bool {
 // releaseValidationSlot returns a slot and decrements the in-flight gauge.
 func (h *Handlers) releaseValidationSlot() {
 	<-h.validationSem
-	DecrementActiveValidations()
+	metrics.DecrementActiveValidations()
 	if h.activity != nil {
 		h.activity.ValidationFinished() // R-052
 	}
@@ -93,7 +95,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-ID", requestID)
 
 	defer func() {
-		RecordAPIRequest("/validate", r.Method, statusCode, time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/validate", r.Method, statusCode, time.Since(startTime).Seconds())
 	}()
 
 	// Log incoming request
@@ -156,8 +158,8 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 				http.StatusInternalServerError, "streaming not supported", r.URL.Path)
 			return
 		}
-		IncrementActiveSSEConnections()
-		defer DecrementActiveSSEConnections()
+		metrics.IncrementActiveSSEConnections()
+		defer metrics.DecrementActiveSSEConnections()
 		_ = sse.WriteEvent("error", validator.ErrorEvent{
 			Message: "validation stream ended and is not resumable; please retry",
 			Fatal:   true,
@@ -190,8 +192,8 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	// silently re-running the validation (R-090).
 	sse.SetStreamID(requestID)
 
-	IncrementActiveSSEConnections()
-	defer DecrementActiveSSEConnections()
+	metrics.IncrementActiveSSEConnections()
+	defer metrics.DecrementActiveSSEConnections()
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
@@ -273,7 +275,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Record metrics
-	RecordValidation(string(result.Result), float64(result.DurationMs)/1000.0)
+	metrics.RecordValidation(string(result.Result), float64(result.DurationMs)/1000.0)
 	LogValidation(requestID, domain, string(result.Result), result.DurationMs)
 }
 
@@ -292,7 +294,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeProblemDetails(w, ErrTypeMethodNotAllowed, "Method Not Allowed",
 			http.StatusMethodNotAllowed, "only GET method is supported", r.URL.Path)
-		RecordAPIRequest("/api/validate", r.Method, "405", time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "405", time.Since(startTime).Seconds())
 		return
 	}
 
@@ -301,7 +303,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	if domain == "" {
 		writeProblemDetails(w, ErrTypeInvalidDomain, "Invalid Domain",
 			http.StatusBadRequest, "domain parameter is required", r.URL.Path)
-		RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
 		return
 	}
 
@@ -310,7 +312,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	if !isValidDomain(domain) {
 		writeProblemDetails(w, ErrTypeInvalidDomain, "Invalid Domain",
 			http.StatusBadRequest, "invalid domain name format", r.URL.Path)
-		RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
 		return
 	}
 
@@ -325,7 +327,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeProblemDetails(w, ErrTypeBadRequest, "Invalid Type",
 			http.StatusBadRequest, "unsupported record type (supported: A, AAAA, MX, TXT, NS, SOA, SRV, CAA, PTR, NAPTR, CNAME, SPF)", r.URL.Path)
-		RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
 		return
 	}
 
@@ -334,7 +336,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "5")
 		writeProblemDetails(w, ErrTypeServiceUnavailable, "Service Unavailable",
 			http.StatusServiceUnavailable, "server is at validation capacity; please retry shortly", r.URL.Path)
-		RecordAPIRequest("/api/validate", r.Method, "503", time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "503", time.Since(startTime).Seconds())
 		return
 	}
 	defer h.releaseValidationSlot()
@@ -344,7 +346,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	if anchors == nil || len(anchors.Anchors) == 0 {
 		writeProblemDetails(w, ErrTypeServiceUnavailable, "Service Unavailable",
 			http.StatusServiceUnavailable, "root trust anchors not available", r.URL.Path)
-		RecordAPIRequest("/api/validate", r.Method, "503", time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "503", time.Since(startTime).Seconds())
 		return
 	}
 
@@ -380,12 +382,12 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		LogError("handlers", err, "action", "validate_json", "request_id", requestID, "domain", domain)
 		writeProblemDetails(w, ErrTypeValidationFailed, "Validation Failed",
 			http.StatusInternalServerError, fmt.Sprintf("validation failed (request_id=%s)", requestID), r.URL.Path)
-		RecordAPIRequest("/api/validate", r.Method, "500", time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "500", time.Since(startTime).Seconds())
 		return
 	}
 
 	// Record metrics
-	RecordValidation(string(result.Result), float64(result.DurationMs)/1000.0)
+	metrics.RecordValidation(string(result.Result), float64(result.DurationMs)/1000.0)
 	LogValidation(requestID, domain, string(result.Result), result.DurationMs)
 
 	// Write JSON response
@@ -393,7 +395,7 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	setNoStore(w)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
-	RecordAPIRequest("/api/validate", r.Method, "200", time.Since(startTime).Seconds())
+	metrics.RecordAPIRequest("/api/validate", r.Method, "200", time.Since(startTime).Seconds())
 }
 
 // HandleAnchors returns the current root trust anchors
@@ -401,7 +403,7 @@ func (h *Handlers) HandleAnchors(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	statusCode := "200"
 	defer func() {
-		RecordAPIRequest("/api/anchors", r.Method, statusCode, time.Since(startTime).Seconds())
+		metrics.RecordAPIRequest("/api/anchors", r.Method, statusCode, time.Since(startTime).Seconds())
 	}()
 
 	if r.Method != http.MethodGet {
