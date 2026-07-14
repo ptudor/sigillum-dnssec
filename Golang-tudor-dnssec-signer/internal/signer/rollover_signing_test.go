@@ -1,10 +1,11 @@
-package main
+package signer
 
 import (
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
@@ -44,7 +45,7 @@ func TestLoadKeysForSigning_MissingOldKeyIsFatal(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dataDir := t.TempDir()
-			cfg := testConfig(t, dataDir)
+			cfg := dnssectest.Config(t, dataDir)
 			keyGen := NewKeyGenerator(cfg)
 			ksk, err := keyGen.GenerateKSK("example.com")
 			if err != nil {

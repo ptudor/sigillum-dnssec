@@ -13,6 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
+	"github.com/ptudor/dnssec-tudor/internal/metrics"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -23,8 +26,8 @@ import (
 type Daemon struct {
 	cfg       *config.Config
 	state     *statepkg.State
-	signer    *Signer
-	rollover  *RolloverManager
+	signer    *signerpkg.Signer
+	rollover  *signerpkg.RolloverManager
 	heartbeat *HeartbeatClient
 
 	ctx    context.Context
@@ -45,8 +48,8 @@ func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 	return &Daemon{
 		cfg:         cfg,
 		state:       state,
-		signer:      NewSigner(cfg, state),
-		rollover:    NewRolloverManager(cfg, state),
+		signer:      signerpkg.NewSigner(cfg, state),
+		rollover:    signerpkg.NewRolloverManager(cfg, state),
 		heartbeat:   NewHeartbeatClient(&cfg.Heartbeat),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -176,8 +179,8 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 
 	d.cfg = cfg
 	d.state = state
-	d.signer = NewSigner(cfg, state)
-	d.rollover = NewRolloverManager(cfg, state)
+	d.signer = signerpkg.NewSigner(cfg, state)
+	d.rollover = signerpkg.NewRolloverManager(cfg, state)
 	d.heartbeat = newHeartbeat
 	d.mu.Unlock()
 
@@ -219,12 +222,12 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 func (d *Daemon) ensureDirectories() error {
 	// Data and output dirs need standard permissions
 	for _, dir := range []string{d.cfg.DataDir, d.cfg.OutputDir} {
-		if err := ensureDir(dir); err != nil {
+		if err := signerpkg.EnsureDir(dir); err != nil {
 			return err
 		}
 	}
 	// Keys directory holds private keys — restrict to owner-only
-	if err := ensureDirSecure(d.cfg.KeysDir()); err != nil {
+	if err := signerpkg.EnsureDirSecure(d.cfg.KeysDir()); err != nil {
 		return err
 	}
 	return nil
@@ -315,8 +318,8 @@ func (d *Daemon) signAllZonesSafe() {
 type snapshot struct {
 	cfg       *config.Config
 	state     *statepkg.State
-	signer    *Signer
-	rollover  *RolloverManager
+	signer    *signerpkg.Signer
+	rollover  *signerpkg.RolloverManager
 	heartbeat *HeartbeatClient
 }
 
@@ -425,7 +428,7 @@ rolloverLoop:
 	}
 
 	// Update Prometheus metrics
-	UpdateZoneMetrics(snap.state)
+	metrics.UpdateZoneMetrics(snap.state)
 }
 
 // checkAndSignZoneSafe wraps checkAndSignZone with per-zone panic recovery
@@ -473,8 +476,8 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// SignAll (R-033): the daemon heals it instead of erroring every cycle
 	// until a CLI `sign` runs.
 	if zoneState == nil || zoneState.KSK == nil || zoneState.ZSK == nil {
-		keyGen := NewKeyGenerator(snap.cfg)
-		ksk, zsk, err := recoverOrGenerateKeys(keyGen, domain)
+		keyGen := signerpkg.NewKeyGenerator(snap.cfg)
+		ksk, zsk, err := signerpkg.RecoverOrGenerateKeys(keyGen, domain)
 		if err != nil {
 			return false, err
 		}
@@ -503,7 +506,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	signStart := time.Now()
 	if err := snap.signer.SignZone(domain); err != nil {
 		snap.state.Mutate(func() { zoneState.AddError(err.Error()) })
-		RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
+		metrics.RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
 		snap.heartbeat.SigningError(domain)
 		return false, err
 	}

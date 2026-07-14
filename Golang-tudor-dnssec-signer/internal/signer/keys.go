@@ -1,4 +1,4 @@
-package main
+package signer
 
 import (
 	"bytes"
@@ -108,7 +108,7 @@ func (kg *KeyGenerator) generateKey(domain string, isKSK bool, algorithmOverride
 	}
 
 	// Save key files
-	if err := kg.saveKeyFiles(domain, keyType, dnskey, privateKey); err != nil {
+	if err := kg.SaveKeyFiles(domain, keyType, dnskey, privateKey); err != nil {
 		return nil, fmt.Errorf("saving key files: %w", err)
 	}
 
@@ -230,9 +230,9 @@ func generateDNSSECKey(domain, algorithm string, flags uint16) (*dns.DNSKEY, []b
 	return dnskey, privateKey, nil
 }
 
-func (kg *KeyGenerator) saveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY, privateKey []byte) error {
+func (kg *KeyGenerator) SaveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY, privateKey []byte) error {
 	keysDir := kg.cfg.KeysDir()
-	if err := ensureDirSecure(keysDir); err != nil {
+	if err := EnsureDirSecure(keysDir); err != nil {
 		return err
 	}
 
@@ -289,7 +289,7 @@ func (kg *KeyGenerator) backupExistingKeyFiles(domain, keyType, baseName string)
 	}
 
 	// Parse existing DNSKEY to get its key tag for the backup filename.
-	existingKey, err := parseDNSKEYFromFile(string(keyData))
+	existingKey, err := ParseDNSKEYFromFile(string(keyData))
 	if err != nil {
 		// Unparseable existing key: preserve it under a UNIQUE .bak base so a prior
 		// .bak from an earlier failure is never clobbered.
@@ -310,7 +310,7 @@ func (kg *KeyGenerator) backupExistingKeyFiles(domain, keyType, baseName string)
 	// when it holds the SAME key — a key-tag collision could otherwise let us silently
 	// drop a different key's backup. If it differs, preserve the live key under a unique
 	// name instead of overwriting the existing backup.
-	if fileExists(backupBase + ".key") {
+	if FileExists(backupBase + ".key") {
 		if existingBackup, err := kg.loadPublicKeyFromPath(backupBase); err == nil &&
 			existingBackup.PublicKey == existingKey.PublicKey {
 			// A crash after only the .key half of a prior backup landed leaves
@@ -320,8 +320,8 @@ func (kg *KeyGenerator) backupExistingKeyFiles(domain, keyType, baseName string)
 			// skipping. Copy rather than rename: the live pair must stay intact
 			// on disk for the caller's atomic overwrite, exactly as this skip
 			// path leaves it today.
-			if !fileExists(backupBase+".private") && fileExists(privFile) {
-				if err := copyFile(privFile, backupBase+".private"); err != nil {
+			if !FileExists(backupBase+".private") && FileExists(privFile) {
+				if err := fsutil.CopyFile(privFile, backupBase+".private"); err != nil {
 					return fmt.Errorf("completing half-written backup (.key present, .private missing): %w", err)
 				}
 				slog.Warn("[KEY] Completed a half-written key backup with the live private key",
@@ -355,7 +355,7 @@ func moveKeyPair(keyFile, privFile, destBase string) error {
 	if err := os.Rename(keyFile, destBase+".key"); err != nil {
 		return fmt.Errorf("backing up public key file: %w", err)
 	}
-	if fileExists(privFile) {
+	if FileExists(privFile) {
 		if err := os.Rename(privFile, destBase+".private"); err != nil {
 			os.Rename(destBase+".key", keyFile) // undo, keep the live pair together
 			return fmt.Errorf("backing up private key file: %w", err)
@@ -369,7 +369,7 @@ func moveKeyPair(keyFile, privFile, destBase string) error {
 func uniqueBackupBase(prefix string) (string, error) {
 	for i := 0; i < 10000; i++ {
 		candidate := fmt.Sprintf("%s.%d", prefix, i)
-		if !fileExists(candidate+".key") && !fileExists(candidate+".private") {
+		if !FileExists(candidate+".key") && !FileExists(candidate+".private") {
 			return candidate, nil
 		}
 	}
@@ -495,7 +495,7 @@ func (kg *KeyGenerator) keyFileMtime(path string) time.Time {
 	return info.ModTime().UTC()
 }
 
-// recoverOrGenerateKeys attempts to recover existing key files from disk before
+// RecoverOrGenerateKeys attempts to recover existing key files from disk before
 // falling back to generating new keys. This prevents DS chain of trust breakage
 // when a zone's state entry is lost but key files still exist on disk.
 //
@@ -505,7 +505,7 @@ func (kg *KeyGenerator) keyFileMtime(path string) time.Time {
 // causes SERVFAIL until the operator notices. Regeneration is reserved for
 // the "no key files present" case only. An operator who truly wants new
 // keys should `dnssec-tudor remove <domain>` + re-add.
-func recoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *statepkg.KeyState, zsk *statepkg.KeyState, err error) {
+func RecoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *statepkg.KeyState, zsk *statepkg.KeyState, err error) {
 	ksk, err = keyGen.RecoverKeyState(domain, true)
 	if err != nil {
 		slog.Error("[KEY] Existing KSK files present but unreadable; refusing to regenerate",
@@ -586,7 +586,7 @@ func (kg *KeyGenerator) loadPublicKeyFromPath(baseName string) (*dns.DNSKEY, err
 	if err != nil {
 		return nil, fmt.Errorf("reading public key: %w", err)
 	}
-	dnskey, err := parseDNSKEYFromFile(string(keyData))
+	dnskey, err := ParseDNSKEYFromFile(string(keyData))
 	if err != nil {
 		return nil, fmt.Errorf("parsing public key: %w", err)
 	}
@@ -623,14 +623,14 @@ func validateLoadedKey(dnskey *dns.DNSKEY, domain, keyType string) error {
 	return nil
 }
 
-// fileExists reports whether path exists (as any file type).
-func fileExists(path string) bool {
+// FileExists reports whether path exists (as any file type).
+func FileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
 
 // loadKeyPairByID loads a backup key pair by its key ID
-func (kg *KeyGenerator) loadKeyPairByID(domain, keyType string, keyID uint16) (*dns.DNSKEY, []byte, error) {
+func (kg *KeyGenerator) LoadKeyPairByID(domain, keyType string, keyID uint16) (*dns.DNSKEY, []byte, error) {
 	keysDir := kg.cfg.KeysDir()
 	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
 	dnskey, priv, err := kg.loadKeyPairFromPath(baseName)
@@ -653,7 +653,7 @@ func (kg *KeyGenerator) loadKeyPairFromPath(baseName string) (*dns.DNSKEY, []byt
 	}
 
 	// Parse DNSKEY from file
-	dnskey, err := parseDNSKEYFromFile(string(keyData))
+	dnskey, err := ParseDNSKEYFromFile(string(keyData))
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing public key: %w", err)
 	}
@@ -665,7 +665,7 @@ func (kg *KeyGenerator) loadKeyPairFromPath(baseName string) (*dns.DNSKEY, []byt
 		return nil, nil, fmt.Errorf("reading private key: %w", err)
 	}
 
-	privateKey, err := parsePrivateKeyFromFile(string(privData))
+	privateKey, err := ParsePrivateKeyFromFile(string(privData))
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing private key: %w", err)
 	}
@@ -674,7 +674,7 @@ func (kg *KeyGenerator) loadKeyPairFromPath(baseName string) (*dns.DNSKEY, []byt
 	// crashed write) before it is used to sign. The ECDSA signing path derives the public
 	// point from the private scalar, so a mismatch would otherwise "sign" and emit RRSIGs
 	// that don't verify against the published DNSKEY — a silent SERVFAIL.
-	if err := verifyKeyPairCorrespondence(dnskey, privateKey); err != nil {
+	if err := VerifyKeyPairCorrespondence(dnskey, privateKey); err != nil {
 		return nil, nil, fmt.Errorf("key pair at %s: %w", baseName, err)
 	}
 
@@ -694,8 +694,8 @@ func statExists(path string) (bool, error) {
 	return false, err
 }
 
-// parseDNSKEYFromFile parses a DNSKEY record from a key file
-func parseDNSKEYFromFile(content string) (*dns.DNSKEY, error) {
+// ParseDNSKEYFromFile parses a DNSKEY record from a key file
+func ParseDNSKEYFromFile(content string) (*dns.DNSKEY, error) {
 	for _, line := range splitLines(content) {
 		if len(line) == 0 || line[0] == ';' {
 			continue
@@ -711,13 +711,13 @@ func parseDNSKEYFromFile(content string) (*dns.DNSKEY, error) {
 	return nil, fmt.Errorf("no DNSKEY record found in file")
 }
 
-// verifyKeyPairCorrespondence checks that the private key material actually corresponds to
+// VerifyKeyPairCorrespondence checks that the private key material actually corresponds to
 // the public key in the DNSKEY. Two failures this guards against: a crash or restore can
 // pair a freshly written .key with a stale .private of a different key (R-009), and a
 // standard BIND/ldns ED25519 key stores the private half as a 32-byte seed the raw signer
 // would otherwise reject (R-010). It accepts every key form this signer generates or
 // imports: 64-byte or 32-byte-seed ED25519, and 32/48-byte ECDSA P-256/P-384.
-func verifyKeyPairCorrespondence(dnskey *dns.DNSKEY, privateKey []byte) error {
+func VerifyKeyPairCorrespondence(dnskey *dns.DNSKEY, privateKey []byte) error {
 	pubBytes, err := base64.StdEncoding.DecodeString(dnskey.PublicKey)
 	if err != nil {
 		return fmt.Errorf("decoding DNSKEY public key: %w", err)
@@ -767,8 +767,8 @@ func verifyECDSACorrespondence(curve elliptic.Curve, size int, privateKey, pubBy
 	return nil
 }
 
-// parsePrivateKeyFromFile parses a private key from BIND format
-func parsePrivateKeyFromFile(content string) ([]byte, error) {
+// ParsePrivateKeyFromFile parses a private key from BIND format
+func ParsePrivateKeyFromFile(content string) ([]byte, error) {
 	for _, line := range splitLines(content) {
 		if len(line) > 12 && line[:12] == "PrivateKey: " {
 			return base64.StdEncoding.DecodeString(line[12:])
@@ -825,17 +825,17 @@ func AlgorithmFromName(name string) (uint8, error) {
 	return alg, nil
 }
 
-// ensureDir creates a directory if it doesn't exist
-func ensureDir(path string) error {
+// EnsureDir creates a directory if it doesn't exist
+func EnsureDir(path string) error {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return fmt.Errorf("creating directory %s: %w", path, err)
 	}
 	return nil
 }
 
-// ensureDirSecure creates a directory with 0700 permissions if it doesn't exist,
+// EnsureDirSecure creates a directory with 0700 permissions if it doesn't exist,
 // and tightens permissions if it already exists with wider access.
-func ensureDirSecure(path string) error {
+func EnsureDirSecure(path string) error {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0700); err != nil {

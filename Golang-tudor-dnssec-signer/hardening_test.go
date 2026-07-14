@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
@@ -220,8 +222,8 @@ func TestEnsureDirSecure_CreatesWithRestrictedPermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	secureDir := filepath.Join(tmpDir, "keys")
 
-	if err := ensureDirSecure(secureDir); err != nil {
-		t.Fatalf("ensureDirSecure failed: %v", err)
+	if err := signerpkg.EnsureDirSecure(secureDir); err != nil {
+		t.Fatalf("EnsureDirSecure failed: %v", err)
 	}
 
 	info, err := os.Stat(secureDir)
@@ -243,8 +245,8 @@ func TestEnsureDirSecure_TightensLoosePermissions(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	if err := ensureDirSecure(looseDir); err != nil {
-		t.Fatalf("ensureDirSecure failed: %v", err)
+	if err := signerpkg.EnsureDirSecure(looseDir); err != nil {
+		t.Fatalf("EnsureDirSecure failed: %v", err)
 	}
 
 	info, err := os.Stat(looseDir)
@@ -265,8 +267,8 @@ func TestEnsureDirSecure_LeavesCorrectPermissionsAlone(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	if err := ensureDirSecure(okDir); err != nil {
-		t.Fatalf("ensureDirSecure failed: %v", err)
+	if err := signerpkg.EnsureDirSecure(okDir); err != nil {
+		t.Fatalf("EnsureDirSecure failed: %v", err)
 	}
 
 	info, _ := os.Stat(okDir)
@@ -280,7 +282,7 @@ func TestEnsureDirSecure_RejectsFile(t *testing.T) {
 	filePath := filepath.Join(tmpDir, "notadir")
 	os.WriteFile(filePath, []byte("x"), 0644)
 
-	err := ensureDirSecure(filePath)
+	err := signerpkg.EnsureDirSecure(filePath)
 	if err == nil {
 		t.Fatal("expected error for file path")
 	}

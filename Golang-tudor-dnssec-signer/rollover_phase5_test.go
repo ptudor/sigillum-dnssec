@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
@@ -26,7 +28,7 @@ func TestStartZSKRollover_KeepsExistingAlgorithm(t *testing.T) {
 	zs := state.GetZone(domain)
 	zs.ZSK.Expires = time.Now().UTC().Add(-time.Hour)
 
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover: %v", err)
 	}
@@ -36,12 +38,12 @@ func TestStartZSKRollover_KeepsExistingAlgorithm(t *testing.T) {
 
 	// The newly-generated (live) ZSK must still be ED25519, matching the KSK,
 	// not the changed config default.
-	keyGen := NewKeyGenerator(cfg)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	newZSK, _, err := keyGen.LoadKeyPair(domain, "zsk")
 	if err != nil {
 		t.Fatalf("load new ZSK: %v", err)
 	}
-	if got := AlgorithmName(newZSK.Algorithm); got != "ED25519" {
+	if got := signerpkg.AlgorithmName(newZSK.Algorithm); got != "ED25519" {
 		t.Errorf("new ZSK algorithm = %s, want ED25519 (R-039)", got)
 	}
 }
@@ -51,7 +53,7 @@ func TestStartZSKRollover_KeepsExistingAlgorithm(t *testing.T) {
 func TestZSKRollover_PhaseGating(t *testing.T) {
 	_, cfg, state, domain := signableZoneDaemon(t)
 	cfg.DNSSEC.DNSKEYTtl = 1 // TTL floor = 1s (fast for the test)
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 
 	zs := state.GetZone(domain)
 	past := time.Now().UTC().Add(-30 * 24 * time.Hour)
@@ -86,7 +88,7 @@ func TestZSKRollover_PhaseGating(t *testing.T) {
 // warning instead of silently letting the ZSK age out.
 func TestCheckZSKRollover_BlockedByKSKRolloverWarns(t *testing.T) {
 	_, cfg, state, domain := signableZoneDaemon(t)
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 
 	zs := state.GetZone(domain)
 	// A KSK rollover occupies the single Rollover slot...
@@ -123,7 +125,7 @@ func TestStartKSKRollover_RollsBackOnSaveFailure(t *testing.T) {
 	// Force Save() to fail by pointing the state path into a nonexistent dir.
 	state.SetPath(filepath.Join(t.TempDir(), "missing-subdir", "state.json"))
 
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 	if err := rm.StartKSKRollover(domain); err == nil {
 		t.Fatal("StartKSKRollover should fail when the state Save fails")
 	}
@@ -138,7 +140,7 @@ func TestStartKSKRollover_RollsBackOnSaveFailure(t *testing.T) {
 	}
 
 	// The live key files must be restored to the OLD key (not the new one).
-	keyGen := NewKeyGenerator(cfg)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	liveKSK, err := keyGen.LoadPublicKey(domain, "ksk")
 	if err != nil {
 		t.Fatalf("load live KSK: %v", err)

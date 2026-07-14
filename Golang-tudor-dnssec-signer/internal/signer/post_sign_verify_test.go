@@ -1,9 +1,10 @@
-package main
+package signer
 
 import (
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 )
 
 // signValidZone builds and signs a small NSEC-signed zone and returns the signed records
@@ -11,7 +12,7 @@ import (
 func signValidZone(t *testing.T) (*Signer, []dns.RR, *signingKeys) {
 	t.Helper()
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 	cfg.DNSSEC.NSECVersion = "nsec"
 	keyGen := NewKeyGenerator(cfg)
 	if _, err := keyGen.GenerateKSK("example.com"); err != nil {

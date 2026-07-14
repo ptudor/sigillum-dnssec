@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -154,7 +156,7 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 	var localKSKTag uint16
 	var localZSKTag uint16
 
-	keyGen := NewKeyGenerator(v.cfg)
+	keyGen := signerpkg.NewKeyGenerator(v.cfg)
 	if zoneState.KSK != nil {
 		localKSKTag = zoneState.KSK.ID
 		ksk, err := keyGen.LoadPublicKey(domain, "ksk")

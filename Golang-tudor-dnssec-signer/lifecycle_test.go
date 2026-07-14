@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
@@ -18,7 +21,7 @@ import (
 func signableZoneDaemon(t *testing.T) (*Daemon, *config.Config, *statepkg.State, string) {
 	t.Helper()
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 	domain := "lifecycle.example."
 	zone := `$ORIGIN lifecycle.example.
 $TTL 3600
@@ -33,14 +36,14 @@ www	IN	A	192.0.2.10
 		t.Fatal(err)
 	}
 	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := signerpkg.EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := signerpkg.EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatal(err)
 	}
 	state := statepkg.NewState(cfg.StatePath())
-	keyGen := NewKeyGenerator(cfg)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	ksk, err := keyGen.GenerateKSK(domain)
 	if err != nil {
 		t.Fatal(err)
@@ -97,7 +100,7 @@ func TestSignAllZones_StopsOnShutdown(t *testing.T) {
 // and leave wg.Wait() hanging).
 func TestDaemon_ShutdownBeforeRun(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 	cfg.Web.Enabled = true
 	cfg.Web.Listen = "127.0.0.1:0"
 	cfg.Health.Listen = "127.0.0.1:0"
@@ -128,7 +131,7 @@ func TestDaemon_HealthBindFatal(t *testing.T) {
 	}
 	defer occupied.Close()
 
-	cfg := testConfig(t, t.TempDir())
+	cfg := dnssectest.Config(t, t.TempDir())
 	cfg.Health.Listen = occupied.Addr().String() // already in use
 	d := NewDaemon(cfg, statepkg.NewState(cfg.StatePath()))
 
@@ -149,7 +152,7 @@ func TestDaemon_WebBindFatal(t *testing.T) {
 	}
 	defer occupied.Close()
 
-	cfg := testConfig(t, t.TempDir())
+	cfg := dnssectest.Config(t, t.TempDir())
 	cfg.Health.Listen = "127.0.0.1:0" // free
 	cfg.Web.Enabled = true
 	cfg.Web.Listen = occupied.Addr().String() // already in use

@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
@@ -15,8 +18,8 @@ func TestRecoverKeyState_OrphanHalf(t *testing.T) {
 	for _, deleted := range []string{".private", ".key"} {
 		t.Run("missing"+deleted, func(t *testing.T) {
 			dataDir := t.TempDir()
-			cfg := testConfig(t, dataDir)
-			keyGen := NewKeyGenerator(cfg)
+			cfg := dnssectest.Config(t, dataDir)
+			keyGen := signerpkg.NewKeyGenerator(cfg)
 			if _, err := keyGen.GenerateKSK("example.com"); err != nil {
 				t.Fatal(err)
 			}
@@ -37,11 +40,11 @@ func TestRecoverKeyState_OrphanHalf(t *testing.T) {
 			if state != nil {
 				t.Fatal("RecoverKeyState must not return a state for an orphan half")
 			}
-			if !fileExists(surviving) {
+			if !signerpkg.FileExists(surviving) {
 				t.Fatalf("the surviving half %s must not be touched", surviving)
 			}
-			if _, _, err := recoverOrGenerateKeys(keyGen, "example.com"); err == nil {
-				t.Fatal("recoverOrGenerateKeys must refuse to regenerate over an orphan half")
+			if _, _, err := signerpkg.RecoverOrGenerateKeys(keyGen, "example.com"); err == nil {
+				t.Fatal("RecoverOrGenerateKeys must refuse to regenerate over an orphan half")
 			}
 		})
 	}
@@ -51,8 +54,8 @@ func TestRecoverKeyState_OrphanHalf(t *testing.T) {
 // new public key with a stale private key) must be rejected at load, not signed with.
 func TestLoadKeyPair_MismatchedPairRejected(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	keyGen := NewKeyGenerator(cfg)
+	cfg := dnssectest.Config(t, dataDir)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	if _, err := keyGen.GenerateKSK("a.example.com"); err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +87,8 @@ func TestSaveKeyFiles_BackupFailureAborts(t *testing.T) {
 		t.Skip("relies on filesystem permissions; not meaningful as root")
 	}
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	keyGen := NewKeyGenerator(cfg)
+	cfg := dnssectest.Config(t, dataDir)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	if _, err := keyGen.GenerateKSK("example.com"); err != nil {
 		t.Fatal(err)
 	}
@@ -117,8 +120,8 @@ func TestStartKSKRollover_BackupFailureFatal(t *testing.T) {
 		t.Skip("relies on filesystem permissions; not meaningful as root")
 	}
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	keyGen := NewKeyGenerator(cfg)
+	cfg := dnssectest.Config(t, dataDir)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 	ksk, err := keyGen.GenerateKSK("example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +133,7 @@ func TestStartKSKRollover_BackupFailureFatal(t *testing.T) {
 
 	state := statepkg.NewState(filepath.Join(dataDir, "state.json"))
 	state.SetZone("example.com", &statepkg.ZoneState{Path: filepath.Join(dataDir, "zone.db"), KSK: ksk, ZSK: zsk})
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 
 	if err := os.Chmod(cfg.KeysDir(), 0500); err != nil {
 		t.Fatal(err)

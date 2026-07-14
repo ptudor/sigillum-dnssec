@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -68,7 +70,7 @@ func BuildDSSet(cfg *config.Config, state *statepkg.State, domain string) ([]*dn
 	}
 
 	digestType := cfg.Registrar.DigestType()
-	keyGen := NewKeyGenerator(cfg)
+	keyGen := signerpkg.NewKeyGenerator(cfg)
 
 	var out []*dns.DS
 	// Active KSK (always present). Key filenames use the primary "ksk" slot.

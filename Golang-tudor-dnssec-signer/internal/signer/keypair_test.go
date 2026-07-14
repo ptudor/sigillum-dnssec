@@ -1,4 +1,4 @@
-package main
+package signer
 
 import (
 	"crypto/ecdsa"
@@ -79,16 +79,16 @@ func TestVerifyKeyPairCorrespondence(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	dnskey := ed25519DNSKEY(pub)
 
-	if err := verifyKeyPairCorrespondence(dnskey, priv.Seed()); err != nil {
+	if err := VerifyKeyPairCorrespondence(dnskey, priv.Seed()); err != nil {
 		t.Fatalf("32-byte seed should correspond: %v", err)
 	}
-	if err := verifyKeyPairCorrespondence(dnskey, priv); err != nil {
+	if err := VerifyKeyPairCorrespondence(dnskey, priv); err != nil {
 		t.Fatalf("64-byte key should correspond: %v", err)
 	}
 
 	// A different key's private half must be rejected (the R-009 mismatch case).
 	_, priv2, _ := ed25519.GenerateKey(rand.Reader)
-	if err := verifyKeyPairCorrespondence(dnskey, priv2); err == nil {
+	if err := VerifyKeyPairCorrespondence(dnskey, priv2); err == nil {
 		t.Fatal("mismatched ED25519 private key must be rejected")
 	}
 
@@ -109,10 +109,10 @@ func TestVerifyKeyPairCorrespondence(t *testing.T) {
 		Algorithm: dns.ECDSAP256SHA256,
 		PublicKey: base64.StdEncoding.EncodeToString(pubBytes),
 	}
-	if err := verifyKeyPairCorrespondence(ecKey, dBytes); err != nil {
+	if err := VerifyKeyPairCorrespondence(ecKey, dBytes); err != nil {
 		t.Fatalf("matching ECDSA pair should correspond: %v", err)
 	}
-	if err := verifyKeyPairCorrespondence(ecKey, make([]byte, 32)); err == nil {
+	if err := VerifyKeyPairCorrespondence(ecKey, make([]byte, 32)); err == nil {
 		t.Fatal("a zero ECDSA scalar must not correspond to the real public key")
 	}
 }

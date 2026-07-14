@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -25,7 +28,7 @@ import (
 func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 	_, cfg, state, domain := signableZoneDaemon(t)
 	cfg.DNSSEC.DNSKEYTtl = 3600 // 1h floor — far longer than the re-sign cadence
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 
 	now := time.Now().UTC()
 	zs := state.GetZone(domain)
@@ -177,7 +180,7 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 	cfg.DNSSEC.DNSKEYTtl = 1                                                    // 1s TTL floor (fast for the test)
 	cfg.DNSSEC.RolloverPrepublish = config.Duration{Duration: 61 * time.Second} // signing dwell =
 	cfg.DNSSEC.RolloverSwitch = config.Duration{Duration: 1 * time.Second}      // prepublish - switch = 60s
-	rm := NewRolloverManager(cfg, state)
+	rm := signerpkg.NewRolloverManager(cfg, state)
 
 	now := time.Now().UTC()
 	zs := state.GetZone(domain)
@@ -236,7 +239,7 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 
 	// The forced re-sign publishes a DNSKEY RRset without the old ZSK: exactly
 	// one ZSK (the new one) and one KSK.
-	if err := NewSigner(cfg, state).SignZone(domain); err != nil {
+	if err := signerpkg.NewSigner(cfg, state).SignZone(domain); err != nil {
 		t.Fatalf("SignZone after completion: %v", err)
 	}
 	f, err := os.Open(filepath.Join(cfg.OutputDir, domain+".zone.signed"))
@@ -272,16 +275,16 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 // .private's only copy.
 func TestBackupKey_CompletesHalfWrittenBackup(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := signerpkg.EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
-	kg := NewKeyGenerator(cfg)
+	kg := signerpkg.NewKeyGenerator(cfg)
 	ksk, err := kg.GenerateKSK("example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	rm := NewRolloverManager(cfg, statepkg.NewState(cfg.StatePath()))
+	rm := signerpkg.NewRolloverManager(cfg, statepkg.NewState(cfg.StatePath()))
 
 	base := filepath.Join(cfg.KeysDir(), "example.com.ksk")
 	backupBase := filepath.Join(cfg.KeysDir(), fmt.Sprintf("example.com.ksk.%d", ksk.ID))
@@ -299,7 +302,7 @@ func TestBackupKey_CompletesHalfWrittenBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := rm.backupKey("example.com", "ksk", ksk.ID); err != nil {
+	if err := rm.BackupKey("example.com", "ksk", ksk.ID); err != nil {
 		t.Fatalf("backupKey must complete a half-written backup, not fail: %v", err)
 	}
 
@@ -318,18 +321,18 @@ func TestBackupKey_CompletesHalfWrittenBackup(t *testing.T) {
 		t.Error("live key files must be untouched by the backup completion")
 	}
 	// The completed backup loads as a valid, corresponding pair.
-	if _, _, err := kg.loadKeyPairByID("example.com", "ksk", ksk.ID); err != nil {
+	if _, _, err := kg.LoadKeyPairByID("example.com", "ksk", ksk.ID); err != nil {
 		t.Errorf("completed backup pair must load: %v", err)
 	}
 }
 
-// backupExistingKeyFiles (via its caller saveKeyFiles / GenerateKSK): the
+// backupExistingKeyFiles (via its caller SaveKeyFiles / GenerateKSK): the
 // same-key skip must first complete a half-written backup pair from the live
 // .private, because the caller immediately overwrites the live files.
 func TestBackupExistingKeyFiles_CompletesHalfWrittenBackup(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	kg := NewKeyGenerator(cfg)
+	cfg := dnssectest.Config(t, dataDir)
+	kg := signerpkg.NewKeyGenerator(cfg)
 	ksk, err := kg.GenerateKSK("example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -351,7 +354,7 @@ func TestBackupExistingKeyFiles_CompletesHalfWrittenBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Overwrite the live pair via new key generation — the saveKeyFiles seam.
+	// Overwrite the live pair via new key generation — the SaveKeyFiles seam.
 	// Pre-fix this skipped the backup ("already backed up") and the overwrite
 	// destroyed the only copy of the old .private.
 	if _, err := kg.GenerateKSK("example.com"); err != nil {
@@ -370,7 +373,7 @@ func TestBackupExistingKeyFiles_CompletesHalfWrittenBackup(t *testing.T) {
 		t.Error("backup pair must hold the OLD key's material after the overwrite")
 	}
 	// The completed backup loads as a valid, corresponding pair.
-	if _, _, err := kg.loadKeyPairByID("example.com", "ksk", ksk.ID); err != nil {
+	if _, _, err := kg.LoadKeyPairByID("example.com", "ksk", ksk.ID); err != nil {
 		t.Errorf("completed backup pair must load: %v", err)
 	}
 }

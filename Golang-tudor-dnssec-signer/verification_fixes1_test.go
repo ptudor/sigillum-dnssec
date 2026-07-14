@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/ptudor/dnssec-tudor/internal/config"
@@ -16,7 +19,7 @@ import (
 // --- Item 1: unwindAdd must never delete a surviving orphan key half ---
 
 // keyPairAbsent must report true only when NEITHER half of the pair exists.
-// A half-present pair means recoverOrGenerateKeys refuses (R-028) rather than
+// A half-present pair means RecoverOrGenerateKeys refuses (R-028) rather than
 // generates, so a failed add's rollback must not treat it as "generated here".
 func TestKeyPairAbsent(t *testing.T) {
 	cases := []struct {
@@ -49,7 +52,7 @@ func TestKeyPairAbsent(t *testing.T) {
 // whose DS may still be live at the parent.
 func TestUnwindAdd_PreservesPrivateOnlyOrphan(t *testing.T) {
 	dir := t.TempDir()
-	cfg := testConfig(t, dir)
+	cfg := dnssectest.Config(t, dir)
 	keysDir := cfg.KeysDir()
 	if err := os.MkdirAll(keysDir, 0700); err != nil {
 		t.Fatal(err)
@@ -62,7 +65,7 @@ func TestUnwindAdd_PreservesPrivateOnlyOrphan(t *testing.T) {
 	state := statepkg.NewState(cfg.StatePath())
 	state.SetZone("example.com", &statepkg.ZoneState{Path: "/zones/example.com.db"})
 
-	// Exactly what runAdd computes before recoverOrGenerateKeys fails on the
+	// Exactly what runAdd computes before RecoverOrGenerateKeys fails on the
 	// incomplete pair: the KSK slot is NOT empty (orphan half present), the
 	// ZSK slot is.
 	kskGenerated := keyPairAbsent(keysDir, "example.com", "ksk")
@@ -76,7 +79,7 @@ func TestUnwindAdd_PreservesPrivateOnlyOrphan(t *testing.T) {
 
 	unwindAdd(cfg, state, "example.com", kskGenerated, zskGenerated, nil, false)
 
-	if !fileExists(orphan) {
+	if !signerpkg.FileExists(orphan) {
 		t.Fatal("unwindAdd deleted the surviving .private orphan — the only recoverable copy of the key")
 	}
 	if state.GetZone("example.com") != nil {
@@ -84,7 +87,7 @@ func TestUnwindAdd_PreservesPrivateOnlyOrphan(t *testing.T) {
 	}
 }
 
-// End-to-end failed-add: a .private-only KSK orphan makes recoverOrGenerateKeys
+// End-to-end failed-add: a .private-only KSK orphan makes RecoverOrGenerateKeys
 // refuse, and the rollback must leave the orphan on disk while cleaning up the
 // zone from state and leaving the config file untouched.
 func TestRunAdd_FailedAddPreservesPrivateOnlyOrphan(t *testing.T) {
@@ -123,7 +126,7 @@ func TestRunAdd_FailedAddPreservesPrivateOnlyOrphan(t *testing.T) {
 		t.Errorf("error should come from key preparation, got: %v", err)
 	}
 
-	if !fileExists(orphan) {
+	if !signerpkg.FileExists(orphan) {
 		t.Fatal("failed add deleted the surviving .private orphan — the only recoverable copy of the key")
 	}
 

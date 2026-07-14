@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
@@ -12,7 +15,7 @@ import (
 // nameserver may still be serving it), not delete it.
 func TestR011_UnwindRestoresPreExistingOutput(t *testing.T) {
 	dir := t.TempDir()
-	cfg := testConfig(t, dir)
+	cfg := dnssectest.Config(t, dir)
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +48,7 @@ func TestR011_UnwindRestoresPreExistingOutput(t *testing.T) {
 // output this add created.
 func TestR011_UnwindRemovesNewlyCreatedOutput(t *testing.T) {
 	dir := t.TempDir()
-	cfg := testConfig(t, dir)
+	cfg := dnssectest.Config(t, dir)
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +61,7 @@ func TestR011_UnwindRemovesNewlyCreatedOutput(t *testing.T) {
 
 	unwindAdd(cfg, state, "new.example", false, false, nil, false)
 
-	if fileExists(signedPath) {
+	if signerpkg.FileExists(signedPath) {
 		t.Fatal("newly-created output should be removed on rollback (no predecessor)")
 	}
 }

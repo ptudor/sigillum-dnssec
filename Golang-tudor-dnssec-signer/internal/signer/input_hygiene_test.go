@@ -1,10 +1,12 @@
-package main
+package signer
 
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -16,7 +18,7 @@ import (
 // has exactly one generated chain and no RRSIG-over-RRSIG.
 func TestSignZone_StripsInputDNSSEC(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 
 	// An input zone that already carries DNSSEC records (as if re-processing a
 	// signed file by mistake): a stray RRSIG covering A, an NSEC3PARAM, and an
@@ -72,7 +74,7 @@ www	3600 IN	RRSIG A 15 3 3600 20991231235959 20200101000000 1111 example.com. AA
 // signed into a broken NSEC/NSEC3 chain.
 func TestSignZone_RejectsOutOfZoneOwner(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
+	cfg := dnssectest.Config(t, dataDir)
 	domain := "example.com"
 
 	zone := `$ORIGIN example.com.
@@ -87,10 +89,10 @@ evil.org.	IN	A	192.0.2.99
 		t.Fatal(err)
 	}
 	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureDir(cfg.OutputDir); err != nil {
+	if err := EnsureDir(cfg.OutputDir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,7 +107,7 @@ evil.org.	IN	A	192.0.2.99
 	if err == nil {
 		t.Fatal("SignZone must reject a zone containing an out-of-zone owner (R-035)")
 	}
-	if !contains(err.Error(), "evil.org") {
+	if !strings.Contains(err.Error(), "evil.org") {
 		t.Errorf("error should name the offending owner, got: %v", err)
 	}
 }

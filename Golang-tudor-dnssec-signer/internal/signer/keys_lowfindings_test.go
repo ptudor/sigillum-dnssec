@@ -1,4 +1,4 @@
-package main
+package signer
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ptudor/dnssec-tudor/internal/dnssectest"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
 	"github.com/miekg/dns"
@@ -15,8 +16,8 @@ import (
 // and any backed-up key file's tag, and tagInUse reports membership.
 func TestExistingKeyTags(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
 	kg := NewKeyGenerator(cfg)
@@ -59,8 +60,8 @@ func TestExistingKeyTags(t *testing.T) {
 // identical re-backup is idempotent.
 func TestBackupKey_RefusesDifferingBackup(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := testConfig(t, dataDir)
-	if err := ensureDir(cfg.KeysDir()); err != nil {
+	cfg := dnssectest.Config(t, dataDir)
+	if err := EnsureDir(cfg.KeysDir()); err != nil {
 		t.Fatal(err)
 	}
 	kg := NewKeyGenerator(cfg)
@@ -76,7 +77,7 @@ func TestBackupKey_RefusesDifferingBackup(t *testing.T) {
 	if err := os.WriteFile(backupBase+".key", []byte("DIFFERENT CONTENT"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := rm.backupKey("example.com", "ksk", ksk.ID); err == nil {
+	if err := rm.BackupKey("example.com", "ksk", ksk.ID); err == nil {
 		t.Fatal("backupKey must refuse to overwrite a differing backup")
 	}
 	if data, _ := os.ReadFile(backupBase + ".key"); string(data) != "DIFFERENT CONTENT" {
@@ -86,10 +87,10 @@ func TestBackupKey_RefusesDifferingBackup(t *testing.T) {
 	// With no conflicting backup, a first backup then an identical re-backup both
 	// succeed (idempotent).
 	os.Remove(backupBase + ".key")
-	if err := rm.backupKey("example.com", "ksk", ksk.ID); err != nil {
+	if err := rm.BackupKey("example.com", "ksk", ksk.ID); err != nil {
 		t.Fatalf("first backup: %v", err)
 	}
-	if err := rm.backupKey("example.com", "ksk", ksk.ID); err != nil {
+	if err := rm.BackupKey("example.com", "ksk", ksk.ID); err != nil {
 		t.Fatalf("idempotent re-backup must succeed: %v", err)
 	}
 }
