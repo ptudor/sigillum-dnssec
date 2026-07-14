@@ -1,4 +1,4 @@
-package main
+package validate
 
 import (
 	"fmt"
@@ -195,7 +195,7 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 	if zoneState.PublishedSerial != 0 {
 		localSerial = zoneState.PublishedSerial
 	}
-	result.DSCheck = v.checkDSAtParent(domain, acceptableKSKs, kskUnloadable)
+	result.DSCheck = v.CheckDSAtParent(domain, acceptableKSKs, kskUnloadable)
 	result.DNSKEYCheck = v.checkDNSKEYVisible(domain, localKSKTag, localZSKTag)
 	result.RRSIGCheck = v.checkRRSIGPresent(domain, localKSKTag, localZSKTag)
 	result.SOACheck = v.checkSOASerial(domain, localSerial)
@@ -245,8 +245,8 @@ func bogusWhenDSPresent(overall string, dsFound bool, dnskeyStatus, rrsigStatus 
 	return overall
 }
 
-// checkDSAtParent queries the parent zone for DS records and compares them to the local KSK.
-func (v *Validator) checkDSAtParent(domain string, acceptableKSKs []*dns.DNSKEY, kskUnloadable bool) DSCheckResult {
+// CheckDSAtParent queries the parent zone for DS records and compares them to the local KSK.
+func (v *Validator) CheckDSAtParent(domain string, acceptableKSKs []*dns.DNSKEY, kskUnloadable bool) DSCheckResult {
 	result := DSCheckResult{Status: "error"}
 
 	parentZone := findParentZone(domain)

@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/validate"
+
 	"github.com/ptudor/dnssec-tudor/internal/registrar"
 
 	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
@@ -718,7 +720,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			Errors:          zoneState.Errors,
 		}
 		if doValidate {
-			v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+			v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 			output.Validation = v.ValidateZone(domain)
 		}
 		jsonData, err := json.MarshalIndent(output, "", "  ")
@@ -732,7 +734,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// Show status for all zones
 	output := buildStatusOutput(state)
 	if doValidate {
-		v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+		v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 		valOutput := v.ValidateAll()
 		for domain, valResult := range valOutput.Zones {
 			if zone, ok := output.Zones[domain]; ok {
@@ -764,7 +766,7 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		timeout = 5 * time.Second
 	}
 
-	v := NewValidator(cfg, state, resolver, timeout)
+	v := validate.NewValidator(cfg, state, resolver, timeout)
 
 	if len(args) == 1 {
 		domain := args[0]
@@ -1109,8 +1111,8 @@ func verifyNewKSKDSAtParent(cfg *config.Config, state *statepkg.State, domain st
 	if err != nil {
 		return false, fmt.Sprintf("could not load the new KSK to verify its DS: %v", err)
 	}
-	v := NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
-	res := v.checkDSAtParent(domain, []*dns.DNSKEY{newKSK}, false)
+	v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+	res := v.CheckDSAtParent(domain, []*dns.DNSKEY{newKSK}, false)
 	if res.MatchesKSK {
 		return true, res.Details
 	}

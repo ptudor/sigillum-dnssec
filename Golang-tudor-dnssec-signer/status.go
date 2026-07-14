@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/validate"
+
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 )
 
@@ -19,17 +21,17 @@ type StatusOutput struct {
 // coupling to the validator is why the presentation DTOs live in the root
 // package (above both state and validate) rather than in the state package.
 type ZoneStatusOutput struct {
-	Status          string                  `json:"status"`
-	Serial          uint32                  `json:"serial,omitempty"`
-	PublishedSerial uint32                  `json:"published_serial,omitempty"`
-	LastSigned      time.Time               `json:"last_signed,omitempty"`
-	SignaturesExp   time.Time               `json:"signatures_expire,omitempty"`
-	KSK             *statepkg.KeyState      `json:"ksk,omitempty"`
-	ZSK             *statepkg.KeyState      `json:"zsk,omitempty"`
-	Rollover        *statepkg.RolloverState `json:"rollover,omitempty"`
-	Warnings        []string                `json:"warnings,omitempty"`
-	Errors          []string                `json:"errors,omitempty"`
-	Validation      *ValidationResult       `json:"validation,omitempty"`
+	Status          string                     `json:"status"`
+	Serial          uint32                     `json:"serial,omitempty"`
+	PublishedSerial uint32                     `json:"published_serial,omitempty"`
+	LastSigned      time.Time                  `json:"last_signed,omitempty"`
+	SignaturesExp   time.Time                  `json:"signatures_expire,omitempty"`
+	KSK             *statepkg.KeyState         `json:"ksk,omitempty"`
+	ZSK             *statepkg.KeyState         `json:"zsk,omitempty"`
+	Rollover        *statepkg.RolloverState    `json:"rollover,omitempty"`
+	Warnings        []string                   `json:"warnings,omitempty"`
+	Errors          []string                   `json:"errors,omitempty"`
+	Validation      *validate.ValidationResult `json:"validation,omitempty"`
 }
 
 // StatusSummary provides a summary of all zones.

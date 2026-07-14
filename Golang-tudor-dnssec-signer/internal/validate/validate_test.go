@@ -1,4 +1,4 @@
-package main
+package validate
 
 import (
 	"fmt"
@@ -167,9 +167,9 @@ func TestDSCheck(t *testing.T) {
 		t.Error("expected DS record not found in mock response")
 	}
 
-	// checkDSAtParent with an unreachable resolver to verify error handling
+	// CheckDSAtParent with an unreachable resolver to verify error handling
 	v := &Validator{resolver: "192.0.2.1:53", timeout: 1 * time.Second}
-	result := v.checkDSAtParent("test.invalid.", nil, false)
+	result := v.CheckDSAtParent("test.invalid.", nil, false)
 	if result.Status != "error" {
 		t.Errorf("expected status=error for unreachable resolver, got %q (details: %s)", result.Status, result.Details)
 	}
