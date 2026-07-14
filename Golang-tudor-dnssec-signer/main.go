@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ptudor/dnssec-tudor/internal/registrar"
+
 	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
 
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
@@ -43,6 +45,10 @@ var (
 )
 
 func main() {
+	// Propagate the ldflags-injected build version into the registrar package
+	// so its Dynadot adapter's default User-Agent reports the real build.
+	registrar.Version = Version
+
 	// Root command
 	rootCmd := &cobra.Command{
 		Use:   "dnssec-tudor",
@@ -205,25 +211,25 @@ visibility at authoritative nameservers, and SOA serial consistency.`,
 		Use:   "get <domain>",
 		Short: "Show DS records currently published at the registrar",
 		Args:  cobra.ExactArgs(1),
-		RunE:  runRegistrarGet,
+		RunE:  RunRegistrarGet,
 	}
 	registrarPushCmd := &cobra.Command{
 		Use:   "push <domain>",
 		Short: "Push expected DS records to the registrar (idempotent)",
 		Args:  cobra.ExactArgs(1),
-		RunE:  runRegistrarPush,
+		RunE:  RunRegistrarPush,
 	}
 	registrarVerifyCmd := &cobra.Command{
 		Use:   "verify <domain>",
 		Short: "Compare expected vs published DS records (exit 1 on drift)",
 		Args:  cobra.ExactArgs(1),
-		RunE:  runRegistrarVerify,
+		RunE:  RunRegistrarVerify,
 	}
 	registrarClearCmd := &cobra.Command{
 		Use:   "clear <domain>",
 		Short: "Remove all DS records at the registrar",
 		Args:  cobra.ExactArgs(1),
-		RunE:  runRegistrarClear,
+		RunE:  RunRegistrarClear,
 	}
 	registrarCmd.AddCommand(registrarGetCmd, registrarPushCmd, registrarVerifyCmd, registrarClearCmd)
 
@@ -935,7 +941,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	// If a registrar is configured for this zone and auto-publish is on,
 	// push the DS record automatically. Failures are non-fatal.
-	maybeAutoPublishDS(cfg, state, domain, "add")
+	MaybeAutoPublishDS(cfg, state, domain, "add")
 
 	return nil
 }
@@ -1059,7 +1065,7 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 	fmt.Println(signerpkg.FormatDSRecordsFromKey(domain, kskKey))
 	fmt.Printf("\nOnce the new DS is published, run: dnssec-tudor rollover complete %s\n", domain)
 
-	maybeAutoPublishDS(cfg, state, domain, "rollover_start")
+	MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
 
 	return nil
 }
@@ -1183,7 +1189,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 
 	runPostSignHook(cfg, domain, zoneState.Path)
 
-	maybeAutoPublishDS(cfg, state, domain, "rollover_complete")
+	MaybeAutoPublishDS(cfg, state, domain, "rollover_complete")
 
 	return nil
 }
@@ -1249,7 +1255,7 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Printf("After the new DS propagates, run: dnssec-tudor rollover complete %s\n", domain)
 
-	maybeAutoPublishDS(cfg, state, domain, "rollover_start")
+	MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
 
 	return nil
 }
