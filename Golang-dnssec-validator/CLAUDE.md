@@ -891,6 +891,15 @@ R-025/R-058):
 
 The freshness/rollover "prefer-fresh-then-fetch-and-cache" behavior described in
 older revisions of this section is **not implemented** (tracked as R-025). Until it
-is, keep the local anchor file current out of band (e.g. from the mirror) and note
-that the pre-published successor KSK is fail-closed until its authentic digest is
-pinned in the binary.
+is, keep the local anchor file current out of band (e.g. from the mirror).
+
+Both the active KSK-2017 (tag 20326) and its pre-published successor KSK-2024
+(tag 38696) are pinned, so the scheduled **2026-10-11 root KSK rollover** is a
+non-event: either KSK alone satisfies the pinned-anchor gate, and the KSK-2017
+entry can be dropped once it is revoked. A build pinning only KSK-2017 would have
+rejected the post-rollover anchor file wholesale — note the failure mode is
+*up-but-503*, not a crash (the process keeps serving the UI while `/health` reports
+`degraded` and validation returns 503), so watch `/health` rather than liveness.
+When pinning a future KSK, do not copy the digest out of the anchor file the pin
+exists to authenticate; derive it by chaining from a digest already pinned, as
+documented in `internal/dns/anchors.go`.
