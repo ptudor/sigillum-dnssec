@@ -26,19 +26,36 @@ func NewResolver(timeout time.Duration, recursiveServer string) *Resolver {
 	}
 }
 
-// ResolveNS resolves the NS records for a zone using a recursive resolver
-func (r *Resolver) ResolveNS(ctx context.Context, zone string) ([]NSRecord, error) {
-	// Query NS records from a recursive resolver
+// exchangeRecursive sends a query to the configured recursive resolver.
+//
+// The CD (checking-disabled) bit is always set. These lookups are infrastructure
+// queries — "which nameservers serve this zone, and at what addresses" — whose
+// answers this tool then validates itself, from the root down, against the
+// authoritative servers. A validating recursive resolver (junia points at a
+// local unbound) SERVFAILs any name in a DNSSEC-broken zone, which would leave
+// the chain stuck at "no nameserver addresses found" and reported as
+// indeterminate. Diagnosing exactly those broken zones is the point of this
+// tool, so it must ask for the raw data and judge for itself; suppressing the
+// resolver's verdict costs nothing, because no trust is ever derived from it.
+func (r *Resolver) exchangeRecursive(ctx context.Context, qname string, qtype uint16) (*dns.Msg, error) {
 	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(zone), dns.TypeNS)
+	msg.SetQuestion(dns.Fqdn(qname), qtype)
 	msg.RecursionDesired = true
+	msg.CheckingDisabled = true
 
 	client := &dns.Client{
 		Net:     "udp",
 		Timeout: r.querier.timeout,
 	}
 
-	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(r.recursive, "53"))
+	resp, _, err := client.ExchangeContext(ctx, msg, dialAddr(r.recursive))
+	return resp, err
+}
+
+// ResolveNS resolves the NS records for a zone using a recursive resolver
+func (r *Resolver) ResolveNS(ctx context.Context, zone string) ([]NSRecord, error) {
+	// Query NS records from a recursive resolver
+	resp, err := r.exchangeRecursive(ctx, zone, dns.TypeNS)
 	if err != nil {
 		return nil, err
 	}
@@ -71,16 +88,7 @@ func (r *Resolver) ResolveAddresses(ctx context.Context, hostname string) ([]net
 	var addresses []net.IP
 
 	// Query A records
-	msgA := new(dns.Msg)
-	msgA.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
-	msgA.RecursionDesired = true
-
-	client := &dns.Client{
-		Net:     "udp",
-		Timeout: r.querier.timeout,
-	}
-
-	respA, _, err := client.ExchangeContext(ctx, msgA, net.JoinHostPort(r.recursive, "53"))
+	respA, err := r.exchangeRecursive(ctx, hostname, dns.TypeA)
 	if err == nil && respA.Rcode == dns.RcodeSuccess {
 		for _, rr := range respA.Answer {
 			if a, ok := rr.(*dns.A); ok {
@@ -90,11 +98,7 @@ func (r *Resolver) ResolveAddresses(ctx context.Context, hostname string) ([]net
 	}
 
 	// Query AAAA records
-	msgAAAA := new(dns.Msg)
-	msgAAAA.SetQuestion(dns.Fqdn(hostname), dns.TypeAAAA)
-	msgAAAA.RecursionDesired = true
-
-	respAAAA, _, err := client.ExchangeContext(ctx, msgAAAA, net.JoinHostPort(r.recursive, "53"))
+	respAAAA, err := r.exchangeRecursive(ctx, hostname, dns.TypeAAAA)
 	if err == nil && respAAAA.Rcode == dns.RcodeSuccess {
 		for _, rr := range respAAAA.Answer {
 			if aaaa, ok := rr.(*dns.AAAA); ok {
@@ -173,22 +177,15 @@ func (r *Resolver) QueryRecordRecursive(ctx context.Context, name string, qtype 
 // Returns true if the domain has its own NS records (is a delegation point)
 func (r *Resolver) CheckZoneCut(ctx context.Context, domain string) (bool, error) {
 	// Query NS records for the domain
-	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(domain), dns.TypeNS)
-	msg.RecursionDesired = true
-
-	client := &dns.Client{
-		Net:     "udp",
-		Timeout: r.querier.timeout,
-	}
-
-	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(r.recursive, "53"))
+	resp, err := r.exchangeRecursive(ctx, domain, dns.TypeNS)
 	if err != nil {
 		return false, err
 	}
 
-	// SERVFAIL often means DNSSEC validation failed - the zone EXISTS but is broken
-	// Treat this as a zone cut so we can validate and report the actual DNSSEC error
+	// A SERVFAIL still reaches us for reasons unrelated to DNSSEC (lame delegation,
+	// upstream failure); CD only suppresses the resolver's own validation verdict.
+	// The zone may well EXIST but be broken, so treat it as a zone cut and let the
+	// chain walk report the real error rather than stopping here.
 	if resp.Rcode == dns.RcodeServerFailure {
 		return true, nil
 	}
