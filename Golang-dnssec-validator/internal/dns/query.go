@@ -9,6 +9,17 @@ import (
 	"github.com/miekg/dns"
 )
 
+// dialAddr returns the address to dial for a DNS server. Servers are normally
+// named without a port ("198.41.0.4", "::1") and get the default :53; an address
+// that already carries a port is passed through, which keeps a resolver on a
+// non-standard port working instead of silently dialling "host:port:53".
+func dialAddr(server string) string {
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server
+	}
+	return net.JoinHostPort(server, "53")
+}
+
 // Querier handles DNS queries
 type Querier struct {
 	timeout time.Duration
@@ -38,6 +49,11 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 	msg.SetQuestion(dns.Fqdn(qname), qtype)
 	msg.SetEdns0(4096, true) // Enable DNSSEC OK (DO) bit
 	msg.RecursionDesired = recurse
+	// Recursive queries go to a resolver that may validate and would then answer
+	// SERVFAIL for a DNSSEC-broken zone, hiding the very records this tool exists
+	// to diagnose. Ask it not to judge; we validate the returned records ourselves.
+	// Authoritative queries (recurse=false) ignore CD, so scope it to recursion.
+	msg.CheckingDisabled = recurse
 
 	// Create client
 	client := &dns.Client{
@@ -46,14 +62,14 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 	}
 
 	// Try UDP first
-	resp, rtt, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(server, "53"))
+	resp, rtt, err := client.ExchangeContext(ctx, msg, dialAddr(server))
 	result.RTT = rtt
 
 	// If truncated, retry with TCP
 	if err == nil && resp.Truncated {
 		result.Truncated = true
 		client.Net = "tcp"
-		resp, rtt, err = client.ExchangeContext(ctx, msg, net.JoinHostPort(server, "53"))
+		resp, rtt, err = client.ExchangeContext(ctx, msg, dialAddr(server))
 		result.RTT = rtt
 	}
 
