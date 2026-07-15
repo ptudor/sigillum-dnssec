@@ -22,19 +22,29 @@ type pinnedAnchor struct {
 }
 
 // pinnedRootAnchors is the set of authoritative IANA root KSK DS records this
-// build accepts as a root of trust. It currently contains only KSK-2017
-// (tag 20326), the active root KSK, whose SHA-256 DS digest is a stable,
-// widely-published IANA constant.
+// build accepts as a root of trust: KSK-2017 (tag 20326), the active root KSK,
+// and KSK-2024 (tag 38696), its pre-published successor. Both SHA-256 DS
+// digests are stable, widely-published IANA constants.
 //
-// The pre-published successor KSK-2024 (tag 38696) is intentionally NOT pinned
-// here: its authoritative digest is not shipped in this repository, and pinning
-// an unverified security constant would be worse than failing closed. Before the
-// scheduled 2026-10-11 root KSK rollover its authentic DS digest MUST be added
-// below from authenticated IANA material. Until then the successor is not
-// trusted for root validation (fail-closed) — strictly safer than trusting a
-// digest supplied by an unauthenticated anchor file. See R-024/R-025.
+// Pinning the successor is what carries this validator through the scheduled
+// 2026-10-11 root KSK rollover. When KSK-2017 is revoked and drops out of the
+// anchor file, a build pinning only KSK-2017 would find no pinned anchor in an
+// otherwise authentic file, reject it wholesale, and serve 503s until patched.
+// With both pinned, either KSK alone satisfies the gate, so the rollover is a
+// non-event and the KSK-2017 entry can be removed after it is revoked.
+//
+// KSK-2024's digest was not adopted from the (unauthenticated) anchor file it
+// is meant to authenticate — that would be circular. It was authenticated by
+// chaining from the digest already pinned here: the root DNSKEY RRset was
+// fetched from the root servers, DS(20326, SHA-256) recomputed from the served
+// KSK-2017 DNSKEY and confirmed equal to the constant below, that key's RRSIG
+// over the whole DNSKEY RRset verified, and KSK-2024's DS then derived from the
+// RRset thereby authenticated — the RFC 5011 introduction path. The result was
+// corroborated against four independent root servers, IANA's root-anchors.xml
+// over HTTPS, and the deployed mirror. See R-024/R-025 and CLAUDE.md.
 var pinnedRootAnchors = []pinnedAnchor{
 	{KeyTag: 20326, Algorithm: 8, DigestType: 2, Digest: "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"},
+	{KeyTag: 38696, Algorithm: 8, DigestType: 2, Digest: "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"},
 }
 
 // IsPinnedRootAnchor reports whether a exactly matches an authoritative pinned

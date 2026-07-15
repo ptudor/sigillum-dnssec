@@ -107,7 +107,7 @@ func TestIsPinnedRootAnchor(t *testing.T) {
 	bad := []Anchor{
 		{KeyTag: 20326, Algorithm: 8, DigestType: 2, Digest: strings.Repeat("A", 64)}, // wrong digest
 		{KeyTag: 20326, Algorithm: 13, DigestType: 2, Digest: realKSK2017Digest},      // wrong algorithm
-		{KeyTag: 38696, Algorithm: 8, DigestType: 2, Digest: realKSK2017Digest},       // successor not pinned
+		{KeyTag: 38696, Algorithm: 8, DigestType: 2, Digest: realKSK2017Digest},       // successor's tag, wrong digest
 	}
 	for i, a := range bad {
 		if IsPinnedRootAnchor(a) {
