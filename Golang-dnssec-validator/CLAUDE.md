@@ -803,43 +803,46 @@ go test -tags=integration ./...
 
 ## Project Structure
 
+Actual layout (see also the category-wide `GO-LAYOUT-STANDARD.md`). The domain
+logic lives in `internal/` packages; the root `package main` is the HTTP
+application/wiring layer. The `internal/` packages never import root and form a
+strict DAG — the validation algorithm is fully self-contained (each package
+carries its own config/params rather than importing a shared root Config).
+
 ```
 Golang-dnssec-validator/
 ├── CLAUDE.md                 # This file — project spec and standards
-├── dnssec-validator.toml.example  # Config template (TOML — the preferred format)
-├── Makefile                  # Build targets (see Common Patterns)
-├── go.mod
-├── go.sum
-├── main.go
-├── cmd/
-│   └── dnssec-validator/
-│       └── main.go           # CLI entry point
+├── dnssec-validator.toml.example
+├── Makefile
+├── go.mod / go.sum
+│
+│  # root package main — HTTP app / wiring layer:
+├── main.go                   # entry point, flags, startup/shutdown, anchor refresh loop
+├── server.go                 # HTTP server setup, routing, security headers
+├── handlers.go               # /validate, /api/validate, /api/anchors, /health request handlers
+├── sse.go                    # Server-Sent Events writer/formatting
+├── health.go                 # /health + /healthz readiness (reflects anchor-store state)
+├── problem.go                # RFC 7807 problem+json error responses
+├── logging.go                # slog setup + Log* helpers (LogWarn/LogValidation/…)
+├── ratelimit.go              # per-IP token-bucket limiter + HTTP middleware, trusted-proxy CIDRs
+├── anchors_store.go          # cached trust-anchor store the app holds (built on internal/dns)
+│
 ├── internal/
-│   ├── config/
-│   │   └── config.go         # Env var parsing with defaults
-│   ├── dns/
-│   │   ├── query.go          # DNS query execution
-│   │   ├── dnssec.go         # DNSSEC validation logic
-│   │   └── anchors.go        # Root anchor loading
-│   ├── validator/
-│   │   ├── validator.go      # Main validation orchestrator
-│   │   ├── chain.go          # Chain of trust walker
-│   │   └── result.go         # Result types
-│   ├── sse/
-│   │   └── writer.go         # SSE event formatting
-│   └── server/
-│       ├── server.go         # HTTP server setup
-│       ├── handlers.go       # Request handlers
-│       ├── middleware.go     # Rate limiting, logging
-│       └── problem.go        # RFC 7807 error responses
-├── static/
-│   ├── index.html            # SPA entry point
-│   ├── style.css             # CSS following TudorDNS standards (see CSS Standards)
-│   └── app.js                # Vanilla JS, no frameworks
-└── testdata/
-    ├── root-anchors.json     # Test trust anchors
-    └── test-responses/       # Mock DNS responses for testing
+│   ├── config/   config.go                                   # Config + loaders (TOML, env fallback), Validate
+│   ├── metrics/  metrics.go                                  # Prometheus/expvar collectors + Record*/Register*
+│   ├── dns/      anchors.go query.go resolver.go types.go    # DNS queries, resolver, root-anchor auth (leaf)
+│   ├── rdap/     client.go types.go                          # RDAP registrable-domain client (leaf)
+│   ├── validator/ validator.go chain.go dnssec.go nsec.go result.go warnings.go  # validation engine (uses dns+rdap)
+│   └── heartbeat/ heartbeat.go                               # AnyStatus heartbeat client (leaf, own local Config)
+│
+├── static/       index.html style.css app.js                 # embedded SPA (go:embed)
+└── testdata/     root-anchors.json, mock DNS responses
 ```
+
+`config` and `metrics` are library-shaped concerns extracted to `internal/`
+(matching the signer). `anchors_store.go` (a stateful cache the server holds)
+and `ratelimit.go` (HTTP middleware) stay at root as app/wiring, alongside the
+HTTP handlers/server/SSE.
 
 ### File Embedding
 
