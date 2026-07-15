@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"math"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,32 +25,41 @@ var (
 )
 
 func main() {
+	// -config is honoured here rather than only documented: without flag parsing
+	// an operator passing `-config /path/to.toml` was silently ignored and the
+	// daemon came up on the default search paths (or, finding none, on bare
+	// defaults) — a config you believed was live but never was. An explicit path
+	// that cannot be read is fatal; it is never quietly downgraded to a fallback.
+	configPath := flag.String("config", "",
+		"path to the TOML config file (default: first of "+strings.Join(config.DefaultConfigPaths, ", ")+", else environment)")
+	flag.Parse()
+
 	// Load configuration
-	config, err := config.LoadConfig()
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		LogError("main", err, "action", "load_config")
 		os.Exit(1)
 	}
 
 	// Setup logging
-	if err := SetupLogging(config); err != nil {
+	if err := SetupLogging(cfg); err != nil {
 		LogError("main", err, "action", "setup_logging")
 		os.Exit(1)
 	}
 	defer CloseLogFile()
 
 	// Log startup
-	LogStartup(Version, BuildTime, config)
+	LogStartup(Version, BuildTime, cfg)
 
 	// R-050: static_dir is a deprecated no-op — the web UI is always served from the
 	// embedded filesystem. Warn (don't fail) when a legacy value is supplied so the
 	// operator knows their override is ignored, without breaking a compatible startup.
-	if config.StaticDir != "" {
-		LogWarn("main", "static_dir is deprecated and ignored; the web UI is served from embedded assets", "static_dir", config.StaticDir)
+	if cfg.StaticDir != "" {
+		LogWarn("main", "static_dir is deprecated and ignored; the web UI is served from embedded assets", "static_dir", cfg.StaticDir)
 	}
 
 	// Create anchors store and load trust anchors
-	anchorsStore := NewAnchorsStore(config.RootAnchorsPath, config.RootAnchorsURL)
+	anchorsStore := NewAnchorsStore(cfg.RootAnchorsPath, cfg.RootAnchorsURL)
 
 	// Root anchor freshness/availability are computed at scrape time so the gauges
 	// never freeze between refreshes or read zero before the first load (R-055).
@@ -82,17 +93,17 @@ func main() {
 	}
 
 	// Create and start server
-	server := NewServer(config, anchorsStore)
+	server := NewServer(cfg, anchorsStore)
 
 	// Initialize heartbeat client
 	hbClient := heartbeat.NewClient(heartbeat.Config{
-		Enabled:    config.HeartbeatEnabled,
-		URL:        config.HeartbeatURL,
-		APIKey:     config.HeartbeatAPIKey,
-		App:        config.HeartbeatApp,
-		StatusURL:  config.HeartbeatStatusURL,
-		InstanceID: config.HeartbeatInstanceID,
-		Interval:   config.HeartbeatInterval,
+		Enabled:    cfg.HeartbeatEnabled,
+		URL:        cfg.HeartbeatURL,
+		APIKey:     cfg.HeartbeatAPIKey,
+		App:        cfg.HeartbeatApp,
+		StatusURL:  cfg.HeartbeatStatusURL,
+		InstanceID: cfg.HeartbeatInstanceID,
+		Interval:   cfg.HeartbeatInterval,
 	})
 
 	// R-052: let periodic heartbeat status reflect live request activity — the
@@ -105,10 +116,10 @@ func main() {
 	var cancelHeartbeat context.CancelFunc
 	if hbClient.Enabled() {
 		LogInfo("main", "heartbeat monitoring enabled",
-			"app", config.HeartbeatApp,
-			"interval", config.HeartbeatInterval.String(),
+			"app", cfg.HeartbeatApp,
+			"interval", cfg.HeartbeatInterval.String(),
 		)
-		cancelHeartbeat = hbClient.StartBackground(context.Background(), config.HeartbeatInterval)
+		cancelHeartbeat = hbClient.StartBackground(context.Background(), cfg.HeartbeatInterval)
 	}
 
 	// Setup signal handling for graceful shutdown
@@ -184,7 +195,7 @@ func main() {
 		}
 
 		// Create shutdown context with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 
 		// Shutdown server
