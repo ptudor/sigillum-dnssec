@@ -61,7 +61,10 @@ dnssec_validator_start()
     install -d -o ${dnssec_validator_svcuser} ${dnssec_validator_logdir}
 
     echo "Starting ${name}."
-    /usr/sbin/daemon -p ${pidfile} -u ${dnssec_validator_svcuser} \
+    # -f detaches daemon(8)'s own inherited stdio. Without it `service dnssec_validator start`
+    # over ssh never returns — the supervisor holds the pipe until the process exits.
+    # It does not replace -o/-S below: those route the child's output, -f the parent's.
+    /usr/sbin/daemon -f -p ${pidfile} -u ${dnssec_validator_svcuser} \
         -S -T ${name} ${dnssec_validator_command}
 }
 

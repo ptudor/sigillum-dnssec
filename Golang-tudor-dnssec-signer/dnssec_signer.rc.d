@@ -57,7 +57,10 @@ dnssec_signer_start()
         _args="${_args} --web ${dnssec_signer_web}"
     fi
 
-    /usr/sbin/daemon -c -p ${pidfile} -u ${dnssec_signer_user} \
+    # -f detaches daemon(8)'s own inherited stdio. Without it `service dnssec_signer start`
+    # over ssh never returns — the supervisor holds the pipe until the process exits.
+    # It does not replace -o/-S below: those route the child's output, -f the parent's.
+    /usr/sbin/daemon -f -c -p ${pidfile} -u ${dnssec_signer_user} \
         -o ${dnssec_signer_logfile} \
         ${command} ${_args}
 }
