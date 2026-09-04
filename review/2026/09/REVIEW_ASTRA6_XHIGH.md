@@ -116,13 +116,123 @@ Initial validation: `go test -race ./...` passed in both Go modules using Go 1.2
 - **Fix specification:** Derive the closest encloser/next closer from the authenticated signature and covering NSEC, and require them to agree. Reject proofs crossing delegations, DNAME boundaries, or an existing closer ancestor. Preserve wildcard expansion at the correct encloser and canonical wraparound behavior. Consume only authenticated denial records as required by RA6X-007.
 - **Verification:** Combine a real signature over `*.example.com. A` with the example signed NSEC and expand to `foo.bar.example.com.`: reject. Repeat with `*.bar.example.com.` and an appropriate proof: accept. Include a query that is itself an existing empty nonterminal.
 
+## RA6X-012 — NSEC3 proofs omit delegation boundaries and opt-out security semantics
+
+- **Severity:** High
+- **Status:** Confirmed by isolated semantic and signed-response probes
+- **Location:** `Golang-dnssec-validator/internal/validator/nsec.go`, `verifyNSEC3NXDOMAIN`, `nsec3Matches`, `nsec3Covers`, `VerifyWildcardDenial`; `validator.go`, `verifyDSAbsence`, `recordValidationVerdict`.
+- **Problem:** NSEC3 closest-encloser discovery checks hashes without inspecting the matching record's NS/SOA/DNAME bitmap. It can deny data below a signed child or DNAME. Covering opt-out records are treated as ordinary authenticated absence and produce Secure leaf verdicts, although they can cover existing unsigned delegations. DS absence accepts a covering opt-out interval without the required closest-provable-encloser proof. Unknown flag bits are not rejected.
+- **Evidence:** A semantic probe with a self-wrapping NSEC3 for `H(child.example.com.)`, bitmap NS/DS, accepts NXDOMAIN for `x.child.example.com.`. A signed self-wrapping apex NSEC3 with `Flags=1` yields `proof.Verified=true` and a Secure leaf verdict. `verifyDSAbsence` checks only `hashBetween(childHash, ...)` plus the opt-out bit. [RFC 5155 §§8.2–8.9 and 9.2](https://www.rfc-editor.org/rfc/rfc5155#section-8.3) define the missing constraints.
+- **Fix specification:** Retain the exact closest-encloser and next-closer records, enforce authority/bitmap boundaries, ignore unknown flag values, and represent opt-out uncertainty separately from successful signature verification. Require a complete closest-provable-encloser proof for opt-out DS absence. A next-closer opt-out proof must not make an ordinary answer Secure. Preserve genuine unsigned delegations as Insecure and secure non-opt-out proofs as Secure; add compatible result metadata rather than renaming existing statuses.
+- **Verification:** Convert both examples into complete signed response fixtures; test signed and unsigned delegations, DNAME enclosers, flags 0/1/2/3, incomplete opt-out DS proofs, and wildcard answers whose next-closer cover has opt-out set. Assert both cryptographic diagnostics and final status.
+
+## RA6X-013 — Wildcard and DS-absence paths combine incompatible NSEC3 chains
+
+- **Severity:** High
+- **Status:** Confirmed for wildcard proofs by an isolated probe; identical parameter-selection defect in DS absence
+- **Location:** `Golang-dnssec-validator/internal/validator/nsec.go`, `VerifyWildcardDenial`, `groupNSEC3ByParams`; `validator.go`, `verifyDSAbsence`.
+- **Problem:** Normal NSEC3 denial partitions records by algorithm/iterations/salt, but wildcard and DS-absence validation hash using only the first record's parameters and search every record's interval. A signed interval from a different chain is then interpreted in the wrong hash space, permitting false absence or an insecure-delegation downgrade.
+- **Evidence:** The probe supplies two self-wrapping records, each owned by `H(foo.example.com.)` under its own salt (empty and `AA`). Each record alone correctly refuses to deny `foo.example.com.`, but together `VerifyWildcardDenial(..., Labels=2)` returns Verified: it computes the first hash and finds it inside the second chain's interval. Both callers directly set `params := records[0]` and never call `groupNSEC3ByParams`.
+- **Fix specification:** Share one parameter-aware proof engine across NXDOMAIN, NODATA, wildcard, and DS absence. Every record used in a proof must have the same authenticated zone, algorithm, iteration count, and decoded salt. Evaluate complete chains independently during transitions; normalize equivalent empty salts. Do not reject a valid complete chain merely because a separate supported chain is incomplete, and never merge their evidence.
+- **Verification:** Sign the two individually insufficient records and confirm their union still fails. Repeat for DS absence, different iteration counts and algorithms, and reversed record order. A complete valid chain alongside an incomplete transition chain must work independently of order.
+
+## RA6X-014 — Valid wildcard NODATA, empty-nonterminal denial, and DNAME answers are unsupported
+
+- **Severity:** Medium
+- **Status:** Confirmed by code paths
+- **Location:** `Golang-dnssec-validator/internal/validator/nsec.go`, `verifyNSECNODATA`, `verifyNSEC3NODATA`; `validator.go`, `verifyActualRecord`; `internal/dns/query.go`, `parseResponse`.
+- **Problem:** NODATA requires an exact NSEC/NSEC3 owner match. That excludes valid wildcard NODATA, where the matching record belongs to the wildcard, and NSEC denial for an empty nonterminal that has no own NSEC. DNAME-generated CNAMEs are also rejected for lacking a CNAME RRSIG, even though the DNAME signature is the relevant authentication. Valid signed domains are reported Bogus.
+- **Evidence:** Both NODATA helpers only return success inside their exact-owner/hash branches. The NSEC helper has no interval/descendant proof case. The parser and leaf verification have no DNAME handling; CNAME verification unconditionally requires its own signature. [RFC 5155 §8.7](https://www.rfc-editor.org/rfc/rfc5155#section-8.7) specifies the wildcard-hash proof.
+- **Fix specification:** Implement explicit wildcard-NODATA and NSEC empty-nonterminal proof branches, with authenticated closest-encloser/type-bitmap constraints. Authenticate DNAME, verify the synthesized CNAME's exact substitution, and follow its target within existing loop/depth limits. Preserve strict rejection of ordinary unsigned CNAMEs, false NXDOMAIN for existing nonterminals, and positive-answer handling. Keep supported query parameters and JSON fields compatible.
+- **Verification:** Serve a signed zone with `*.example.com. A`, query absent AAAA at `foo.example.com.`, and require Secure NODATA under NSEC and NSEC3. Query an empty nonterminal under NSEC. Test a signed DNAME answer, a tampered synthesized target, and a DNAME chain that exceeds the DNS name-length limit.
+
+## RA6X-015 — CNAME traversal is detached from the authenticated leaf response and fails open on lookup errors
+
+- **Severity:** High
+- **Status:** Confirmed by control flow; end-to-end response-switching fixture still recommended
+- **Location:** `Golang-dnssec-validator/internal/validator/validator.go`, `verifyActualRecord`, `checkAndFollowCNAME`, `validateWithCache`; `internal/dns/query.go`, `parseResponse`.
+- **Problem:** After verifying one leaf response, the validator makes a second DNS request to decide which CNAME target to follow. It neither authenticates that response nor binds `CNAME[0]` to the queried owner/Answer section. If the second lookup fails, returns no CNAME, or is altered, target validation can be skipped or directed to a different name while the first CNAME's signature keeps the result Secure. Explicit CNAME queries are also made dependent on target-CNAME existence, although the requested CNAME RRset itself is the answer.
+- **Evidence:** `checkAndFollowCNAME` takes `queryResult.CNAME[0]` from the merged parser, returns `(nil,nil)` when no server responds/no CNAME appears, and never checks a signature. Its caller ignores `err != nil`. `RecordValidation` retains neither the authenticated target nor a pending-target requirement. A signed alias to a bogus target plus a failed second request can therefore leave `lastStatus == StatusSecure`.
+- **Fix specification:** Return authenticated answer/alias data with leaf verification and follow that exact CNAME owner/target without rediscovery. Treat failure to validate a required target as Indeterminate, not successful completion. Ignore unrelated CNAMEs and unauthenticated sections. For `type=CNAME`, complete upon authenticating the requested RRset; if additional traversal is offered, separate it from that query's verdict. Preserve loop/depth guards, sticky insecure ancestry, and original requested type for ordinary alias resolution.
+- **Verification:** Serve a valid signed CNAME to a bogus target, then drop or change subsequent replies: final status must never be Secure. Inject an unrelated Additional CNAME; it must not be followed. Test cross-zone and same-zone aliases, explicit CNAME queries, and second-hop timeouts.
+
+## RA6X-016 — Trusted key material loses its zone identity during signature verification
+
+- **Severity:** High
+- **Status:** Confirmed by isolated executable probe; exploitation requires key reuse across zones or another same-key signing context
+- **Location:** `Golang-dnssec-validator/internal/validator/dnssec.go`, `verifyDNSKEYRRSIGOne`, `VerifyRRsetRRSIGFromResponse`, `VerifyDenialRRSIGFromResponse`, `reconstructDNSKEY`; `internal/dns/types.go`, `DNSKEYRecord`/`RRSIGRecord`.
+- **Problem:** DNSKEY owners are discarded, and verification reconstructs trusted keys and DNSKEY RRset owners from the incoming signature's SignerName. Cryptographic success can authenticate a different zone's signature when the two zones reuse a key. DS/denial helpers also do not enforce the expected signing zone. The leaf path's preliminary signer check is insufficient because it can inspect a different signature from the one that succeeds (RA6X-009).
+- **Evidence:** The probe creates a key at `other.example.`, computes the DS for the same key at `child.example.`, and passes a DNSKEY signature produced only at `other.example.` to `VerifyDNSKEYRRSIGByKeys`; it succeeds. `verifyDNSKEYRRSIGOne` reconstructs every record at `rrsigRecord.SignerName` and has no expected-zone argument. Denial verification similarly creates a trusted key at each received SignerName.
+- **Fix specification:** Carry the authenticated zone/owner with each trusted key set. Require DNSKEY RRset owner and signer to equal the child zone; DS signer to equal the actual parent zone; and denial owner/signer to satisfy that zone's authority rules. Verify original wire records, without rewriting their owner/class to make signatures fit. Preserve legitimate key reuse and key-tag collisions; only cross-zone authentication must stop.
+- **Verification:** Reuse a KSK/ZSK across two independently signed zones and replay each zone's DNSKEY, DS, NSEC/NSEC3, and leaf signatures into the other. Reject cross-zone evidence while accepting each original response and legitimate shared-key deployments. Test this after RA6X-007 and RA6X-009.
+
+## RA6X-017 — Unsupported DS algorithms and first-signature rejection produce false Bogus verdicts
+
+- **Severity:** Medium
+- **Status:** Confirmed; first-signature denial failure reproduced
+- **Location:** `Golang-dnssec-validator/internal/validator/validator.go`, `verifyActualRecord`, `validateZone`; `dnssec.go`, `ValidateChainLink`; `nsec.go`, `VerifyNSECDenialWithRRSIG`, `VerifyNSEC3DenialWithRRSIG`.
+- **Problem:** Leaf verification commits to the first covering RRSIG/tag, and denial wrappers reject an expired or unknown-key first signature before the crypto layer can try valid alternatives. Separately, an authenticated DS set containing only unsupported algorithms/digests is classified Bogus instead of having no supported authentication path. These cases break valid rollovers and make diagnostics differ from DNSSEC validators.
+- **Evidence:** The isolated probe's denial crypto helper accepts a valid signature after an expired first signature, while `VerifyNSECDenialWithRRSIG` returns `NSEC RRSIG expired`. Leaf candidate keys are selected only for `FindRRSIGForType`'s first tag. No capability classification occurs before `ValidateChainLink`'s `no matching DNSKEY` Bogus result. See [RFC 6840 §5.4](https://www.rfc-editor.org/rfc/rfc6840#section-5.4) and [RFC 4035 §5.2](https://www.rfc-editor.org/rfc/rfc4035#section-5.2).
+- **Fix specification:** Try each eligible covering signature as a whole and accept a fully valid candidate; integrate with RA6X-009's metadata binding. Classify authenticated DS records by supported algorithm/digest before matching, following the no-supported-path rule only after parent authentication. Preserve Bogus for an available supported path whose signatures/digests fail; never allow an unknown extra DS to downgrade a broken supported chain.
+- **Verification:** Permute expired, unsupported, missing-key, and valid signatures with different tags under A, CNAME, NSEC, and NSEC3. Test only-unsupported DS, mixed supported/unsupported DS with a good supported path, and a broken supported path. All orders must yield the same correct verdict.
+
+## RA6X-018 — Per-server Secure indicators are transport success, and extended mode misses signature failures
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-dnssec-validator/internal/validator/validator.go`, `ValidateMultipleServers`, `compareDNSKEYSets`, `queryLeafAllServers`, `leafFingerprint`; `static/app.js`, `showZoneDetails`.
+- **Problem:** Every successful NOERROR DNSKEY response is labeled Secure before cryptographic validation, including empty or unsigned responses. Only the first usable server's data is validated. Other servers serving identical data with missing/expired signatures are shown as secure and generate no disagreement. DNSKEY consensus compares only 16-bit tags, and leaf fingerprinting lowercases case-sensitive RDATA such as TXT.
+- **Evidence:** `AddressResult{Status: StatusSecure}` is changed only for transport/RCODE errors. `compareDNSKEYSets` uses `map[uint16]bool`; empty DNSKEY responses are skipped in consensus. Leaf fingerprints omit RRSIG and call `strings.ToLower(rr.String())`. UI renders each address's status as a checkmark without another verification gate.
+- **Fix specification:** Distinguish queried/reachable from authenticated, then validate each server's applicable DNSKEY/DS/leaf response against the authenticated chain in extended mode. Compare canonical RRsets by complete key material and type-aware RDATA; retain case where DNS semantics require it. Report nonresponders, incomplete data, and signature differences without requiring every server to agree to establish one valid path. Preserve quick-mode latency and existing overall-status policy, documenting how disagreement affects diagnostics.
+- **Verification:** Use two servers with identical data but a missing/expired signature on one; the second must be flagged. Test an empty DNSKEY response, same-tag different keys, duplicate records, TXT case changes, TTL-only differences, and equivalent case-insensitive domain-name RDATA.
+
+## RA6X-019 — Recursive infrastructure lookups ignore truncation, owner identity, and some DNS errors
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-dnssec-validator/internal/dns/resolver.go`, `exchangeRecursive`, `ResolveNS`, `ResolveAddresses`, `CheckZoneCut`, `DiscoverZoneCuts`; `internal/validator/validator.go`, `validateZone`.
+- **Problem:** Infrastructure queries use a separate UDP-only path without TCP retry. Large NS/address answers can be truncated and silently treated as complete or as missing zone cuts. NS discovery accepts any NS owner in Answer, including records reached through aliases. Address lookup returns `(empty,nil)` even after both queries fail. The walk then derives a parent by dropping one label instead of using its actual discovered predecessor, causing misdirected DS requests for delegations whose parent skips labels.
+- **Evidence:** `exchangeRecursive` returns immediately after UDP `ExchangeContext`; none of its callers check `Truncated`. `CheckZoneCut` tests only the record's Go type; `ResolveNS` drops the owner. `ResolveAddresses` always ends with `return addresses,nil`. `validateZone` receives `hierarchy` but ignores it and calls `GetParentZone(zone)`.
+- **Fix specification:** Share robust DNS transport with TCP fallback and explicit RCODE/error handling, keeping CD enabled for diagnostics. Bind NS records to the requested owner and follow aliases only where appropriate. Carry the actual authenticated parent from the zone walk for DS queries; incomplete discovery must not authorize parent denial below a possible child. Preserve successful partial A/AAAA lookup behavior while surfacing failed families and transport truncation.
+- **Verification:** A local recursive fixture must return TC over UDP and a complete TCP answer, unrelated-owner NS/CNAME answers, address SERVFAIL/timeouts, and a delegation `child.branch.example.` directly from `example.`. Check complete server enumeration, correct parent DS destination, and bounded cancellation.
+
+## RA6X-020 — JSON write deadline expires before valid configured validation work finishes
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-dnssec-validator/server.go`, `nonSSEWriteTimeout`, `registerRoutes`, `withWriteDeadline`; `handlers.go`, `HandleValidateJSON`.
+- **Problem:** JSON validation gets an absolute 30-second socket write deadline at handler entry, while its configurable work timeout may exceed 30 seconds and defaults to exactly 30. Slow validations therefore finish with a result that cannot be delivered, including timeout diagnostics at the default boundary. JSON encoding errors are ignored and the request is counted as HTTP 200.
+- **Evidence:** `/api/validate` is wrapped in `withWriteDeadline(30*time.Second, ...)`; the handler creates a separate context using `config.TotalTimeout` and encodes only after `v.Validate` returns. Nothing re-arms the deadline for result writing or handles `Encode` errors.
+- **Fix specification:** Bound validation time and response-write time separately: arm a short write deadline when the completed result is ready, or allocate total work time plus a bounded delivery budget. Preserve request cancellation and non-SSE slow-client protection. Log/count failed response writes without exposing partial JSON as successful validation.
+- **Verification:** Use a real HTTP server/socket and a deterministic validation delay crossing 30 seconds with `TotalTimeout=60s`; the completed response must arrive. Test default-timeout diagnostics and a client that stops reading after work completes. Avoid a ResponseRecorder-only test, which cannot reproduce socket deadlines.
+
+## RA6X-021 — Arbitrary HTTP methods create unbounded Prometheus time series
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-dnssec-validator/internal/metrics/metrics.go`, `promAPIRequests`, `RecordAPIRequest`; `handlers.go`, all method-rejection paths.
+- **Problem:** The raw request method is a persistent CounterVec label. An unauthenticated caller can send a new valid HTTP token as the method on each request, receiving 405 while adding a never-evicted metric series. Per-IP rate limiting bounds the rate, not lifetime cardinality, and rotating source IPs accelerates exhaustion.
+- **Evidence:** `promAPIRequests` labels are endpoint/method/status; handlers pass `r.Method` even on 405; `WithLabelValues` creates a series for every new method string. No normalization, allowlist, or removal exists.
+- **Fix specification:** Map HTTP methods to a fixed known set plus one `OTHER` label before recording metrics, including rejected requests. Keep endpoint/status labels bounded and metric name/label keys unchanged. Preserve the actual method in structured request logs if desired.
+- **Verification:** Send thousands of distinct methods to each API route, collect the registry, and assert the number of method label values stays within the documented fixed bound; normal GET/POST/etc. labels and 405 behavior must remain correct.
+
+## RA6X-022 — SSE completion and cached UI results do not represent the finished top-level validation
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-dnssec-validator/internal/validator/validator.go`, early Bogus returns in `validateWithCache`, leaf validation/cache updates; `static/app.js`, `addZoneCard`, `completeValidation`, error/complete event handlers.
+- **Problem:** Nested CNAME validation emits terminal `complete` events on early Bogus returns without checking depth; the browser closes at that event and misses the actual top-level result. Zone events are emitted before leaf record verification, while the UI stores the early object in click handlers and never reconciles it with the complete payload. Thus final leaf failures/proofs/disagreements can be absent from the visible details even after the final result is known. Shared cached zone objects also overwrite per-name `RecordValidation` during same-zone CNAME traversal.
+- **Evidence:** Only the normal end-of-function complete emission has `depth == 0`; both Bogus branches emit unconditionally. `completeValidation` updates badges/raw JSON only, and `seenZones` prevents replacing early cards. `validatedZones[zone].RecordValidation` is overwritten for each alias in that zone, although the field describes an individual queried name.
+- **Fix specification:** Emit exactly one terminal event for the top-level request and carry nested failures as CNAME results. Cache zone authentication separately from per-name answer validation. Reconcile cards/tabs from the final payload and expose all leaf denial/wildcard/server-disagreement diagnostics without hiding failures behind a successful data signature. Preserve event names and compatible payload fields; additive identifiers for per-name results are appropriate.
+- **Verification:** Record the SSE stream for an alias to a bogus target and assert one complete event containing the original chain and CNAME failure. In a browser, verify expired leaf signatures and wildcard-proof failures appear in zone details after completion. Test two aliases in the same zone whose leaf outcomes differ.
+
 ## Checkpoint summary
 
-| Severity | Findings |
-|---|---|
-| Critical | RA6X-007, RA6X-008 |
-| High | RA6X-001–RA6X-006, RA6X-009–RA6X-011 |
-| Medium | None recorded yet |
-| Low | None recorded yet |
+| Severity | Count | Findings |
+|---|---:|---|
+| Critical | 2 | RA6X-007, RA6X-008 |
+| High | 13 | RA6X-001, RA6X-002, RA6X-003, RA6X-004, RA6X-005, RA6X-006, RA6X-009, RA6X-010, RA6X-011, RA6X-012, RA6X-013, RA6X-015, RA6X-016 |
+| Medium | 7 | RA6X-014, RA6X-017, RA6X-018, RA6X-019, RA6X-020, RA6X-021, RA6X-022 |
+| Low | 0 | None recorded yet |
 
-Provisional fix order: RA6X-007/008 → RA6X-009 → RA6X-010/011; independently, RA6X-006 → RA6X-002 → RA6X-001/005 → RA6X-004 → RA6X-003. Establish authenticated-data boundaries before adding denial rules, and persistence/publication tracking before cache-dependent rollover phases.
+Provisional fix order: RA6X-007/008/016 → RA6X-009/017 → RA6X-010–014/015/019 → RA6X-018/022. Independently: RA6X-006 → RA6X-002 → RA6X-001/005 → RA6X-004 → RA6X-003. RA6X-020/021 can be fixed independently. The remaining signer/supporting-file review is in progress.
