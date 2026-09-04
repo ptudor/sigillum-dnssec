@@ -366,13 +366,63 @@ Initial validation: `go test -race ./...` passed in both Go modules using Go 1.2
 - **Fix specification:** Validate and normalize the persistence schema before exposing state: initialize an explicitly allowed empty map, reject null zone entries, invalid domains/paths, impossible phase/type combinations and inconsistent key identities. Preserve backward-compatible omitted fields with conservative defaults, while failing closed for ambiguous rollover state. Return actionable errors without overwriting the original file. Align with RA6X-002/025/026.
 - **Verification:** Load null maps, null entries, unknown phases/types, missing rollover keys and supported legacy state fixtures through both startup and reload. Invalid state must return a controlled error and preserve output/disk evidence; valid legacy state must remain usable without silently dropping rollover keys.
 
+## RA6X-037 — Signer heartbeat redirects can disclose its API key across origins or over HTTP
+
+- **Severity:** Medium
+- **Status:** Confirmed by an isolated local HTTP/TLS probe
+- **Location:** `Golang-tudor-dnssec-signer/heartbeat.go:43–66`, `NewHeartbeatClient`, `Send` (111–136); `internal/config/config.go:506–508`.
+- **Problem:** Configuration requires HTTPS unless explicitly overridden, but the HTTP client follows redirects without enforcing that restriction. A 307/308 response replays the form body, including the API key, to a different origin or a cleartext destination. The sibling validator's heartbeat client already constrains redirects, so the shared security expectation is implemented inconsistently.
+- **Evidence:** The client sets only `Timeout`; `Send` puts `api_key` in a replayable `strings.Reader` POST body. A TLS `httptest` endpoint redirecting with 307 to a second plain HTTP server caused that server to receive the synthetic API key with `AllowInsecure` left false. The test changed only TLS trust roots using the test server's client, retaining Go's default redirect behavior.
+- **Fix specification:** Apply an explicit redirect policy before replaying credential-bearing requests: reject cross-origin redirects and HTTPS downgrades, or disable redirects entirely with an actionable error. Preserve legitimate same-origin endpoint normalization if supported, bounded redirect counts, event queue behavior and the explicit initial-HTTP development override. Do not log the key, form body or secret-bearing URLs.
+- **Verification:** Test 307 and 308 redirects from a trusted local TLS endpoint to another HTTPS origin and to HTTP; the destination must receive no request containing the key. Test same-origin redirects, loops and the explicit development override separately.
+
+## RA6X-038 — Config add/remove operations can turn valid TOML into a corrupted configuration
+
+- **Severity:** Medium
+- **Status:** Confirmed by two isolated config-editing probes
+- **Location:** `Golang-tudor-dnssec-signer/internal/config/config.go:618–736`, `AddZoneToConfigFile`, `RemoveZoneFromConfigFile`, table-header helpers.
+- **Problem:** Removal recognizes headers by line text without tracking TOML string context. A header-looking line inside a multiline hook string can be mistaken for the actual zone table; removal then deletes the string terminator and unrelated contents. Addition uses Go `%q` escaping for TOML strings, which emits escapes that TOML rejects for otherwise valid Unix filenames. Both operations return success after replacing the configuration without parsing the result.
+- **Evidence:** Start with valid TOML consisting of `[hooks]`, `post_sign = '''`, a line `[zones."example.com"]`, `printf hello`, the closing `'''`, then the actual `[zones."example.com"]` table and its path. `RemoveZoneFromConfigFile` returns nil and the resulting file fails with an unterminated multiline literal string. Separately, adding a source path containing a literal BEL byte writes `\a` using `%q`; the TOML decoder rejects that escape. Both behaviors reproduced in temporary files.
+- **Fix specification:** Identify zone tables using TOML syntax/context, preserving unrelated tables, multiline strings and comments. Serialize newly added values using TOML-compatible escaping. Before atomic replacement, parse and validate the candidate and assert that its semantic change is limited to the intended zone. Handle supported whitespace, quoted keys and commented headers consistently. Preserve CLI syntax, existing config fields, permissions and the useful comment-preserving behavior; failure must leave the original bytes intact.
+- **Verification:** Add/remove zones from configurations with basic/literal multiline hook strings containing apparent headers, commented headers, spaced/dotted table syntax, escaped paths and final tables without trailing newlines. Assert valid TOML before/after and equality of unrelated configuration values. Invalid candidate output must never replace the original.
+
+## RA6X-039 — Registrar diagnostic script signs the wrong bytes for empty request bodies
+
+- **Severity:** Medium
+- **Status:** Confirmed with synthetic credentials and a stubbed curl executable
+- **Location:** `Golang-tudor-dnssec-signer/scripts/dynadot-probe.sh:137–141`, `call`; reference implementation `internal/registrar/dynadot.go`, request signature construction.
+- **Problem:** Bash command substitution strips trailing newlines from the constructed string to sign. GET and DELETE have empty bodies, so required separators disappear and their HMAC differs from the Go adapter. This diagnostic can report authentication failure even with correct credentials, undermining investigation of registrar publication failures. Bodies ending in newlines have the same defect.
+- **Evidence:** `string_to_sign=$(printf '%s\n%s\n%s\n%s' "$API_KEY" "$path" "$req_id" "$body")` loses two trailing LF bytes when both request ID and body are empty, and one when an ID is present. A local run of `get` and `del`, with no network request, produced signatures different from an independent HMAC over `api_key + "\n" + path + "\n\n"`.
+- **Fix specification:** Construct/sign the exact byte sequence without lossy command substitution, for example using Bash's `printf -v` or a direct pipeline that preserves trailing bytes. Keep the raw request body identical to the signed body, preserve optional request IDs and the existing macOS Bash 3.2 compatibility, and make the redacted diagnostic accurately show separator bytes. Do not change the Go adapter's authentication formula.
+- **Verification:** Compare script signatures with the Go adapter or fixed independent vectors for GET, DELETE and PUT, with/without request IDs and with empty/newline-terminated bodies. Use synthetic credentials and a local/stub transport; no registrar mutation is needed.
+
+## RA6X-040 — Startup can race configuration reload before workers obtain a guarded snapshot
+
+- **Severity:** Medium
+- **Status:** Confirmed by Go's race detector in an isolated startup/reload probe
+- **Location:** `Golang-tudor-dnssec-signer/daemon.go:180`, `Reload`; `daemon.go:287`, `runSigningLoop`; `Run` startup and `main.go`, `runServe` signal handling.
+- **Problem:** Reload replaces `d.cfg` under the daemon mutex, but the signing goroutine reads its initial poll interval without that mutex. A SIGHUP during startup can race that read. Other startup references, notably starting `d.heartbeat`, similarly occur outside the snapshot guard. A mutex around writes alone does not make publication safe, and startup/shutdown ordering needs a coherent lifecycle boundary.
+- **Evidence:** A temporary test creates a daemon, starts `runSigningLoop` with its wait-group registration, calls `Reload` repeatedly with fresh config copies, then cancels and waits. `go test -race . -run TestAstra6StartupReloadRace -v` reports the read at `daemon.go:287` racing the write at line 180. The ordinary suite passes because it does not exercise this startup interleaving.
+- **Fix specification:** Read the initial configuration and worker dependencies through a guarded immutable snapshot, or serialize reload until startup has published a ready lifecycle state. Audit every startup reference to pointers swapped by reload and coordinate heartbeat start/stop and worker registration with cancellation. Preserve hot reload, listener restrictions, poll-interval reset behavior and graceful shutdown; do not hold the daemon lock across network operations.
+- **Verification:** Add deterministic startup barriers around worker creation and snapshot acquisition, reload at each barrier, and run under `-race`. Also deliver shutdown before/after those boundaries and assert no worker starts after shutdown completion and no heartbeat/client remains orphaned.
+
+## RA6X-041 — Unusable anchor refreshes can replace working trust anchors and suppress fallback
+
+- **Severity:** Medium
+- **Status:** Confirmed from the load/refresh data flow
+- **Location:** `Golang-dnssec-validator/internal/dns/anchors.go:107–147`, `finalizeAnchors`; `LoadAnchorsWithFallback` (233–246); `GetActiveAnchors` (250–276); `anchors_store.go:28–39`, `Load`.
+- **Problem:** The loader validates expiry and digest structure, but does not require a currently active pinned anchor. A file containing only future-dated anchors, or anchors with malformed/missing `ValidFrom`, counts as a successful nonempty load and prevents URL fallback. An empty anchor set returned by the URL also counts as success. Refresh then overwrites the last usable set and resets its age, turning a recoverable bad mirror update into a validation outage until a later successful reload.
+- **Evidence:** File fallback tests only `len(anchors.Anchors) > 0`; active-date filtering occurs later in `GetActiveAnchors`. `AnchorsStore.Load` unconditionally assigns the returned set and `loadedAt`. Thus a correctly pinned tuple with `ValidFrom` in the future passes file loading but yields zero active anchors. This is separate from the authenticity flaw in RA6X-008.
+- **Fix specification:** Validate dates and require at least one currently usable authenticated anchor before declaring a source/load successful. Retain future anchors alongside active ones for rollover. Try the configured fallback for an unusable file; if every source fails, retain any still-valid last-known-good set and do not reset successful-refresh metrics. Never continue trusting expired anchors merely to preserve availability. Preserve file-first/offline operation and static pinning unless deliberately redesigned with RA6X-008.
+- **Verification:** Refresh a working store with future-only, malformed-date, expired-only and empty source documents; test both file and URL paths. Require fallback or a controlled error without replacing a still-valid set/resetting its timestamp. A mixed active/future set must load and make the future key usable at its activation time.
+
 ## Checkpoint summary
 
 | Severity | Count | Findings |
 |---|---:|---|
 | Critical | 2 | RA6X-007, RA6X-008 |
 | High | 20 | RA6X-001, RA6X-002, RA6X-003, RA6X-004, RA6X-005, RA6X-006, RA6X-009, RA6X-010, RA6X-011, RA6X-012, RA6X-013, RA6X-015, RA6X-016, RA6X-023, RA6X-024, RA6X-025, RA6X-026, RA6X-027, RA6X-028, RA6X-031 |
-| Medium | 14 | RA6X-014, RA6X-017, RA6X-018, RA6X-019, RA6X-020, RA6X-021, RA6X-022, RA6X-029, RA6X-030, RA6X-032, RA6X-033, RA6X-034, RA6X-035, RA6X-036 |
+| Medium | 19 | RA6X-014, RA6X-017, RA6X-018, RA6X-019, RA6X-020, RA6X-021, RA6X-022, RA6X-029, RA6X-030, RA6X-032, RA6X-033, RA6X-034, RA6X-035, RA6X-036, RA6X-037, RA6X-038, RA6X-039, RA6X-040, RA6X-041 |
 | Low | 0 | None recorded yet |
 
-Provisional fix order: RA6X-007/008/016 → RA6X-009/017 → RA6X-010–014/015/019 → RA6X-018/022. Signer persistence: RA6X-006/026/036 → RA6X-025 → RA6X-002/023/030 → RA6X-024/001/005. Signer publication: RA6X-028 → RA6X-029; RA6X-035/034/031 → RA6X-004/027 → RA6X-003. RA6X-032/033 follow the corrected state/publication model; RA6X-020/021 are independent. Supporting-file and test coverage review remains in progress.
+Provisional fix order: RA6X-007/008/016 → RA6X-009/017/041 → RA6X-010–014/015/019 → RA6X-018/022. Signer persistence: RA6X-006/026/036/040 → RA6X-025 → RA6X-002/023/030 → RA6X-038/024/001/005. Signer publication: RA6X-028 → RA6X-029; RA6X-035/034/031 → RA6X-004/027 → RA6X-003. RA6X-032/033 follow the corrected state/publication model; RA6X-020/021/037/039 are independent. Supporting-file and test coverage review remains in progress.
