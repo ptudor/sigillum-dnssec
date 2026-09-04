@@ -1,6 +1,6 @@
 # DNSSEC codebase review — Astra 6, XHigh
 
-Review date: 2026-09-04. Baseline: `4354f33` on `main`.
+Review date: 2026-09-04. Source baseline: `a22bfe8` on `main`, after fetching and reconciling the remote service-script update. Review-only commits follow that baseline.
 
 Analysis only. No implementation files are changed. This report is being developed in checkpoints; the final checkpoint will contain the complete coverage record, verification results, severity table, and dependency-aware fix order. Findings describe the baseline code, irrespective of claims in earlier reviews. Locations are relative to the repository root. “Confirmed” means the code path establishes the defect; “Needs investigation” identifies a remaining assumption to test.
 
@@ -66,13 +66,63 @@ Initial validation: `go test -race ./...` passed in both Go modules using Go 1.2
 - **Fix specification:** Make the initial state load/check/write participate in the same lock protocol as all other writers, loading under the lock immediately before any write. Prefer a nondestructive writability check and avoid writing an unchanged startup snapshot. Reject duplicate instances before any shared-state mutation; port binding alone must not authorize unprotected writes. Preserve existing startup diagnostics and supported CLI concurrency.
 - **Verification:** Pause startup after its initial load, commit a CLI rollover/add, resume startup, and confirm the newer state survives. Repeat with an already-running daemon occupying the listen port; failed startup must leave state and key files byte-for-byte unchanged.
 
+## RA6X-007 — Unsigned Additional DS records can authenticate an attacker-controlled child
+
+- **Severity:** Critical
+- **Status:** Confirmed by an isolated executable probe
+- **Location:** `Golang-dnssec-validator/internal/dns/query.go`, `parseResponse`; `internal/validator/validator.go`, `queryDSFromParentWithValidation`, `validateZone`; `internal/validator/dnssec.go`, `verifyDSRRSIGSet`, `CollectDSMatchedKeys`.
+- **Problem:** The parser combines DS records from Answer, Authority, and Additional and discards their owner/section. DS signature verification authenticates the Answer RRset for the requested child, but subsequent chain construction consumes the combined list. An attacker who can alter DNS responses can append their own unsigned DS and use it to authenticate an entirely attacker-controlled child DNSKEY RRset and answers, while the genuine parent signature still passes.
+- **Evidence:** A local UDP response containing a genuinely signed `example.com. DS` in Answer and an unsigned attacker-key DS owned by `unrelated.invalid.` in Additional passes `verifyDSRRSIGSet`. `CollectDSMatchedKeys(queryResult.DS, attackerKeys, "example.com.")` then returns the attacker key; its signature over an attacker-only child DNSKEY RRset passes `VerifyDNSKEYRRSIGByKeys`. The probe does not require forging the genuine parent's signature.
+- **Fix specification:** Carry owner, class, and section through parsing, and return the exact authenticated DS RRset from verification. Only those records may enter chain matching; never use the unfiltered display/diagnostic slice as trusted data. Require the expected child owner and parent signer and reject ambiguous unrelated data without promoting it. Preserve JSON compatibility through additive metadata or separate internal authenticated objects. Apply the same authenticated-data boundary to DNSKEY and denial records, including Authority and Additional handling.
+- **Verification:** Create two child keys and a parent signing key. Serve a signed DS for child key A in Answer, append unsigned DS for key B in Additional (test both matching and unrelated owner), and serve a child DNSKEY RRset signed only by B. Validation must be Bogus. The identical response with only A's authenticated chain must be Secure. Repeat with injected DS in Authority and with a legitimate Additional section containing unrelated records.
+
+## RA6X-008 — A mixed anchor document bypasses the root-anchor pinning boundary
+
+- **Severity:** Critical
+- **Status:** Confirmed by an isolated executable probe; exploitation requires influence over an anchor document and DNS responses
+- **Location:** `Golang-dnssec-validator/internal/dns/anchors.go`, `finalizeAnchors`; `internal/validator/dnssec.go`, `VerifyRootTrustAnchor`, `CollectAnchorMatchedKeys`; `internal/validator/validator.go`, root branch of `validateZone`.
+- **Problem:** Loading requires that at least one anchor is pinned, but retains arbitrary additional anchors. The initial root check considers pinned anchors; the later list of keys allowed to authenticate the DNSKEY RRset considers all loaded anchors. A malicious mirror/file can preserve the genuine public anchor while adding its own root of trust. The root response can include the genuine public KSK and be signed only by the attacker key.
+- **Evidence:** The probe loads JSON with the real pinned KSK-2017 DS plus a generated unpinned ECDSA DS. `VerifyRootTrustAnchor` succeeds because the response includes the genuine public KSK. `CollectAnchorMatchedKeys` includes the attacker key, and `VerifyDNSKEYRRSIGByKeys` accepts a signature made only by that key over the mixed DNSKEY RRset. Existing wholesale-replacement tests do not cover this mixed set.
+- **Fix specification:** Make every root authentication path use only active, exact pinned anchors (or keys introduced through an explicitly authenticated update mechanism). Filter at the final trust decision as well as ingestion; do not rely on an earlier existential check. Unpinned loaded entries may be diagnostic data but cannot authenticate signatures. Preserve acceptance of either currently shipped genuine root pin and supported rollover overlap.
+- **Verification:** Retain a genuine active pinned DS/key, add an attacker DS/key, and sign the mixed root RRset only with the attacker key: reject it. A genuine pinned-key signature must still succeed. Exercise both file and URL loaders, direct helper calls, future/expired anchors, and both shipped root pins.
+
+## RA6X-009 — Wildcard checks use metadata from a signature that never verified
+
+- **Severity:** High
+- **Status:** Confirmed by an isolated executable probe
+- **Location:** `Golang-dnssec-validator/internal/validator/validator.go`, `verifyActualRecord`, `verifyWildcard`; `internal/validator/dnssec.go`, `FindRRSIGForType`, `VerifyRRsetRRSIGFromResponseAnyKey`.
+- **Problem:** Leaf validation selects the first RRSIG for metadata, while the raw-response helper can succeed using another RRSIG. The first signature's unauthenticated Labels value then decides whether wildcard denial proof is necessary. An attacker can replay a legitimate wildcard signature and prepend an invalid signature claiming an exact-name answer, bypassing the required denial proof.
+- **Evidence:** The probe signs `*.example.com. A`, expands it to `www.example.com.`, and prepends a copy with `Labels=3` and invalid signature bytes. Raw verification succeeds using the genuine wildcard signature. `verifyWildcard` uses the forged first record, leaves `Wildcard=false`, and `recordValidationVerdict` returns Secure despite no NSEC/NSEC3 proof.
+- **Fix specification:** Return the exact verified signature and RRset from the crypto layer and use only their authenticated fields for wildcard, owner, signer, algorithm, and timing decisions. Evaluate each candidate signature as an indivisible candidate; a candidate's successful crypto check must not validate another candidate's metadata. Preserve acceptance of legitimate multi-signature responses and the current public result shape.
+- **Verification:** Prepend and append invalid same-tag RRSIGs with different Labels/SignerName to an authentic wildcard response. Missing or invalid denial proof must remain Bogus regardless of ordering. Authentic wildcard proof must succeed, as must an ordinary exact-name answer with a valid signature.
+
+## RA6X-010 — NSEC NXDOMAIN accepts existing empty nonterminals and crosses delegation cuts
+
+- **Severity:** High
+- **Status:** Confirmed by isolated semantic probes
+- **Location:** `Golang-dnssec-validator/internal/validator/nsec.go`, `VerifyNSECDenial`, `verifyNSECNXDOMAIN`, `closestEncloserFromNSEC`.
+- **Problem:** Canonical interval coverage alone is treated as name absence. An NSEC endpoint below the queried name proves that the query is an existing empty nonterminal; a parent NSEC at a delegation cannot deny names inside the child. These distinctions are missing, allowing replay of authentic signed parent-zone records to justify false NXDOMAIN conclusions.
+- **Evidence:** `VerifyNSECDenial("a.example.com.", A, [{Owner:"example.com.", NextDomain:"x.a.example.com.", bitmap:SOA/NS/NSEC/RRSIG}], NXDOMAIN)` succeeds, although `x.a.example.com.` proves `a.example.com.` exists. It also succeeds for `x.child.example.com.` with an NSEC `child.example.com. → example.com.` whose bitmap includes NS and DS, despite the signed child delegation. The probes test interval semantics; a signed fixture should additionally cover the full request path.
+- **Fix specification:** Reject NXDOMAIN if either endpoint proves the queried name exists as an empty nonterminal. Enforce zone authority and delegation/DNAME boundaries when deriving closest enclosers and accepting coverage. Bind every denial RRset to the authenticated zone; incomplete or unauthenticated discovery cannot authorize using parent denial below a child. Preserve legitimate apex-only wraparound chains and exact DS-absence-at-delegation handling.
+- **Verification:** Add signed end-to-end versions of both examples; neither may be Secure NXDOMAIN. Empty-nonterminal A queries should accept a valid NOERROR/NODATA response. Test a real child NXDOMAIN signed by the child, parent DS NODATA at an unsigned delegation, and root/apex wraparound records.
+
+## RA6X-011 — NSEC wildcard proof does not establish the claimed closest encloser
+
+- **Severity:** High
+- **Status:** Confirmed by an isolated semantic probe
+- **Location:** `Golang-dnssec-validator/internal/validator/nsec.go`, `VerifyWildcardDenial`, NSEC branch.
+- **Problem:** The NSEC branch ignores the authenticated RRSIG Labels value and accepts any interval covering the expanded query name. It can approve synthesis from an ancestor wildcard even when the same NSEC proves a closer existing name, which blocks that wildcard.
+- **Evidence:** For `foo.bar.example.com.` and `wildcardLabels=2` (source `*.example.com.`), a record `bar.example.com. → z.bar.example.com.` makes `VerifyWildcardDenial` return `Verified=true`. That record proves `bar.example.com.` exists, so `*.example.com.` cannot synthesize this answer. This error remains after fixing RA6X-009.
+- **Fix specification:** Derive the closest encloser/next closer from the authenticated signature and covering NSEC, and require them to agree. Reject proofs crossing delegations, DNAME boundaries, or an existing closer ancestor. Preserve wildcard expansion at the correct encloser and canonical wraparound behavior. Consume only authenticated denial records as required by RA6X-007.
+- **Verification:** Combine a real signature over `*.example.com. A` with the example signed NSEC and expand to `foo.bar.example.com.`: reject. Repeat with `*.bar.example.com.` and an appropriate proof: accept. Include a query that is itself an existing empty nonterminal.
+
 ## Checkpoint summary
 
 | Severity | Findings |
 |---|---|
-| Critical | None recorded yet |
-| High | RA6X-001–RA6X-006 |
+| Critical | RA6X-007, RA6X-008 |
+| High | RA6X-001–RA6X-006, RA6X-009–RA6X-011 |
 | Medium | None recorded yet |
 | Low | None recorded yet |
 
-Provisional fix order: RA6X-006 → RA6X-002 → RA6X-001 and RA6X-005 → RA6X-004 → RA6X-003. Persistence and publication tracking must be established before adding cache-dependent rollover phases.
+Provisional fix order: RA6X-007/008 → RA6X-009 → RA6X-010/011; independently, RA6X-006 → RA6X-002 → RA6X-001/005 → RA6X-004 → RA6X-003. Establish authenticated-data boundaries before adding denial rules, and persistence/publication tracking before cache-dependent rollover phases.
