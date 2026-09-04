@@ -226,13 +226,153 @@ Initial validation: `go test -race ./...` passed in both Go modules using Go 1.2
 - **Fix specification:** Emit exactly one terminal event for the top-level request and carry nested failures as CNAME results. Cache zone authentication separately from per-name answer validation. Reconcile cards/tabs from the final payload and expose all leaf denial/wildcard/server-disagreement diagnostics without hiding failures behind a successful data signature. Preserve event names and compatible payload fields; additive identifiers for per-name results are appropriate.
 - **Verification:** Record the SSE stream for an alias to a bogus target and assert one complete event containing the original chain and CNAME failure. In a browser, verify expired leaf signatures and wildcard-proof failures appear in zone details after completion. Test two aliases in the same zone whose leaf outcomes differ.
 
+## RA6X-023 — An existing truncated private-key backup is accepted before the live key is overwritten
+
+- **Severity:** High
+- **Status:** Confirmed by executable probe
+- **Location:** `Golang-tudor-dnssec-signer/internal/signer/rollover.go:416–456`, `BackupKey`; `internal/signer/keys.go:279–350`, `backupExistingKeyFiles`; `internal/fsutil/fsutil.go`, `CopyFile`.
+- **Problem:** Backup recovery checks that the public half matches and the private half exists, but does not validate private contents. A crash or failed copy can leave an empty/truncated private file. Retrying rollover then destroys the last usable live private key while claiming that its backup is safe. Subsequent rollover signing fails and cannot reconstruct the old private key required by the current trust chain.
+- **Evidence:** Both backup paths use `!FileExists(... + ".private")` as the repair condition. `CopyFile` opens/truncates the destination and copies directly, so an interrupted write produces an existing incomplete file. The isolated probe created a valid backup, truncated its private half, and successfully started KSK rollover; signing then failed with `no PrivateKey field found in file`, and the backup remained empty.
+- **Fix specification:** Validate the complete backup pair, expected owner/role/algorithm and cryptographic correspondence before allowing any live-key overwrite. Repair an incomplete backup atomically from a verified live pair, preserving conflicting material for diagnosis. Make backups durable before activation, including file and directory synchronization. Never overwrite a different key on a tag collision. Integrate with RA6X-002 rather than relying on filename existence as transaction recovery.
+- **Verification:** Exercise missing, zero-length, truncated, mismatched and unreadable private backups, including interruption during the private copy. Every retry must preserve a usable old pair or abort before live replacement. Verify both direct rollover backup and implicit backup during key generation/import.
+
+## RA6X-024 — Import mutates live keys/output before validating ownership and does not restore prior artifacts on failure
+
+- **Severity:** High
+- **Status:** Confirmed
+- **Location:** `Golang-tudor-dnssec-signer/main.go:1398–1558`, `runImport`, `loadBindKeyPair`; `internal/signer/keys.go`, `SaveKeyFiles`.
+- **Problem:** Import prechecks flags, pair correspondence and matching algorithms but leaves domain ownership validation until signing, after writing both live key slots. Failure writing the second key, signing, state persistence or config persistence leaves a partially applied import. Config-append failure unconditionally removes the signed output, including a file that existed before import. A recovery/migration attempt can therefore replace working keys or delete a served zone despite returning an error.
+- **Evidence:** `SaveKeyFiles` runs at lines 1482/1485; `SignZone` validates loaded key ownership later. Signing failure removes only the in-memory zone. A state-save failure returns without restoring keys/output. The config failure path calls `os.Remove(signedPath)` without saving/restoring pre-existing bytes, unlike the corresponding add rollback path.
+- **Fix specification:** Before activation, validate both keys' canonical owner, protocol, supported algorithm, role and actual signing capability, and stage the complete signed zone. Commit keys, state, configuration and output as a recoverable transaction; on failure restore the exact prior artifacts and ownership/modes, or retain a clearly identified recoverable staged transaction without publishing it. Never delete pre-existing output as cleanup. Preserve import syntax, supported BIND input forms and unrelated configured zones; coordinate shared transaction machinery with RA6X-002/023.
+- **Verification:** Import valid pairs for the wrong domain and assert no live artifact changes. Fault-inject each key write, signing, state save and final config append with pre-existing keys/output present. Restart/retry after each interruption and verify the prior generation remains usable and output is never removed unintentionally.
+
+## RA6X-025 — State merging loses CLI warnings and resurrects removed zones despite the process lock
+
+- **Severity:** High
+- **Status:** Confirmed by executable probe
+- **Location:** `Golang-tudor-dnssec-signer/internal/state/state.go:189–229`, `ReloadFromDisk`, `rolloverEqual`; `daemon.go`, `signAllZones`; `registrar_cli.go`, `lockedRunPush`, `persistRegistrarUrgentWarning`, `clearStickyWarnings`; `main.go`, `runRemove`.
+- **Problem:** The merge treats `LastSigned` and a subset of rollover fields as a version for all zone state. CLI updates to warnings/errors or deletion have neither a newer signing timestamp nor a different rollover, so the daemon ignores them and overwrites the disk on its next save. An urgent registrar-recovery warning can disappear, a cleared warning can reappear, and successful `remove` can be undone in state before the documented SIGHUP. The lock serializes writes but does not resolve these stale-object merges.
+- **Evidence:** The only merge cases are a missing in-memory zone, newer disk `LastSigned`, or differing `rolloverEqual` with a non-older timestamp. There is no deletion handling or general mutation revision. A probe saved an urgent warning through a second State object: reload ignored it. Removing the disk zone followed by daemon-style reload/save recreated that zone on disk.
+- **Fix specification:** Use an authoritative reload under the process lock before mutation, or explicit persisted revisions plus deletion markers and well-defined conflict resolution. Preserve all CLI mutations, including warning addition/clearance, removal and phase metadata changes that do not sign. Coordinate config/state snapshots so stale pre-SIGHUP configuration cannot recreate removed state. Preserve single-writer behavior, existing state readability and unrelated zones; do not solve this by always replacing newer unsaved signing results with older disk data.
+- **Verification:** Interleave daemon cycles with registrar warning add/clear, remove, add and rollover commands. After every subsequent save/restart, the last serialized mutation must persist. Include equal `LastSigned`, changes only to rollover timestamps, and removal before SIGHUP.
+
+## RA6X-026 — The daemon continues signing and overwrites disk state after a failed reload
+
+- **Severity:** High
+- **Status:** Confirmed
+- **Location:** `Golang-tudor-dnssec-signer/daemon.go`, `signAllZones` (both `ReloadFromDisk` calls); `internal/state/state.go`, `ReloadFromDisk`, `Save`.
+- **Problem:** If state becomes unreadable or malformed while the daemon is running, it logs a warning and continues using stale in-memory state. It can then sign with key files changed by a CLI transition and overwrite the unreadable/newer state with its old snapshot. This turns a recoverable read failure into lost rollover or registrar state and potentially publishes an incorrect trust-chain generation.
+- **Evidence:** Both reload errors are logged without returning. Signing/rollover processing and final `Save()` still execute. A missing state file is also treated as a successful no-op reload, permitting silent reconstruction from potentially stale memory.
+- **Fix specification:** Fail the mutation cycle closed when the authoritative state cannot be loaded/validated after obtaining the process lock. Preserve existing output and disk evidence, expose a persistent operational failure, and retry the read on the next cycle. Define explicit recovery for an intentionally missing state file rather than equating it with an empty/no-change update. Coordinate with RA6X-002/025/036; retain service liveness and unrelated read-only diagnostics.
+- **Verification:** After daemon startup, replace state with malformed JSON, deny reads, and simulate an interrupted CLI key transition. Assert no key/zone/state mutation until a valid consistent state is restored, and health reports the blocked signing cycle.
+
+## RA6X-027 — Lowering TTL immediately before rollover discards still-live cache lifetimes
+
+- **Severity:** High
+- **Status:** Confirmed by executable probe
+- **Location:** `Golang-tudor-dnssec-signer/internal/signer/sign.go:209–222`, `SignZone`; `internal/signer/rollover.go`, `dnskeyTTLFloor`, `zskRetirementFloor`; `internal/state/state.go`, published TTL fields.
+- **Problem:** The signer retains maximum published TTLs only while rollover is already active. A normal re-sign with lower TTL replaces the recorded larger TTL immediately, even though resolvers may still hold the previous RRsets for their original lifetimes. Starting rollover next uses the reduced floor and can activate/retire keys before those old caches expire.
+- **Evidence:** Both assignments use `zoneState.Rollover == nil || newTTL > recordedTTL`. A probe signed with a seven-day DNSKEY TTL, lowered it to one hour, immediately re-signed, and observed `PublishedDNSKEYTTL == 3600`. The seven-day cache horizon was lost with no elapsed wait. The same reset applies to `PublishedMaxRRSIGTTL`.
+- **Fix specification:** Retain publication-generation cache horizons, including larger TTLs preceding a decrease, until their original expiry. Use those horizons for prepublication and retirement and persist them across restart. Include generated denial records when computing relevant signature cache lifetimes. Preserve configured TTLs on wire; the fix must lengthen safety waits, not silently undo the operator's TTL change. Build on publication acknowledgments from RA6X-004.
+- **Verification:** Prime a validating resolver with long-lived old DNSKEY/data RRsets, lower TTLs, re-sign and immediately start rollover. Verify continuous validation and retention of old keys until the original cache horizon. Cover restart and repeated TTL increases/decreases before and during rollover.
+
+## RA6X-028 — Equivalent escaped DNS owner names are signed as different RRsets
+
+- **Severity:** High
+- **Status:** Confirmed by executable probe
+- **Location:** `Golang-tudor-dnssec-signer/internal/signer/sign.go`, RRset grouping in `signRecordsWithKeys` and `verifySignedRecords`, NSEC/NSEC3 owner collection and delegation helpers.
+- **Problem:** Owner identity is based on lowercased presentation strings rather than decoded canonical DNS labels. Two spellings of the same wire name can form separate RRsets and denial-chain owners. The signer's self-verification repeats the same grouping mistake, so it reports success for output whose signatures fail after an authoritative server merges the equivalent owners.
+- **Evidence:** The probe supplied A records at `www.example.com.` and `\119ww.example.com.`. `SignZone` succeeded and wrote two A-covering signatures. Normalizing both owners to their identical wire name produced a two-record RRset for which neither signature verified. This is a complete output correctness failure, not merely inconsistent display casing.
+- **Fix specification:** Introduce one canonical wire-label identity function and use it consistently for RRsets, owner equality, subdomain/delegation checks, empty non-terminals and denial-chain ordering/closure. Keep original presentation where appropriate for output, while signing the complete semantic RRset. Handle escaped dots, decimal escapes and escaped ASCII case; do not merge distinct binary labels or lowercase opaque RDATA.
+- **Verification:** Sign equivalent escaped/unescaped owner spellings and verify the served RRsets with an independent implementation or wire-normalized parser. Cover NSEC and NSEC3, wildcard/delegation names, owner case, escaped dots and different binary labels; assert one semantic RRset and valid denial chains.
+
+## RA6X-029 — Zone validation accepts CNAME/data conflicts and self-verifies the invalid zone
+
+- **Severity:** Medium
+- **Status:** Confirmed by executable probe
+- **Location:** `Golang-tudor-dnssec-signer/internal/signer/sign.go`, `validateZoneRecords`, `ValidateZoneFile`, `SignZone`, `verifySignedRecords`.
+- **Problem:** Input validation checks apex SOA/NS and zone membership but omits semantic owner constraints. An owner containing both a CNAME and A record is accepted, signed and atomically replaces the previous output. Authoritative loaders may reject that output, leaving deployment stale, or serve an invalid alias/data combination. Signature correctness alone does not make a zone publishable.
+- **Evidence:** A probe with both `www.example.com. A 192.0.2.2` and `www.example.com. CNAME ns.example.com.` returned successful signing and wrote the signed file. There is no CNAME exclusivity check before publication.
+- **Fix specification:** Validate canonical owner/type constraints before writing output: CNAME must not coexist with ordinary data, multiple conflicting CNAME targets must be rejected, and apex/delegation/DNAME structural constraints should be audited with explicit accepted exceptions for DNSSEC metadata and glue. Preserve supported RR types and legitimate delegation data. Reuse RA6X-028 canonical identities; do not require a running authoritative server merely to validate input.
+- **Verification:** Add invalid CNAME+A, CNAME+MX, multiple-target and apex-CNAME fixtures and assert failure leaves prior output/state intact. Include valid CNAME plus generated DNSSEC metadata and delegation/glue fixtures accepted by an independent authoritative zone checker.
+
+## RA6X-030 — Expanded Ed25519 private-key validation does not verify the seed against its public half
+
+- **Severity:** Medium
+- **Status:** Confirmed by executable probe
+- **Location:** `Golang-tudor-dnssec-signer/internal/signer/keys.go`, `VerifyKeyPairCorrespondence`; `main.go`, `loadBindKeyPair`; `internal/signer/crypto.go`.
+- **Problem:** For the 64-byte Ed25519 form, correspondence validation trusts the embedded public-key suffix instead of deriving it from the private seed. A corrupt seed with an unchanged suffix passes validation but generates invalid signatures. Import/recovery therefore accepts unusable key material before the later signing verification catches it, after live-file mutation in the import path.
+- **Evidence:** The probe generated an Ed25519 pair, flipped the first seed byte while leaving the public suffix intact, and observed `VerifyKeyPairCorrespondence` return nil. Signing succeeded at the API level, but the resulting signature failed verification with the advertised public key.
+- **Fix specification:** Derive the expanded key from the seed, compare the derived public key and stored suffix, and reject inconsistent expanded keys before persistence. Validate scalar ranges for ECDSA in the same boundary audit. Preserve support for valid 32-byte seed and 64-byte expanded inputs; never silently rewrite a malformed key during import.
+- **Verification:** Mutate each half independently and test truncated/oversized forms. Valid seed/expanded forms must still sign and verify; malformed forms must fail before any live key/output changes.
+
+## RA6X-031 — A lost DELETE response can strand the registrar with no DS and bypass emergency recovery
+
+- **Severity:** High
+- **Status:** Confirmed by executable transport probe
+- **Location:** `Golang-tudor-dnssec-signer/internal/registrar/registrar_dynadot.go:549–588`, `ReplaceDS`; `registrar_cli.go`, emergency warning handling.
+- **Problem:** The restore logic runs only after a successful HTTP response to DELETE. A server can apply the deletion and then lose the connection or exceed the caller deadline before returning its response. The client treats that ambiguous outcome as a harmless clear failure, performs no restoration and returns no `ErrRegistrarDSEmpty` sentinel, so callers also omit the sticky emergency warning. The parent can be left with an insecure delegation.
+- **Evidence:** A probe transport applied DELETE to a simulated DS store and returned `io.ErrUnexpectedEOF`. `ReplaceDS` returned a plain `clear_dnssec` error, issued only the initial PUT, never restored, and left the store empty. Its detached restore context is constructed only after the early DELETE-error return.
+- **Fix specification:** Treat any potentially dispatched DELETE as an uncertain destructive operation. On transport/cancellation/ambiguous server failure, reconcile the registrar's actual state and restore the desired safe set using a bounded detached context; if safety cannot be verified, return an emergency outcome and persist remediation state. Verify postconditions rather than assuming an accepted/empty response means the DS set is already correct. Preserve explicit `registrar clear` semantics and additive rollover publication; never delete an old DS merely to resolve uncertainty.
+- **Verification:** Simulate DELETE applied then EOF, timeout/cancellation, non-JSON/error response, and asynchronous acceptance. Confirm restoration or a persistent emergency warning; test restart between deletion and recovery. Distinguish explicit clear from replace and preserve all required old/new DS records.
+
+## RA6X-032 — The signer's live validation can pass invalid signatures and understate a broken DS chain
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-tudor-dnssec-signer/internal/validate/validate.go`, `evalRRSIGCover`, `checkRRSIGPresent`, `checkDNSKEYVisible`, `computeOverall`, `bogusWhenDSPresent`; `dnssecstatus/index.html`, `isServfail`.
+- **Problem:** The command/dashboard describes signatures as valid using only their time window and key tag; it never verifies their cryptographic bytes or binds them to the returned RRset/owner. DNSKEY visibility also compares only 16-bit tags. A broken served zone can therefore get a full pass. Separately, a known mismatching parent DS with otherwise passing checks becomes `partial`, and a missing one-of-two required signatures can also remain partial despite an authenticated DS chain. The static dashboard infers SERVFAIL from error-message text, including resolver-side failures, rather than the structured verdict.
+- **Evidence:** `evalRRSIGCover` returns `valid=true` after `ValidityPeriod` without calling `Verify`; even an empty `Signature` qualifies. `checkDNSKEYVisible` sets found flags from `KeyTag()` only. `computeOverall("fail", "pass", "pass", "pass")` returns partial, and the DS-specific override considers DNSKEY/RRSIG status `fail` but not `DSCheck.MatchesKSK` or missing-signature partial states.
+- **Fix specification:** Distinguish presence/freshness observations from cryptographically validated RRsets. Verify SOA and DNSKEY signatures against complete owner-bound keys and RRsets, including supported rollover alternatives; propagate an actually broken trust chain as failure while retaining partial for uncertainty/approaching refresh. Keep existing JSON fields/CLI flags compatible and add explicit evidence fields if needed. Make the static dashboard consume the structured result and preserve resolver-outage uncertainty.
+- **Verification:** Serve matching tags and current timestamps with corrupt/empty signatures, wrong owner/full key material, a mismatching parent DS and exactly one missing required signature. None may pass; proven broken chains must fail. Valid dual-signature rollover, refresh warnings and resolver outages must remain correctly distinguished.
+
+## RA6X-033 — Configured zones that fail initialization can be absent from every health/status count
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-tudor-dnssec-signer/daemon.go`, `checkAndSignZone`, `checkAndSignZoneSafe`; `health.go`, `healthHandler`, `healthzHandler`; `status.go`, `buildStatusOutput`; `internal/metrics/metrics.go`, `UpdateZoneMetrics`.
+- **Problem:** If a configured zone has no state and key recovery/generation fails, the daemon returns before creating an error-bearing zone or recording a failed signing operation. Status, metrics and health enumerate only state, so the failed zone is invisible and health can return 200 with all counted zones healthy. Zero signing/expiry timestamps are also skipped rather than identifying an uninitialized zone.
+- **Evidence:** The `RecoverOrGenerateKeys` error branch returns before `SetZone`, `AddError`, `RecordSigningOperation` and `SigningError`. Health checks directory writability and existing state entries; it never compares them to `cfg.Zones`. Its expiration loop ignores zero timestamps.
+- **Fix specification:** Track initialization failure for every configured zone, using a retryable placeholder or separate operational status. Reconcile configured/managed counts and make readiness fail for a configured zone that has never produced a valid deployed generation. Preserve error recovery on later cycles and distinguish liveness from readiness; do not expose private key data in status.
+- **Verification:** Start with writable directories and a corrupt existing key pair for a configured zone absent from state. Assert the zone appears with its error, failure metrics increment, and readiness is unsuccessful. Repair keys and verify initialization clears the error and restores readiness.
+
+## RA6X-034 — Hook timeouts do not bound descendants holding inherited stderr pipes
+
+- **Severity:** Medium
+- **Status:** Needs investigation — confirm process-tree behavior on each supported Unix target
+- **Location:** `Golang-tudor-dnssec-signer/hooks.go`, `executeHook`, `executeBatchHook`, `executeHookSync`; `daemon.go`, hook wait/shutdown handling.
+- **Problem:** Hooks use `exec.CommandContext` to kill the direct process after 30 seconds, but do not configure `WaitDelay` or terminate a process group. In asynchronous paths, stderr is copied through a pipe into a capped writer. A shell's descendant can retain that pipe after the shell is killed, keeping `Run` blocked beyond the advertised timeout. Repeated cycles can accumulate stuck hooks and external reload operations, and shutdown tracking can remain occupied.
+- **Evidence:** Both asynchronous paths set `command.Stderr = stderrBuf` and call `command.Run()` with no pipe-wait bound or process-tree cleanup. The buffer cap limits memory per hook, not the lifetime of the copy goroutine or subprocess descendants. Existing timeout intent is expressed only through the context.
+- **Fix specification:** Bound command and pipe-drain lifetime, and define supported-platform process-tree cancellation for timed-out hooks. Preserve useful stderr prefixes, existing hook environment and successful long-but-within-budget hooks. Ensure descendants cannot later deploy a stale generation after a timeout; coordinate deployment ordering with RA6X-004.
+- **Verification:** Run a hook whose shell launches a child inheriting stderr and which outlives the shell timeout. Check elapsed execution/shutdown time, child cleanup and subsequent hook ordering on FreeBSD/Linux/macOS; include exec-style and shell-style hooks and a child that ignores the first termination signal.
+
+## RA6X-035 — Missing signed output does not trigger regeneration while state still looks fresh
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-tudor-dnssec-signer/internal/signer/sign.go`, `NeedsSign`; `daemon.go`, reload and signing-cycle change detection.
+- **Problem:** Change detection relies on unsigned source metadata, forced signing and signature refresh time; it does not verify the published output exists. Deleting/restoring only part of the output directory, or changing `output_dir` on reload, can leave a zone without a signed file until the next signature refresh even though the daemon is running and state reports a recent success.
+- **Evidence:** `NeedsSign` receives the source path and checks source/state timestamps and size; there is no stat/read check of `<output_dir>/<domain>.zone.signed`. Reload does not force regeneration solely because the output directory changes.
+- **Fix specification:** Treat absent/unreadable/non-regular output and a changed output destination as requiring safe regeneration/deployment. Reconcile directory setup on reload, preserve the prior served generation when the new destination fails, and record output-specific failures in readiness. Avoid re-signing every poll or using output mtime as the sole proof of integrity.
+- **Verification:** Sign a zone, remove its output while keeping source/state unchanged, and run a cycle: the output must be restored immediately. Repeat after changing output directory and with an unwritable destination; verify error visibility and preservation of the prior served file.
+
+## RA6X-036 — Syntactically valid malformed state is accepted and later panics or changes rollover interpretation
+
+- **Severity:** Medium
+- **Status:** Confirmed
+- **Location:** `Golang-tudor-dnssec-signer/internal/state/state.go`, `LoadState`, `ReloadFromDisk`, `SetZone`, `SnapshotZones`; `internal/signer/sign.go`, `loadKeysForSigning`.
+- **Problem:** JSON parsing is treated as full state validation. `{"zones":null}` replaces the initialized map with nil, and null zone entries are accepted. Later writes/dereferences panic. Unsupported rollover types/phases and inconsistent identities are also not rejected at load time, allowing fallback signing paths to interpret damaged state as ordinary operation. This is particularly dangerous during recovery or state migration.
+- **Evidence:** `LoadState` returns immediately after `json.Unmarshal`; `ReloadFromDisk` dereferences `diskZone.LastSigned` without checking for null entries. `SetZone` assigns into the map. Signing switches on recognized rollover type/phase without an exhaustive validated state boundary.
+- **Fix specification:** Validate and normalize the persistence schema before exposing state: initialize an explicitly allowed empty map, reject null zone entries, invalid domains/paths, impossible phase/type combinations and inconsistent key identities. Preserve backward-compatible omitted fields with conservative defaults, while failing closed for ambiguous rollover state. Return actionable errors without overwriting the original file. Align with RA6X-002/025/026.
+- **Verification:** Load null maps, null entries, unknown phases/types, missing rollover keys and supported legacy state fixtures through both startup and reload. Invalid state must return a controlled error and preserve output/disk evidence; valid legacy state must remain usable without silently dropping rollover keys.
+
 ## Checkpoint summary
 
 | Severity | Count | Findings |
 |---|---:|---|
 | Critical | 2 | RA6X-007, RA6X-008 |
-| High | 13 | RA6X-001, RA6X-002, RA6X-003, RA6X-004, RA6X-005, RA6X-006, RA6X-009, RA6X-010, RA6X-011, RA6X-012, RA6X-013, RA6X-015, RA6X-016 |
-| Medium | 7 | RA6X-014, RA6X-017, RA6X-018, RA6X-019, RA6X-020, RA6X-021, RA6X-022 |
+| High | 20 | RA6X-001, RA6X-002, RA6X-003, RA6X-004, RA6X-005, RA6X-006, RA6X-009, RA6X-010, RA6X-011, RA6X-012, RA6X-013, RA6X-015, RA6X-016, RA6X-023, RA6X-024, RA6X-025, RA6X-026, RA6X-027, RA6X-028, RA6X-031 |
+| Medium | 14 | RA6X-014, RA6X-017, RA6X-018, RA6X-019, RA6X-020, RA6X-021, RA6X-022, RA6X-029, RA6X-030, RA6X-032, RA6X-033, RA6X-034, RA6X-035, RA6X-036 |
 | Low | 0 | None recorded yet |
 
-Provisional fix order: RA6X-007/008/016 → RA6X-009/017 → RA6X-010–014/015/019 → RA6X-018/022. Independently: RA6X-006 → RA6X-002 → RA6X-001/005 → RA6X-004 → RA6X-003. RA6X-020/021 can be fixed independently. The remaining signer/supporting-file review is in progress.
+Provisional fix order: RA6X-007/008/016 → RA6X-009/017 → RA6X-010–014/015/019 → RA6X-018/022. Signer persistence: RA6X-006/026/036 → RA6X-025 → RA6X-002/023/030 → RA6X-024/001/005. Signer publication: RA6X-028 → RA6X-029; RA6X-035/034/031 → RA6X-004/027 → RA6X-003. RA6X-032/033 follow the corrected state/publication model; RA6X-020/021 are independent. Supporting-file and test coverage review remains in progress.
