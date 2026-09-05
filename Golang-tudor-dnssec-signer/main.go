@@ -416,24 +416,18 @@ func preflightConfigAppend(path string) error {
 	return f.Close()
 }
 
-// runPostSignHook fires the configured post-sign hook synchronously after a
-// CLI command re-signed a zone. CLI commands must run the hook synchronously
-// — the async daemon variant would be killed when the process exits — and
-// they must run it at all: without this, `rollover complete` would write a
-// new signed zone that NSD doesn't load until the next natural re-sign.
-// Hook failures are logged, never fatal — the signing itself succeeded.
+// runPostSignHook fires the configured post-sign hook synchronously for one
+// zone a CLI command just signed, under the same contract the daemon uses
+// (RA6X-043): a batch invocation naming the single domain when coalescing is
+// on, the per-zone invocation otherwise. Failures are logged; the command's
+// signing result stands. Callers that must surface the failure use
+// firePostSignHooks directly.
 func runPostSignHook(cfg *config.Config, domain, zonePath string) {
-	if cfg.Hooks.PostSign == "" && len(cfg.Hooks.PostSignCmd) == 0 {
+	if !hookConfigured(&cfg.Hooks) {
 		return
 	}
 	slog.Info("[CLI] Executing post-sign hook", "domain", domain)
-	hookEnv := &HookEnv{
-		Domain:     domain,
-		ZonePath:   zonePath,
-		SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
-		OutputDir:  cfg.OutputDir,
-	}
-	if err := executeHookSync(&cfg.Hooks, hookEnv); err != nil {
+	if err := firePostSignHooks(&cfg.Hooks, cfg.OutputDir, []SignedZoneRef{signedRef(cfg, domain, zonePath)}, nil); err != nil {
 		slog.Error("[CLI] Post-sign hook failed", "domain", domain, "error", err)
 	}
 }
@@ -701,7 +695,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 	// still signed (their signed files written), so the post-sign hook must
 	// still fire and the status JSON must still print. We surface the failure
 	// via the exit code at the end so cron/CI detect it (R-024).
-	signErr := signer.SignAll()
+	signedDomains, signErr := signer.SignAllReport()
 
 	// Advance automatic ZSK rollovers on the one-shot path too, so a cron-only
 	// deployment (no long-running `serve`) actually performs the rollover that
@@ -722,11 +716,20 @@ func runSign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state after rollover checks: %w", err)
 	}
 
-	// Execute post-sign hook once after all zones are signed
-	if cfg.Hooks.PostSign != "" || len(cfg.Hooks.PostSignCmd) > 0 {
-		slog.Info("[CLI] Executing post-sign hook")
-		if err := executeHookSync(&cfg.Hooks, &HookEnv{OutputDir: cfg.OutputDir}); err != nil {
-			slog.Error("[CLI] Post-sign hook failed", "error", err)
+	// Post-sign hooks for the zones that actually signed, under the daemon's
+	// contract (RA6X-043): one batch invocation with every signed domain when
+	// coalescing, else one per-zone invocation each; none when nothing signed.
+	// A hook failure means the signed files may not be served yet, so it is
+	// surfaced through the exit code like a signing failure.
+	var hookErr error
+	if len(signedDomains) > 0 && hookConfigured(&cfg.Hooks) {
+		slog.Info("[CLI] Executing post-sign hook", "signed", len(signedDomains))
+		refs := make([]SignedZoneRef, 0, len(signedDomains))
+		for _, domain := range signedDomains {
+			refs = append(refs, signedRef(cfg, domain, cfg.Zones[domain].Path))
+		}
+		if hookErr = firePostSignHooks(&cfg.Hooks, cfg.OutputDir, refs, nil); hookErr != nil {
+			slog.Error("[CLI] Post-sign hook failed", "error", hookErr)
 		}
 	}
 
@@ -739,6 +742,9 @@ func runSign(cmd *cobra.Command, args []string) error {
 
 	if signErr != nil {
 		return fmt.Errorf("signing failed: %w", signErr)
+	}
+	if hookErr != nil {
+		return fmt.Errorf("zones signed, but the post-sign hook failed (signed output may not be served yet): %w", hookErr)
 	}
 	return nil
 }

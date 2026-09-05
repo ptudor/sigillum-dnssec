@@ -176,7 +176,9 @@ func TestExecuteHook_WaitGroupTracked(t *testing.T) {
 	hooks := &config.HooksConfig{PostSign: "touch " + marker, Shell: true}
 
 	var wg sync.WaitGroup
-	executeHook(hooks, &HookEnv{Domain: "x."}, &wg)
+	if err := firePostSignHooks(hooks, dir, []SignedZoneRef{{Domain: "x."}}, &wg); err != nil {
+		t.Fatal(err)
+	}
 	wg.Wait() // must not return until the tracked goroutine is Done
 
 	if _, err := os.Stat(marker); err != nil {
@@ -188,10 +190,12 @@ func TestExecuteHook_WaitGroupTracked(t *testing.T) {
 func TestExecuteBatchHook_WaitGroupTracked(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "batch-hook-ran")
-	hooks := &config.HooksConfig{PostSign: "touch " + marker, Shell: true}
+	hooks := &config.HooksConfig{PostSign: "touch " + marker, Shell: true, CoalescePostSign: true}
 
 	var wg sync.WaitGroup
-	executeBatchHook(hooks, []string{"a.", "b."}, dir, &wg)
+	if err := firePostSignHooks(hooks, dir, []SignedZoneRef{{Domain: "a."}, {Domain: "b."}}, &wg); err != nil {
+		t.Fatal(err)
+	}
 	wg.Wait()
 
 	if _, err := os.Stat(marker); err != nil {

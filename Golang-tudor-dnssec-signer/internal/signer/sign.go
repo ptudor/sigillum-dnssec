@@ -51,8 +51,22 @@ func NewSigner(cfg *config.Config, state *statepkg.State) *Signer {
 // initialize or sign, so one-shot callers (cron/CI via `sign`) detect it by
 // exit code (R-024).
 func (s *Signer) SignAll() error {
+	_, err := s.SignAllReport()
+	return err
+}
+
+// SignAllReport is SignAll that also reports which zones were signed
+// successfully, in configuration order, so callers can apply the post-sign
+// hook contract to exactly those zones (RA6X-043).
+func (s *Signer) SignAllReport() (signed []string, err error) {
 	var total, failed int
-	for domain, zoneCfg := range s.cfg.Zones {
+	domains := make([]string, 0, len(s.cfg.Zones))
+	for domain := range s.cfg.Zones {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+	for _, domain := range domains {
+		zoneCfg := s.cfg.Zones[domain]
 		total++
 		zoneState := s.state.GetZone(domain)
 
@@ -89,16 +103,17 @@ func (s *Signer) SignAll() error {
 			failed++
 		} else {
 			s.state.Mutate(zoneState.ClearErrors)
+			signed = append(signed, domain)
 		}
 	}
 
 	if err := s.state.Save(); err != nil {
-		return err
+		return signed, err
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d of %d zones failed to sign", failed, total)
+		return signed, fmt.Errorf("%d of %d zones failed to sign", failed, total)
 	}
-	return nil
+	return signed, nil
 }
 
 // SignZone signs a single zone
