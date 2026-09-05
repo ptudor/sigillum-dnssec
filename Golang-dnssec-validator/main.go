@@ -76,7 +76,7 @@ func main() {
 			if a == nil {
 				return 0
 			}
-			return float64(len(dns.GetActiveAnchors(a)))
+			return float64(len(dns.GetActivePinnedAnchors(a)))
 		},
 	)
 

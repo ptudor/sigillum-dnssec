@@ -1061,13 +1061,15 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 
 	if zone == "." {
 		// Root zone - verify DNSKEYs against the trust anchors (digest match).
-		activeAnchors := dnspkg.GetActiveAnchors(v.anchors)
+		// Only currently-active, exactly pinned anchors may establish root trust;
+		// any other loaded entry is diagnostic data (RA6X-008).
+		activeAnchors := dnspkg.GetActivePinnedAnchors(v.anchors)
 		if len(activeAnchors) == 0 {
-			// No currently-active trust anchor (all future-dated, expired, or with
-			// invalid validity timestamps). This is a local trust configuration/
-			// update failure, not evidence that the root is bogus (R-039).
+			// No currently-active pinned trust anchor (all future-dated, expired,
+			// unpinned, or with invalid validity timestamps). This is a local trust
+			// configuration/update failure, not evidence that the root is bogus (R-039).
 			result.Status = StatusIndeterminate
-			result.AddError("no currently-active root trust anchor available (check anchor validity dates / refresh the anchor set); cannot establish trust")
+			result.AddError("no currently-active pinned root trust anchor available (check anchor validity dates / refresh the anchor set); cannot establish trust")
 			return result, nil
 		}
 		link, err := VerifyRootTrustAnchor(result.DNSKEY, activeAnchors)
