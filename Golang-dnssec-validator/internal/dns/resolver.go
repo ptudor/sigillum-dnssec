@@ -26,6 +26,15 @@ func NewResolver(timeout time.Duration, recursiveServer string) *Resolver {
 	}
 }
 
+// SetDefaultPort changes the port dialled for servers named without one (the
+// default is 53) for both authoritative and recursive queries. It exists so a
+// hermetic DNS fixture listening on an ephemeral loopback port can stand in
+// for the recursive resolver and the authoritative servers it names, driving
+// the real resolution and validation code paths (RA6X-050).
+func (r *Resolver) SetDefaultPort(port string) {
+	r.querier.port = port
+}
+
 // exchangeRecursive sends a query to the configured recursive resolver.
 //
 // The CD (checking-disabled) bit is always set. These lookups are infrastructure
@@ -48,7 +57,7 @@ func (r *Resolver) exchangeRecursive(ctx context.Context, qname string, qtype ui
 		Timeout: r.querier.timeout,
 	}
 
-	resp, _, err := client.ExchangeContext(ctx, msg, dialAddr(r.recursive))
+	resp, _, err := client.ExchangeContext(ctx, msg, r.querier.dial(r.recursive))
 	return resp, err
 }
 

@@ -1,0 +1,282 @@
+package validator
+
+import (
+	"context"
+	"crypto"
+	"net"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/miekg/dns"
+	dnspkg "github.com/ptudor/dnssec-validator/internal/dns"
+)
+
+// This file is the hermetic caller-level harness the Astra 6 review asked for
+// (RA6X-050): a loopback DNS server that stands in for the recursive resolver
+// AND for every authoritative server the validator discovers, so crafted,
+// genuinely signed responses can be driven through the real orchestration
+// path (validateZone, verifyActualRecord, Validate) without any network.
+
+// qkey identifies a question the mock knows how to answer.
+type qkey struct {
+	name  string
+	qtype uint16
+}
+
+// mockDNS is a hermetic loopback DNS server.
+type mockDNS struct {
+	t    *testing.T
+	srv  *dns.Server
+	ip   string
+	port string
+
+	mu       sync.Mutex
+	handlers map[qkey]func(req *dns.Msg) *dns.Msg
+	seen     []dns.Question
+}
+
+// newMockDNS starts a UDP DNS server on an ephemeral loopback port. Questions
+// without a registered handler get an empty NOERROR answer.
+func newMockDNS(t *testing.T) *mockDNS {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	host, port, err := net.SplitHostPort(pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("split addr: %v", err)
+	}
+	m := &mockDNS{t: t, ip: host, port: port, handlers: make(map[qkey]func(*dns.Msg) *dns.Msg)}
+
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", func(w dns.ResponseWriter, req *dns.Msg) {
+		if len(req.Question) != 1 {
+			return
+		}
+		q := req.Question[0]
+		m.mu.Lock()
+		m.seen = append(m.seen, q)
+		h := m.handlers[qkey{dns.CanonicalName(q.Name), q.Qtype}]
+		m.mu.Unlock()
+
+		var resp *dns.Msg
+		if h != nil {
+			resp = h(req)
+		}
+		if resp == nil {
+			resp = new(dns.Msg)
+			resp.SetReply(req)
+		} else {
+			resp.SetReply(req)
+			// SetReply resets the section slices only when they are nil; keep
+			// the handler's answer and just fix up the header fields.
+		}
+		resp.Authoritative = true
+		if opt := req.IsEdns0(); opt != nil {
+			resp.SetEdns0(4096, opt.Do())
+		}
+		_ = w.WriteMsg(resp)
+	})
+
+	started := make(chan struct{})
+	m.srv = &dns.Server{PacketConn: pc, Handler: mux, NotifyStartedFunc: func() { close(started) }}
+	go func() { _ = m.srv.ActivateAndServe() }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mock DNS server did not start")
+	}
+	t.Cleanup(func() { _ = m.srv.Shutdown() })
+	return m
+}
+
+// on registers a handler for one question. The handler returns a message whose
+// Rcode and sections are used as the response.
+func (m *mockDNS) on(name string, qtype uint16, fn func(req *dns.Msg) *dns.Msg) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.handlers[qkey{dns.CanonicalName(name), qtype}] = fn
+}
+
+// answer registers a NOERROR response with the given Answer-section records.
+func (m *mockDNS) answer(name string, qtype uint16, rrs ...dns.RR) {
+	m.on(name, qtype, func(req *dns.Msg) *dns.Msg {
+		resp := new(dns.Msg)
+		resp.Answer = append(resp.Answer, rrs...)
+		return resp
+	})
+}
+
+// respond registers a fully specified response: rcode plus the three sections.
+func (m *mockDNS) respond(name string, qtype uint16, rcode int, answer, authority, additional []dns.RR) {
+	m.on(name, qtype, func(req *dns.Msg) *dns.Msg {
+		resp := new(dns.Msg)
+		resp.Rcode = rcode
+		resp.Answer = append(resp.Answer, answer...)
+		resp.Ns = append(resp.Ns, authority...)
+		resp.Extra = append(resp.Extra, additional...)
+		return resp
+	})
+}
+
+// serveInfra makes the mock answer the recursive infrastructure questions for
+// zone: NS zone → ns.<zone>, and A ns.<zone> → the mock's own address. AAAA
+// gets an empty NOERROR by default.
+func (m *mockDNS) serveInfra(zone string) {
+	zone = dns.Fqdn(zone)
+	nsName := "ns." + strings.TrimPrefix(zone, ".")
+	if zone == "." {
+		nsName = "ns.root-fixture.invalid."
+	}
+	m.answer(zone, dns.TypeNS, &dns.NS{Hdr: rrHdr(zone, dns.TypeNS), Ns: nsName})
+	m.answer(nsName, dns.TypeA, &dns.A{Hdr: rrHdr(nsName, dns.TypeA), A: net.ParseIP(m.ip)})
+}
+
+// questions returns a copy of every question the mock has received.
+func (m *mockDNS) questions() []dns.Question {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]dns.Question(nil), m.seen...)
+}
+
+// newValidator builds a Validator whose recursive resolver, authoritative
+// servers and root servers are all the mock, using the port seam.
+func (m *mockDNS) newValidator() *Validator {
+	v := NewValidator(2*time.Second, 20*time.Second, 4, &dnspkg.RootAnchors{Zone: "."}, m.ip)
+	v.resolver.SetDefaultPort(m.port)
+	v.rootServers = []string{m.ip}
+	v.SetQuickMode(false)
+	return v
+}
+
+func rrHdr(name string, rrtype uint16) dns.RR_Header {
+	return dns.RR_Header{Name: dns.Fqdn(name), Rrtype: rrtype, Class: dns.ClassINET, Ttl: 300}
+}
+
+// testZone is a signed test zone: an ECDSA P-256 KSK and ZSK with signers.
+type testZone struct {
+	name      string
+	ksk, zsk  *dns.DNSKEY
+	kskSigner crypto.Signer
+	zskSigner crypto.Signer
+}
+
+func newTestZone(t *testing.T, name string) *testZone {
+	t.Helper()
+	name = dns.Fqdn(name)
+	z := &testZone{name: name}
+	z.ksk, z.kskSigner = genSigningKey(t, name, 257)
+	z.zsk, z.zskSigner = genSigningKey(t, name, 256)
+	return z
+}
+
+func genSigningKey(t *testing.T, zone string, flags uint16) (*dns.DNSKEY, crypto.Signer) {
+	t.Helper()
+	k := &dns.DNSKEY{
+		Hdr:       dns.RR_Header{Name: zone, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
+		Flags:     flags,
+		Protocol:  3,
+		Algorithm: dns.ECDSAP256SHA256,
+	}
+	priv, err := k.Generate(256)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	signer, ok := priv.(crypto.Signer)
+	if !ok {
+		t.Fatal("generated key is not a crypto.Signer")
+	}
+	return k, signer
+}
+
+// dnskeyRRset returns the zone's DNSKEY RRset as wire records.
+func (z *testZone) dnskeyRRset() []dns.RR {
+	return []dns.RR{z.ksk, z.zsk}
+}
+
+// keyRecords returns the parsed-style DNSKEY records a real Answer-section parse
+// of the zone's DNSKEY RRset would produce.
+func (z *testZone) keyRecords() []dnspkg.DNSKEYRecord {
+	return []dnspkg.DNSKEYRecord{
+		dnspkg.DNSKEYFromRR(z.ksk, dnspkg.SectionAnswer),
+		dnspkg.DNSKEYFromRR(z.zsk, dnspkg.SectionAnswer),
+	}
+}
+
+// ds returns the SHA-256 DS record for the zone's KSK.
+func (z *testZone) ds(t *testing.T) *dns.DS {
+	t.Helper()
+	d := z.ksk.ToDS(dns.SHA256)
+	if d == nil {
+		t.Fatal("ToDS returned nil")
+	}
+	d.Hdr.Ttl = 300
+	return d
+}
+
+// signWith signs rrs (one RRset) with the given key/signer, naming the zone as
+// signer. Labels is derived from the owner (wildcard label excluded).
+func signWith(t *testing.T, zone string, key *dns.DNSKEY, signer crypto.Signer, rrs []dns.RR) *dns.RRSIG {
+	t.Helper()
+	if len(rrs) == 0 {
+		t.Fatal("signWith: empty RRset")
+	}
+	owner := rrs[0].Header().Name
+	labels := dns.CountLabel(owner)
+	if strings.HasPrefix(owner, "*.") {
+		labels--
+	}
+	sig := &dns.RRSIG{
+		Hdr:         dns.RR_Header{Name: owner, Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: rrs[0].Header().Ttl},
+		TypeCovered: rrs[0].Header().Rrtype,
+		Algorithm:   key.Algorithm,
+		Labels:      uint8(labels),
+		OrigTtl:     rrs[0].Header().Ttl,
+		Expiration:  uint32(time.Now().Add(24 * time.Hour).Unix()),
+		Inception:   uint32(time.Now().Add(-time.Hour).Unix()),
+		KeyTag:      key.KeyTag(),
+		SignerName:  dns.Fqdn(zone),
+	}
+	if err := sig.Sign(signer, rrs); err != nil {
+		t.Fatalf("sign %s %s: %v", owner, dns.TypeToString[sig.TypeCovered], err)
+	}
+	return sig
+}
+
+// signKSK signs rrs with the zone's KSK.
+func (z *testZone) signKSK(t *testing.T, rrs ...dns.RR) *dns.RRSIG {
+	return signWith(t, z.name, z.ksk, z.kskSigner, rrs)
+}
+
+// signZSK signs rrs with the zone's ZSK.
+func (z *testZone) signZSK(t *testing.T, rrs ...dns.RR) *dns.RRSIG {
+	return signWith(t, z.name, z.zsk, z.zskSigner, rrs)
+}
+
+// serveDNSKEY makes the mock serve the zone's DNSKEY RRset signed by its KSK.
+func (z *testZone) serveDNSKEY(t *testing.T, m *mockDNS) {
+	t.Helper()
+	rrset := z.dnskeyRRset()
+	sig := z.signKSK(t, rrset...)
+	m.answer(z.name, dns.TypeDNSKEY, append(rrset, sig)...)
+}
+
+// serveDS makes parent serve the signed DS RRset for child, with optional extra
+// Authority/Additional records (the injection surface under test).
+func (parent *testZone) serveDS(t *testing.T, m *mockDNS, child *testZone, authority, additional []dns.RR) {
+	t.Helper()
+	ds := child.ds(t)
+	sig := parent.signZSK(t, ds)
+	m.respond(child.name, dns.TypeDS, dns.RcodeSuccess, []dns.RR{ds, sig}, authority, additional)
+}
+
+// testCtx returns a context bounded for a hermetic test.
+func testCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}

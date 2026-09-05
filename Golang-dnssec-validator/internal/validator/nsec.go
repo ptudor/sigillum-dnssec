@@ -78,22 +78,24 @@ func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.
 		return proof
 	}
 
-	// Cryptographically verify every NSEC RRset in the response. This is the security-
-	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
-	if _, err := VerifyDenialRRSIGFromResponse(rawResponse, 47, dnskeys); err != nil {
-		proof.Error = fmt.Sprintf("NSEC RRSIG cryptographic verification failed: %v", err)
-		return proof
-	}
-
 	// Record the NSEC records for display
 	for _, nsec := range nsecRecords {
 		proof.Records = append(proof.Records, fmt.Sprintf("%s → %s [%v]", nsec.Owner, nsec.NextDomain, nsec.TypeBitmap))
 	}
 
-	// Verify the denial proof (ranges/type bitmap)
-	basicProof, err := VerifyNSECDenial(qname, qtype, nsecRecords, rcode)
+	// Cryptographically verify the NSEC RRsets in the response. This is the security-
+	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
+	// The proof below consumes ONLY the records whose RRset verified (RA6X-007).
+	verified, rejected, err := VerifyDenialRRsetsFromResponse(rawResponse, 47, dnskeys, "")
 	if err != nil {
-		proof.Error = err.Error()
+		proof.Error = fmt.Sprintf("NSEC RRSIG cryptographic verification failed: %v", err)
+		return proof
+	}
+
+	// Verify the denial proof (ranges/type bitmap) over the authenticated records.
+	basicProof, err := VerifyNSECDenial(qname, qtype, nsecRecordsFromVerified(verified), rcode)
+	if err != nil {
+		proof.Error = err.Error() + rejectedNote(rejected)
 		return proof
 	}
 	if basicProof != nil {
@@ -269,13 +271,6 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 		return proof
 	}
 
-	// Cryptographically verify every NSEC3 RRset in the response. This is the security-
-	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
-	if _, err := VerifyDenialRRSIGFromResponse(rawResponse, 50, dnskeys); err != nil {
-		proof.Error = fmt.Sprintf("NSEC3 RRSIG cryptographic verification failed: %v", err)
-		return proof
-	}
-
 	// Record the NSEC3 records for display
 	for _, nsec3 := range nsec3Records {
 		optOut := ""
@@ -285,10 +280,19 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 		proof.Records = append(proof.Records, fmt.Sprintf("%s → %s [%v]%s", nsec3.HashedOwner, nsec3.NextHashed, nsec3.TypeBitmap, optOut))
 	}
 
-	// Verify the denial proof (hashes/ranges/type bitmap)
-	basicProof, err := VerifyNSEC3Denial(qname, qtype, nsec3Records, zone, rcode)
+	// Cryptographically verify the NSEC3 RRsets in the response. This is the security-
+	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
+	// The proof below consumes ONLY the records whose RRset verified (RA6X-007).
+	verified, rejected, err := VerifyDenialRRsetsFromResponse(rawResponse, 50, dnskeys, "")
 	if err != nil {
-		proof.Error = err.Error()
+		proof.Error = fmt.Sprintf("NSEC3 RRSIG cryptographic verification failed: %v", err)
+		return proof
+	}
+
+	// Verify the denial proof (hashes/ranges/type bitmap) over the authenticated records.
+	basicProof, err := VerifyNSEC3Denial(qname, qtype, nsec3RecordsFromVerified(verified), zone, rcode)
+	if err != nil {
+		proof.Error = err.Error() + rejectedNote(rejected)
 		return proof
 	}
 	if basicProof != nil {
