@@ -119,7 +119,7 @@ func TestChildOfInsecureZoneReadsInsecure(t *testing.T) {
 	}
 
 	child := NewZoneResult("sub.example.com.")
-	v.finalizeNoDSDelegation(child, "sub.example.com.", threaded, nil)
+	v.finalizeNoDSDelegation(child, "sub.example.com.", "example.com.", threaded, nil)
 	if child.Status != StatusInsecure {
 		t.Fatalf("child of an insecure zone must read insecure, got %s", child.Status)
 	}
@@ -127,7 +127,7 @@ func TestChildOfInsecureZoneReadsInsecure(t *testing.T) {
 	// The secure-parent path stays fail-closed: without a DS-absence proof the
 	// child of a SIGNED parent is still indeterminate, not insecure.
 	pre := NewZoneResult("sub.example.com.")
-	v.finalizeNoDSDelegation(pre, "sub.example.com.", signedAncestorKeys, nil)
+	v.finalizeNoDSDelegation(pre, "sub.example.com.", "example.com.", signedAncestorKeys, nil)
 	if pre.Status != StatusIndeterminate {
 		t.Fatalf("child of a signed parent without a DS-absence proof must stay indeterminate, got %s", pre.Status)
 	}
@@ -173,13 +173,13 @@ func TestVerifyDNSKEYRRSIGByKeys_DoubleSignature(t *testing.T) {
 
 	// Double signature with the non-matching RRSIGs sorted first: the RRset
 	// must be accepted via the DS-matched signature.
-	if err := VerifyDNSKEYRRSIGByKeys(dnskeys, []dnspkg.RRSIGRecord{sigB, sigC, sigA}, authed); err != nil {
+	if err := VerifyDNSKEYRRSIGByKeys(zone, dnskeys, []dnspkg.RRSIGRecord{sigB, sigC, sigA}, authed); err != nil {
 		t.Fatalf("an RRset with any one RRSIG under a DS-matched key must verify (RFC 4035 §5.3.3), got: %v", err)
 	}
 
 	// Every RRSIG by a non-authenticated key: still fail closed (R-080), with
 	// an aggregate error naming all attempts.
-	err := VerifyDNSKEYRRSIGByKeys(dnskeys, []dnspkg.RRSIGRecord{sigB, sigC}, authed)
+	err := VerifyDNSKEYRRSIGByKeys(zone, dnskeys, []dnspkg.RRSIGRecord{sigB, sigC}, authed)
 	if err == nil {
 		t.Fatal("a DNSKEY RRset with no RRSIG under a DS-matched key was accepted; R-080 not enforced")
 	}
@@ -412,7 +412,7 @@ func TestVerifyDSAbsenceNSEC3IterationCap(t *testing.T) {
 			TypeBitmap:  []string{"NS"},
 		}},
 	}
-	proof, ok := v.verifyDSAbsence(child, []dnspkg.DNSKEYRecord{parentKey}, overCap)
+	proof, ok := v.verifyDSAbsence(child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, overCap)
 	if ok {
 		t.Fatal("an NSEC3 with iterations over the RFC 9276 cap must not prove DS absence")
 	}
@@ -423,7 +423,7 @@ func TestVerifyDSAbsenceNSEC3IterationCap(t *testing.T) {
 	// Through finalizeNoDSDelegation the over-cap NSEC3 yields the fail-closed
 	// non-insecure outcome (bogus), never an insecure downgrade.
 	r := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r, child, []dnspkg.DNSKEYRecord{parentKey}, overCap)
+	v.finalizeNoDSDelegation(r, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, overCap)
 	if r.Status != StatusBogus {
 		t.Fatalf("over-cap NSEC3 DS-absence proof should yield bogus, got %s", r.Status)
 	}
@@ -431,12 +431,12 @@ func TestVerifyDSAbsenceNSEC3IterationCap(t *testing.T) {
 	// A modest iteration count is unaffected: a signed NSEC3 delegation match
 	// still proves the insecure delegation.
 	qr, signedParentKey := buildNSEC3DSAbsenceResponse(t, child, parentZone, 10)
-	proof10, ok10 := v.verifyDSAbsence(child, []dnspkg.DNSKEYRecord{signedParentKey}, qr)
+	proof10, ok10 := v.verifyDSAbsence(child, parentZone, []dnspkg.DNSKEYRecord{signedParentKey}, qr)
 	if !ok10 {
 		t.Fatalf("a signed NSEC3 with iterations=10 must still prove DS absence, got error: %s", proof10.Error)
 	}
 	r10 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r10, child, []dnspkg.DNSKEYRecord{signedParentKey}, qr)
+	v.finalizeNoDSDelegation(r10, child, parentZone, []dnspkg.DNSKEYRecord{signedParentKey}, qr)
 	if r10.Status != StatusInsecure {
 		t.Fatalf("valid NSEC3 absence proof should yield insecure, got %s", r10.Status)
 	}

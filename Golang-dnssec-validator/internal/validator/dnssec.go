@@ -278,6 +278,12 @@ func CollectDSMatchedKeys(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKE
 			if childDNSKEY[i].KeyTag != ds.KeyTag {
 				continue
 			}
+			// RA6X-016: a key that carries its authenticated owner must belong
+			// to this zone; the DS digest is computed at zone, so a key parsed
+			// at another owner can never be "the child's key" here.
+			if !keyBelongsToZone(childDNSKEY[i], zone) {
+				continue
+			}
 			// R-043: a DS must not authenticate a non-zone/invalid-protocol key.
 			if !childDNSKEY[i].EligibleForVerification() {
 				continue
@@ -314,6 +320,10 @@ func CollectAnchorMatchedKeys(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.An
 			if dnskeys[i].KeyTag != uint16(anchor.KeyTag) || dnskeys[i].Algorithm != uint8(anchor.Algorithm) {
 				continue
 			}
+			// RA6X-016: only a key owned by the root zone can be the root's key.
+			if !keyBelongsToZone(dnskeys[i], ".") {
+				continue
+			}
 			// R-043: an anchor must not authenticate a non-zone/invalid-protocol
 			// or revoked key.
 			if !dnskeys[i].EligibleForVerification() {
@@ -332,13 +342,31 @@ func CollectAnchorMatchedKeys(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.An
 	return matched
 }
 
-// VerifyDNSKEYRRSIGByKeys verifies that the DNSKEY RRset is signed by one of the
+// keyBelongsToZone reports whether a trusted key may act as zone's key: a key
+// that carries an authenticated owner must be owned by zone; a key built
+// in-process without an owner is accepted (its caller vouches for it). This is
+// the zone-identity check that stops a key reused by two zones from
+// authenticating the other zone's signatures (RA6X-016).
+func keyBelongsToZone(key dnspkg.DNSKEYRecord, zone string) bool {
+	if key.Owner == "" {
+		return true
+	}
+	return dns.CanonicalName(key.Owner) == dns.CanonicalName(zone)
+}
+
+// VerifyDNSKEYRRSIGByKeys verifies that zone's DNSKEY RRset is signed by one of the
 // parent/anchor-authenticated keys — not merely by some key that happens to be present
 // in the RRset. This closes the RFC 4035 §5.2 binding: a rogue self-signed KSK added to
 // the served RRset must not be able to authenticate the RRset. authenticatedKeys is the
 // set produced by CollectDSMatchedKeys (non-root) or CollectAnchorMatchedKeys (root).
 // This performs FULL cryptographic verification — the whole point of a diagnostic tool.
-func VerifyDNSKEYRRSIGByKeys(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecord, authenticatedKeys []dnspkg.DNSKEYRecord) error {
+//
+// The RRset owner, the signature's Signer's Name and every trusted key's owner
+// must all be zone (RA6X-016): a signature this key material produced at some
+// other zone, or a DNSKEY record parsed at another owner, never authenticates
+// this zone. Callers holding the raw response should prefer
+// VerifyDNSKEYRRsetFromResponse, which verifies the original wire records.
+func VerifyDNSKEYRRSIGByKeys(zone string, dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSIGRecord, authenticatedKeys []dnspkg.DNSKEYRecord) error {
 	// Find every RRSIG covering DNSKEY (type 48)
 	covering := FindRRSIGsForType(dns.TypeDNSKEY, rrsigs)
 	if len(covering) == 0 {
@@ -354,7 +382,7 @@ func VerifyDNSKEYRRSIGByKeys(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSI
 	// one needs to chain to the parent's DS.
 	var errs []error
 	for _, rrsigRecord := range covering {
-		err := verifyDNSKEYRRSIGOne(dnskeys, rrsigRecord, authenticatedKeys)
+		err := verifyDNSKEYRRSIGOne(zone, dnskeys, rrsigRecord, authenticatedKeys)
 		if err == nil {
 			return nil
 		}
@@ -374,7 +402,9 @@ func VerifyDNSKEYRRSIGByKeys(dnskeys []dnspkg.DNSKEYRecord, rrsigs []dnspkg.RRSI
 // verifyDNSKEYRRSIGOne checks a single RRSIG over the DNSKEY RRset: time
 // validity, membership of the signing key in the parent/anchor-authenticated
 // set (the RFC 4035 §5.2 binding — R-080), and full cryptographic verification.
-func verifyDNSKEYRRSIGOne(dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSIGRecord, authenticatedKeys []dnspkg.DNSKEYRecord) error {
+func verifyDNSKEYRRSIGOne(zone string, dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSIGRecord, authenticatedKeys []dnspkg.DNSKEYRecord) error {
+	zone = dns.Fqdn(zone)
+
 	// Check time validity first (cheap check before expensive crypto)
 	if !VerifyRRSIGValid(rrsigRecord) {
 		if rrsigRecord.IsExpired {
@@ -383,30 +413,44 @@ func verifyDNSKEYRRSIGOne(dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSI
 		return fmt.Errorf("DNSKEY RRSIG not yet valid (inception: %s)", rrsigRecord.Inception.Format(time.RFC3339))
 	}
 
+	// RA6X-016: the DNSKEY RRset of zone is signed by zone (RFC 4035 §5.3.1);
+	// a signature naming any other zone as signer is another zone's evidence.
+	if dns.CanonicalName(rrsigRecord.SignerName) != dns.CanonicalName(zone) {
+		return fmt.Errorf("DNSKEY RRSIG signer %s is not the zone %s", rrsigRecord.SignerName, zone)
+	}
+	if rrsigRecord.Owner != "" && dns.CanonicalName(rrsigRecord.Owner) != dns.CanonicalName(zone) {
+		return fmt.Errorf("DNSKEY RRSIG owner %s is not the zone %s", rrsigRecord.Owner, zone)
+	}
+
 	// The signing key MUST be one of the parent/anchor-authenticated keys. Requiring
 	// membership here — rather than trusting the key named by the RRSIG — is what binds
 	// the DNSKEY RRset to the parent's DS (RFC 4035 §5.2). Key tags collide, so try
 	// EVERY authenticated key sharing the tag, not just the first (R-044).
 	var candidates []dnspkg.DNSKEYRecord
 	for i := range authenticatedKeys {
-		if authenticatedKeys[i].KeyTag == rrsigRecord.KeyTag {
+		if authenticatedKeys[i].KeyTag == rrsigRecord.KeyTag && keyBelongsToZone(authenticatedKeys[i], zone) {
 			candidates = append(candidates, authenticatedKeys[i])
 		}
 	}
 	if len(candidates) == 0 {
-		return fmt.Errorf("DNSKEY RRset is not signed by a parent-authenticated key (RRSIG key tag %d is not DS/anchor-matched)", rrsigRecord.KeyTag)
+		return fmt.Errorf("DNSKEY RRset is not signed by a parent-authenticated key of %s (RRSIG key tag %d is not DS/anchor-matched)", zone, rrsigRecord.KeyTag)
 	}
 
 	// Reconstruct the dns.RRSIG for verification
-	rrsig, err := reconstructRRSIG(rrsigRecord.SignerName, rrsigRecord)
+	rrsig, err := reconstructRRSIG(zone, rrsigRecord)
 	if err != nil {
 		return fmt.Errorf("failed to reconstruct RRSIG: %w", err)
 	}
 
-	// Build the DNSKEY RRset that was signed
+	// Build the DNSKEY RRset that was signed. Every member must be a record of
+	// this zone; a DNSKEY parsed at another owner is not part of the RRset and
+	// is never rewritten to make the signature fit (RA6X-016).
 	var rrset []dns.RR
 	for _, dk := range dnskeys {
-		dnskey, err := reconstructDNSKEY(rrsigRecord.SignerName, dk)
+		if !keyBelongsToZone(dk, zone) {
+			return fmt.Errorf("DNSKEY at %s is not part of the %s DNSKEY RRset", dk.Owner, zone)
+		}
+		dnskey, err := reconstructDNSKEY(zone, dk)
 		if err != nil {
 			return fmt.Errorf("failed to reconstruct DNSKEY for RRset: %w", err)
 		}
@@ -416,7 +460,7 @@ func verifyDNSKEYRRSIGOne(dnskeys []dnspkg.DNSKEYRecord, rrsigRecord dnspkg.RRSI
 	// Perform cryptographic signature verification against each candidate key.
 	var lastErr error
 	for _, ck := range candidates {
-		signingKey, err := reconstructDNSKEY(rrsigRecord.SignerName, ck)
+		signingKey, err := reconstructDNSKEY(zone, ck)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to reconstruct signing key: %w", err)
 			continue
