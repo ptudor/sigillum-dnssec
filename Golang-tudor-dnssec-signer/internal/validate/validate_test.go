@@ -224,7 +224,7 @@ func TestDNSKEYCheck(t *testing.T) {
 	// Test checkDNSKEYVisible with the mock — it will fail on NS resolution
 	// since our mock doesn't serve NS records, but verify error handling
 	v := &Validator{timeout: 2 * time.Second}
-	result := v.checkDNSKEYVisible("example.com", kskTag, zskTag)
+	result := v.checkDNSKEYVisible("example.com", kskTag, zskTag, nil, nil)
 	if result.Status != "error" {
 		t.Logf("DNSKEY check status: %s (details: %s)", result.Status, result.Details)
 	}

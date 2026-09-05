@@ -52,7 +52,13 @@ func TestDaemonReload_HandlersReflectNewState(t *testing.T) {
 	cfg2 := newCfg()
 	cfg2.Zones["new.example."] = config.ZoneConfig{Path: "/zones/new.db"}
 	state2 := statepkg.NewState(cfg2.StatePath())
-	state2.SetZone("new.example.", &statepkg.ZoneState{Serial: 2, SignaturesExp: time.Now().Add(14 * 24 * time.Hour)})
+	// A zone that is ready: keys initialized, signed and confirmed served
+	// (RA6X-033 makes readiness fail for anything less).
+	state2.SetZone("new.example.", &statepkg.ZoneState{
+		Serial: 2, SignaturesExp: time.Now().Add(14 * 24 * time.Hour),
+		KSK: &statepkg.KeyState{ID: 1, Algorithm: "ED25519"}, ZSK: &statepkg.KeyState{ID: 2, Algorithm: "ED25519"},
+		LastSigned: time.Now(), PublishedAt: time.Now(), PublishedGenerationSignedAt: time.Now(),
+	})
 
 	d := NewDaemon(cfg1, state1)
 	// One server handler instance, constructed once — exactly the startup wiring.

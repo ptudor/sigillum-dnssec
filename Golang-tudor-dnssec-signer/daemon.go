@@ -580,6 +580,7 @@ rolloverLoop:
 		if zoneState == nil || zoneState.ZSK == nil {
 			continue
 		}
+		rolloverFailed := false
 		for name, check := range map[string]func(string) error{
 			"ZSK":       snap.rollover.CheckZSKRollover,
 			"KSK":       snap.rollover.CheckKSKRollover,
@@ -590,8 +591,13 @@ rolloverLoop:
 					slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "rollover", name, "error", err)
 				} else {
 					slog.Error("[ROLLOVER] rollover check failed", "domain", domain, "rollover", name, "error", err)
+					rolloverFailed = true
+					snap.state.Mutate(func() { zoneState.SetOperationError(statepkg.OpRollover, name+" rollover: "+err.Error()) })
 				}
 			}
+		}
+		if !rolloverFailed {
+			snap.state.Mutate(func() { zoneState.ClearOperationError(statepkg.OpRollover) })
 		}
 	}
 
@@ -626,7 +632,7 @@ rolloverLoop:
 	}
 
 	// Update Prometheus metrics
-	metrics.UpdateZoneMetrics(snap.state)
+	metrics.UpdateZoneMetrics(snap.state, configuredZones(snap.cfg)...)
 }
 
 // checkAndSignZoneSafe wraps checkAndSignZone with per-zone panic recovery
@@ -691,6 +697,17 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 		keyGen := signerpkg.NewKeyGenerator(snap.cfg)
 		ksk, zsk, err := signerpkg.RecoverOrGenerateKeys(keyGen, domain)
 		if err != nil {
+			// RA6X-033: an initialization failure must be visible everywhere a
+			// zone is counted. Keep (or create) a keyless placeholder carrying
+			// the error — it is retried on every cycle — and account for the
+			// failed operation in metrics and the heartbeat.
+			if zoneState == nil {
+				zoneState = &statepkg.ZoneState{Path: zoneCfg.Path}
+				snap.state.SetZone(domain, zoneState)
+			}
+			snap.state.Mutate(func() { zoneState.SetOperationError(statepkg.OpInit, err.Error()) })
+			metrics.RecordSigningOperation(domain, 0, false)
+			snap.heartbeat.SigningError(domain)
 			return false, err
 		}
 		zoneState = &statepkg.ZoneState{
@@ -708,16 +725,15 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// Sign the zone
 	signStart := time.Now()
 	if err := snap.signer.SignZone(domain); err != nil {
-		snap.state.Mutate(func() { zoneState.AddError(err.Error()) })
+		snap.state.Mutate(func() { zoneState.SetOperationError(statepkg.OpSigning, err.Error()) })
 		metrics.RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
 		snap.heartbeat.SigningError(domain)
 		return false, err
 	}
 
-	// Clear errors on success and send completion heartbeat with the serial
-	// actually served (differs from the unsigned serial under serial_policy
-	// = "epoch")
-	snap.state.Mutate(zoneState.ClearErrors)
+	// A successful sign has already cleared the signing error (RA6X-048);
+	// send the completion heartbeat with the serial actually served
+	// (differs from the unsigned serial under serial_policy = "epoch").
 	snap.heartbeat.SigningComplete(domain, zoneState.PublishedSerial)
 
 	// Execute per-zone post-sign hook only when NOT coalescing — the caller
@@ -839,9 +855,6 @@ func newRolloverManager(cfg *config.Config, state *statepkg.State) *signerpkg.Ro
 // generation each hook covered, and persists. A hook failure leaves the zone
 // pending so the next cycle retries the deployment.
 func (d *Daemon) confirmPublication(zones []SignedZoneRef, hookErr error) {
-	if hookErr != nil {
-		return
-	}
 	snap := d.takeSnapshot()
 	lock, err := acquireStateLock(snap.cfg.DataDir, 10*time.Second)
 	if err != nil {
@@ -857,10 +870,23 @@ func (d *Daemon) confirmPublication(zones []SignedZoneRef, hookErr error) {
 	changed := false
 	for _, z := range zones {
 		zs := snap.state.GetZone(z.Domain)
-		if zs == nil || z.SignedAt.IsZero() {
+		if zs == nil {
 			continue
 		}
-		snap.state.Mutate(func() { zs.ConfirmPublication(z.SignedAt, now) })
+		if hookErr != nil {
+			// The deployment failed: record it as its own operation (RA6X-048)
+			// and leave the zone pending so the next cycle retries the hook.
+			snap.state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, "post-sign hook failed: "+hookErr.Error()) })
+			changed = true
+			continue
+		}
+		if z.SignedAt.IsZero() {
+			continue
+		}
+		snap.state.Mutate(func() {
+			zs.ConfirmPublication(z.SignedAt, now)
+			zs.ClearOperationError(statepkg.OpDeployment)
+		})
 		changed = true
 		slog.Info("[DAEMON] Publication confirmed by hook", "domain", z.Domain, "generation_signed_at", z.SignedAt.Format(time.RFC3339))
 	}
@@ -895,4 +921,13 @@ func (d *Daemon) probePendingPublications(snap snapshot) {
 		snap.state.Mutate(func() { zs.ConfirmPublication(zs.LastSigned, now) })
 		slog.Info("[DAEMON] Publication confirmed by authoritative probe", "domain", domain, "details", details)
 	}
+}
+
+// configuredZones lists the zones the configuration manages.
+func configuredZones(cfg *config.Config) []string {
+	out := make([]string, 0, len(cfg.Zones))
+	for domain := range cfg.Zones {
+		out = append(out, domain)
+	}
+	return out
 }

@@ -425,12 +425,15 @@ function toggleZone(header) {
 }
 
 function isServfail(z) {
-  // A zone is SERVFAIL-broken if DNSKEY/RRSIG/SOA all fail to resolve.
-  // This means validating resolvers will return SERVFAIL for the entire zone.
-  var checks = [z.dnskey_check, z.rrsig_check, z.soa_check];
-  return checks.every(function(c) {
-    return c.status === 'error' && /failed to resolve NS|no NS records found/i.test(c.details || '');
-  });
+  // The structured verdict from the validator: a proven broken trust chain
+  // or unreachable authoritative servers while the validator's own resolver
+  // worked. A resolver-side outage is reported separately as uncertain, never
+  // as SERVFAIL (it is not evidence about the zone).
+  return z.servfail === true;
+}
+
+function isResolverOutage(z) {
+  return z.resolver_outage === true;
 }
 
 function renderCriticalAlert(zones) {
@@ -440,18 +443,31 @@ function renderCriticalAlert(zones) {
       critical.push(domain);
     }
   }
-  if (critical.length === 0) return;
+  var hasOutage = false;
+  for (var d0 in zones) {
+    if (isResolverOutage(zones[d0])) hasOutage = true;
+  }
+  if (critical.length === 0 && !hasOutage) return;
 
   critical.sort();
   var el = document.getElementById('critical-alert');
   el.style.display = '';
-  var html = '<strong>SERVFAIL — NS resolution failure (' + critical.length + ' zone' + (critical.length > 1 ? 's' : '') + ')</strong>';
+  var html = '<strong>SERVFAIL — validating resolvers fail these zones (' + critical.length + ' zone' + (critical.length > 1 ? 's' : '') + ')</strong>';
   html += '<ul>';
   critical.forEach(function(d) {
-    var detail = zones[d].dnskey_check.details || zones[d].soa_check.details || '';
+    var z = zones[d];
+    var detail = z.rrsig_check.details || z.dnskey_check.details || z.ds_check.details || z.soa_check.details || '';
     html += '<li><span class="critical-domain">' + escapeHtml(d) + '</span> <span class="critical-detail">' + escapeHtml(detail) + '</span></li>';
   });
   html += '</ul>';
+  var outage = [];
+  for (var domain in zones) {
+    if (isResolverOutage(zones[domain])) outage.push(domain);
+  }
+  if (outage.length > 0) {
+    outage.sort();
+    html += '<p class="critical-detail">Not assessed (validator resolver outage): ' + outage.map(escapeHtml).join(', ') + '</p>';
+  }
   el.innerHTML = html;
 }
 

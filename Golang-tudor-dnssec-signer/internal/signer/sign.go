@@ -84,8 +84,12 @@ func (s *Signer) SignAllReport() (signed []string, err error) {
 			if err != nil {
 				slog.Error("[SIGN] Cannot initialize zone; skipping", "domain", domain, "error", err)
 				placeholder := &statepkg.ZoneState{Path: zoneCfg.Path}
-				placeholder.AddError(err.Error())
+				if zoneState != nil {
+					placeholder = zoneState
+				}
+				s.state.Mutate(func() { placeholder.SetOperationError(statepkg.OpInit, err.Error()) })
 				s.state.SetZone(domain, placeholder)
+				metrics.RecordSigningOperation(domain, 0, false)
 				failed++
 				continue
 			}
@@ -99,10 +103,9 @@ func (s *Signer) SignAllReport() (signed []string, err error) {
 
 		if err := s.SignZone(domain); err != nil {
 			slog.Error("[SIGN] Failed to sign zone", "domain", domain, "error", err)
-			s.state.Mutate(func() { zoneState.AddError(err.Error()) })
+			s.state.Mutate(func() { zoneState.SetOperationError(statepkg.OpSigning, err.Error()) })
 			failed++
 		} else {
-			s.state.Mutate(zoneState.ClearErrors)
 			signed = append(signed, domain)
 		}
 	}
@@ -336,6 +339,11 @@ func (s *Signer) recordSignedZone(domain string, zoneState *statepkg.ZoneState, 
 			zoneState.PendingPublication = true
 		}
 		zoneState.ClearTransientWarnings()
+		// A successful sign resolves exactly the signing error (RA6X-048);
+		// deployment, rollover and registrar problems stay until their own
+		// operation succeeds.
+		zoneState.ClearOperationError(statepkg.OpSigning)
+		zoneState.ClearOperationError(statepkg.OpInit)
 		if durabilityUncertain != "" {
 			zoneState.AddWarning(durabilityUncertain)
 		}
@@ -749,7 +757,7 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneStat
 	if err != nil {
 		slog.Error("[SIGN] Cannot stat zone file", "domain", domain, "path", zonePath, "error", err)
 		s.state.Mutate(func() {
-			zoneState.AddError(fmt.Sprintf("zone file missing or inaccessible: %v", err))
+			zoneState.SetOperationError(statepkg.OpSigning, fmt.Sprintf("zone file missing or inaccessible: %v", err))
 		})
 		return false, ""
 	}

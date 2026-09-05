@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"time"
 
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
@@ -49,7 +50,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 
 // healthHandler returns detailed health status
 func healthHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State, cfg *config.Config, daemon *Daemon) {
-	status := buildStatusOutput(state)
+	status := buildStatusOutput(state, configuredZones(cfg)...)
 
 	// Check if any zones have errors
 	healthy := status.Summary.Errors == 0
@@ -108,6 +109,15 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State
 		depErrors = append(depErrors, fmt.Sprintf("expired_signatures: %v", expiredZones))
 	}
 
+	// RA6X-033: readiness covers every CONFIGURED zone, not only the ones that
+	// made it into state. A configured zone with no state entry never
+	// initialized; a zone that never produced a signed generation, or whose
+	// generation was never confirmed served, is not ready either.
+	for _, problem := range unreadyZones(cfg, state) {
+		depErrors = append(depErrors, problem)
+		healthy = false
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if !healthy {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -138,7 +148,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State
 
 // healthzHandler returns simple OK for kubernetes probes
 func healthzHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State, cfg *config.Config, daemon *Daemon) {
-	status := buildStatusOutput(state)
+	status := buildStatusOutput(state, configuredZones(cfg)...)
 	healthy := status.Summary.Errors == 0
 
 	// Check directory dependencies
@@ -170,6 +180,9 @@ func healthzHandler(w http.ResponseWriter, r *http.Request, state *statepkg.Stat
 			healthy = false
 			break
 		}
+	}
+	if len(unreadyZones(cfg, state)) > 0 {
+		healthy = false
 	}
 
 	if !healthy {
@@ -211,4 +224,31 @@ func checkDirWritable(dir string) error {
 		slog.Warn("[HEALTH] failed to remove write-check temp file", "path", name, "error", err)
 	}
 	return nil
+}
+
+// unreadyZones reports every configured zone that has not produced a valid,
+// deployed generation (RA6X-033): absent from state (initialization never
+// succeeded), never signed, or signed but never confirmed served.
+func unreadyZones(cfg *config.Config, state *statepkg.State) []string {
+	var problems []string
+	zones := state.SnapshotZones()
+	names := make([]string, 0, len(cfg.Zones))
+	for domain := range cfg.Zones {
+		names = append(names, domain)
+	}
+	sort.Strings(names)
+	for _, domain := range names {
+		zs, ok := zones[domain]
+		switch {
+		case !ok:
+			problems = append(problems, fmt.Sprintf("zone %s: configured but not initialized", domain))
+		case zs.KSK == nil || zs.ZSK == nil:
+			problems = append(problems, fmt.Sprintf("zone %s: key initialization has not succeeded", domain))
+		case zs.LastSigned.IsZero():
+			problems = append(problems, fmt.Sprintf("zone %s: never signed", domain))
+		case zs.PendingPublication && zs.PublishedAt.IsZero():
+			problems = append(problems, fmt.Sprintf("zone %s: signed but never confirmed served", domain))
+		}
+	}
+	return problems
 }

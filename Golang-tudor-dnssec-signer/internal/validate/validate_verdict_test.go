@@ -87,29 +87,19 @@ func TestEvaluateDSMatch(t *testing.T) {
 // ignored when the key tag is known.
 func TestEvalRRSIGCover(t *testing.T) {
 	now := time.Now()
-	mk := func(covered, tag uint16, exp, inc time.Time) *dns.RRSIG {
-		return &dns.RRSIG{
-			Hdr:         dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET},
-			TypeCovered: covered,
-			Algorithm:   dns.ED25519,
-			KeyTag:      tag,
-			SignerName:  "example.com.",
-			Inception:   uint32(inc.Unix()),
-			Expiration:  uint32(exp.Unix()),
-		}
-	}
+	f := newSignedFixture(t, "example.com.", 256)
+	keys := []*dns.DNSKEY{f.key}
+	answer := func(sigs ...dns.RR) []dns.RR { return append(append([]dns.RR{}, f.soa...), sigs...) }
 
-	t.Run("valid in-window RRSIG counts", func(t *testing.T) {
-		ans := []dns.RR{mk(dns.TypeSOA, 111, now.Add(24*time.Hour), now.Add(-time.Hour))}
-		e := evalRRSIGCover(ans, dns.TypeSOA, 111, now)
-		if !e.valid || e.expired {
-			t.Errorf("valid RRSIG: got valid=%v expired=%v", e.valid, e.expired)
+	t.Run("valid in-window verifying RRSIG counts", func(t *testing.T) {
+		e := evalRRSIGCover(answer(f.sign(t, f.soa, now.Add(-time.Hour), now.Add(24*time.Hour))), dns.TypeSOA, keys, now)
+		if !e.valid || e.expired || e.broken {
+			t.Errorf("valid RRSIG: got valid=%v expired=%v broken=%v", e.valid, e.expired, e.broken)
 		}
 	})
 
 	t.Run("expired RRSIG does not count as valid", func(t *testing.T) {
-		ans := []dns.RR{mk(dns.TypeSOA, 111, now.Add(-time.Hour), now.Add(-48*time.Hour))}
-		e := evalRRSIGCover(ans, dns.TypeSOA, 111, now)
+		e := evalRRSIGCover(answer(f.sign(t, f.soa, now.Add(-48*time.Hour), now.Add(-time.Hour))), dns.TypeSOA, keys, now)
 		if e.valid {
 			t.Error("expired RRSIG must not be valid")
 		}
@@ -118,41 +108,102 @@ func TestEvalRRSIGCover(t *testing.T) {
 		}
 	})
 
-	t.Run("foreign key tag is ignored when tag is known", func(t *testing.T) {
-		ans := []dns.RR{mk(dns.TypeSOA, 999, now.Add(24*time.Hour), now.Add(-time.Hour))}
-		e := evalRRSIGCover(ans, dns.TypeSOA, 111, now) // want tag 111, record has 999
+	t.Run("corrupt signature bytes are broken, not valid", func(t *testing.T) {
+		sig := f.sign(t, f.soa, now.Add(-time.Hour), now.Add(24*time.Hour))
+		b := []byte(sig.Signature)
+		if b[0] == 'A' {
+			b[0] = 'B'
+		} else {
+			b[0] = 'A'
+		}
+		sig.Signature = string(b)
+		e := evalRRSIGCover(answer(sig), dns.TypeSOA, keys, now)
+		if e.valid || !e.present || !e.broken {
+			t.Errorf("corrupt RRSIG must be present+broken: present=%v valid=%v broken=%v", e.present, e.valid, e.broken)
+		}
+	})
+
+	t.Run("empty signature is broken", func(t *testing.T) {
+		sig := f.sign(t, f.soa, now.Add(-time.Hour), now.Add(24*time.Hour))
+		sig.Signature = ""
+		e := evalRRSIGCover(answer(sig), dns.TypeSOA, keys, now)
+		if e.valid || !e.broken {
+			t.Errorf("empty RRSIG must not be valid: valid=%v broken=%v", e.valid, e.broken)
+		}
+	})
+
+	t.Run("signature over a different RRset does not verify", func(t *testing.T) {
+		other := newSignedFixture(t, "example.com.", 256)
+		other.soa[0].(*dns.SOA).Serial = 99 // same owner/type, different data
+		sig := f.sign(t, other.soa, now.Add(-time.Hour), now.Add(24*time.Hour))
+		e := evalRRSIGCover(answer(sig), dns.TypeSOA, keys, now)
+		if e.valid || !e.broken {
+			t.Errorf("a signature over other data must be broken: valid=%v broken=%v", e.valid, e.broken)
+		}
+	})
+
+	t.Run("foreign key is ignored", func(t *testing.T) {
+		foreign := newSignedFixture(t, "example.com.", 256)
+		sig := foreign.sign(t, f.soa, now.Add(-time.Hour), now.Add(24*time.Hour))
+		e := evalRRSIGCover(answer(sig), dns.TypeSOA, keys, now)
 		if e.present || e.valid {
 			t.Errorf("foreign-key RRSIG must not count: present=%v valid=%v", e.present, e.valid)
 		}
 	})
 
-	t.Run("unknown local tag accepts any signer", func(t *testing.T) {
-		ans := []dns.RR{mk(dns.TypeSOA, 999, now.Add(24*time.Hour), now.Add(-time.Hour))}
-		e := evalRRSIGCover(ans, dns.TypeSOA, 0, now) // wantTag 0 = unknown
-		if !e.valid {
-			t.Error("with unknown local tag, an in-window RRSIG should count")
+	t.Run("same tag, different key material is not our key", func(t *testing.T) {
+		// A served key that merely shares the tag: verification against OUR
+		// material fails, so the signature is broken rather than accepted.
+		impostor := newSignedFixture(t, "example.com.", 256)
+		sig := impostor.sign(t, f.soa, now.Add(-time.Hour), now.Add(24*time.Hour))
+		sig.KeyTag = f.key.KeyTag()
+		e := evalRRSIGCover(answer(sig), dns.TypeSOA, keys, now)
+		if e.valid || !e.broken {
+			t.Errorf("tag-only match must not validate: valid=%v broken=%v", e.valid, e.broken)
+		}
+	})
+
+	t.Run("wrong owner or signer name is not this RRset's signature", func(t *testing.T) {
+		sig := f.sign(t, f.soa, now.Add(-time.Hour), now.Add(24*time.Hour))
+		sig.Hdr.Name = "other.example."
+		e := evalRRSIGCover(answer(sig), dns.TypeSOA, keys, now)
+		if e.present || e.valid {
+			t.Errorf("owner-mismatched RRSIG must not count: present=%v valid=%v", e.present, e.valid)
+		}
+		sig2 := f.sign(t, f.soa, now.Add(-time.Hour), now.Add(24*time.Hour))
+		sig2.SignerName = "other.example."
+		e = evalRRSIGCover(answer(sig2), dns.TypeSOA, keys, now)
+		if e.present || e.valid {
+			t.Errorf("signer-mismatched RRSIG must not count: present=%v valid=%v", e.present, e.valid)
 		}
 	})
 }
 
 // R-048: DS-present with a failing DNSKEY/RRSIG is bogus (fail), not partial.
 func TestBogusWhenDSPresent(t *testing.T) {
+	ds := func(found, matches bool, status string) DSCheckResult {
+		return DSCheckResult{Found: found, MatchesKSK: matches, Status: status}
+	}
 	cases := []struct {
-		overall             string
-		dsFound             bool
-		dnskey, rrsig, want string
+		name   string
+		ds     DSCheckResult
+		dnskey string
+		rrsig  RRSIGCheckResult
+		want   bool
 	}{
-		{"partial", true, "fail", "pass", "fail"},
-		{"partial", true, "pass", "fail", "fail"},
-		{"partial", true, "pass", "pass", "partial"},
-		{"pass", true, "pass", "pass", "pass"},
-		{"partial", false, "fail", "fail", "partial"}, // no DS → not our concern
+		{"DNSKEY fails under a DS", ds(true, true, "pass"), "fail", RRSIGCheckResult{Status: "pass"}, true},
+		{"RRSIG fails under a DS", ds(true, true, "pass"), "pass", RRSIGCheckResult{Status: "fail", Broken: true}, true},
+		{"refresh-window partial stays partial", ds(true, true, "pass"), "pass", RRSIGCheckResult{Status: "partial"}, false},
+		{"one required signature missing is bogus (RA6X-032)", ds(true, true, "pass"), "pass", RRSIGCheckResult{Status: "partial", Broken: true}, true},
+		{"mismatching parent DS is bogus (RA6X-032)", ds(true, false, "fail"), "pass", RRSIGCheckResult{Status: "pass"}, true},
+		{"all pass", ds(true, true, "pass"), "pass", RRSIGCheckResult{Status: "pass"}, false},
+		{"no DS → not our concern", ds(false, false, "fail"), "fail", RRSIGCheckResult{Status: "fail", Broken: true}, false},
+		{"DS check errored (uncertain)", DSCheckResult{Found: true, Status: "error"}, "pass", RRSIGCheckResult{Status: "pass"}, false},
 	}
 	for _, c := range cases {
-		got := bogusWhenDSPresent(c.overall, c.dsFound, c.dnskey, c.rrsig)
+		got := bogusWhenDSPresent(c.ds, DNSKEYCheckResult{Status: c.dnskey}, c.rrsig)
 		if got != c.want {
-			t.Errorf("bogusWhenDSPresent(%q,%v,%q,%q) = %q, want %q",
-				c.overall, c.dsFound, c.dnskey, c.rrsig, got, c.want)
+			t.Errorf("%s: bogusWhenDSPresent = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

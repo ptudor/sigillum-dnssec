@@ -24,7 +24,13 @@ type ValidationResult struct {
 	RRSIGCheck  RRSIGCheckResult  `json:"rrsig_check"`
 	SOACheck    SOACheckResult    `json:"soa_check"`
 	Overall     string            `json:"overall"` // "pass", "fail", "partial", "error"
-	Errors      []string          `json:"errors,omitempty"`
+	// Servfail is the structured verdict "validating resolvers fail this
+	// zone": a proven broken trust chain or unreachable authoritative servers
+	// while the local resolver works (RA6X-032). ResolverOutage marks the
+	// uncertain case where the validator's own resolver did not respond.
+	Servfail       bool     `json:"servfail"`
+	ResolverOutage bool     `json:"resolver_outage"`
+	Errors         []string `json:"errors,omitempty"`
 }
 
 // DSCheckResult holds the result of querying the parent zone for DS records.
@@ -45,15 +51,28 @@ type DNSKEYCheckResult struct {
 	ZSKFound bool     `json:"zsk_found"`
 	AuthNS   string   `json:"auth_ns"`
 	KeyTags  []uint16 `json:"key_tags,omitempty"`
-	Details  string   `json:"details"`
+	// MaterialMatched is true when the served keys were compared by complete
+	// owner-bound key material (flags, algorithm, public key), not by key
+	// tag alone (RA6X-032); false only when no local key could be loaded.
+	MaterialMatched bool   `json:"material_matched"`
+	Details         string `json:"details"`
 }
 
-// RRSIGCheckResult holds the result of checking RRSIG presence on key RR types.
+// RRSIGCheckResult holds the result of verifying the SOA and DNSKEY
+// signatures served by the authoritative nameserver. SOASigned and
+// DNSKEYSigned are true only for a signature that cryptographically verifies
+// over the served RRset under an expected key and is inside its validity
+// window (RA6X-032).
 type RRSIGCheckResult struct {
 	Status       string `json:"status"`
 	SOASigned    bool   `json:"soa_signed"`
 	DNSKEYSigned bool   `json:"dnskey_signed"`
-	Details      string `json:"details"`
+	// Verified reports that cryptographic verification was performed.
+	Verified bool `json:"verified"`
+	// Broken marks a proven defect — a required signature is missing,
+	// expired or does not verify — as opposed to the refresh-window notice.
+	Broken  bool   `json:"broken"`
+	Details string `json:"details"`
 }
 
 // SOACheckResult holds the result of comparing local and remote SOA serials.
@@ -162,8 +181,9 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 		return result
 	}
 
-	// Load actual KSK for DS comparison
-	var localKSK *dns.DNSKEY
+	// Load the actual local key material: DS comparison and served-key
+	// checks bind to complete keys, never to 16-bit tags alone (RA6X-032).
+	var localKSK, localZSK *dns.DNSKEY
 	var localKSKTag uint16
 	var localZSKTag uint16
 
@@ -179,6 +199,12 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 	}
 	if zoneState.ZSK != nil {
 		localZSKTag = zoneState.ZSK.ID
+		zsk, err := keyGen.LoadPublicKey(domain, "zsk")
+		if err != nil {
+			slog.Debug("[VALIDATE] Failed to load ZSK", "domain", domain, "error", err)
+		} else {
+			localZSK = zsk
+		}
 	}
 
 	// Build the set of KSKs whose DS we accept at the parent: the current KSK
@@ -200,6 +226,30 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 	// — we must NOT fail open to "pass" just because some DS exists at the parent.
 	kskUnloadable := zoneState.KSK != nil && len(acceptableKSKs) == 0
 
+	// The keys whose signatures we accept for each role: the current keys plus
+	// the rollover alternatives that legitimately sign during a phase (the old
+	// KSK during a KSK/algorithm rollover; the old ZSK while it still signs or
+	// is still published).
+	signingKSKs := acceptableKSKs
+	var signingZSKs []*dns.DNSKEY
+	if localZSK != nil {
+		signingZSKs = append(signingZSKs, localZSK)
+	}
+	if r := zoneState.Rollover; r != nil {
+		var oldZSKID uint16
+		switch r.Type {
+		case "zsk":
+			oldZSKID = r.OldKeyID
+		case "algorithm":
+			oldZSKID = r.OldZSKID
+		}
+		if oldZSKID != 0 {
+			if oldZSK, err := keyGen.LoadPublicKeyByID(domain, "zsk", oldZSKID); err == nil && oldZSK != nil {
+				signingZSKs = append(signingZSKs, oldZSK)
+			}
+		}
+	}
+
 	// Run checks. The serial the world should see is the published one
 	// (differs from the unsigned serial under serial_policy = "epoch").
 	localSerial := zoneState.Serial
@@ -207,8 +257,8 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 		localSerial = zoneState.PublishedSerial
 	}
 	result.DSCheck = v.CheckDSAtParent(domain, acceptableKSKs, kskUnloadable)
-	result.DNSKEYCheck = v.checkDNSKEYVisible(domain, localKSKTag, localZSKTag)
-	result.RRSIGCheck = v.checkRRSIGPresent(domain, localKSKTag, localZSKTag)
+	result.DNSKEYCheck = v.checkDNSKEYVisible(domain, localKSKTag, localZSKTag, localKSK, localZSK)
+	result.RRSIGCheck = v.checkRRSIGPresent(domain, localKSKTag, localZSKTag, signingKSKs, signingZSKs)
 	result.SOACheck = v.checkSOASerial(domain, localSerial)
 
 	// Compute overall status
@@ -230,18 +280,24 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 		result.SOACheck.Status == "error" {
 		if v.resolverReachable() {
 			result.Overall = "fail"
+			result.Servfail = true
 		} else {
 			result.Overall = "error"
+			result.ResolverOutage = true
 			result.Errors = append(result.Errors,
 				"all checks errored and the local resolver did not respond — this is likely a validator-side resolver problem, not a zone failure")
 		}
 	}
 
 	// Override: a zone whose parent publishes a DS (so resolvers WILL try to
-	// validate it) but whose DNSKEY or RRSIG check fails is bogus/SERVFAIL, not
-	// "partial" (R-048).
-	result.Overall = bogusWhenDSPresent(result.Overall, result.DSCheck.Found,
-		result.DNSKEYCheck.Status, result.RRSIGCheck.Status)
+	// validate it) but whose chain is proven broken — mismatching DS, missing
+	// or unverifiable keys, a required signature missing, expired or invalid
+	// — is bogus/SERVFAIL, not "partial" (R-048, RA6X-032). Uncertainty
+	// (errors) and the refresh-window notice stay partial.
+	if bogusWhenDSPresent(result.DSCheck, result.DNSKEYCheck, result.RRSIGCheck) {
+		result.Overall = "fail"
+		result.Servfail = true
+	}
 
 	return result
 }
@@ -249,11 +305,17 @@ func (v *Validator) ValidateZone(domain string) *ValidationResult {
 // bogusWhenDSPresent downgrades the overall verdict to "fail" when the parent
 // publishes a DS (the zone is meant to validate) but the DNSKEY or RRSIG check
 // failed — a SERVFAIL/bogus condition that must not read as "partial" (R-048).
-func bogusWhenDSPresent(overall string, dsFound bool, dnskeyStatus, rrsigStatus string) string {
-	if dsFound && (dnskeyStatus == "fail" || rrsigStatus == "fail") {
-		return "fail"
+func bogusWhenDSPresent(ds DSCheckResult, dnskey DNSKEYCheckResult, rrsig RRSIGCheckResult) bool {
+	if !ds.Found {
+		return false
 	}
-	return overall
+	if ds.Status == "fail" && !ds.MatchesKSK {
+		return true // the parent's DS authenticates none of our keys
+	}
+	if dnskey.Status == "fail" {
+		return true
+	}
+	return rrsig.Status == "fail" || rrsig.Broken
 }
 
 // CheckDSAtParent queries the parent zone for DS records and compares them to the local KSK.
@@ -361,8 +423,8 @@ func evaluateDSMatch(result DSCheckResult, dsRecords []*dns.DS, acceptableKSKs [
 }
 
 // checkDNSKEYVisible queries the zone's authoritative NS for DNSKEY records.
-func (v *Validator) checkDNSKEYVisible(domain string, kskTag, zskTag uint16) DNSKEYCheckResult {
-	result := DNSKEYCheckResult{Status: "error"}
+func (v *Validator) checkDNSKEYVisible(domain string, kskTag, zskTag uint16, localKSK, localZSK *dns.DNSKEY) DNSKEYCheckResult {
+	result := DNSKEYCheckResult{Status: "error", MaterialMatched: localKSK != nil || localZSK != nil}
 
 	authNS, err := v.resolveNS(dns.Fqdn(domain))
 	if err != nil {
@@ -377,14 +439,26 @@ func (v *Validator) checkDNSKEYVisible(domain string, kskTag, zskTag uint16) DNS
 		return result
 	}
 
+	// A served key counts as ours only when its complete material matches
+	// the local key (owner, flags, algorithm, public key); a key that merely
+	// shares the 16-bit tag is a different key (RA6X-032). Tags are the
+	// fallback only when no local key material could be loaded.
 	for _, rr := range msg.Answer {
 		if dnskey, ok := rr.(*dns.DNSKEY); ok {
 			tag := dnskey.KeyTag()
 			result.KeyTags = append(result.KeyTags, tag)
-			if tag == kskTag {
+			if localKSK != nil {
+				if sameKeyMaterial(dnskey, localKSK) {
+					result.KSKFound = true
+				}
+			} else if tag == kskTag {
 				result.KSKFound = true
 			}
-			if tag == zskTag {
+			if localZSK != nil {
+				if sameKeyMaterial(dnskey, localZSK) {
+					result.ZSKFound = true
+				}
+			} else if tag == zskTag {
 				result.ZSKFound = true
 			}
 		}
@@ -415,53 +489,106 @@ func (v *Validator) checkDNSKEYVisible(domain string, kskTag, zskTag uint16) DNS
 }
 
 // checkRRSIGPresent checks that SOA and DNSKEY have RRSIG records at the authoritative NS.
-// rrsigEval summarizes the RRSIGs covering one type in an answer.
+// rrsigEval summarizes the RRSIGs covering one RRset in an answer.
 type rrsigEval struct {
-	present    bool      // an RRSIG covering the type exists at all
-	valid      bool      // ...and one is within its validity window (matching the known key tag, if any)
-	expired    bool      // present but all out of window (expired or not-yet-valid)
+	present    bool      // an RRSIG covering the type by an expected key exists at all
+	valid      bool      // ...and one verifies cryptographically over the served RRset inside its validity window
+	expired    bool      // present, verifying, but ALL out of window (expired or not-yet-valid)
+	broken     bool      // present and in window, but none verifies over the served RRset
 	validExp   time.Time // expiration of the valid signature found (when valid)
 	expiredExp time.Time // earliest expiration among out-of-window sigs (for messaging)
 }
 
-// evalRRSIGCover inspects the RRSIGs covering `covered` in an answer. An RRSIG
-// only counts as valid when it is temporally in-window (RFC 1982 arithmetic via
-// ValidityPeriod) and, when the signing key tag is known, its KeyTag matches —
-// so an expired or foreign-key signature never reads as "signed" (R-012).
-func evalRRSIGCover(answer []dns.RR, covered uint16, wantTag uint16, now time.Time) rrsigEval {
+// sameKeyMaterial reports whether two DNSKEYs are the same key: same owner,
+// flags, protocol, algorithm and public key.
+func sameKeyMaterial(a, b *dns.DNSKEY) bool {
+	return a != nil && b != nil &&
+		dns.CanonicalName(a.Hdr.Name) == dns.CanonicalName(b.Hdr.Name) &&
+		a.Flags == b.Flags && a.Protocol == b.Protocol && a.Algorithm == b.Algorithm &&
+		a.PublicKey == b.PublicKey
+}
+
+// evalRRSIGCover inspects the RRSIGs covering `covered` at the RRset's owner
+// in an answer and verifies them cryptographically over the served RRset
+// (RA6X-032). Only signatures by one of `keys` (complete key material) are
+// considered; callers without local keys pass the served DNSKEY RRset. A
+// signature counts as valid only when it is temporally in window (RFC 1982
+// arithmetic via ValidityPeriod), its owner and signer name are the RRset's
+// owner, and Verify succeeds over the complete served RRset — so an expired,
+// foreign, corrupt or empty signature never reads as "signed" (R-012).
+func evalRRSIGCover(answer []dns.RR, covered uint16, keys []*dns.DNSKEY, now time.Time) rrsigEval {
 	var e rrsigEval
+	// The served RRset, bound to one owner.
+	var rrset []dns.RR
+	var owner string
+	for _, rr := range answer {
+		if rr.Header().Rrtype != covered {
+			continue
+		}
+		if owner == "" {
+			owner = dns.CanonicalName(rr.Header().Name)
+		}
+		if dns.CanonicalName(rr.Header().Name) != owner {
+			continue
+		}
+		rrset = append(rrset, rr)
+	}
+	if len(rrset) == 0 {
+		return e
+	}
 	for _, rr := range answer {
 		rrsig, ok := rr.(*dns.RRSIG)
 		if !ok || rrsig.TypeCovered != covered {
 			continue
 		}
-		if wantTag != 0 && rrsig.KeyTag != wantTag {
+		if dns.CanonicalName(rrsig.Hdr.Name) != owner || dns.CanonicalName(rrsig.SignerName) != owner {
+			continue // a signature over another owner or from another signer is not this RRset's
+		}
+		var key *dns.DNSKEY
+		for _, k := range keys {
+			if k != nil && k.KeyTag() == rrsig.KeyTag && k.Algorithm == rrsig.Algorithm {
+				key = k
+				break
+			}
+		}
+		if key == nil {
 			continue // signed by a key we don't recognize as this zone's — don't count it
 		}
 		e.present = true
 		exp := time.Unix(int64(rrsig.Expiration), 0).UTC()
-		if rrsig.ValidityPeriod(now) {
-			e.valid = true
-			e.validExp = exp
-			// RFC 4035 §5.3.3: resolvers accept an RRset when ANY one of its
-			// RRSIGs validates, so a valid signature supersedes any expired
-			// one seen earlier in the answer — keep the documented invariant
-			// that expired means "present but ALL out of window" regardless
-			// of RR order.
-			e.expired = false
-			e.expiredExp = time.Time{}
-			return e
+		if !rrsig.ValidityPeriod(now) {
+			if !e.valid {
+				e.expired = true
+				if e.expiredExp.IsZero() || exp.Before(e.expiredExp) {
+					e.expiredExp = exp
+				}
+			}
+			continue
 		}
-		e.expired = true
-		if e.expiredExp.IsZero() || exp.Before(e.expiredExp) {
-			e.expiredExp = exp
+		if err := rrsig.Verify(key, rrset); err != nil {
+			if !e.valid {
+				e.broken = true
+			}
+			continue
 		}
+		e.valid = true
+		e.validExp = exp
+		// RFC 4035 §5.3.3: resolvers accept an RRset when ANY one of its
+		// RRSIGs validates, so a valid signature supersedes any expired or
+		// broken one seen earlier in the answer — keep the documented
+		// invariant that expired/broken mean "ALL signatures" regardless of
+		// RR order.
+		e.expired = false
+		e.broken = false
+		e.expiredExp = time.Time{}
+		return e
 	}
 	return e
 }
 
-func (v *Validator) checkRRSIGPresent(domain string, kskTag, zskTag uint16) RRSIGCheckResult {
+func (v *Validator) checkRRSIGPresent(domain string, kskTag, zskTag uint16, kskKeys, zskKeys []*dns.DNSKEY) RRSIGCheckResult {
 	result := RRSIGCheckResult{Status: "error"}
+	_, _ = kskTag, zskTag
 
 	authNS, err := v.resolveNS(dns.Fqdn(domain))
 	if err != nil {
@@ -477,24 +604,51 @@ func (v *Validator) checkRRSIGPresent(domain string, kskTag, zskTag uint16) RRSI
 		result.Details = fmt.Sprintf("SOA query to %s failed: %v", authNS, err)
 		return result
 	}
-	soa := evalRRSIGCover(soaMsg.Answer, dns.TypeSOA, zskTag, now)
-
 	dnskeyMsg, err := queryDirect(authNS, dns.Fqdn(domain), dns.TypeDNSKEY, v.timeout)
 	if err != nil {
 		result.Details = fmt.Sprintf("DNSKEY query to %s failed: %v", authNS, err)
 		return result
 	}
-	dnskey := evalRRSIGCover(dnskeyMsg.Answer, dns.TypeDNSKEY, kskTag, now)
+
+	// Signatures are verified with the local key material for each role.
+	// Without local keys the served DNSKEY RRset is the only key source; the
+	// result then proves consistency of what is served, not that it is ours.
+	if len(kskKeys) == 0 || len(zskKeys) == 0 {
+		var served []*dns.DNSKEY
+		for _, rr := range dnskeyMsg.Answer {
+			if k, ok := rr.(*dns.DNSKEY); ok {
+				served = append(served, k)
+			}
+		}
+		if len(kskKeys) == 0 {
+			kskKeys = served
+		}
+		if len(zskKeys) == 0 {
+			zskKeys = served
+		}
+	}
+	result.Verified = true
+	soa := evalRRSIGCover(soaMsg.Answer, dns.TypeSOA, zskKeys, now)
+	dnskey := evalRRSIGCover(dnskeyMsg.Answer, dns.TypeDNSKEY, kskKeys, now)
 
 	result.SOASigned = soa.valid
 	result.DNSKEYSigned = dnskey.valid
 
-	// An out-of-window RRSIG is the single most common DNSSEC outage and the whole
-	// point of this check: a present-but-expired signature is a hard fail naming
-	// the expiry, not a silent pass.
+	// An out-of-window or non-verifying RRSIG is a hard fail naming the
+	// cause, not a silent pass; a missing required signature is a proven
+	// defect too (Broken) even though one of the two RRsets validates.
 	switch {
+	case soa.broken || dnskey.broken:
+		result.Status = "fail"
+		result.Broken = true
+		which := "SOA"
+		if !soa.broken {
+			which = "DNSKEY"
+		}
+		result.Details = fmt.Sprintf("RRSIG over %s is present and in window but does not verify against the served RRset and expected key; resolvers will SERVFAIL", which)
 	case soa.expired || dnskey.expired:
 		result.Status = "fail"
+		result.Broken = true
 		exp := soa.expiredExp
 		if exp.IsZero() || (!dnskey.expiredExp.IsZero() && dnskey.expiredExp.Before(exp)) {
 			exp = dnskey.expiredExp
@@ -517,6 +671,7 @@ func (v *Validator) checkRRSIGPresent(domain string, kskTag, zskTag uint16) RRSI
 		}
 	case soa.valid || dnskey.valid:
 		result.Status = "partial"
+		result.Broken = true // one required signature is missing: with a DS at the parent this is bogus
 		missing := "DNSKEY"
 		if !soa.valid {
 			missing = "SOA"
@@ -524,6 +679,7 @@ func (v *Validator) checkRRSIGPresent(domain string, kskTag, zskTag uint16) RRSI
 		result.Details = fmt.Sprintf("valid RRSIG missing for %s", missing)
 	default:
 		result.Status = "fail"
+		result.Broken = true
 		result.Details = "no valid RRSIG records found for SOA or DNSKEY"
 	}
 

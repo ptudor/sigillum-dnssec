@@ -148,7 +148,7 @@ func deleteZoneMetrics(domain string) {
 }
 
 // UpdateZoneMetrics updates all zone-related metrics from state
-func UpdateZoneMetrics(state *statepkg.State) {
+func UpdateZoneMetrics(state *statepkg.State, configured ...string) {
 	// Operate on a consistent deep-copied snapshot so we never read live zone
 	// state while the signing goroutine mutates it, and never hold the state
 	// lock across the Prometheus gauge updates below.
@@ -156,6 +156,15 @@ func UpdateZoneMetrics(state *statepkg.State) {
 
 	var total, healthy, actionRequired, warning, errors int
 	current := make(map[string]struct{}, len(zones))
+
+	// A configured zone with no state entry never initialized (RA6X-033): it
+	// counts as a zone in error rather than disappearing from every gauge.
+	for _, domain := range configured {
+		if _, ok := zones[domain]; !ok {
+			total++
+			errors++
+		}
+	}
 
 	for domain, zone := range zones {
 		total++
