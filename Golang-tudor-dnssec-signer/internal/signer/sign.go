@@ -344,8 +344,19 @@ func (k *signingKeys) validateConsistency() error {
 func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneState *statepkg.ZoneState) (*signingKeys, error) {
 	keys := &signingKeys{}
 
+	// The persisted state names the generation each live slot must hold
+	// (RA6X-002). Loading by role alone would accept whatever file is there —
+	// after a rollover interrupted between its state save and its activation,
+	// that is the wrong generation. EnsureLiveKey checks the live pair's tag
+	// against the record and re-activates the recorded generation from its
+	// tag-named copy when they differ, failing closed when it cannot.
+	expectedKSK, expectedZSK, err := expectedLiveKeyTags(zoneState)
+	if err != nil {
+		return nil, err
+	}
+
 	// Load current KSK
-	ksk, kskPriv, err := keyGen.LoadKeyPair(domain, "ksk")
+	ksk, kskPriv, err := keyGen.EnsureLiveKey(domain, "ksk", expectedKSK)
 	if err != nil {
 		return nil, fmt.Errorf("loading KSK: %w", err)
 	}
@@ -354,7 +365,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 	keys.signingKSKPs = append(keys.signingKSKPs, kskPriv)
 
 	// Load current ZSK
-	zsk, zskPriv, err := keyGen.LoadKeyPair(domain, "zsk")
+	zsk, zskPriv, err := keyGen.EnsureLiveKey(domain, "zsk", expectedZSK)
 	if err != nil {
 		return nil, fmt.Errorf("loading ZSK: %w", err)
 	}
@@ -385,9 +396,9 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 			// ZSK pre-publish: publish BOTH old and new ZSK in the DNSKEY
 			// RRset, but continue signing every non-DNSKEY RRset with the OLD
 			// ZSK. The new ZSK is already in keys.dnskeys via the
-			// LoadKeyPair("zsk") call above (SaveKeyFiles renamed the old
-			// key file aside when the rollover started, so the *.zsk.key
-			// path now resolves to the new key). Append the OLD ZSK so the
+			// EnsureLiveKey("zsk") call above (the live *.zsk.key slot holds
+			// the NEW key during pre-publish; expectedLiveKeyTags names it
+			// from Rollover.NewKeyID). Append the OLD ZSK so the
 			// signing key's keytag actually appears in the published RRset
 			// — without this, RRSIGs reference a DNSKEY that isn't there
 			// and every validating resolver returns bogus.
@@ -452,6 +463,23 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 		return nil, fmt.Errorf("internal key state for %s: %w", domain, err)
 	}
 	return keys, nil
+}
+
+// expectedLiveKeyTags returns the key tags the live KSK and ZSK slots must hold
+// according to the persisted zone state. The live KSK is always KeyState.ID.
+// The live ZSK is KeyState.ID except during ZSK pre-publish, when the zone
+// keeps signing with the old key (still KeyState.ID) while the live slot
+// already holds the pre-published new key named by Rollover.NewKeyID.
+func expectedLiveKeyTags(zoneState *statepkg.ZoneState) (ksk, zsk uint16, err error) {
+	if zoneState.KSK == nil || zoneState.ZSK == nil {
+		return 0, 0, fmt.Errorf("zone state names no KSK/ZSK to sign with")
+	}
+	ksk = zoneState.KSK.ID
+	zsk = zoneState.ZSK.ID
+	if r := zoneState.Rollover; r != nil && r.Type == "zsk" && r.State == statepkg.ZSKRolloverStatePrePublish {
+		zsk = r.NewKeyID
+	}
+	return ksk, zsk, nil
 }
 
 const (
@@ -1058,8 +1086,8 @@ func (s *Signer) signRRSIG(rrsig *dns.RRSIG, rrset []dns.RR, key *dns.DNSKEY, pr
 		switch len(privateKey) {
 		case ed25519.SeedSize: // 32-byte seed
 			edKey = ed25519.NewKeyFromSeed(privateKey)
-		case ed25519.PrivateKeySize: // 64-byte expanded key
-			edKey = ed25519.PrivateKey(privateKey)
+		case ed25519.PrivateKeySize: // 64-byte expanded key: derive from its seed (RA6X-030)
+			edKey = ed25519.NewKeyFromSeed(privateKey[:ed25519.SeedSize])
 		default:
 			return fmt.Errorf("invalid ED25519 private key length %d (want %d or %d)", len(privateKey), ed25519.SeedSize, ed25519.PrivateKeySize)
 		}
