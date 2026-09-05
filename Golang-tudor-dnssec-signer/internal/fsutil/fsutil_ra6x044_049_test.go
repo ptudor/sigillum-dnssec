@@ -145,3 +145,93 @@ func TestRA6X049_DurabilityOutcomes(t *testing.T) {
 		t.Fatalf("SyncDir on a temp dir: %v", err)
 	}
 }
+
+// withFailingDirSync makes every directory fsync fail with err for the test.
+func withFailingDirSync(t *testing.T, err error) {
+	t.Helper()
+	prev := syncDirFn
+	syncDirFn = func(string) error { return err }
+	t.Cleanup(func() { syncDirFn = prev })
+}
+
+// RA6X-049 at the write helpers, not just the helper types: a directory fsync
+// that fails AFTER the rename must leave the new bytes in place (the rename
+// succeeded — that file is the current generation) and report the uncertainty
+// as a *DurabilityError, so callers reconcile with the visible generation
+// instead of rolling back a file that is already live.
+//
+// TestRA6X049_DurabilityOutcomes above covers the classification helpers; this
+// covers the contract the callers actually depend on.
+func TestRA6X049_WriteHelpersReportCommittedButUnsynced(t *testing.T) {
+	withFailingDirSync(t, syscall.EIO)
+
+	t.Run("WriteFileAtomicOwned", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "zone.signed")
+		if err := os.WriteFile(path, []byte("old"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		err := WriteFileAtomicOwned(path, []byte("new"), 0644)
+		if err == nil {
+			t.Fatal("a failed directory fsync must be reported, not discarded")
+		}
+		if !IsCommitted(err) {
+			t.Fatalf("a post-rename sync failure must be a committed write, got %v", err)
+		}
+		got, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(got) != "new" {
+			t.Fatalf("the replacement is visible and must be kept; file holds %q", got)
+		}
+		assertNoTempLeft(t, dir, "zone.signed")
+	})
+
+	t.Run("CopyFile", func(t *testing.T) {
+		dir := t.TempDir()
+		src := filepath.Join(dir, "src.key")
+		dst := filepath.Join(dir, "dst.key")
+		if err := os.WriteFile(src, []byte("material"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		err := CopyFile(src, dst)
+		if err == nil {
+			t.Fatal("a failed directory fsync must be reported, not discarded")
+		}
+		if !IsCommitted(err) {
+			t.Fatalf("a post-rename sync failure must be a committed write, got %v", err)
+		}
+		got, readErr := os.ReadFile(dst)
+		if readErr != nil {
+			t.Fatalf("the copy is in place and must be kept: %v", readErr)
+		}
+		if string(got) != "material" {
+			t.Fatalf("copied bytes = %q, want %q", got, "material")
+		}
+	})
+
+	t.Run("pre-rename failures are not committed", func(t *testing.T) {
+		dir := t.TempDir()
+		// A source that cannot be read fails before anything is renamed.
+		if err := CopyFile(filepath.Join(dir, "missing"), filepath.Join(dir, "dst")); err == nil {
+			t.Fatal("copying a missing source must fail")
+		} else if IsCommitted(err) {
+			t.Fatalf("a pre-rename failure must not be reported as committed: %v", err)
+		}
+	})
+}
+
+// assertNoTempLeft fails if the atomic-write temp file survived.
+func assertNoTempLeft(t *testing.T, dir, base string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != base {
+			t.Fatalf("staged file %q left behind in %s", e.Name(), dir)
+		}
+	}
+}
