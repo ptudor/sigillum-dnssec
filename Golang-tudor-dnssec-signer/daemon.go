@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -518,7 +517,7 @@ func (d *Daemon) signAllZones() {
 	// (one per zone) into exactly one, at the cost of losing the per-zone
 	// DNSSEC_DOMAIN env var. Consumers get DNSSEC_DOMAINS (space-list) and
 	// DNSSEC_BATCH_SIZE instead.
-	var signedDomains []string
+	var signedZones []SignedZoneRef
 signLoop:
 	for domain := range snap.cfg.Zones {
 		// Stop promptly on shutdown rather than iterating every remaining zone
@@ -527,12 +526,12 @@ signLoop:
 		// are persisted and their reload fires (R-019).
 		select {
 		case <-d.ctx.Done():
-			slog.Info("[DAEMON] Shutdown requested; ending signing cycle early", "signed", len(signedDomains))
+			slog.Info("[DAEMON] Shutdown requested; ending signing cycle early", "signed", len(signedZones))
 			break signLoop
 		default:
 		}
 		if d.checkAndSignZoneSafe(snap, domain) {
-			signedDomains = append(signedDomains, domain)
+			signedZones = append(signedZones, signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path))
 		}
 	}
 
@@ -583,8 +582,8 @@ rolloverLoop:
 
 	// Fire the coalesced post-sign hook after state is saved — this way
 	// any consumer that introspects state.json sees the just-signed zones.
-	if snap.cfg.Hooks.CoalescePostSign && len(signedDomains) > 0 {
-		executeBatchHook(&snap.cfg.Hooks, signedDomains, snap.cfg.OutputDir, &d.hookWG)
+	if snap.cfg.Hooks.CoalescePostSign && len(signedZones) > 0 {
+		_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir, signedZones, &d.hookWG)
 	}
 
 	// Update Prometheus metrics
@@ -685,15 +684,8 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// Execute per-zone post-sign hook only when NOT coalescing — the caller
 	// will fire one batched hook at end-of-cycle when coalesce is on.
 	if !snap.cfg.Hooks.CoalescePostSign {
-		if snap.cfg.Hooks.PostSign != "" || len(snap.cfg.Hooks.PostSignCmd) > 0 {
-			hookEnv := &HookEnv{
-				Domain:     domain,
-				ZonePath:   zoneCfg.Path,
-				SignedPath: filepath.Join(snap.cfg.OutputDir, domain+".zone.signed"),
-				OutputDir:  snap.cfg.OutputDir,
-			}
-			executeHook(&snap.cfg.Hooks, hookEnv, &d.hookWG)
-		}
+		_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir,
+			[]SignedZoneRef{signedRef(snap.cfg, domain, zoneCfg.Path)}, &d.hookWG)
 	}
 
 	return true, nil

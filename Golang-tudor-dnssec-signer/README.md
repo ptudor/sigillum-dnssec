@@ -337,9 +337,24 @@ of once per zone, receiving `DNSSEC_DOMAINS` (space-separated list) and
 
 The hook also runs after CLI commands that write a signed zone (`sign`,
 `resign`, `add`, `import`, `rollover start/complete/algorithm`), synchronously,
-so the nameserver picks up the new output before the command exits.
+so the nameserver picks up the new output before the command exits. The CLI
+follows the same contract as the daemon: with `coalesce_post_sign = true` one
+invocation receives `DNSSEC_DOMAINS`/`DNSSEC_BATCH_SIZE` for every zone the
+command signed (a single-zone command still gets the batch variables);
+otherwise each signed zone gets its own invocation with the per-zone
+variables. Zones that failed to sign are never handed to the hook, a command
+that signed nothing runs no hook, and any `DNSSEC_*` variable inherited from
+the parent environment is stripped so a script cannot read a stale value.
+`sign` exits non-zero when the hook fails (the zones are signed, but may not
+be served yet).
 
-**Note:** Hooks have a 30-second timeout. If your hook needs longer (e.g., zone transfers to secondaries), consider having the hook trigger an async process instead.
+**Note:** Hooks have a 30-second timeout. When it expires the hook's whole
+process group is sent SIGTERM, then SIGKILL two seconds later, and the wait
+for its output pipes is bounded — a background child that inherited the pipes
+cannot hold the signer past the timeout. A descendant that starts its own
+session (`setsid`, a daemonizing service) is outside that group and must
+manage its own lifetime. If your hook needs longer (e.g., zone transfers to
+secondaries), have it trigger an asynchronous process instead.
 
 ## BIND Integration
 

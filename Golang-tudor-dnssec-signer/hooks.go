@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +18,39 @@ import (
 	"github.com/ptudor/dnssec-tudor/internal/metrics"
 )
 
+// Hook execution (RA6X-034 lifecycle bounds, RA6X-043 shared CLI/daemon
+// contract).
+//
+// A post-sign hook runs after zones were signed successfully. The daemon fires
+// it asynchronously (tracked on a wait group so shutdown waits for it) and the
+// CLI fires it synchronously (an async hook would be killed when the process
+// exits). Both use the same invocation semantics (firePostSignHooks): with
+// coalesce_post_sign the hook runs once per pass with DNSSEC_DOMAINS and
+// DNSSEC_BATCH_SIZE for the zones that signed; otherwise once per signed zone
+// with the per-zone variables. Inherited DNSSEC_* variables are always
+// stripped so a script cannot read stale values from the parent environment,
+// and a pass that signed nothing runs no hook.
+//
+// Every hook is bounded: the command gets hookTimeout, its process group is
+// terminated (then killed) when that expires, and the wait for its stdout and
+// stderr pipes is bounded by hookWaitDelay so a descendant that inherited the
+// pipes cannot hold the caller past the timeout.
+
+var (
+	// hookTimeout bounds one hook invocation. Package variables (not
+	// constants) so tests can shorten them.
+	hookTimeout = 30 * time.Second
+	// hookWaitDelay bounds how long Run waits for the hook's output pipes to
+	// close after the process was cancelled or exited: a descendant holding
+	// the inherited stderr pipe would otherwise block indefinitely.
+	hookWaitDelay = 5 * time.Second
+	// hookKillGrace is how long a timed-out process group gets to react to
+	// SIGTERM before it is killed.
+	hookKillGrace = 2 * time.Second
+)
+
 // maxHookStderr bounds how many bytes of a hook's stderr are retained. A broken
-// hook that writes stderr continuously for up to the 30s timeout could otherwise
+// hook that writes stderr continuously for up to the timeout could otherwise
 // allocate an unbounded bytes.Buffer and OOM the daemon (R-023). 64 KiB is ample
 // for a diagnostic prefix.
 const maxHookStderr = 64 * 1024
@@ -55,12 +88,30 @@ func (c *cappedBuffer) String() string {
 	return s
 }
 
-// HookEnv contains environment variables passed to hooks
+// HookEnv contains environment variables passed to a per-zone hook.
 type HookEnv struct {
 	Domain     string // The domain that was signed
 	ZonePath   string // Path to the unsigned zone file
 	SignedPath string // Path to the signed zone file
 	OutputDir  string // Output directory for signed zones
+}
+
+// SignedZoneRef identifies one zone a signing pass published: what the hook
+// contract needs to describe it.
+type SignedZoneRef struct {
+	Domain     string
+	ZonePath   string
+	SignedPath string
+}
+
+// signedRef builds the hook reference for a zone from its source path and the
+// configured output directory.
+func signedRef(cfg *config.Config, domain, zonePath string) SignedZoneRef {
+	return SignedZoneRef{
+		Domain:     domain,
+		ZonePath:   zonePath,
+		SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
+	}
 }
 
 // hookCmd returns the command name and arguments for a hook, along with a
@@ -85,168 +136,186 @@ func hookCmd(hooks *config.HooksConfig) (name string, args []string, identity st
 	return parts[0], parts[1:], "post_sign", true
 }
 
-// executeHook runs a post-sign hook command asynchronously with environment variables.
-// Log messages contain the hook identity (e.g., "post_sign") and outcome only—
-// raw command strings are never logged. When wg is non-nil (the daemon path) the
-// goroutine is tracked on it so shutdown can wait for the hook to finish before
-// the process exits (R-026); CLI callers pass nil.
-func executeHook(hooks *config.HooksConfig, env *HookEnv, wg *sync.WaitGroup) {
-	name, args, identity, ok := hookCmd(hooks)
-	if !ok {
-		return
-	}
-
-	if wg != nil {
-		wg.Add(1)
-	}
-	go func() {
-		if wg != nil {
-			defer wg.Done()
-		}
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "hook", identity, "domain", env.Domain)
-			}
-		}()
-
-		startTime := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		slog.Debug("[HOOK] Executing hook", "hook", identity, "domain", env.Domain)
-
-		command := exec.CommandContext(ctx, name, args...)
-		command.Stdout = io.Discard
-
-		// Capture a BOUNDED prefix of stderr for error reporting: a broken hook that
-		// writes continuously must not allocate until the daemon is killed (R-023).
-		stderrBuf := &cappedBuffer{max: maxHookStderr}
-		command.Stderr = stderrBuf
-
-		// Set environment variables for the hook
-		command.Env = append(os.Environ(),
-			fmt.Sprintf("DNSSEC_DOMAIN=%s", env.Domain),
-			fmt.Sprintf("DNSSEC_ZONE_PATH=%s", env.ZonePath),
-			fmt.Sprintf("DNSSEC_SIGNED_PATH=%s", env.SignedPath),
-			fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", env.OutputDir),
-		)
-
-		if err := command.Run(); err != nil {
-			duration := time.Since(startTime).Seconds()
-			metrics.RecordHookExecution("post_sign", duration, false)
-			stderr := strings.TrimSpace(stderrBuf.String())
-			if ctx.Err() == context.DeadlineExceeded {
-				slog.Error("[HOOK] Hook timed out", "hook", identity, "domain", env.Domain)
-			} else if stderr != "" {
-				slog.Error("[HOOK] Hook failed", "hook", identity, "domain", env.Domain, "error", err, "stderr", stderr)
-			} else {
-				slog.Error("[HOOK] Hook failed", "hook", identity, "domain", env.Domain, "error", err)
-			}
-			return
-		}
-
-		duration := time.Since(startTime).Seconds()
-		metrics.RecordHookExecution("post_sign", duration, true)
-		slog.Debug("[HOOK] Hook completed successfully", "hook", identity, "domain", env.Domain, "duration_ms", int64(duration*1000))
-	}()
+// hookConfigured reports whether a post-sign hook is set.
+func hookConfigured(hooks *config.HooksConfig) bool {
+	_, _, _, ok := hookCmd(hooks)
+	return ok
 }
 
-// executeBatchHook runs a post-sign hook once for a batch of signed
-// domains. Used by the daemon when coalesce_post_sign is enabled so a
-// single cycle that signs N zones produces one hook invocation rather
-// than N. The hook receives `DNSSEC_DOMAINS` (space-separated) instead
-// of the per-zone `DNSSEC_DOMAIN` — consumers like `nsd-control reload`
-// don't need per-zone paths, and a full reload is cheaper than N
-// targeted reloads at scale. A zero-length domains slice is a no-op.
-func executeBatchHook(hooks *config.HooksConfig, domains []string, outputDir string, wg *sync.WaitGroup) {
-	name, args, identity, ok := hookCmd(hooks)
-	if !ok || len(domains) == 0 {
-		return
-	}
-
-	if wg != nil {
-		wg.Add(1)
-	}
-	go func() {
-		if wg != nil {
-			defer wg.Done()
+// hookEnviron builds a hook's environment: the parent environment with every
+// inherited DNSSEC_* variable removed, plus exactly the variables of the
+// invocation mode, so a script never reads a stale or opposite-mode value.
+func hookEnviron(vars ...string) []string {
+	env := make([]string, 0, len(os.Environ())+len(vars))
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "DNSSEC_") {
+			continue
 		}
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("[HOOK] Panic in post-sign hook", "panic", r, "hook", identity, "batch_size", len(domains))
-			}
-		}()
-
-		startTime := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		slog.Debug("[HOOK] Executing batched hook", "hook", identity, "batch_size", len(domains))
-
-		command := exec.CommandContext(ctx, name, args...)
-		command.Stdout = io.Discard
-		// Bounded stderr capture (R-023): a runaway batch hook must not exhaust memory.
-		stderrBuf := &cappedBuffer{max: maxHookStderr}
-		command.Stderr = stderrBuf
-
-		// DNSSEC_DOMAINS is the batched counterpart of DNSSEC_DOMAIN.
-		// Consumers that used $DNSSEC_DOMAIN in per-zone hooks need to
-		// switch to iterating $DNSSEC_DOMAINS, or just issue a reload-all.
-		command.Env = append(os.Environ(),
-			fmt.Sprintf("DNSSEC_DOMAINS=%s", strings.Join(domains, " ")),
-			fmt.Sprintf("DNSSEC_BATCH_SIZE=%d", len(domains)),
-			fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", outputDir),
-		)
-
-		if err := command.Run(); err != nil {
-			duration := time.Since(startTime).Seconds()
-			metrics.RecordHookExecution("post_sign_batch", duration, false)
-			stderr := strings.TrimSpace(stderrBuf.String())
-			if ctx.Err() == context.DeadlineExceeded {
-				slog.Error("[HOOK] Batched hook timed out", "hook", identity, "batch_size", len(domains))
-			} else if stderr != "" {
-				slog.Error("[HOOK] Batched hook failed", "hook", identity, "batch_size", len(domains), "error", err, "stderr", stderr)
-			} else {
-				slog.Error("[HOOK] Batched hook failed", "hook", identity, "batch_size", len(domains), "error", err)
-			}
-			return
-		}
-
-		duration := time.Since(startTime).Seconds()
-		metrics.RecordHookExecution("post_sign_batch", duration, true)
-		slog.Debug("[HOOK] Batched hook completed", "hook", identity, "batch_size", len(domains), "duration_ms", int64(duration*1000))
-	}()
+		env = append(env, kv)
+	}
+	return append(env, vars...)
 }
 
-// executeHookSync runs a hook synchronously and returns the error.
-// Used for CLI commands, which must wait for completion — an async hook
-// spawned from a CLI command would be killed when the process exits.
-// env may be nil; when set, the same DNSSEC_* variables the daemon's
-// per-zone hook receives are exported.
-func executeHookSync(hooks *config.HooksConfig, env *HookEnv) error {
-	name, args, identity, ok := hookCmd(hooks)
-	if !ok {
-		return nil
+func perZoneVars(env *HookEnv) []string {
+	return []string{
+		fmt.Sprintf("DNSSEC_DOMAIN=%s", env.Domain),
+		fmt.Sprintf("DNSSEC_ZONE_PATH=%s", env.ZonePath),
+		fmt.Sprintf("DNSSEC_SIGNED_PATH=%s", env.SignedPath),
+		fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", env.OutputDir),
 	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func batchVars(domains []string, outputDir string) []string {
+	return []string{
+		fmt.Sprintf("DNSSEC_DOMAINS=%s", strings.Join(domains, " ")),
+		fmt.Sprintf("DNSSEC_BATCH_SIZE=%d", len(domains)),
+		fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", outputDir),
+	}
+}
+
+// errHookTimeout marks a hook that exceeded hookTimeout.
+var errHookTimeout = errors.New("hook timed out")
+
+// runHook runs one hook invocation to completion with bounded lifetime: the
+// command is started in its own process group, cancelled as a group when
+// hookTimeout expires (terminate, then kill after hookKillGrace), and the
+// output pipes are waited on for at most hookWaitDelay after that. stderr is
+// captured as a bounded prefix and returned with the error.
+func runHook(hooks *config.HooksConfig, env []string, stdout io.Writer) (stderr string, err error) {
+	name, args, _, ok := hookCmd(hooks)
+	if !ok {
+		return "", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 	defer cancel()
 
-	slog.Debug("[HOOK] Executing hook synchronously", "hook", identity)
-
 	command := exec.CommandContext(ctx, name, args...)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if env != nil {
-		command.Env = append(os.Environ(),
-			fmt.Sprintf("DNSSEC_DOMAIN=%s", env.Domain),
-			fmt.Sprintf("DNSSEC_ZONE_PATH=%s", env.ZonePath),
-			fmt.Sprintf("DNSSEC_SIGNED_PATH=%s", env.SignedPath),
-			fmt.Sprintf("DNSSEC_OUTPUT_DIR=%s", env.OutputDir),
-		)
-	}
+	command.Stdout = stdout
+	// Capture a BOUNDED prefix of stderr for error reporting: a broken hook that
+	// writes continuously must not allocate until the daemon is killed (R-023).
+	stderrBuf := &cappedBuffer{max: maxHookStderr}
+	command.Stderr = stderrBuf
+	command.Env = env
+	command.WaitDelay = hookWaitDelay
+	configureHookProcess(command)
 
-	return command.Run()
+	runErr := command.Run()
+	stderr = strings.TrimSpace(stderrBuf.String())
+	if runErr == nil {
+		return stderr, nil
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return stderr, fmt.Errorf("%w after %s: %v", errHookTimeout, hookTimeout, runErr)
+	}
+	return stderr, runErr
 }
 
-// copyFile copies a file from src to dst, preserving permissions
+// logHookResult records the outcome of one hook invocation.
+func logHookResult(kind, identity string, attrs []any, stderr string, err error, start time.Time) {
+	duration := time.Since(start).Seconds()
+	metrics.RecordHookExecution(kind, duration, err == nil)
+	fields := append([]any{"hook", identity}, attrs...)
+	switch {
+	case err == nil:
+		slog.Debug("[HOOK] Hook completed", append(fields, "duration_ms", int64(duration*1000))...)
+	case errors.Is(err, errHookTimeout):
+		slog.Error("[HOOK] Hook timed out; its process group was terminated", append(fields, "error", err)...)
+	case stderr != "":
+		slog.Error("[HOOK] Hook failed", append(fields, "error", err, "stderr", stderr)...)
+	default:
+		slog.Error("[HOOK] Hook failed", append(fields, "error", err)...)
+	}
+}
+
+// firePostSignHooks applies the post-sign hook contract to the zones a pass
+// signed successfully (RA6X-043). With coalescing, one batch invocation
+// receives every domain (even a single one); otherwise each zone gets its own
+// invocation with its exact source and output paths. When wg is non-nil the
+// invocations run asynchronously and are tracked on it (the daemon); when it
+// is nil they run synchronously and the first failure is returned (the CLI).
+// A pass that signed nothing runs no hook.
+func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []SignedZoneRef, wg *sync.WaitGroup) error {
+	if !hookConfigured(hooks) || len(signed) == 0 {
+		return nil
+	}
+	_, _, identity, _ := hookCmd(hooks)
+
+	type invocation struct {
+		kind  string
+		env   []string
+		attrs []any
+	}
+	var invocations []invocation
+	if hooks.CoalescePostSign {
+		domains := make([]string, len(signed))
+		for i, z := range signed {
+			domains[i] = z.Domain
+		}
+		invocations = append(invocations, invocation{
+			kind:  "post_sign_batch",
+			env:   hookEnviron(batchVars(domains, outputDir)...),
+			attrs: []any{"batch_size", len(domains)},
+		})
+	} else {
+		for _, z := range signed {
+			invocations = append(invocations, invocation{
+				kind:  "post_sign",
+				env:   hookEnviron(perZoneVars(&HookEnv{Domain: z.Domain, ZonePath: z.ZonePath, SignedPath: z.SignedPath, OutputDir: outputDir})...),
+				attrs: []any{"domain", z.Domain},
+			})
+		}
+	}
+
+	run := func(inv invocation, stdout io.Writer) error {
+		start := time.Now()
+		slog.Debug("[HOOK] Executing hook", append([]any{"hook", identity}, inv.attrs...)...)
+		stderr, err := runHook(hooks, inv.env, stdout)
+		logHookResult(inv.kind, identity, inv.attrs, stderr, err, start)
+		return err
+	}
+
+	if wg == nil {
+		var first error
+		for _, inv := range invocations {
+			if err := run(inv, os.Stdout); err != nil && first == nil {
+				first = err
+			}
+		}
+		return first
+	}
+	for _, inv := range invocations {
+		inv := inv
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("[HOOK] Panic in post-sign hook", append([]any{"panic", r, "hook", identity}, inv.attrs...)...)
+				}
+			}()
+			_ = run(inv, io.Discard)
+		}()
+	}
+	return nil
+}
+
+// executeHookSync runs a per-zone hook synchronously with env's variables and
+// returns its error. It bypasses the coalescing contract (callers that want
+// the contract use firePostSignHooks) and exists for direct invocation.
+func executeHookSync(hooks *config.HooksConfig, env *HookEnv) error {
+	if !hookConfigured(hooks) {
+		return nil
+	}
+	_, _, identity, _ := hookCmd(hooks)
+	var vars []string
+	if env != nil {
+		vars = perZoneVars(env)
+	}
+	start := time.Now()
+	stderr, err := runHook(hooks, hookEnviron(vars...), os.Stdout)
+	if stderr != "" {
+		fmt.Fprintln(os.Stderr, stderr)
+	}
+	logHookResult("post_sign", identity, nil, stderr, err, start)
+	return err
+}
