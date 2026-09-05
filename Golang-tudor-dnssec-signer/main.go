@@ -985,6 +985,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		KSK:  ksk,
 		ZSK:  zsk,
 	}
+	state.ClearRemoved(domain)
 	state.SetZone(domain, zoneState)
 
 	// Sign the zone
@@ -1090,7 +1091,10 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	state.RemoveZone(domain)
+	// Record a deletion marker rather than merely dropping the entry, so a
+	// running daemon whose configuration still lists the zone cannot re-create
+	// it from that stale configuration before the documented SIGHUP (RA6X-025).
+	state.MarkRemoved(domain)
 	if err := persistState(state); err != nil {
 		if inConfig {
 			// Restore the exact original config bytes (all keys/comments/order),
@@ -1600,6 +1604,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 			RolloverDue: now.Add(time.Duration(float64(zskLifetime) * 0.75)),
 		},
 	}
+	state.ClearRemoved(domain)
 	state.SetZone(domain, zoneState)
 
 	// Add to in-memory config
