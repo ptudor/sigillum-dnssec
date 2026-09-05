@@ -371,11 +371,19 @@ func TestDynadotAddDS_AcceptsAcceptedEnvelope(t *testing.T) {
 // DELETE (clear stale), PUT (re-publish). Order matters because the prior
 // DELETE-first implementation could leave a zone with zero DS records when
 // the PUT format was rejected by the API — a silent DNSSEC outage.
+// dsListBody is the GET response of a registrar holding exactly key tag 1
+// (the read-back ReplaceDS uses to verify its postcondition, RA6X-031).
+const dsListBody = `{"code":200,"message":"Success","data":{"dnssec_info_list":[{"key_tag":1,"algorithm":"15","digest_type":"2","digest":"aa"}]}}`
+
 func TestDynadotReplaceDS_CallOrder(t *testing.T) {
 	var order []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		order = append(order, r.Method)
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			io.WriteString(w, dsListBody)
+			return
+		}
 		io.WriteString(w, `{"code":200,"message":"Success"}`)
 	}))
 	defer srv.Close()
@@ -384,7 +392,7 @@ func TestDynadotReplaceDS_CallOrder(t *testing.T) {
 	if err := c.ReplaceDS(context.Background(), "example.com", []*dns.DS{mkDS(1, 15, 2, "aa")}); err != nil {
 		t.Fatalf("ReplaceDS: %v", err)
 	}
-	want := []string{http.MethodPut, http.MethodDelete, http.MethodPut}
+	want := []string{http.MethodPut, http.MethodDelete, http.MethodPut, http.MethodGet}
 	if len(order) != len(want) {
 		t.Fatalf("expected %v, got %v", want, order)
 	}
@@ -446,6 +454,10 @@ func TestDynadotReplaceDS_RestoreRetrySucceeds(t *testing.T) {
 	var puts int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			io.WriteString(w, dsListBody)
+			return
+		}
 		if r.Method == http.MethodPut {
 			puts++
 			// puts==1 is the pre-DELETE publish (ok); puts 2 and 3 are restore
@@ -517,6 +529,9 @@ func TestDynadotReplaceDS_RestoreSurvivesParentCancel(t *testing.T) {
 				sawRestorePut = true
 				cancel() // tear down the caller's context mid-restore
 			}
+		case http.MethodGet:
+			io.WriteString(w, dsListBody)
+			return
 		}
 		io.WriteString(w, `{"code":200,"message":"Success"}`)
 	}))

@@ -66,6 +66,7 @@ type RegistrarDynadotConfig struct {
 	APIKey      string   `toml:"api_key"`      // required; keep config file mode 0640 or stricter
 	APISecret   string   `toml:"api_secret"`   // required; HMAC key for X-Signature
 	Sandbox     bool     `toml:"sandbox"`      // true → api-sandbox.dynadot.com
+	BaseURL     string   `toml:"base_url"`     // override the API endpoint (a local proxy or a test double); takes precedence over sandbox
 	Timeout     Duration `toml:"timeout"`      // default 30s
 	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
 	UserAgent   string   `toml:"user_agent"`   // override the default dnssec-tudor/<version> UA

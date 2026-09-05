@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,7 +24,7 @@ import (
 
 // sharedDynadotLimiter is the process-wide Dynadot rate limiter. Shared by
 // every DynadotClient so the sliding window spans operations (R-073).
-var sharedDynadotLimiter = newSlidingLimiter()
+var sharedDynadotLimiter = newWindowLimiter()
 
 // DynadotClient talks to Dynadot's restful/v2 API.
 //
@@ -42,7 +43,7 @@ type DynadotClient struct {
 	userAgent     string
 	sendRequestID bool
 	http          *http.Client
-	limiter       *slidingLimiter
+	limiter       *windowLimiter
 }
 
 // defaultUserAgent returns the UA string used for Dynadot (and any future
@@ -82,6 +83,9 @@ func NewDynadotClient(cfg *config.RegistrarDynadotConfig) (*DynadotClient, error
 	baseURL := "https://api.dynadot.com"
 	if cfg.Sandbox {
 		baseURL = "https://api-sandbox.dynadot.com"
+	}
+	if override := strings.TrimSpace(cfg.BaseURL); override != "" {
+		baseURL = strings.TrimRight(override, "/")
 	}
 
 	timeout := cfg.Timeout.Duration
@@ -252,15 +256,18 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 		"method", method, "path", path,
 		"request_id", requestID, "send_request_id_header", c.sendRequestID)
 
+	// From here on the request may have reached the registrar: every failure
+	// is wrapped as dispatched so destructive callers treat it as an
+	// uncertain outcome rather than a no-op (RA6X-031).
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("dynadot %s %s: %w", method, path, err)
+		return nil, &dispatchedError{fmt.Errorf("dynadot %s %s: %w", method, path, err)}
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, fmt.Errorf("reading dynadot response: %w", err)
+		return nil, &dispatchedError{fmt.Errorf("reading dynadot response: %w", err)}
 	}
 
 	// Some endpoints may return an empty 200 body; treat that as success.
@@ -280,8 +287,8 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	if err := json.Unmarshal(raw, &env); err != nil {
 		// Surface the first chunk of the body so the operator has
 		// something to grep for — opaque "non-JSON body" was useless.
-		return nil, fmt.Errorf("dynadot %s %s (HTTP %d): non-JSON body: %q",
-			method, path, resp.StatusCode, truncate(string(raw), 256))
+		return nil, &dispatchedError{fmt.Errorf("dynadot %s %s (HTTP %d): non-JSON body: %q",
+			method, path, resp.StatusCode, truncate(string(raw), 256))}
 	}
 
 	// The HTTP status code is authoritative; the envelope's `code` should
@@ -298,7 +305,7 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 				msg = http.StatusText(resp.StatusCode)
 			}
 		}
-		return nil, fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
+		return nil, &dispatchedError{fmt.Errorf("dynadot %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)}
 	}
 	if env.Code != 0 && (env.Code < 200 || env.Code >= 300) {
 		// Dynadot sometimes returns HTTP 200 with a failure code in the
@@ -312,10 +319,27 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 		if msg == "" {
 			msg = truncate(strings.TrimSpace(string(raw)), 256)
 		}
-		return nil, fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, msg)
+		return nil, &dispatchedError{fmt.Errorf("dynadot %s %s: envelope code %d: %s", method, path, env.Code, msg)}
 	}
 
 	return env.Data, nil
+}
+
+// dispatchedError wraps a failure from a request that may have reached the
+// registrar and been applied (transport error, timeout, cancellation while in
+// flight, unreadable or non-JSON response, error status). A destructive
+// operation that fails this way has an uncertain outcome and must reconcile
+// the registrar's actual state instead of assuming nothing changed.
+type dispatchedError struct{ err error }
+
+func (e *dispatchedError) Error() string { return e.err.Error() }
+func (e *dispatchedError) Unwrap() error { return e.err }
+
+// wasDispatched reports whether err came from a request that may have been
+// applied by the registrar.
+func wasDispatched(err error) bool {
+	var d *dispatchedError
+	return errors.As(err, &d)
 }
 
 // truncate returns s trimmed to at most max runes, with an ellipsis marker
@@ -524,28 +548,26 @@ func (c *DynadotClient) AddDS(ctx context.Context, domain string, records []*dns
 // ReplaceDS leaves the registrar with exactly `records`. Sequence:
 //  1. PUT each desired record (additive upsert by key_tag).
 //  2. DELETE the entire DS set.
-//  3. PUT each desired record again, restoring the intended state.
+//  3. PUT each desired record again, then GET the set and verify it.
 //
 // PUT-first is deliberate: if the PUT format is wrong, the credentials are
 // wrong, or the API is down, step 1 fails and we return *before any
 // destructive op*, leaving whatever the registrar previously held intact.
-// The earlier DELETE-then-PUT order had a failure mode where a broken PUT
-// silently left the zone with zero DS records, which validators interpret
-// as an unsigned delegation — a silent DNSSEC outage. Two PUTs per record
-// is fine: Dynadot's PUT is documented as upsert by key_tag, so the second
-// pass is idempotent over a clean (post-DELETE) registrar.
 //
-// Passing an empty `records` slice is `registrar clear` — performs only
-// the DELETE, no PUTs.
+// The DELETE is an uncertain destructive operation (RA6X-031): a transport
+// error, a timeout, a cancellation while in flight or an unreadable response
+// may all hide a deletion the server applied. Any such failure is treated as
+// "possibly cleared": the restore and its verification run regardless, on a
+// context detached from the caller with a fresh bounded budget and recovery
+// priority at the rate limiter, and the postcondition is established by
+// reading the set back — never by assuming an accepted response means the set
+// is correct. When the desired records cannot be verified present, the error
+// unwraps to ErrRegistrarDSEmpty so callers escalate and persist remediation
+// state. Extra records that survive a DELETE that did not apply are reported
+// as an ordinary error: no DS is ever deleted merely to resolve uncertainty.
 //
-// The restore (step 3) is the one window where a transient failure is
-// genuinely dangerous: the DELETE has already wiped the set, so giving up here
-// strands the zone with zero DS at the parent. To make the restore maximally
-// failure-proof it runs on a context detached from the caller (a cancelled or
-// nearly-expired parent deadline must not abort it) with a fresh generous
-// budget, and is retried with short backoff. If it still can't restore, the
-// error unwraps to ErrRegistrarDSEmpty so the caller escalates loudly and
-// records a zone warning (R-004).
+// Passing an empty `records` slice is `registrar clear`: only the DELETE is
+// issued; an uncertain outcome is reconciled by reading the set back.
 func (c *DynadotClient) ReplaceDS(ctx context.Context, domain string, records []*dns.DS) error {
 	if len(records) > 0 {
 		if err := c.AddDS(ctx, domain, records); err != nil {
@@ -553,39 +575,72 @@ func (c *DynadotClient) ReplaceDS(ctx context.Context, domain string, records []
 		}
 	}
 
-	if _, err := c.do(ctx, http.MethodDelete, dnssecPath(domain), nil); err != nil {
-		return fmt.Errorf("clear_dnssec: %w", err)
+	_, delErr := c.do(ctx, http.MethodDelete, dnssecPath(domain), nil)
+	if delErr != nil && !wasDispatched(delErr) {
+		// Never reached the registrar; nothing was cleared. The desired
+		// records were already published additively above.
+		return fmt.Errorf("clear_dnssec (not sent): %w", delErr)
 	}
-	slog.Info("[REGISTRAR] dynadot DS cleared", "domain", domain)
-
-	if len(records) == 0 {
-		return nil
+	if delErr == nil {
+		slog.Info("[REGISTRAR] dynadot DS cleared", "domain", domain)
+	} else {
+		slog.Warn("[REGISTRAR] dynadot DS clear outcome uncertain; reconciling the registrar's actual DS set",
+			"domain", domain, "error", delErr)
 	}
 
-	// Restore, detached from the caller's context so a cancel or an almost-spent
-	// parent deadline can't abort a restore whose failure would leave zero DS.
-	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	// Recovery runs detached from the caller's context (a cancel or an
+	// almost-spent parent deadline must not abort it), with a fresh budget and
+	// priority at the rate limiter.
+	recoveryCtx, cancel := context.WithTimeout(withRecoveryPriority(context.WithoutCancel(ctx)), 2*time.Minute)
 	defer cancel()
 
-	const restoreAttempts = 3
-	var restoreErr error
-retry:
-	for attempt := 1; attempt <= restoreAttempts; attempt++ {
-		if restoreErr = c.AddDS(restoreCtx, domain, records); restoreErr == nil {
+	if len(records) == 0 {
+		if delErr == nil {
 			return nil
 		}
-		slog.Warn("[REGISTRAR] dynadot DS restore attempt failed",
-			"domain", domain, "attempt", attempt, "max_attempts", restoreAttempts, "error", restoreErr)
+		have, err := c.GetDS(recoveryCtx, domain)
+		if err != nil {
+			return fmt.Errorf("clear_dnssec: outcome uncertain (%v) and the DS set could not be read back: %w", delErr, err)
+		}
+		if len(have) == 0 {
+			slog.Info("[REGISTRAR] dynadot DS clear confirmed by read-back", "domain", domain)
+			return nil
+		}
+		return fmt.Errorf("clear_dnssec: %w (the registrar still holds %d DS record(s))", delErr, len(have))
+	}
+
+	const restoreAttempts = 3
+	lastErr := delErr
+	for attempt := 1; attempt <= restoreAttempts; attempt++ {
+		if err := c.AddDS(recoveryCtx, domain, records); err != nil {
+			lastErr = err
+			slog.Warn("[REGISTRAR] dynadot DS restore attempt failed",
+				"domain", domain, "attempt", attempt, "max_attempts", restoreAttempts, "error", err)
+		} else if have, err := c.GetDS(recoveryCtx, domain); err != nil {
+			lastErr = fmt.Errorf("verifying the DS set after restore: %w", err)
+			slog.Warn("[REGISTRAR] dynadot DS set could not be read back after restore",
+				"domain", domain, "attempt", attempt, "error", err)
+		} else {
+			missing, extra := CompareDSSets(records, have)
+			if len(missing) == 0 {
+				if len(extra) > 0 {
+					return fmt.Errorf("registrar holds the desired DS set but %d extra DS record(s) remain because the clear did not apply (%v); re-run `dnssec-tudor registrar push %s`",
+						len(extra), delErr, domain)
+				}
+				slog.Info("[REGISTRAR] dynadot DS set verified", "domain", domain, "records", len(records))
+				return nil
+			}
+			lastErr = fmt.Errorf("%d of %d desired DS record(s) not present after restore", len(missing), len(records))
+			slog.Warn("[REGISTRAR] dynadot DS restore not yet visible", "domain", domain, "attempt", attempt, "missing", len(missing))
+		}
 		if attempt < restoreAttempts {
-			select {
-			case <-restoreCtx.Done():
-				break retry // budget exhausted; stop retrying and surface the sentinel
-			case <-time.After(time.Duration(attempt) * time.Second):
+			if err := sleepCtx(recoveryCtx, time.Duration(attempt)*time.Second); err != nil {
+				break // budget exhausted; surface the sentinel
 			}
 		}
 	}
-	return fmt.Errorf("%w: zone %s restore failed after %d attempts: %v",
-		ErrRegistrarDSEmpty, domain, restoreAttempts, restoreErr)
+	return fmt.Errorf("%w: zone %s DS set could not be verified after %d restore attempts: %v",
+		ErrRegistrarDSEmpty, domain, restoreAttempts, lastErr)
 }
 
 // parseDynadotUint8 parses Dynadot's algorithm / digest_type field into the

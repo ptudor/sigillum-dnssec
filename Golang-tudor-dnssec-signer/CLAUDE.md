@@ -182,6 +182,7 @@ enabled = true
 api_key = ""                    # required; protect with config file mode 0640
 api_secret = ""                 # required; HMAC-SHA256 key for X-Signature
 sandbox = false                 # true → api-sandbox.dynadot.com (safe for testing)
+# base_url = "http://127.0.0.1:8088"  # override the endpoint (egress proxy or test double); wins over sandbox
 timeout = "30s"
 auto_publish = true             # Push DS automatically on add/rollover events
 
@@ -396,11 +397,22 @@ on a transient API error.
   `algorithm` and `digest_type` as strings, so the adapter converts them
   back to numeric DNS field values.
 - Rate limit: regular accounts are capped at 60 req/min. The adapter
-  uses a sliding-scale limiter — 100ms gap for the first 20 requests
-  in a burst, 500ms for the next 20, 2s thereafter; the counter resets
-  after 60s of no calls. This stays burst-friendly for normal rollover
-  work (≤3 calls) while self-throttling any bulk push that would
-  otherwise hit Dynadot's 429 ceiling.
+  enforces that as a rolling-window quota (never more than 60 admissions
+  in any 60 s window, 10 of which are reserved for post-clear DS recovery
+  and its read-back) on top of burst spacing — 100ms gap for the first 20
+  requests in the window, 500ms for the next 20, 2s thereafter. Every HTTP
+  attempt, retries included, is gated; waiting is cancellation-aware and a
+  cancelled caller consumes no slot. The limiter is process-wide: separate
+  processes sharing one Dynadot account share its quota and need external
+  coordination (RA6X-051).
+- `ReplaceDS` treats the DELETE as an uncertain destructive operation: any
+  failure after the request may have been dispatched (transport error,
+  timeout, cancellation in flight, unreadable response, error status) is
+  followed by the restore anyway, on a detached bounded context, and the
+  result is established by reading the DS set back — never by trusting an
+  accepted response. An unverifiable set is an emergency (`ErrRegistrarDSEmpty`,
+  sticky `URGENT:` zone warning); surviving extra records are an ordinary
+  error, since no DS is ever deleted merely to resolve uncertainty (RA6X-031).
 
 ### Failure semantics
 
