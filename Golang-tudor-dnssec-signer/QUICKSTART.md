@@ -18,15 +18,37 @@ sudo cp dnssec-tudor /usr/local/bin/
 
 ## Step 2: Create Directories
 
-```bash
-sudo mkdir -p /etc/dnssec-tudor
-sudo mkdir -p /var/lib/dnssec-tudor/{keys,signed}
+The service runs unprivileged as the `dnssec-tudor` account (the systemd
+unit in step 8 sets `User=dnssec-tudor`, so the account is required, not
+optional). It must be able to read the unsigned zones, write keys, state and
+signed output, and NSD must be able to read the signed output:
 
-# Optional: dedicated user
-sudo useradd -r -s /bin/false dnssec-tudor
-sudo chown -R dnssec-tudor:dnssec-tudor /var/lib/dnssec-tudor
-sudo chmod 700 /var/lib/dnssec-tudor/keys
+```bash
+sudo useradd -r -s /usr/sbin/nologin -d /var/lib/dnssec-tudor dnssec-tudor
+sudo mkdir -p /etc/dnssec-tudor
+sudo install -d -o dnssec-tudor -g dnssec-tudor -m 750 /var/lib/dnssec-tudor
+sudo install -d -o dnssec-tudor -g dnssec-tudor -m 700 /var/lib/dnssec-tudor/keys
+sudo install -d -o dnssec-tudor -g nsd -m 750 /var/lib/dnssec-tudor/signed   # NSD reads here
+# Unsigned zones: readable by the service account (adjust to where they live)
+sudo chgrp -R dnssec-tudor /etc/nsd/zones && sudo chmod -R g+rX /etc/nsd/zones
 ```
+
+The signer must also be able to tell NSD to reload without a password. Do not
+give the account a general `sudo` or `systemctl` grant; allow exactly the one
+reload command it runs from the hook:
+
+```bash
+sudo tee /etc/sudoers.d/dnssec-tudor << 'EOF'
+dnssec-tudor ALL=(root) NOPASSWD: /usr/sbin/nsd-control reload
+EOF
+sudo chmod 440 /etc/sudoers.d/dnssec-tudor
+sudo -u dnssec-tudor sudo -n /usr/sbin/nsd-control reload   # must succeed non-interactively
+```
+
+(An alternative with no sudo at all: make the account a member of the group
+that may read NSD's control key files and socket, so `nsd-control reload`
+works directly; whichever you choose, the non-interactive test above must
+pass before the daemon is started.)
 
 ## Step 3: Create Configuration
 
@@ -51,7 +73,9 @@ enabled = false
 # Add your zones here after step 4
 
 [hooks]
-post_sign = "systemctl reload nsd"  # or: nsd-control reload
+# Exactly the command allowed in /etc/sudoers.d/dnssec-tudor (step 2). The
+# hook must succeed: a signed zone counts as published only after it does.
+post_sign_cmd = ["/usr/bin/sudo", "-n", "/usr/sbin/nsd-control", "reload"]
 EOF
 ```
 
@@ -207,7 +231,21 @@ dnssec-tudor ds another.com --config /etc/dnssec-tudor/config.toml
 Check the path in your config matches your actual zone file location.
 
 ### "Algorithm not supported by registrar"
-Switch to ECDSAP256SHA256 in config.toml — it has wider support than ED25519.
+Do **not** just change `algorithm` in config.toml: the setting only applies to
+keys generated in the future, existing zones keep their keys, and an ordinary
+KSK rollover always keeps a zone's current algorithm. Migrate the zone with
+the supported rollover, which publishes both algorithms until the new DS is
+live and the caches have drained:
+
+```bash
+dnssec-tudor rollover algorithm example.com ECDSAP256SHA256 --config /etc/dnssec-tudor/config.toml
+# publish the printed DS at the registrar, wait for it to propagate, then:
+dnssec-tudor rollover complete example.com --config /etc/dnssec-tudor/config.toml
+# later, when status asks for it, remove the old DS; retirement is automatic
+```
+
+Set `algorithm = "ECDSAP256SHA256"` in config.toml as well so zones added
+later start on the algorithm your registrar accepts.
 
 ### Signatures expiring
 The daemon should re-sign automatically. Check logs:

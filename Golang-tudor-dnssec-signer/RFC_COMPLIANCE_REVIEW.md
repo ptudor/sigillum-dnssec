@@ -1,8 +1,19 @@
 # RFC Compliance Review: dnssec-tudor
 
+> **Historical review — superseded (2026-09-05).** This is the record of the
+> 2026-01 review and its fixes, not a current compliance claim. Its
+> conclusion ("all issues addressed", "valid signed zones for all
+> authoritative DNS scenarios") was contradicted by the 2026-09 Astra 6
+> review, which found and fixed further defects (canonical owner identity,
+> CNAME/DNAME/delegation validation, denial-chain verification, algorithm-safe
+> KSK rollover, cache-safe retirement — RA6X-001–004, 028, 029, 056 among
+> others). The current contract is the code and its regression tests
+> (`*_ra6x*_test.go`) plus the ledger under `review/2026/09/`; nothing here
+> is a pending instruction.
+
 **Reviewer perspective**: Skeptical RFC author who has seen too many broken DNSSEC implementations.
 
-**Status**: Critical issues have been fixed. Some medium/low priority items remain.
+**Status (historical)**: Critical issues of the 2026-01 review were fixed then; see the banner above for what superseded this document.
 
 **Last Updated**: 2026-01-19
 

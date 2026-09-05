@@ -1,5 +1,17 @@
 # RFC Compliance Documentation
 
+> **Historical status table — superseded (2026-09-05).** This table records the
+> state of the 2026-01 review and is not maintained as a current claim. Rows
+> marked "Partial", "Non-compliant" or "No warning" for authenticated denial
+> (NSEC/NSEC3 proofs, opt-out, wildcard proofs) and for RFC 6840 §5.11 no
+> longer describe the code: denial proofs are validated in
+> `internal/validator/nsec.go` and chain links accept any valid DS→DNSKEY path.
+> Note in particular that §5.11 does **not** require every DS algorithm to
+> validate; the "requires ALL algorithms validate" statement below is a
+> misreading of the RFC. For current behaviour consult the code, the
+> regression tests named after each finding (`*_ra6x*_test.go`) and the review
+> ledger under `review/2026/09/`.
+
 ## DNSSEC Validator — Standards Conformance
 
 This document tracks compliance with relevant IETF RFCs for DNS and DNSSEC.
