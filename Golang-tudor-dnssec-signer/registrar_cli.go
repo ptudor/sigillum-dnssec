@@ -26,7 +26,7 @@ import (
 // separately (Mutate's fn must not re-enter State methods).
 func recordRegistrarWarning(state *statepkg.State, domain, msg string) {
 	state.UpdateZone(domain, func(z *statepkg.ZoneState) { z.AddWarning(msg) })
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		slog.Error("[REGISTRAR] failed to persist zone warning", "domain", domain, "warning", msg, "error", err)
 	}
 }
@@ -59,7 +59,7 @@ func resolveRegistrar(domain string) (*config.Config, *statepkg.State, registrar
 // resolveRegistrarLocked is the mutating-command variant of resolveRegistrar,
 // used by `registrar push` and `registrar clear`: it loads state under the
 // cross-process state lock (R-007) and returns the unlock func for the caller
-// to defer. push persists registrar state (zone warnings) via state.Save() —
+// to defer. push persists registrar state (zone warnings) via persistState(state) —
 // saving a snapshot loaded outside the lock can clobber a concurrent
 // daemon/CLI write, and the daemon's fresher-LastSigned merge then drops the
 // URGENT zero-DS warning (R-032); clear's destructive DS wipe must likewise
@@ -234,7 +234,7 @@ func clearRegistrarStickyWarnings(state *statepkg.State, domain string, want []*
 		cleared = len(z.Warnings) != before
 	})
 	if cleared {
-		if err := state.Save(); err != nil {
+		if err := persistState(state); err != nil {
 			slog.Error("[REGISTRAR] failed to persist cleared warning after successful DS push",
 				"domain", domain, "error", err)
 		}

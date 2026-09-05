@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -356,8 +357,11 @@ func loadConfigAndState() (*config.Config, *statepkg.State, error) {
 	}
 
 	// Capture the data_dir owner before any writes so CLI commands run as
-	// root will chown what they create. No-op for non-root invocations.
-	fsutil.InitOwnershipTarget(cfg.DataDir)
+	// root will chown what they create. No-op for non-root invocations. A
+	// failed inspection is an error, not a silent no-op (RA6X-044).
+	if _, err := fsutil.InitOwnershipTarget(cfg.DataDir); err != nil {
+		return nil, nil, err
+	}
 
 	state, err := statepkg.LoadState(cfg.StatePath())
 	if err != nil {
@@ -378,7 +382,12 @@ func loadConfigStateLocked() (cfg *config.Config, state *statepkg.State, unlock 
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("loading config: %w", err)
 	}
-	fsutil.InitOwnershipTarget(cfg.DataDir)
+	// A mutating command run as root must not create a root-owned tree the
+	// daemon account cannot use; the operator bootstraps it explicitly
+	// (RA6X-044). Root-only deployments create the directory as root first.
+	if err := checkOwnershipBootstrap(cfg.DataDir); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := signerpkg.EnsureDir(cfg.DataDir); err != nil {
 		return nil, nil, nil, fmt.Errorf("ensuring data_dir for state lock: %w", err)
 	}
@@ -448,7 +457,7 @@ func keyPairAbsent(keysDir, domain, role string) bool {
 // from `add` surfaces unchanged.
 func unwindAdd(cfg *config.Config, state *statepkg.State, domain string, removeKSK, removeZSK bool, origOutput []byte, outputExisted bool) {
 	state.RemoveZone(domain)
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		slog.Warn("[CLI] Rollback: failed to save state", "domain", domain, "error", err)
 	}
 
@@ -501,12 +510,60 @@ func loadStateLocked(cfg *config.Config) (*statepkg.State, error) {
 	return state, nil
 }
 
+// checkOwnershipBootstrap initializes ownership transfer for a mutating CLI
+// command and refuses to proceed when the tree does not exist and the command
+// runs as root (RA6X-044).
+func checkOwnershipBootstrap(dataDir string) error {
+	status, err := fsutil.InitOwnershipTarget(dataDir)
+	if err != nil {
+		return err
+	}
+	if status == fsutil.OwnershipTargetMissing {
+		return errors.New(fsutil.BootstrapInstructions(dataDir))
+	}
+	return nil
+}
+
+// persistState saves state and classifies the outcome (RA6X-049): a save whose
+// file is visible but whose directory sync failed is reported as a warning and
+// treated as success — the visible file IS the current generation and must not
+// be rolled back — while a pre-rename failure is returned for the caller's
+// rollback handling.
+func persistState(state *statepkg.State) error {
+	err := state.Save()
+	if err == nil {
+		return nil
+	}
+	if fsutil.IsCommitted(err) {
+		slog.Warn("[CLI] state saved but its durability across power loss is uncertain", "error", err)
+		return nil
+	}
+	return err
+}
+
+// commitConfigEdit classifies a config-file edit outcome the same way as
+// persistState (RA6X-049).
+func commitConfigEdit(err error) error {
+	if err == nil {
+		return nil
+	}
+	if fsutil.IsCommitted(err) {
+		slog.Warn("[CLI] config file updated but its durability across power loss is uncertain", "error", err)
+		return nil
+	}
+	return err
+}
+
 func runServe(cmd *cobra.Command, args []string) error {
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
-	fsutil.InitOwnershipTarget(cfg.DataDir)
+	// The daemon creates its own tree as whatever account it runs as; an
+	// inspection failure is still an error (RA6X-044).
+	if _, err := fsutil.InitOwnershipTarget(cfg.DataDir); err != nil {
+		return err
+	}
 	if err := signerpkg.EnsureDir(cfg.DataDir); err != nil {
 		return fmt.Errorf("ensuring data_dir: %w", err)
 	}
@@ -659,7 +716,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
 		}
 	}
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		return fmt.Errorf("saving state after rollover checks: %w", err)
 	}
 
@@ -714,7 +771,7 @@ func runResign(cmd *cobra.Command, args []string) error {
 	}
 
 	// Save state
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
@@ -937,7 +994,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated, origOutput, outputExisted)
 		return fmt.Errorf("saving state: %w", err)
 	}
@@ -945,7 +1002,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Config append happens last. The pre-flight makes failure here unlikely,
 	// but if it still fails (race, disk full), unwind everything so state.json
 	// stays consistent with the config file.
-	if err := config.AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+	if err := commitConfigEdit(config.AddZoneToConfigFile(configPath, domain, zonePath)); err != nil {
 		unwindAdd(cfg, state, domain, kskGenerated, zskGenerated, origOutput, outputExisted)
 		return fmt.Errorf("adding zone to config file: %w", err)
 	}
@@ -1019,7 +1076,7 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		if err := preflightConfigAppend(configPath); err != nil {
 			return fmt.Errorf("config file %s not writable (needed to remove the zone entry): %w", configPath, err)
 		}
-		if err := config.RemoveZoneFromConfigFile(configPath, domain); err != nil {
+		if err := commitConfigEdit(config.RemoveZoneFromConfigFile(configPath, domain)); err != nil {
 			if err == config.ErrZoneNotInConfig {
 				// The parsed config confirmed the zone IS present, yet the
 				// rewriter could not locate its table header (a hand-edited
@@ -1034,7 +1091,7 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	state.RemoveZone(domain)
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		if inConfig {
 			// Restore the exact original config bytes (all keys/comments/order),
 			// preserving ownership/mode, so the failed removal leaves config and
@@ -1085,7 +1142,7 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
@@ -1220,7 +1277,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
@@ -1268,7 +1325,7 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
@@ -1556,7 +1613,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 
 	// Save state first — if this fails, config file is untouched
-	if err := state.Save(); err != nil {
+	if err := persistState(state); err != nil {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
@@ -1564,9 +1621,9 @@ func runImport(cmd *cobra.Command, args []string) error {
 	// preflight (e.g. a race), unwind the state so it doesn't diverge from config and a
 	// retry isn't blocked at "already managed". Converted key files are left in place (a
 	// registrar DS may reference them) with a note (R-023).
-	if err := config.AddZoneToConfigFile(configPath, domain, zonePath); err != nil {
+	if err := commitConfigEdit(config.AddZoneToConfigFile(configPath, domain, zonePath)); err != nil {
 		state.RemoveZone(domain)
-		if serr := state.Save(); serr != nil {
+		if serr := persistState(state); serr != nil {
 			slog.Error("[CLI] Rollback: failed to remove zone from state after config-append failure",
 				"domain", domain, "error", serr)
 		}

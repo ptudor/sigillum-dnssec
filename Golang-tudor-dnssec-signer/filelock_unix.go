@@ -29,7 +29,12 @@ func acquireStateLock(dataDir string, timeout time.Duration) (*stateLock, error)
 	if err != nil {
 		return nil, fmt.Errorf("opening lock file %s: %w", lockPath, err)
 	}
-	fsutil.ChownToTarget(lockPath)
+	// A root-owned 0600 lock file the daemon cannot open would silently skip
+	// every daemon cycle; ownership assignment is part of taking the lock (RA6X-044).
+	if err := fsutil.ChownToTarget(lockPath); err != nil {
+		f.Close()
+		return nil, err
+	}
 
 	deadline := time.Now().Add(timeout)
 	for {
@@ -60,7 +65,10 @@ func acquireInstanceLock(dataDir string) (*stateLock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening instance lock %s: %w", lockPath, err)
 	}
-	fsutil.ChownToTarget(lockPath)
+	if err := fsutil.ChownToTarget(lockPath); err != nil {
+		f.Close()
+		return nil, err
+	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		if err == syscall.EWOULDBLOCK {

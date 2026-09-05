@@ -260,15 +260,27 @@ func (kg *KeyGenerator) SaveKeyFiles(domain, keyType string, dnskey *dns.DNSKEY,
 	// first: if a crash lands between the two, the correspondence check in
 	// loadKeyPairFromPath rejects the resulting pair and the prior signed zone keeps
 	// serving, rather than a half-written file being read.
-	if err := fsutil.WriteFileAtomicOwned(privFile, []byte(privContent), 0600); err != nil {
+	if err := fsutil.WriteFileAtomicOwned(privFile, []byte(privContent), 0600); err != nil && !durabilityWarning(err, privFile) {
 		return fmt.Errorf("writing private key file: %w", err)
 	}
-	if err := fsutil.WriteFileAtomicOwned(keyFile, []byte(keyContent), 0644); err != nil {
+	if err := fsutil.WriteFileAtomicOwned(keyFile, []byte(keyContent), 0644); err != nil && !durabilityWarning(err, keyFile) {
 		return fmt.Errorf("writing public key file: %w", err)
 	}
 
 	slog.Debug("[KEY] Saved key files", "domain", domain, "type", keyType, "key_tag", dnskey.KeyTag())
 	return nil
+}
+
+// durabilityWarning reports whether err is a visible-but-unsynced commit
+// (RA6X-049). The file is in place and is the current generation; the
+// uncertainty is logged and the operation continues rather than rolling back
+// a possibly committed file.
+func durabilityWarning(err error, path string) bool {
+	if !fsutil.IsCommitted(err) {
+		return false
+	}
+	slog.Warn("[FS] file replaced but directory sync failed; durability across power loss uncertain", "path", path, "error", err)
+	return true
 }
 
 // backupExistingKeyFiles checks for pre-existing key files and backs them up with the key
@@ -825,21 +837,33 @@ func AlgorithmFromName(name string) (uint8, error) {
 	return alg, nil
 }
 
-// EnsureDir creates a directory if it doesn't exist
+// EnsureDir creates a directory if it doesn't exist. A directory created by a
+// root-run CLI is assigned daemon ownership like any other write (RA6X-044).
 func EnsureDir(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return fmt.Errorf("creating directory %s: %w", path, err)
+	}
+	if err := fsutil.ChownToTarget(path); err != nil {
+		return fmt.Errorf("assigning ownership of created directory %s: %w", path, err)
 	}
 	return nil
 }
 
 // EnsureDirSecure creates a directory with 0700 permissions if it doesn't exist,
-// and tightens permissions if it already exists with wider access.
+// and tightens permissions if it already exists with wider access. A directory
+// created by a root-run CLI is assigned daemon ownership (RA6X-044) — a
+// root-owned 0700 keys directory is unusable by an unprivileged daemon.
 func EnsureDirSecure(path string) error {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0700); err != nil {
 			return fmt.Errorf("creating directory %s: %w", path, err)
+		}
+		if err := fsutil.ChownToTarget(path); err != nil {
+			return fmt.Errorf("assigning ownership of created directory %s: %w", path, err)
 		}
 		return nil
 	}

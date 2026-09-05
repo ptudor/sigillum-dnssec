@@ -81,6 +81,13 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 
 	metrics.RecordRolloverOperation(domain, "ksk", "start")
 	if err := rm.state.Save(); err != nil {
+		if fsutil.IsCommitted(err) {
+			// The rollover record IS on disk; only its durability is uncertain.
+			// Rolling the keys back now would create the very divergence the
+			// rollback below exists to prevent (RA6X-049).
+			slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
+			return nil
+		}
 		// R-038: the key files are already rotated (live = new KSK) but the state
 		// did not persist. Revert the in-memory rollover and restore the old KSK
 		// files so the next sign doesn't publish a KSK the parent DS doesn't
@@ -560,6 +567,10 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 
 	metrics.RecordRolloverOperation(domain, "algorithm", "start")
 	if err := rm.state.Save(); err != nil {
+		if fsutil.IsCommitted(err) {
+			slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
+			return nil
+		}
 		// R-038: both key pairs are already rotated on disk but the state did not
 		// persist. Revert in-memory and restore the old KSK+ZSK files so the next
 		// sign doesn't publish new-algorithm keys with no rollover record (the

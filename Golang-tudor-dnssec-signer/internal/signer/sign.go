@@ -192,8 +192,16 @@ func (s *Signer) SignZone(domain string) error {
 
 	// Write signed zone
 	outputPath := filepath.Join(s.cfg.OutputDir, fmt.Sprintf("%s.zone.signed", domain))
+	durabilityUncertain := ""
 	if err := s.writeSignedZone(domain, outputPath, signedRecords); err != nil {
-		return fmt.Errorf("writing signed zone: %w", err)
+		if !fsutil.IsCommitted(err) {
+			return fmt.Errorf("writing signed zone: %w", err)
+		}
+		// The signed zone is visible and is the generation now being served;
+		// only its durability across power loss is uncertain (RA6X-049).
+		// Reconcile with the visible generation rather than rolling back.
+		durabilityUncertain = fmt.Sprintf("signed zone written but its directory sync failed; durability across power loss uncertain: %v", err)
+		slog.Warn("[SIGN] "+durabilityUncertain, "domain", domain, "path", outputPath)
 	}
 
 	// Update state under the write lock so concurrent readers (web UI,
@@ -221,6 +229,9 @@ func (s *Signer) SignZone(domain string) error {
 			zoneState.PublishedMaxRRSIGTTL = maxRRSIGTTL
 		}
 		zoneState.ClearTransientWarnings()
+		if durabilityUncertain != "" {
+			zoneState.AddWarning(durabilityUncertain)
+		}
 
 		// Check for upcoming rollovers
 		s.checkRolloverWarnings(domain, zoneState)
@@ -1453,8 +1464,11 @@ func (s *Signer) writeSignedZone(domain, path string, records []dns.RR) error {
 	// loss, matching the file-and-directory durability contract used for state/config
 	// (writeFileAtomicOwned). Without this the directory entry can be lost after state
 	// was saved with a new serial, leaving NeedsSign to trust state and decline to
-	// recreate the missing output.
-	fsutil.SyncDir(filepath.Dir(path))
+	// recreate the missing output. A sync failure is reported as a durability
+	// outcome: the signed zone is visible and stays the current generation (RA6X-049).
+	if err := fsutil.SyncDir(filepath.Dir(path)); err != nil {
+		return &fsutil.DurabilityError{Path: path, Err: err}
+	}
 
 	return nil
 }
