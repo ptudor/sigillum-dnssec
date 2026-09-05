@@ -6,37 +6,87 @@ import (
 	"time"
 )
 
-// slidingLimiter is a lightweight sliding-scale rate limiter. The first few
-// requests are allowed with a small gap between them, after which the gap
-// grows in tiers so sustained bursts self-throttle rather than hitting
-// Dynadot's 60/min hard limit. The counter resets after an idle window,
-// so occasional small bursts don't accumulate "debt" from earlier activity.
+// Rate limiting for the Dynadot API (RA6X-051).
 //
-// Tiers (chosen to match the user's sliding shape — burst-friendly up front,
-// then back off):
+// Dynadot caps a regular account at 60 requests per minute. windowLimiter
+// enforces that as a rolling-window quota — no more than `quota` admissions in
+// any `window` — and additionally keeps the burst-friendly inter-request
+// spacing (tierDelay) so a bulk push self-throttles before the ceiling is
+// reached. A reserve of the quota is held back for recovery work (the
+// post-DELETE DS restore and its verification, see ReplaceDS), which is
+// admitted under a context marked withRecoveryPriority, so an exhausted
+// ordinary budget can never starve the one sequence that must complete.
 //
-//	req  1..20  → 100ms gap
-//	req 21..40  → 500ms gap
-//	req 41+     → 2s  gap
+// Every HTTP attempt — retries included — is gated. Waiting never holds the
+// mutex, so a queued caller observes its own cancellation promptly, and a
+// cancelled caller never consumes a slot. The limiter is shared process-wide;
+// separate processes that share one Dynadot account share its quota too and
+// need external coordination, which this in-process accounting cannot provide.
 //
-// After `idleReset` with no calls, the counter returns to zero.
-type slidingLimiter struct {
-	mu        sync.Mutex
-	count     int
-	last      time.Time
-	idleReset time.Duration
+// Tiers (burst-friendly up front, then back off):
+//
+//	admissions in window  1..20  → 100ms gap
+//	admissions in window 21..40  → 500ms gap
+//	admissions in window 41+     → 2s  gap
+
+const (
+	dynadotWindow          = time.Minute
+	dynadotQuota           = 60
+	dynadotRecoveryReserve = 10
+)
+
+type recoveryPriorityKey struct{}
+
+// withRecoveryPriority marks a context whose requests may draw on the
+// recovery reserve of the quota.
+func withRecoveryPriority(ctx context.Context) context.Context {
+	return context.WithValue(ctx, recoveryPriorityKey{}, true)
 }
 
-// newSlidingLimiter returns a limiter with the default Dynadot-appropriate
-// tier and a 60-second idle reset. Exposed as its own constructor so tests
-// and future registrar adapters can reuse it.
-func newSlidingLimiter() *slidingLimiter {
-	return &slidingLimiter{idleReset: 60 * time.Second}
+func hasRecoveryPriority(ctx context.Context) bool {
+	v, _ := ctx.Value(recoveryPriorityKey{}).(bool)
+	return v
 }
 
-// tierDelay returns the minimum inter-request gap for the Nth request in a
-// burst (count==0 is the first request). Pure so tests can verify the
-// tiers without sleeping.
+// windowLimiter admits requests under a rolling-window quota plus tiered
+// spacing. now and wait are injectable for deterministic tests.
+type windowLimiter struct {
+	mu       sync.Mutex
+	window   time.Duration
+	quota    int
+	reserve  int
+	admitted []time.Time // admission times within the window, ascending
+	now      func() time.Time
+	wait     func(ctx context.Context, d time.Duration) error
+}
+
+// newWindowLimiter returns the Dynadot limiter: 60 per rolling minute with 10
+// reserved for recovery.
+func newWindowLimiter() *windowLimiter {
+	return &windowLimiter{
+		window:  dynadotWindow,
+		quota:   dynadotQuota,
+		reserve: dynadotRecoveryReserve,
+		now:     time.Now,
+		wait:    sleepCtx,
+	}
+}
+
+// sleepCtx waits for d or until ctx is done, whichever comes first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// tierDelay returns the minimum inter-request gap after `count` admissions in
+// the current window (count==0 is the first request). Pure so tests can
+// verify the tiers without sleeping.
 func tierDelay(count int) time.Duration {
 	switch {
 	case count < 20:
@@ -48,38 +98,60 @@ func tierDelay(count int) time.Duration {
 	}
 }
 
-// gate blocks until the caller is allowed to issue its next request, or until
-// ctx is cancelled (in which case it returns ctx.Err() and does not consume a
-// slot). Safe for concurrent callers — the mutex is held across the wait on
-// purpose, which serializes callers (exactly what a rate limiter wants).
-// Honoring ctx keeps a graceful shutdown or a caller deadline from being stuck
-// behind the 2s throttle tier (R-073).
-func (l *slidingLimiter) gate(ctx context.Context) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	now := time.Now()
-
-	// Reset the tier counter after an idle period so a fresh burst starts
-	// back at the cheap 100ms tier rather than the punitive 2s tier.
-	if !l.last.IsZero() && now.Sub(l.last) > l.idleReset {
-		l.count = 0
+// prune drops admissions that have left the window. Caller holds mu.
+func (l *windowLimiter) prune(now time.Time) {
+	cutoff := now.Add(-l.window)
+	i := 0
+	for i < len(l.admitted) && !l.admitted[i].After(cutoff) {
+		i++
 	}
+	if i > 0 {
+		l.admitted = append([]time.Time(nil), l.admitted[i:]...)
+	}
+}
 
-	if !l.last.IsZero() {
-		minGap := tierDelay(l.count)
-		if wait := minGap - now.Sub(l.last); wait > 0 {
-			timer := time.NewTimer(wait)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-timer.C:
+// gate blocks until the caller may issue its next request or ctx is done (in
+// which case ctx.Err() is returned and no slot is consumed). Cancellation is
+// checked before admission even when no delay is due.
+func (l *windowLimiter) gate(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		l.mu.Lock()
+		now := l.now()
+		l.prune(now)
+		limit := l.quota - l.reserve
+		if hasRecoveryPriority(ctx) {
+			limit = l.quota
+		}
+		var wait time.Duration
+		if n := len(l.admitted); n >= limit && limit > 0 {
+			// The slot frees when the limit-th most recent admission leaves the window.
+			wait = l.admitted[n-limit].Add(l.window).Sub(now)
+		}
+		if n := len(l.admitted); n > 0 {
+			if gap := tierDelay(n) - now.Sub(l.admitted[n-1]); gap > wait {
+				wait = gap
 			}
 		}
+		if wait <= 0 {
+			l.admitted = append(l.admitted, now)
+			l.mu.Unlock()
+			return nil
+		}
+		l.mu.Unlock()
+		if err := l.wait(ctx, wait); err != nil {
+			return err
+		}
 	}
+}
 
-	l.count++
-	l.last = time.Now()
-	return nil
+// admissionsInWindow reports how many requests were admitted within the
+// window ending now (test/diagnostic helper).
+func (l *windowLimiter) admissionsInWindow() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.prune(l.now())
+	return len(l.admitted)
 }
