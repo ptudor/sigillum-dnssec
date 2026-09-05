@@ -202,7 +202,8 @@ func runHook(hooks *config.HooksConfig, env []string, stdout io.Writer) (stderr 
 	command.Stderr = stderrBuf
 	command.Env = env
 	command.WaitDelay = hookWaitDelay
-	configureHookProcess(command)
+	release := configureHookProcess(command)
+	defer release()
 
 	runErr := command.Run()
 	stderr = strings.TrimSpace(stderrBuf.String())
