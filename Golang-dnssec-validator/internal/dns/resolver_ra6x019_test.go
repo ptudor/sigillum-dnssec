@@ -30,14 +30,24 @@ func key(name string, qtype uint16) string {
 
 func newInfraMock(t *testing.T) *infraMock {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	var pc net.PacketConn
+	var ln net.Listener
+	var host, port string
+	for attempt := 0; attempt < 20; attempt++ {
+		var err error
+		pc, err = net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		host, port, _ = net.SplitHostPort(pc.LocalAddr().String())
+		if ln, err = net.Listen("tcp", net.JoinHostPort(host, port)); err == nil {
+			break
+		}
+		_ = pc.Close()
+		ln = nil
 	}
-	host, port, _ := net.SplitHostPort(pc.LocalAddr().String())
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		t.Fatalf("listen tcp: %v", err)
+	if ln == nil {
+		t.Fatal("could not bind a UDP/TCP port pair")
 	}
 	m := &infraMock{t: t, host: host, port: port, handlers: map[string]func(*dns.Msg) *dns.Msg{}, truncate: map[string]bool{}, drop: map[string]bool{}}
 	mux := dns.NewServeMux()

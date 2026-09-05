@@ -54,6 +54,12 @@ var base32ExtendedHex = base32.HexEncoding.WithPadding(base32.NoPadding)
 // response is evaluated as a whole by the crypto layer; an expired or unknown-key
 // signature does not stop a valid alternative from authenticating the RRset (RA6X-017).
 func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
+	return verifyNSECDenialWithRRSIGB(nil, qname, qtype, nsecRecords, dnskeys, zone, rawResponse, rcode)
+}
+
+// verifyNSECDenialWithRRSIGB is VerifyNSECDenialWithRRSIG charged against a
+// validation's work budget (RA6X-052).
+func verifyNSECDenialWithRRSIGB(b *VerifyBudget, qname string, qtype uint16, nsecRecords []dnspkg.NSECRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
 	proof := &NSECProof{
 		ProofType: "NSEC",
 		Records:   make([]string, 0),
@@ -84,7 +90,7 @@ func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.
 	// Cryptographically verify the NSEC RRsets in the response. This is the security-
 	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
 	// The proof below consumes ONLY the records whose RRset verified (RA6X-007).
-	verified, rejected, err := VerifyDenialRRsetsFromResponse(rawResponse, 47, dnskeys, zone)
+	verified, rejected, err := verifyDenialRRsetsFromResponseB(b, rawResponse, 47, dnskeys, zone)
 	if err != nil {
 		proof.Error = fmt.Sprintf("NSEC RRSIG cryptographic verification failed: %v", err)
 		return proof
@@ -383,6 +389,12 @@ func verifyNSECNODATA(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 // as a whole by the crypto layer; an expired or unknown-key signature does not stop a
 // valid alternative from authenticating the RRset (RA6X-017).
 func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
+	return verifyNSEC3DenialWithRRSIGB(nil, qname, qtype, nsec3Records, dnskeys, zone, rawResponse, rcode)
+}
+
+// verifyNSEC3DenialWithRRSIGB is VerifyNSEC3DenialWithRRSIG charged against a
+// validation's work budget (RA6X-052).
+func verifyNSEC3DenialWithRRSIGB(b *VerifyBudget, qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
 	proof := &NSECProof{
 		ProofType: "NSEC3",
 		Records:   make([]string, 0),
@@ -424,7 +436,7 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 	// Cryptographically verify the NSEC3 RRsets in the response. This is the security-
 	// critical step: key-tag/timestamp matching alone does not prove the denial is genuine.
 	// The proof below consumes ONLY the records whose RRset verified (RA6X-007).
-	verified, rejected, err := VerifyDenialRRsetsFromResponse(rawResponse, 50, dnskeys, zone)
+	verified, rejected, err := verifyDenialRRsetsFromResponseB(b, rawResponse, 50, dnskeys, zone)
 	if err != nil {
 		proof.Error = fmt.Sprintf("NSEC3 RRSIG cryptographic verification failed: %v", err)
 		return proof
