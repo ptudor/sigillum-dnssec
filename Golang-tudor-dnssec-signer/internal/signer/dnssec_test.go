@@ -1218,12 +1218,24 @@ ns1	IN	A	192.0.2.1
 		t.Errorf("New zone should need signing, got needs=%v reason=%q", needs, reason)
 	}
 
-	// Zone with recent signing and matching serial should NOT need signing
+	// Zone with recent signing and matching serial should NOT need signing.
+	// A signed zone's output must exist for that (RA6X-035): a fresh-looking
+	// state whose output is missing regenerates it.
 	now := time.Now().UTC()
 	zoneState := &statepkg.ZoneState{
 		Serial:        2024011501,
 		LastSigned:    now,
 		SignaturesExp: now.Add(14 * 24 * time.Hour),
+	}
+	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
+	if !needs || reason != "signed output missing" {
+		t.Errorf("Zone whose signed output is missing should need signing, got needs=%v reason=%q", needs, reason)
+	}
+	if err := EnsureDir(cfg.OutputDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(signer.OutputPath("example.com"), []byte("; signed output present\n"), 0644); err != nil {
+		t.Fatal(err)
 	}
 	needs, _ = signer.NeedsSign("example.com", zonePath, zoneState)
 	if needs {

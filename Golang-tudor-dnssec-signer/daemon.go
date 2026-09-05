@@ -291,6 +291,20 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 		slog.Info("[DAEMON] Poll interval updated", "old", oldCfg.PollInterval.String(), "new", cfg.PollInterval.String())
 	}
 
+	// A changed output directory is reconciled now: the destination is created
+	// (or the failure surfaced) and every zone's output is found missing there
+	// on the next cycle, which regenerates it; the previous directory's files
+	// are left in place for whatever still serves them (RA6X-035).
+	if oldCfg.OutputDir != cfg.OutputDir {
+		if err := signerpkg.EnsureDir(cfg.OutputDir); err != nil {
+			slog.Error("[DAEMON] Output directory changed but cannot be created; signed zones cannot be published there until it is fixed",
+				"old", oldCfg.OutputDir, "new", cfg.OutputDir, "error", err)
+		} else {
+			slog.Info("[DAEMON] Output directory changed; signed zones will be regenerated there on the next cycle",
+				"old", oldCfg.OutputDir, "new", cfg.OutputDir)
+		}
+	}
+
 	// Warn if listen addresses changed (requires restart)
 	if oldCfg.Web.Listen != cfg.Web.Listen || oldCfg.Web.Enabled != cfg.Web.Enabled {
 		slog.Warn("[DAEMON] Web listen address changed; restart required to take effect",
@@ -649,19 +663,10 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 		snap.state.SetZone(domain, zoneState)
 	}
 
-	// R-003: the active config is authoritative for the source path. Change
-	// detection above used zoneCfg.Path, but SignZone reads zoneState.Path — if the
-	// operator edited the zone's `path` and reloaded, reconcile the state to the
-	// config path so we parse/sign the SAME file change detection saw, not the stale
-	// path in state.json. SignZone captures source mtime/size and writes output only
-	// after a successful parse, so a failed/unparseable new path leaves the prior
-	// signed output and change-detection bookkeeping intact.
-	if zoneState.Path != zoneCfg.Path {
-		slog.Info("[DAEMON] Zone source path changed in config; signing the new path",
-			"domain", domain, "old_path", zoneState.Path, "new_path", zoneCfg.Path)
-		snap.state.UpdateZone(domain, func(zs *statepkg.ZoneState) { zs.Path = zoneCfg.Path })
-	}
-
+	// The active configuration is authoritative for the source path: SignZone
+	// reads Signer.SourcePath (the configured path) and records it in state
+	// only after a successful publication, so a failed or unparseable new path
+	// leaves the prior signed output and source reference intact (RA6X-005).
 	// Sign the zone
 	signStart := time.Now()
 	if err := snap.signer.SignZone(domain); err != nil {

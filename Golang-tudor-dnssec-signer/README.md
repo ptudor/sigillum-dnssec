@@ -194,6 +194,32 @@ dnssec-tudor resign example.com --config config.toml
 dnssec-tudor remove example.com --config config.toml
 ```
 
+### Updating Zone Files
+
+The daemon signs a zone again when its unsigned file changes. Whatever
+produces that file — an editor, a generator, a deployment script — must
+replace it **atomically**: write the new content to a temporary file in the
+same directory, `fsync` it, then `rename` it over the zone path. The signer
+reads each zone through a single file descriptor and refuses a file that
+changes while it is being read, but no metadata check can tell a complete
+small zone from a paused in-place rewrite that has so far written only a
+valid SOA/NS prefix. In-place writes (`>` redirection, editors that save in
+place) risk publishing such a prefix, with authenticated denial of existence
+for every record that had not been written yet. Pipes, devices and
+directories are rejected as zone sources.
+
+```bash
+# Safe: atomic replacement
+generate-zone > /etc/dnssec-tudor/zones/example.com.db.tmp && \
+  mv /etc/dnssec-tudor/zones/example.com.db.tmp /etc/dnssec-tudor/zones/example.com.db
+```
+
+Changing a zone's `path` in the config (then `SIGHUP`, `sign` or `resign`)
+signs the new file on the next pass regardless of its timestamp or size; the
+previous signed output is kept until the new source parses and publishes. A
+signed output that goes missing from `output_dir` is regenerated on the next
+cycle, and a changed `output_dir` is populated on the next cycle after reload.
+
 ### Migrating from BIND
 
 If you have existing BIND-style DNSSEC keys (from `dnssec-keygen` or similar), you can import them without changing your DS records at the registrar:
