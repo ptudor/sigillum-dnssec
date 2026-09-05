@@ -39,11 +39,12 @@ type mockDNS struct {
 	ip6        string
 	byFamily   map[string]map[qkey]func(req *dns.Msg) *dns.Msg
 
-	mu       sync.Mutex
-	handlers map[qkey]func(req *dns.Msg) *dns.Msg
-	dropped  map[qkey]bool // questions that get no reply at all
-	truncate map[qkey]bool // questions answered truncated (empty) over UDP only
-	seen     []dns.Question
+	mu            sync.Mutex
+	handlers      map[qkey]func(req *dns.Msg) *dns.Msg
+	dropped       map[qkey]bool // questions that get no reply at all
+	truncate      map[qkey]bool // questions answered truncated (empty) over UDP only
+	seen          []dns.Question
+	seenRecursive []bool // RD flag of each question in seen (false = an authoritative dial)
 }
 
 // newMockDNS starts a DNS server on an ephemeral loopback port over both UDP
@@ -72,6 +73,7 @@ func newMockDNS(t *testing.T) *mockDNS {
 		}
 		m.mu.Lock()
 		m.seen = append(m.seen, q)
+		m.seenRecursive = append(m.seenRecursive, req.RecursionDesired)
 		h := m.handlers[key]
 		if fam := m.byFamily[family]; fam != nil {
 			if fh, ok := fam[key]; ok {
@@ -285,6 +287,11 @@ func (m *mockDNS) newValidator() *Validator {
 func (m *mockDNS) newValidatorWithTimeout(queryTimeout time.Duration) *Validator {
 	v := NewValidator(queryTimeout, 20*time.Second, 4, &dnspkg.RootAnchors{Zone: "."}, m.ip)
 	v.resolver.SetDefaultPort(m.port)
+	// The hermetic fixture lives on loopback, which the public-only egress
+	// policy refuses; allow it explicitly as a private deployment would.
+	loopback := dnspkg.PublicOnlyPolicy(m.ip)
+	loopback.AllowPrivate = true
+	v.SetEgressPolicy(loopback)
 	v.rootServers = []string{m.ip}
 	v.SetQuickMode(false)
 	return v

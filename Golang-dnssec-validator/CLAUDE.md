@@ -591,6 +591,17 @@ Configuration is **TOML-first, with environment variables as a fallback** — th
 
    Copy `dnssec-validator.toml.example` as your starting point. Unknown/misspelled keys are rejected at load time (strict decoding), so a typo is a startup error rather than a silently ignored setting.
 
+   **Outbound DNS egress (RA6X-054).** Authoritative-server addresses come from
+   DNS data the requesting client controls, so the service dials only public
+   unicast destinations by default: loopback, link-local, private (RFC 1918,
+   ULA, CGNAT), multicast and reserved addresses are refused at the single
+   dial boundary every query (UDP and TCP retry) passes through, IPv4-mapped
+   IPv6 included. The configured `recursive_resolver` is always allowed.
+   `private_destination_allowlist = ["10.0.0.0/8"]` admits specific internal
+   ranges for a private diagnostic deployment; `allow_private_destinations =
+   true` disables the check for a deliberately internal instance. Both are
+   TOML-only (no environment fallback).
+
 2. **Environment variables (fallback).** When no TOML file is present — typical for a container or a minimal systemd unit — the same settings are read from the process environment (set them with systemd `Environment=`/`EnvironmentFile=` or exported shell variables). This project does **not** read a `.env` dotfile; TOML is the house configuration format.
 
 ### Environment variable fallback reference
