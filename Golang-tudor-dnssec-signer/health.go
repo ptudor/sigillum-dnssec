@@ -72,6 +72,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request, state *statepkg.State
 	// Check signing loop liveness
 	signingLoopAlive := true
 	if daemon != nil {
+		// RA6X-026: a cycle that could not load the authoritative state is a
+		// persistent operational failure until the file is repaired.
+		if fault := daemon.StateFault(); fault != "" {
+			depErrors = append(depErrors, "state: "+fault)
+			healthy = false
+		}
 		if daemon.signingLoopDead.Load() {
 			depErrors = append(depErrors, "signing_loop: goroutine has exited")
 			healthy = false
@@ -145,6 +151,9 @@ func healthzHandler(w http.ResponseWriter, r *http.Request, state *statepkg.Stat
 
 	// Check signing loop liveness
 	if daemon != nil {
+		if daemon.StateFault() != "" {
+			healthy = false
+		}
 		if daemon.signingLoopDead.Load() {
 			healthy = false
 		}

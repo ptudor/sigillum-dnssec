@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -28,4 +29,16 @@ func acquireStateLock(_ string, _ time.Duration) (*stateLock, error) {
 
 func (l *stateLock) release() {
 	winLockMu.Unlock()
+}
+
+// acquireInstanceLock has no cross-process effect on Windows (see acquireStateLock);
+// a second daemon in the same process is still refused by the process-local mutex.
+func acquireInstanceLock(_ string) (*stateLock, error) {
+	winLockWarn.Do(func() {
+		slog.Warn("[STATE] cross-process state locking is not implemented on Windows; concurrent daemon+CLI writes are not serialized")
+	})
+	if !winLockMu.TryLock() {
+		return nil, fmt.Errorf("another dnssec-tudor instance holds the process-local lock; refusing to start a second instance")
+	}
+	return &stateLock{}, nil
 }
