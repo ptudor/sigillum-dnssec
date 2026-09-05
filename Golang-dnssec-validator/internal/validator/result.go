@@ -123,11 +123,16 @@ type StartEvent struct {
 	Mode      string    `json:"mode"` // quick or extended
 }
 
-// ZoneEvent is sent for each zone validation result
+// ZoneEvent is sent for each zone validation result. It may be sent more than
+// once for the leaf zone: first when the zone authenticates, then again with
+// the per-name record validation attached. QueryName and Depth identify which
+// name (top-level or alias hop) the zone result belongs to (RA6X-022).
 type ZoneEvent struct {
 	Zone       string           `json:"zone"`
 	Status     ValidationStatus `json:"status"`
 	ZoneResult *ZoneResult      `json:"zone_result,omitempty"`
+	QueryName  string           `json:"query_name,omitempty"`
+	Depth      int              `json:"depth"`
 }
 
 // ProgressEvent is sent during validation to show progress
@@ -179,6 +184,7 @@ type Disagreement struct {
 
 // RecordValidation represents validation of an actual record (A, AAAA, MX, etc.)
 type RecordValidation struct {
+	Name                  string     `json:"name,omitempty"`                    // the queried name this validation belongs to — RA6X-022
 	RecordType            string     `json:"record_type"`                       // "A", "AAAA", "MX", etc.
 	RecordCount           int        `json:"record_count"`                      // Number of records found
 	RRSIGVerified         bool       `json:"rrsig_verified"`                    // RRSIG cryptographically verified

@@ -31,6 +31,12 @@
     let currentDepth = 0;
     let seenZones = new Set();
     let inCnameChain = false;
+    // Latest zone result per zone, and the per-name record validations that
+    // belong to each zone (a zone can serve several names in one validation
+    // when an alias stays in-zone) — reconciled from every zone event and
+    // from the final complete payload (RA6X-022).
+    let zoneResults = {};
+    let zoneRecords = {};
 
     // Initialize
     function init() {
@@ -199,6 +205,8 @@
         currentDepth = 0;
         seenZones = new Set();
         inCnameChain = false;
+        zoneResults = {};
+        zoneRecords = {};
         chainVisualizationEl.innerHTML = '';
         zoneTabsEl.innerHTML = '';
         zoneContentEl.innerHTML = '';
@@ -241,13 +249,61 @@
         return indent;
     }
 
+    // Remember a per-name record validation for its zone (RA6X-022).
+    function rememberRecord(zone, rv) {
+        if (!rv) return;
+        var list = zoneRecords[zone] || [];
+        var name = rv.name || '';
+        for (var i = 0; i < list.length; i++) {
+            if ((list[i].name || '') === name) {
+                list[i] = rv;
+                zoneRecords[zone] = list;
+                return;
+            }
+        }
+        list.push(rv);
+        zoneRecords[zone] = list;
+    }
+
+    // Reconcile an already-rendered zone card/tab with a newer zone result:
+    // a later zone event (the leaf zone is re-sent once its record validation
+    // exists) or the final complete payload (RA6X-022).
+    function updateZoneCard(zone, status, zoneResult) {
+        if (zoneResult) {
+            zoneResults[zone] = zoneResult;
+            rememberRecord(zone, zoneResult.record_validation);
+        }
+        var item = chainVisualizationEl.querySelector('.zone-item[data-zone="' + CSS.escape(zone) + '"]');
+        if (item) {
+            item.className = 'zone-item ' + status;
+            item.setAttribute('aria-label', 'Zone ' + zone + ' status ' + status);
+            var icon = item.querySelector('.zone-status-icon');
+            if (icon) {
+                icon.className = 'zone-status-icon ' + status;
+                icon.textContent = getStatusIcon(status);
+            }
+            if (zoneResult) {
+                item.dataset.result = JSON.stringify(zoneResult);
+            }
+        }
+        if (selectedZone === zone && zoneResults[zone]) {
+            showZoneDetails(zoneResults[zone]);
+        }
+    }
+
     // Add zone item to tree visualization
     function addZoneCard(zone, status, zoneResult) {
-        // Skip if zone was already rendered (prevent duplicates from nested CNAME chains)
+        // A zone already rendered (a repeated leaf event, or a zone reused by a
+        // nested CNAME chain) is reconciled in place rather than duplicated.
         if (seenZones.has(zone)) {
+            updateZoneCard(zone, status, zoneResult);
             return;
         }
         seenZones.add(zone);
+        if (zoneResult) {
+            zoneResults[zone] = zoneResult;
+            rememberRecord(zone, zoneResult.record_validation);
+        }
 
         // Create tree item
         var item = document.createElement('div');
@@ -274,14 +330,14 @@
             item.dataset.result = JSON.stringify(zoneResult);
         }
 
-        // Click handler
+        // Click handler — always shows the LATEST result for the zone
         item.addEventListener('click', function() {
-            selectZone(zone, zoneResult);
+            selectZone(zone);
         });
         item.addEventListener('keydown', function(e) {
             if (e.key === 'Enter' || e.key === ' ') {
                 e.preventDefault();
-                selectZone(zone, zoneResult);
+                selectZone(zone);
             }
         });
 
@@ -298,14 +354,14 @@
         tab.textContent = zone === '.' ? 'root' : zone.replace(/\.$/, '');
         tab.dataset.zone = zone;
         tab.addEventListener('click', function() {
-            selectZone(zone, zoneResult);
+            selectZone(zone);
         });
         tab.addEventListener('keydown', handleZoneTabKeydown);
         zoneTabsEl.appendChild(tab);
 
         // Auto-select first zone
         if (!selectedZone) {
-            selectZone(zone, zoneResult);
+            selectZone(zone);
         }
 
         // Increment depth for next zone
@@ -313,7 +369,7 @@
     }
 
     // Select a zone to show details
-    function selectZone(zone, zoneResult) {
+    function selectZone(zone) {
         selectedZone = zone;
 
         // Update tree item selection
@@ -332,9 +388,9 @@
             }
         });
 
-        // Show zone details
-        if (zoneResult) {
-            showZoneDetails(zoneResult);
+        // Show zone details (latest known result)
+        if (zoneResults[zone]) {
+            showZoneDetails(zoneResults[zone]);
         }
     }
 
@@ -354,12 +410,20 @@
             zoneResult.nameservers.forEach(function(ns) {
                 if (ns.addresses && ns.addresses.length > 0) {
                     ns.addresses.forEach(function(addr) {
+                        // A per-address status is a verdict on THIS server's own
+                        // answer against the authenticated chain (RA6X-018):
+                        // secure = its DNSKEY RRset and signature verified;
+                        // bogus = it answered but disagreed or failed to verify;
+                        // indeterminate = it did not answer; validating = not judged.
                         html += '<li class="ns-item">';
-                        html += '<span class="ns-status ' + getStatusClass(addr.status) + '">' + getStatusIcon(addr.status) + '</span>';
+                        html += '<span class="ns-status ' + getStatusClass(addr.status) + '" title="' + escapeHtml(addr.status) + '">' + getStatusIcon(addr.status) + '</span>';
                         html += '<span class="ns-name">' + escapeHtml(ns.name) + '</span>';
                         html += '<span class="ns-ip">(' + escapeHtml(addr.ip) + ')</span>';
                         if (addr.rtt_ns) {
                             html += '<span class="ns-rtt">' + formatRTT(addr.rtt_ns) + '</span>';
+                        }
+                        if (addr.error) {
+                            html += '<span class="ns-error">' + escapeHtml(addr.error) + '</span>';
                         }
                         html += '</li>';
                     });
@@ -485,23 +549,18 @@
             html += '</div>';
         }
 
-        // Record Validation (actual record RRSIG)
-        if (zoneResult.record_validation) {
-            var rv = zoneResult.record_validation;
-            html += '<h4>Record Signature Verification</h4>';
-            html += '<div class="record-card">';
-            html += '<div class="record-data">';
-            if (rv.rrsig_verified) {
-                html += '<span class="ns-status secure">\u2713</span> ' + escapeHtml(rv.record_type) + ' RRSIG cryptographically verified (key tag ' + rv.signing_key_tag + ')';
-            } else if (rv.error) {
-                html += '<span class="ns-status error">\u2717</span> ' + escapeHtml(rv.error);
-            } else {
-                html += '<span class="ns-status warning">\u26A0</span> ' + escapeHtml(rv.record_type) + ' RRSIG not verified';
-            }
-            html += '</div>';
-            html += '<div class="record-meta">Records found: ' + rv.record_count + '</div>';
-            html += '</div>';
+        // Record Validation (actual record RRSIG), one entry per queried name
+        // in this zone (RA6X-022). Denial, wildcard and per-server diagnostics
+        // are shown alongside the signature outcome so a failure is never hidden
+        // behind a verified data signature.
+        var records = zoneRecords[zoneResult.zone] || [];
+        if (records.length === 0 && zoneResult.record_validation) {
+            records = [zoneResult.record_validation];
         }
+        records.forEach(function(rv) {
+            html += '<h4>Record Signature Verification' + (rv.name ? ' — ' + escapeHtml(rv.name) : '') + '</h4>';
+            html += renderRecordValidation(rv);
+        });
 
         // NSEC records
         if (zoneResult.nsec && zoneResult.nsec.length > 0) {
@@ -571,6 +630,17 @@
             html += '</div>';
         }
 
+        // Server disagreements (RA6X-018): diagnostic, never a verdict change
+        if (zoneResult.disagreements && zoneResult.disagreements.length > 0) {
+            html += '<h4>Server Disagreements</h4>';
+            zoneResult.disagreements.forEach(function(d) {
+                html += '<div class="record-card" style="border-left: 3px solid var(--warning);">';
+                html += '<div class="record-data">' + escapeHtml((d.server && d.server !== d.ip ? d.server + ' ' : '') + d.ip) + ': ' + escapeHtml(d.issue) + '</div>';
+                html += '<div class="record-meta">Expected: ' + escapeHtml(d.expected || '') + ' | Got: ' + escapeHtml(d.got || '') + '</div>';
+                html += '</div>';
+            });
+        }
+
         // Errors
         if (zoneResult.errors && zoneResult.errors.length > 0) {
             html += '<h4>Errors</h4>';
@@ -594,10 +664,101 @@
         zoneContentEl.innerHTML = html;
     }
 
+    // Render one NSEC/NSEC3 proof (denial or wildcard) as a record card.
+    function renderProof(title, proof) {
+        var html = '<div class="record-card">';
+        html += '<div class="record-header">';
+        html += '<span class="record-type">' + escapeHtml(title) + ' (' + escapeHtml(proof.proof_type || '') + ')</span>';
+        html += '<span class="record-tag">' + escapeHtml(proof.response_type || '') + '</span>';
+        html += '</div>';
+        html += '<div class="record-data">';
+        if (proof.verified && proof.opt_out) {
+            html += '<span class="ns-status warning">\u26A0</span> ';
+        } else if (proof.verified) {
+            html += '<span class="ns-status secure">\u2713</span> ';
+        } else {
+            html += '<span class="ns-status error">\u2717</span> ';
+        }
+        html += escapeHtml(proof.explanation || proof.error || '');
+        html += '</div>';
+        var meta = [];
+        if (proof.covering_nsec) meta.push('Covering: ' + escapeHtml(proof.covering_nsec));
+        if (proof.closest_encloser) meta.push('Closest encloser: ' + escapeHtml(proof.closest_encloser));
+        if (proof.next_closer) meta.push('Next closer: ' + escapeHtml(proof.next_closer));
+        if (proof.opt_out) meta.push('Opt-out: conclusion is insecure, not secure');
+        if (proof.ignored && proof.ignored.length) meta.push('Ignored: ' + escapeHtml(proof.ignored.join('; ')));
+        if (meta.length) {
+            html += '<div class="record-meta">' + meta.join(' | ') + '</div>';
+        }
+        html += '</div>';
+        return html;
+    }
+
+    // Render one per-name record validation with all of its diagnostics.
+    function renderRecordValidation(rv) {
+        var html = '<div class="record-card">';
+        html += '<div class="record-data">';
+        if (rv.rrsig_verified) {
+            html += '<span class="ns-status secure">\u2713</span> ' + escapeHtml(rv.record_type) + ' RRSIG cryptographically verified (key tag ' + rv.signing_key_tag + ')';
+        } else if (rv.error) {
+            html += '<span class="ns-status error">\u2717</span> ' + escapeHtml(rv.error);
+        } else {
+            html += '<span class="ns-status warning">\u26A0</span> ' + escapeHtml(rv.record_type) + ' RRSIG not verified';
+        }
+        html += '</div>';
+        var meta = ['Records found: ' + rv.record_count];
+        if (rv.target) meta.push('Target: ' + escapeHtml(rv.target));
+        if (rv.synthesized_from) meta.push('Synthesized from DNAME at: ' + escapeHtml(rv.synthesized_from));
+        html += '<div class="record-meta">' + meta.join(' | ') + '</div>';
+        html += '</div>';
+
+        if (rv.wildcard) {
+            html += '<div class="record-card">';
+            html += '<div class="record-data">';
+            html += (rv.wildcard_proof_verified ? '<span class="ns-status secure">\u2713</span> ' : '<span class="ns-status error">\u2717</span> ');
+            html += 'Answer synthesized from wildcard ' + escapeHtml(rv.wildcard_source || '') + (rv.wildcard_proof_verified ? ' with a verified no-exact-match proof' : ' WITHOUT a verified no-exact-match proof');
+            html += '</div>';
+            html += '</div>';
+            if (rv.wildcard_proof) {
+                html += renderProof('Wildcard proof', rv.wildcard_proof);
+            }
+        }
+        if (rv.denial_proof) {
+            html += renderProof('Denial of existence', rv.denial_proof);
+        }
+        if (rv.server_disagreements && rv.server_disagreements.length > 0) {
+            rv.server_disagreements.forEach(function(d) {
+                html += '<div class="record-card" style="border-left: 3px solid var(--warning);">';
+                html += '<div class="record-data" style="color: var(--warning);">' + escapeHtml(d) + '</div>';
+                html += '</div>';
+            });
+        }
+        return html;
+    }
+
     // Complete validation
     function completeValidation(data) {
         currentResult = data;
         hideStatus();
+
+        // Reconcile every card and tab from the final payload: the zone events
+        // streamed earlier may predate the leaf record validation, and alias
+        // hops carry their own chains (RA6X-022).
+        var chains = [data.chain || []];
+        (data.cname_chains || []).forEach(function(c) { chains.push(c.chain || []); });
+        chains.forEach(function(chain) {
+            chain.forEach(function(zr) {
+                if (!zr || !zr.zone) return;
+                if (seenZones.has(zr.zone)) {
+                    updateZoneCard(zr.zone, zr.status, zr);
+                } else {
+                    addZoneCard(zr.zone, zr.status, zr);
+                }
+            });
+        });
+        if (selectedZone && zoneResults[selectedZone]) {
+            showZoneDetails(zoneResults[selectedZone]);
+        }
 
         // Update badges
         var badgeHtml = '<span class="badge ' + data.result + '">' + data.result + '</span>';

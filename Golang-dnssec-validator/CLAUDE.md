@@ -190,6 +190,28 @@ Flag any server returning different results:
 }
 ```
 
+#### How disagreement affects diagnostics (RA6X-018)
+
+Per-address status is a verdict on **that server's own answer** against the
+authenticated chain, not a transport result:
+
+| Address status | Meaning |
+|----------------|---------|
+| `secure` | The server's DNSKEY RRset holds exactly the authenticated key material and its RRSIG verifies under the DS/anchor-authenticated keys. |
+| `bogus` | The server answered, but its DNSKEY RRset differs from the authenticated one or its signature does not verify. Recorded in `disagreements` and as a zone warning. |
+| `indeterminate` | The server did not answer (timeout, transport error, failure RCODE). |
+| `insecure` | The zone is insecure (no DS / opt-out); the server's answer was not judged cryptographically. |
+
+The zone's verdict is established from the **first server response that
+authenticates** (DS/anchor digest match plus a verifying RRSIG over the wire
+RRset); every other queried server is then judged against it. Disagreement is
+diagnostic: one dissenting server never changes the zone's verdict, and not
+every server has to agree for a valid path to be found. The same rule applies
+to the leaf answer (`record_validation.server_disagreements`: differing content
+or a failing signature on another server) and, in extended mode, to the parent
+servers' DS answers (`disagreements` entries whose `server` is `parent <zone>`).
+Quick mode queries at most two servers and judges those.
+
 ### 3. DNSSEC Validation Details
 
 For each zone, capture and display:

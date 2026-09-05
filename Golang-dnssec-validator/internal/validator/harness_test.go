@@ -33,6 +33,11 @@ type mockDNS struct {
 	port string
 
 	tcp *dns.Server
+	// IPv6 loopback listeners (enableDualStack) let one mock act as two
+	// distinct servers, ::1 and 127.0.0.1, sharing one port.
+	udp6, tcp6 *dns.Server
+	ip6        string
+	byFamily   map[string]map[qkey]func(req *dns.Msg) *dns.Msg
 
 	mu       sync.Mutex
 	handlers map[qkey]func(req *dns.Msg) *dns.Msg
@@ -62,6 +67,7 @@ func newMockDNS(t *testing.T) *mockDNS {
 		handlers: make(map[qkey]func(*dns.Msg) *dns.Msg),
 		dropped:  make(map[qkey]bool),
 		truncate: make(map[qkey]bool),
+		byFamily: make(map[string]map[qkey]func(*dns.Msg) *dns.Msg),
 	}
 
 	mux := dns.NewServeMux()
@@ -71,9 +77,18 @@ func newMockDNS(t *testing.T) *mockDNS {
 		}
 		q := req.Question[0]
 		key := qkey{dns.CanonicalName(q.Name), q.Qtype}
+		family := "v4"
+		if host, _, err := net.SplitHostPort(w.LocalAddr().String()); err == nil && strings.Contains(host, ":") {
+			family = "v6"
+		}
 		m.mu.Lock()
 		m.seen = append(m.seen, q)
 		h := m.handlers[key]
+		if fam := m.byFamily[family]; fam != nil {
+			if fh, ok := fam[key]; ok {
+				h = fh
+			}
+		}
 		drop := m.dropped[key]
 		trunc := m.truncate[key]
 		m.mu.Unlock()
@@ -128,6 +143,56 @@ func newMockDNS(t *testing.T) *mockDNS {
 	}
 	t.Cleanup(func() { _ = m.srv.Shutdown(); _ = m.tcp.Shutdown() })
 	return m
+}
+
+// enableDualStack adds IPv6 loopback listeners on the mock's port so the mock
+// answers as two servers (127.0.0.1 and ::1). It returns false when IPv6
+// loopback is unavailable on this host; callers then skip.
+func (m *mockDNS) enableDualStack(t *testing.T) bool {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", net.JoinHostPort("::1", m.port))
+	if err != nil {
+		return false
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort("::1", m.port))
+	if err != nil {
+		_ = pc.Close()
+		return false
+	}
+	handler := m.srv.Handler
+	started := make(chan struct{}, 2)
+	m.udp6 = &dns.Server{PacketConn: pc, Handler: handler, NotifyStartedFunc: func() { started <- struct{}{} }}
+	m.tcp6 = &dns.Server{Listener: ln, Handler: handler, NotifyStartedFunc: func() { started <- struct{}{} }}
+	go func() { _ = m.udp6.ActivateAndServe() }()
+	go func() { _ = m.tcp6.ActivateAndServe() }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("mock DNS IPv6 server did not start")
+		}
+	}
+	t.Cleanup(func() { _ = m.udp6.Shutdown(); _ = m.tcp6.Shutdown() })
+	m.ip6 = "::1"
+	return true
+}
+
+// onFamily registers a handler that applies only when the query arrived on the
+// given address family ("v4" = 127.0.0.1, "v6" = ::1), overriding on().
+func (m *mockDNS) onFamily(family, name string, qtype uint16, fn func(req *dns.Msg) *dns.Msg) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.byFamily[family] == nil {
+		m.byFamily[family] = make(map[qkey]func(*dns.Msg) *dns.Msg)
+	}
+	m.byFamily[family][qkey{dns.CanonicalName(name), qtype}] = fn
+}
+
+// clearFamilyOverrides removes every per-family handler override.
+func (m *mockDNS) clearFamilyOverrides() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.byFamily = make(map[string]map[qkey]func(*dns.Msg) *dns.Msg)
 }
 
 // drop makes the mock never answer the question (client-side timeout).
@@ -185,6 +250,9 @@ func (m *mockDNS) serveInfra(zone string) {
 	}
 	m.answer(zone, dns.TypeNS, &dns.NS{Hdr: rrHdr(zone, dns.TypeNS), Ns: nsName})
 	m.answer(nsName, dns.TypeA, &dns.A{Hdr: rrHdr(nsName, dns.TypeA), A: net.ParseIP(m.ip)})
+	if m.ip6 != "" {
+		m.answer(nsName, dns.TypeAAAA, &dns.AAAA{Hdr: rrHdr(nsName, dns.TypeAAAA), AAAA: net.ParseIP(m.ip6)})
+	}
 }
 
 // questions returns a copy of every question the mock has received.
@@ -421,4 +489,11 @@ func testCtx(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+// dnsQueryResultRaw wraps a packed response as a QueryResult for fingerprinting.
+func dnsQueryResultRaw(raw []byte) dnspkg.QueryResult {
+	var msg dns.Msg
+	_ = msg.Unpack(raw)
+	return dnspkg.QueryResult{RCode: msg.Rcode, RCodeName: dnspkg.RCodeName(msg.Rcode), RawResponse: raw}
 }

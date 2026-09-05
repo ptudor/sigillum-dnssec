@@ -235,14 +235,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 				lastStatus = StatusBogus
 				result.Result = StatusBogus
 				result.DurationMs = time.Since(start).Milliseconds()
-				v.emitEvent("complete", CompleteEvent{
-					Result:      result.Result,
-					Chain:       result.Chain,
-					CNAMEChains: result.CNAMEChains,
-					DurationMs:  result.DurationMs,
-					Errors:      result.Errors,
-					Warnings:    result.Warnings,
-				})
+				v.emitComplete(depth, result)
 				return result, nil
 			case StatusInsecure:
 				ancestorInsecure = true
@@ -286,6 +279,8 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			Zone:       zone,
 			Status:     zoneResult.Status,
 			ZoneResult: zoneResult,
+			QueryName:  result.Domain,
+			Depth:      depth,
 		})
 
 		// Track overall status
@@ -295,14 +290,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			// Stop validation on bogus
 			result.Result = StatusBogus
 			result.DurationMs = time.Since(start).Milliseconds()
-			v.emitEvent("complete", CompleteEvent{
-				Result:      result.Result,
-				Chain:       result.Chain,
-				CNAMEChains: result.CNAMEChains,
-				DurationMs:  result.DurationMs,
-				Errors:      result.Errors,
-				Warnings:    result.Warnings,
-			})
+			v.emitComplete(depth, result)
 			return result, nil
 		case StatusInsecure:
 			ancestorInsecure = true
@@ -337,11 +325,10 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 					fmt.Sprintf("wildcard-synthesized answer from %s lacks a verified closest-encloser proof of no direct match",
 						recordValidation.WildcardSource))
 			}
-			// Update the cached result too
-			if cached, ok := validatedZones[leafZone.Zone]; ok {
-				cached.RecordValidation = recordValidation
-				cached.Warnings = leafZone.Warnings
-			}
+			// The cache holds ZONE authentication only. The per-name answer
+			// validation stays on this request's copy of the zone result, so a
+			// later name in the same zone (an alias hop) neither inherits nor
+			// overwrites it (RA6X-022).
 			// R-082: fold the leaf record's signature outcome into the overall verdict. A
 			// secure chain over an answer whose RRSIG is missing/expired/forged (and which
 			// is not a verified denial) is not secure — the caller reads result.Result, so
@@ -362,6 +349,16 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			if lastStatus == StatusSecure && recordValidation.RRSIGVerified {
 				aliasTarget = recordValidation.Target
 			}
+			// Re-emit the leaf zone now that its per-name record validation
+			// exists, so a streaming client can reconcile the card it drew
+			// from the earlier, leaf-less zone event (RA6X-022).
+			v.emitEvent("zone", ZoneEvent{
+				Zone:       leafZone.Zone,
+				Status:     leafZone.Status,
+				ZoneResult: leafZone,
+				QueryName:  result.Domain,
+				Depth:      depth,
+			})
 		}
 	} else if lastStatus != StatusBogus && leafZoneName != "" {
 		// No authenticated leaf exists below an insecure or indeterminate chain;
@@ -404,19 +401,26 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 	result.Result = lastStatus
 	result.DurationMs = time.Since(start).Milliseconds()
 
-	// Emit complete event (only for top-level)
-	if depth == 0 {
-		v.emitEvent("complete", CompleteEvent{
-			Result:      result.Result,
-			Chain:       result.Chain,
-			CNAMEChains: result.CNAMEChains,
-			DurationMs:  result.DurationMs,
-			Errors:      result.Errors,
-			Warnings:    result.Warnings,
-		})
-	}
+	v.emitComplete(depth, result)
 
 	return result, nil
+}
+
+// emitComplete emits the terminal event for the TOP-LEVEL request only. A
+// nested alias-target validation returns its outcome to the caller, which
+// carries it as a CNAMEChainResult in the one terminal event (RA6X-022).
+func (v *Validator) emitComplete(depth int, result *ValidationResult) {
+	if depth != 0 {
+		return
+	}
+	v.emitEvent("complete", CompleteEvent{
+		Result:      result.Result,
+		Chain:       result.Chain,
+		CNAMEChains: result.CNAMEChains,
+		DurationMs:  result.DurationMs,
+		Errors:      result.Errors,
+		Warnings:    result.Warnings,
+	})
 }
 
 // nextParentDNSKEY decides which DNSKEY set to carry into the next (child)
@@ -542,68 +546,145 @@ func (v *Validator) discoverAliasTarget(ctx context.Context, domain, leafZone st
 
 // queryLeafAllServers queries the leaf record from the authoritative servers.
 // In quick mode it returns the first usable answer. In extended mode it queries
-// EVERY server, returns the first usable answer for the cryptographic
-// verification, and reports any server whose answer disagrees with it — the
-// "query every NS, flag inconsistencies" feature, previously applied only to the
-// DNSKEY step (R-100).
-func (v *Validator) queryLeafAllServers(ctx context.Context, nsAddresses []string, domain string) (*dnspkg.QueryResult, []string) {
-	var first *dnspkg.QueryResult
-	var firstFP string
-	var disagreements []string
-
+// EVERY server, returns the first usable answer whose positive data verifies
+// under the zone's keys (or the first usable answer when none does, so the
+// failure is reported), and flags every other server whose answer differs by
+// content or whose signature fails — the "query every NS, flag inconsistencies"
+// feature (R-100, RA6X-018). Disagreement here is diagnostic: it never changes
+// the verdict that the chosen answer earns on its own.
+func (v *Validator) queryLeafAllServers(ctx context.Context, nsAddresses []string, domain, zone string, dnskeys []dnspkg.DNSKEYRecord) (*dnspkg.QueryResult, []string) {
+	var usable []*dnspkg.QueryResult
 	for _, addr := range nsAddresses {
 		select {
 		case <-ctx.Done():
-			return first, disagreements
+			break
 		default:
 		}
 		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, v.leafType())
 		if err != nil || result == nil || result.Error != "" {
 			continue
 		}
-		if first == nil {
-			first = result
-			firstFP = v.leafFingerprint(result)
-			if v.quickMode {
-				return first, nil
-			}
-			continue
-		}
-		if v.leafFingerprint(result) != firstFP {
-			disagreements = append(disagreements, fmt.Sprintf(
-				"%s (%s) returned a different %s answer (%s) than %s (%s) (%s)",
-				result.Server, result.IP, v.leafTypeName(), result.RCodeName,
-				first.Server, first.IP, first.RCodeName))
+		usable = append(usable, result)
+		if v.quickMode {
+			return result, nil
 		}
 	}
-	return first, disagreements
+	if len(usable) == 0 {
+		return nil, nil
+	}
+
+	// Pick the first answer whose positive data verifies; a server serving
+	// the right data with a broken signature must not block a valid path.
+	chosen := usable[0]
+	for _, qr := range usable {
+		if v.leafSignatureError(qr, domain, zone, dnskeys) == nil {
+			chosen = qr
+			break
+		}
+	}
+
+	chosenFP := v.leafFingerprint(chosen)
+	var disagreements []string
+	for _, qr := range usable {
+		if qr == chosen {
+			continue
+		}
+		if fp := v.leafFingerprint(qr); fp != chosenFP {
+			disagreements = append(disagreements, fmt.Sprintf(
+				"%s (%s) returned a different %s answer (%s) than %s (%s) (%s)",
+				qr.Server, qr.IP, v.leafTypeName(), qr.RCodeName,
+				chosen.Server, chosen.IP, chosen.RCodeName))
+			continue
+		}
+		if err := v.leafSignatureError(qr, domain, zone, dnskeys); err != nil {
+			disagreements = append(disagreements, fmt.Sprintf(
+				"%s (%s) returned the same %s answer as %s (%s) but its signature does not verify: %v",
+				qr.Server, qr.IP, v.leafTypeName(), chosen.Server, chosen.IP, err))
+		}
+	}
+	return chosen, disagreements
+}
+
+// leafSignatureError verifies the positive data in a leaf answer (the queried
+// type at the owner, or the CNAME at the owner) under the zone's keys. Denial
+// answers carry no positive RRset and are not judged here; they return nil.
+func (v *Validator) leafSignatureError(qr *dnspkg.QueryResult, domain, zone string, dnskeys []dnspkg.DNSKEYRecord) error {
+	if qr.RCode != dns.RcodeSuccess || len(qr.RawResponse) == 0 {
+		return nil
+	}
+	switch {
+	case answerHasTypeAt(qr.RawResponse, v.leafType(), domain):
+		_, err := VerifyRRsetFromResponse(qr.RawResponse, v.leafType(), dnskeys, domain, zone, true)
+		return err
+	case len(answerCNAMEsOwnedBy(qr.CNAME, domain)) > 0:
+		if dnameAncestorInAnswer(qr, domain) != "" {
+			return nil // authenticated through the DNAME path instead
+		}
+		_, err := VerifyRRsetFromResponse(qr.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
+		return err
+	}
+	return nil
 }
 
 // leafFingerprint builds a TTL-insensitive canonical summary of a server's
-// answer for the leaf type (RCODE plus the sorted leaf/CNAME rdata), so answers
-// can be compared across servers without flagging benign TTL differences.
+// answer for the leaf type (RCODE plus the sorted, de-duplicated leaf/CNAME
+// rdata), so answers can be compared across servers without flagging benign
+// TTL differences. Comparison is type-aware (RA6X-018): owner names and the
+// domain names inside RDATA are case-insensitive in DNS and are lowercased,
+// while case-sensitive RDATA such as TXT is retained as served.
 func (v *Validator) leafFingerprint(qr *dnspkg.QueryResult) string {
 	parts := []string{qr.RCodeName}
 	if len(qr.RawResponse) > 0 {
 		var msg dns.Msg
 		if err := msg.Unpack(qr.RawResponse); err == nil {
+			seen := make(map[string]bool)
 			var rrs []string
 			for _, rr := range msg.Answer {
 				t := rr.Header().Rrtype
 				if t != v.leafType() && t != dns.TypeCNAME {
 					continue
 				}
-				h := rr.Header()
-				saved := h.Ttl
-				h.Ttl = 0
-				rrs = append(rrs, strings.ToLower(rr.String()))
-				h.Ttl = saved
+				c := canonicalRRString(rr)
+				if !seen[c] {
+					seen[c] = true
+					rrs = append(rrs, c)
+				}
 			}
 			sort.Strings(rrs)
 			parts = append(parts, rrs...)
 		}
 	}
 	return strings.Join(parts, "|")
+}
+
+// canonicalRRString renders a record for comparison: TTL zeroed, the owner
+// and every domain name in the RDATA lowercased (RFC 4034 §6.2 canonical
+// form), other RDATA byte-for-byte as served.
+func canonicalRRString(rr dns.RR) string {
+	c := dns.Copy(rr)
+	h := c.Header()
+	h.Name = dns.CanonicalName(h.Name)
+	h.Ttl = 0
+	switch v := c.(type) {
+	case *dns.CNAME:
+		v.Target = dns.CanonicalName(v.Target)
+	case *dns.DNAME:
+		v.Target = dns.CanonicalName(v.Target)
+	case *dns.NS:
+		v.Ns = dns.CanonicalName(v.Ns)
+	case *dns.PTR:
+		v.Ptr = dns.CanonicalName(v.Ptr)
+	case *dns.MX:
+		v.Mx = dns.CanonicalName(v.Mx)
+	case *dns.SRV:
+		v.Target = dns.CanonicalName(v.Target)
+	case *dns.SOA:
+		v.Ns = dns.CanonicalName(v.Ns)
+		v.Mbox = dns.CanonicalName(v.Mbox)
+	case *dns.NAPTR:
+		v.Replacement = dns.CanonicalName(v.Replacement)
+	}
+	return c.String()
 }
 
 // verifyActualRecord queries and verifies the actual record (A, AAAA, etc.) RRSIG
@@ -616,6 +697,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, zone)
 	if err != nil || len(nsRecords) == 0 {
 		return &RecordValidation{
+			Name:       NormalizeDomain(domain),
 			RecordType: v.leafTypeName(),
 			Error:      fmt.Sprintf("failed to resolve nameservers: %v", err),
 		}
@@ -632,16 +714,18 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	// Query the leaf record type from authoritative servers. In extended mode we
 	// query every server and flag per-server disagreement (R-100); the first
 	// usable answer is used for the cryptographic verification below.
-	queryResult, disagreements := v.queryLeafAllServers(ctx, nsAddresses, domain)
+	queryResult, disagreements := v.queryLeafAllServers(ctx, nsAddresses, domain, zone, dnskeys)
 
 	if queryResult == nil {
 		return &RecordValidation{
+			Name:       NormalizeDomain(domain),
 			RecordType: v.leafTypeName(),
 			Error:      fmt.Sprintf("failed to query %s record from authoritative servers", v.leafTypeName()),
 		}
 	}
 
 	validation := &RecordValidation{
+		Name:                NormalizeDomain(domain),
 		RecordType:          v.leafTypeName(),
 		ServerDisagreements: disagreements,
 	}
@@ -1084,52 +1168,72 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		Action: fmt.Sprintf("querying %d nameservers", len(nsAddresses)),
 	})
 
-	serverResults, disagreements := v.ValidateMultipleServers(ctx, zone, nsAddresses)
-	result.Disagreements = disagreements
+	serverResults := v.ValidateMultipleServers(ctx, zone, nsAddresses)
 
-	// Update nameserver results with per-server status
-	serverResultMap := make(map[string]AddressResult)
-	for _, sr := range serverResults {
-		serverResultMap[sr.IP] = sr
-	}
-	for i, ns := range result.Nameservers {
-		for j, addr := range ns.Addresses {
-			if sr, ok := serverResultMap[addr.IP]; ok {
-				result.Nameservers[i].Addresses[j] = sr
+	// applyServerResults copies the per-server outcomes onto the nameserver
+	// entries. It runs again after authentication so each address shows
+	// whether ITS answer chained to the trust anchor (RA6X-018), not merely
+	// whether it answered.
+	applyServerResults := func() {
+		serverResultMap := make(map[string]AddressResult)
+		for _, sr := range serverResults {
+			serverResultMap[sr.IP] = sr
+		}
+		for i, ns := range result.Nameservers {
+			for j, addr := range ns.Addresses {
+				if sr, ok := serverResultMap[addr.IP]; ok {
+					result.Nameservers[i].Addresses[j] = sr
+				}
 			}
 		}
 	}
+	applyServerResults()
 
-	// Find the first successful response
-	var dnskeyResult *dnspkg.QueryResult
-	for _, sr := range serverResults {
-		if sr.Response != nil && sr.Status == StatusSecure {
-			dnskeyResult = sr.Response
-			break
+	// Usable responses answered NOERROR; those carrying an Answer-section
+	// DNSKEY RRset owned by the zone are candidates for the chain.
+	var usable, withKeys []int
+	for i := range serverResults {
+		if serverResults[i].Response == nil {
+			continue
+		}
+		usable = append(usable, i)
+		if len(answerDNSKEYsOwnedBy(serverResults[i].Response.DNSKEY, zone)) > 0 {
+			withKeys = append(withKeys, i)
 		}
 	}
 
-	if dnskeyResult == nil {
+	if len(usable) == 0 {
 		result.Status = StatusIndeterminate
 		result.AddError("failed to query DNSKEY from any nameserver")
 		return result, nil
 	}
 
-	// Report disagreements as warnings
-	if len(disagreements) > 0 {
-		for _, d := range disagreements {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Nameserver %s: %s (expected %s, got %s)", d.IP, d.Issue, d.Expected, d.Got))
-		}
+	// Diagnostics come from the first response carrying keys, else the first
+	// usable one (an unsigned zone's denial records live there). The zone's
+	// DNSKEY RRset is the Answer-section set owned by the zone; keys in other
+	// sections or at other owners are never part of it (RA6X-007). The full
+	// parsed set with its section metadata remains visible per server in
+	// Nameservers[].Addresses[].Response.
+	diag := serverResults[usable[0]].Response
+	if len(withKeys) > 0 {
+		diag = serverResults[withKeys[0]].Response
 	}
+	result.DNSKEY = answerDNSKEYsOwnedBy(diag.DNSKEY, zone)
+	result.RRSIG = diag.RRSIG
+	result.NSEC = diag.NSEC
+	result.NSEC3 = diag.NSEC3
 
-	// Store DNSKEY records. The zone's DNSKEY RRset is the Answer-section set
-	// owned by the zone; keys in other sections or at other owners are never
-	// part of it (RA6X-007). The full parsed set with its section metadata
-	// remains visible per server in Nameservers[].Addresses[].Response.
-	result.DNSKEY = answerDNSKEYsOwnedBy(dnskeyResult.DNSKEY, zone)
-	result.RRSIG = dnskeyResult.RRSIG
-	result.NSEC = dnskeyResult.NSEC
-	result.NSEC3 = dnskeyResult.NSEC3
+	// markUsable sets every NOERROR server to a final per-server status when
+	// the zone's verdict does not rest on per-server authentication.
+	markUsable := func(status ValidationStatus, reason string) {
+		for _, i := range usable {
+			serverResults[i].Status = status
+			if reason != "" {
+				serverResults[i].Error = reason
+			}
+		}
+		applyServerResults()
+	}
 
 	// R-033: below an insecure (proven-unsigned) ancestor there is no authenticated
 	// chain back to the configured root, so any DS/DNSKEY observed at this child is
@@ -1141,11 +1245,12 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		result.Status = StatusInsecure
 		result.Warnings = append(result.Warnings,
 			"delegation is below an insecure (unsigned) ancestor; no authenticated chain to the root — treated as insecure")
+		markUsable(StatusInsecure, "")
 		return result, nil
 	}
 
 	// Check if zone is signed
-	if len(result.DNSKEY) == 0 {
+	if len(withKeys) == 0 {
 		// Zone might be insecure - check for DS in parent
 		if zone != "." {
 			parentZone := parentZoneFromHierarchy(zone, hierarchy)
@@ -1157,27 +1262,37 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 				result.AddError(fmt.Sprintf("failed to query DS from parent: %v", err))
 				return result, nil
 			}
+			result.Disagreements = append(result.Disagreements, ds.Disagreements...)
 			if len(ds.Observed) == 0 {
 				// No DS in parent: insecure delegation only if the parent authenticatedly
 				// proves the DS RRset is absent (R-081 downgrade guard).
 				v.finalizeNoDSDelegation(result, zone, parentZone, parentDNSKEY, ds.Response)
+				if result.Status == StatusInsecure {
+					markUsable(StatusInsecure, "")
+				} else {
+					markUsable(result.Status, "zone served no DNSKEY RRset")
+				}
 				return result, nil
 			}
 			// DS exists but no DNSKEY = bogus
 			result.Status = StatusBogus
 			result.AddError("DS exists in parent but zone has no DNSKEY")
+			markUsable(StatusBogus, "DS exists in parent but this server served no DNSKEY RRset")
 			return result, nil
 		}
 		// Root without DNSKEY is bogus
 		result.Status = StatusBogus
 		result.AddError("root zone has no DNSKEY")
+		markUsable(StatusBogus, "served no DNSKEY RRset for the root")
 		return result, nil
 	}
 
-	// Establish the set of keys the parent authenticates for this zone. The DNSKEY RRset
-	// MUST be signed by one of THESE keys (RFC 4035 §5.2), so DS/anchor authentication is
-	// done first and its key identity is then required by the DNSKEY-RRSIG check below.
-	var authenticatedKeys []dnspkg.DNSKEYRecord
+	// Establish the trust source for this zone: the pinned anchors for the root,
+	// the parent's authenticated DS RRset otherwise. The DNSKEY RRset MUST be
+	// signed by a key this source authenticates (RFC 4035 §5.2), so the source
+	// is fixed first and its key identity is then required of every server's
+	// DNSKEY response below.
+	var trust func(keys []dnspkg.DNSKEYRecord) (*ChainLink, []dnspkg.DNSKEYRecord, error)
 
 	if zone == "." {
 		// Root zone - verify DNSKEYs against the trust anchors (digest match).
@@ -1192,14 +1307,13 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			result.AddError("no currently-active pinned root trust anchor available (check anchor validity dates / refresh the anchor set); cannot establish trust")
 			return result, nil
 		}
-		link, err := VerifyRootTrustAnchor(result.DNSKEY, activeAnchors)
-		if err != nil {
-			result.Status = StatusBogus
-			result.AddError(fmt.Sprintf("root trust anchor verification failed: %v", err))
-			return result, nil
+		trust = func(keys []dnspkg.DNSKEYRecord) (*ChainLink, []dnspkg.DNSKEYRecord, error) {
+			link, err := VerifyRootTrustAnchor(keys, activeAnchors)
+			if err != nil {
+				return nil, nil, fmt.Errorf("root trust anchor verification failed: %v", err)
+			}
+			return link, CollectAnchorMatchedKeys(keys, activeAnchors), nil
 		}
-		result.ChainLink = link
-		authenticatedKeys = CollectAnchorMatchedKeys(result.DNSKEY, activeAnchors)
 	} else {
 		// Non-root zone - verify DS from parent
 		parentZone := parentZoneFromHierarchy(zone, hierarchy)
@@ -1209,6 +1323,7 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			result.AddError(fmt.Sprintf("failed to query DS from parent: %v", err))
 			return result, nil
 		}
+		result.Disagreements = append(result.Disagreements, ds.Disagreements...)
 
 		// Store DS validation result
 		if ds.Validation != nil {
@@ -1219,6 +1334,9 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			// No DS: insecure delegation only if the parent authenticatedly proves the
 			// DS RRset is absent (R-081 downgrade guard).
 			v.finalizeNoDSDelegation(result, zone, parentZone, parentDNSKEY, ds.Response)
+			if result.Status == StatusInsecure {
+				markUsable(StatusInsecure, "")
+			}
 			return result, nil
 		}
 
@@ -1255,23 +1373,22 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			result.Status = StatusInsecure
 			result.Warnings = append(result.Warnings,
 				"the authenticated DS RRset contains only unsupported algorithms/digest types: no supported authentication path, so the zone is treated as unsigned (RFC 4035 §5.2 / RFC 6840 §5.2)")
+			markUsable(StatusInsecure, "")
 			result.QueryTimeNs = time.Since(start).Nanoseconds()
 			return result, nil
 		}
 
-		// Validate DS matches DNSKEY (digest) and record the chain link, using
-		// ONLY the exact DS RRset the parent's signature authenticated (RA6X-007)
-		// and this validator can act on (RA6X-017).
-		link, err := ValidateChainLink(supportedDS, result.DNSKEY, zone)
-		if err != nil {
-			result.Status = StatusBogus
-			result.AddError(fmt.Sprintf("chain of trust validation failed: %v", err))
-			return result, nil
+		trust = func(keys []dnspkg.DNSKEYRecord) (*ChainLink, []dnspkg.DNSKEYRecord, error) {
+			// Validate DS matches DNSKEY (digest) and record the chain link, using
+			// ONLY the exact DS RRset the parent's signature authenticated (RA6X-007)
+			// and this validator can act on (RA6X-017).
+			link, err := ValidateChainLink(supportedDS, keys, zone)
+			if err != nil {
+				return nil, nil, fmt.Errorf("chain of trust validation failed: %v", err)
+			}
+			// R-080: the DNSKEY RRset must be signed by a key the DS actually authenticates.
+			return link, CollectDSMatchedKeys(supportedDS, keys, zone), nil
 		}
-		result.ChainLink = link
-
-		// R-080: the DNSKEY RRset must be signed by a key the DS actually authenticates.
-		authenticatedKeys = CollectDSMatchedKeys(supportedDS, result.DNSKEY, zone)
 
 		// Query RDAP for out-of-band DS verification (only for registrable domains)
 		if v.rdapClient != nil && IsRegistrableDomain(zone) {
@@ -1283,21 +1400,59 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		}
 	}
 
-	// R-080: verify the DNSKEY RRset is signed by one of the parent/anchor-authenticated
-	// keys — not merely by a key present in the RRset. This binds the DNSKEY RRset to the
-	// parent's DS (RFC 4035 §5.2) and rejects a rogue self-signed KSK added to the RRset.
-	// The verification runs over the exact wire RRset in the Answer section owned by
-	// the zone, never over a reconstruction of the merged display slice (RA6X-007).
-	if len(dnskeyResult.RawResponse) == 0 {
-		result.Status = StatusIndeterminate
-		result.AddError("DNSKEY response could not be retained in wire form; cannot verify the DNSKEY RRset")
-		return result, nil
+	// Authenticate the zone from the first server response whose DNSKEY RRset
+	// chains to the trust source: DS/anchor digest match AND an RRSIG over the
+	// exact wire RRset (Answer section, owned by the zone — RA6X-007) by an
+	// authenticated key (RFC 4035 §5.2, R-080). One valid path suffices; the
+	// other servers are then judged against it rather than being required to
+	// agree beforehand (RA6X-018).
+	var authenticatedKeys []dnspkg.DNSKEYRecord
+	chosen := -1
+	var firstErr error
+	for _, i := range withKeys {
+		sr := &serverResults[i]
+		keys := answerDNSKEYsOwnedBy(sr.Response.DNSKEY, zone)
+		link, authed, err := trust(keys)
+		if err == nil {
+			if len(sr.Response.RawResponse) == 0 {
+				err = fmt.Errorf("DNSKEY response could not be retained in wire form; cannot verify the DNSKEY RRset")
+			} else if _, verr := VerifyDNSKEYRRsetFromResponse(sr.Response.RawResponse, zone, authed); verr != nil {
+				err = fmt.Errorf("DNSKEY RRSIG verification failed: %v", verr)
+			}
+		}
+		if err != nil {
+			sr.Status = StatusBogus
+			sr.Error = err.Error()
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		chosen = i
+		result.ChainLink = link
+		authenticatedKeys = authed
+		result.DNSKEY = keys
+		result.RRSIG = sr.Response.RRSIG
+		result.NSEC = sr.Response.NSEC
+		result.NSEC3 = sr.Response.NSEC3
+		break
 	}
-	if _, err := VerifyDNSKEYRRsetFromResponse(dnskeyResult.RawResponse, zone, authenticatedKeys); err != nil {
+	if chosen < 0 {
 		result.Status = StatusBogus
-		result.AddError(fmt.Sprintf("DNSKEY RRSIG verification failed: %v", err))
+		result.AddError(firstErr.Error())
+		for _, i := range usable {
+			if serverResults[i].Status == StatusValidating {
+				serverResults[i].Status = StatusBogus
+				serverResults[i].Error = "served no DNSKEY RRset while other servers did"
+			}
+		}
+		applyServerResults()
 		return result, nil
 	}
+
+	// Judge every queried server against the authenticated chain (RA6X-018).
+	v.judgeDNSKEYServers(result, serverResults, zone, result.DNSKEY, authenticatedKeys)
+	applyServerResults()
 
 	// RFC 4034 §3.1.3: Detect wildcard synthesis (informational)
 	if rrsig := FindRRSIGForType(dns.TypeDNSKEY, result.RRSIG); rrsig != nil {
@@ -1345,6 +1500,9 @@ type parentDSResult struct {
 	// Response is the parent's raw query result, kept so the caller can inspect
 	// the authenticated denial (NSEC/NSEC3) when the DS RRset is absent (R-081).
 	Response *dnspkg.QueryResult
+	// Disagreements records parent servers whose DS answer differed from, or
+	// failed to authenticate against, the one used (extended mode, RA6X-018).
+	Disagreements []Disagreement
 }
 
 // parentZoneFromHierarchy returns the zone that precedes zone in the walked
@@ -1395,11 +1553,21 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 		parentNS = fallbackServers
 	}
 
-	// Query DS from parent nameservers
-	for _, addr := range parentNS {
+	// Query DS from parent nameservers. The first usable answer establishes
+	// the DS RRset; in extended mode the remaining parent servers are queried
+	// too and judged against it (RA6X-018).
+	var out *parentDSResult
+	for idx, addr := range parentNS {
 		result, err := v.resolver.QueryDSAuthoritative(ctx, addr, zone)
+		if out != nil {
+			// Extended mode: judge this parent server against the chosen answer.
+			if d := judgeParentDSServer(out, addr, result, err, zone, parentZone, parentDNSKEY); d != nil {
+				out.Disagreements = append(out.Disagreements, *d)
+			}
+			continue
+		}
 		if err == nil && result.Error == "" && result.RCode == 0 {
-			out := &parentDSResult{
+			out = &parentDSResult{
 				Observed:   answerDSOwnedBy(result.DS, zone),
 				Validation: validation,
 				Response:   result,
@@ -1410,16 +1578,87 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 			if len(parentDNSKEY) > 0 && len(out.Observed) > 0 {
 				out.Authenticated = verifyDSRRSIGSet(validation, zone, parentZone, parentDNSKEY, result.RawResponse)
 			}
-
-			return out, nil
+			if v.quickMode || idx == len(parentNS)-1 {
+				return out, nil
+			}
+			continue
 		}
 		// NXDOMAIN or no DS records
 		if result != nil && result.RCode == dns.RcodeNameError {
 			return &parentDSResult{Validation: validation, Response: result}, nil // Zone doesn't exist in parent
 		}
 	}
+	if out != nil {
+		return out, nil
+	}
 
 	return nil, fmt.Errorf("failed to query DS from parent zone")
+}
+
+// judgeParentDSServer compares one additional parent server's DS answer with
+// the chosen one (RA6X-018): it must answer, serve the same DS RRset for the
+// child, and (when the parent's keys are known) its signature must verify.
+func judgeParentDSServer(chosen *parentDSResult, addr string, qr *dnspkg.QueryResult, err error, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord) *Disagreement {
+	d := &Disagreement{Server: "parent " + parentZone, IP: addr}
+	switch {
+	case err != nil:
+		d.Issue, d.Expected, d.Got = "parent server did not answer the DS query", "DS answer", err.Error()
+		return d
+	case qr == nil || qr.Error != "":
+		d.Issue, d.Expected = "parent server did not answer the DS query", "DS answer"
+		if qr != nil {
+			d.Got = qr.Error
+		}
+		return d
+	case qr.RCode != dns.RcodeSuccess:
+		d.Issue, d.Expected, d.Got = "parent server answered the DS query with an error", "NOERROR", qr.RCodeName
+		return d
+	}
+	observed := answerDSOwnedBy(qr.DS, zone)
+	if !sameDSRecords(observed, chosen.Observed) {
+		d.Issue, d.Expected, d.Got = "parent server served a different DS RRset", dsSummary(chosen.Observed), dsSummary(observed)
+		return d
+	}
+	if len(parentDNSKEY) > 0 && len(observed) > 0 {
+		v := &DSValidation{ParentZone: parentZone}
+		if got := verifyDSRRSIGSet(v, zone, parentZone, parentDNSKEY, qr.RawResponse); got == nil {
+			d.Issue, d.Expected, d.Got = "parent server's DS RRSIG does not verify", "valid signature", v.Error
+			return d
+		}
+	}
+	return nil
+}
+
+// sameDSRecords reports whether two DS sets hold the same records.
+func sameDSRecords(a, b []dnspkg.DSRecord) bool {
+	key := func(d dnspkg.DSRecord) string {
+		return fmt.Sprintf("%d/%d/%d/%s", d.KeyTag, d.Algorithm, d.DigestType, strings.ToUpper(d.Digest))
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]bool, len(a))
+	for _, d := range a {
+		set[key(d)] = true
+	}
+	for _, d := range b {
+		if !set[key(d)] {
+			return false
+		}
+	}
+	return true
+}
+
+// dsSummary describes a DS set briefly for a disagreement message.
+func dsSummary(ds []dnspkg.DSRecord) string {
+	if len(ds) == 0 {
+		return "no DS"
+	}
+	parts := make([]string, 0, len(ds))
+	for _, d := range ds {
+		parts = append(parts, fmt.Sprintf("%d/%d/%d", d.KeyTag, d.Algorithm, d.DigestType))
+	}
+	return fmt.Sprintf("%d DS (%s)", len(ds), strings.Join(parts, ","))
 }
 
 // verifyDSRRSIGSet verifies the DS RRset for childZone in the parent's raw
@@ -1625,9 +1864,14 @@ func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone, parentZone 
 	result.AddError(errMsg)
 }
 
-// ValidateMultipleServers queries all servers in parallel and checks for consensus.
-// In quick mode, only the first two servers are queried for speed.
-func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, servers []string) ([]AddressResult, []Disagreement) {
+// ValidateMultipleServers queries the zone's DNSKEY from all servers in
+// parallel and records each server's REACHABILITY: a NOERROR answer is
+// StatusValidating (queried, not yet judged) with its response attached; a
+// transport failure or failure RCODE is StatusIndeterminate. Nothing here is
+// an authentication verdict — judgeDNSKEYServers assigns those once the zone's
+// chain is established (RA6X-018). In quick mode, only the first two servers
+// are queried for speed.
+func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, servers []string) []AddressResult {
 	// In quick mode, limit to first 2 servers (primary + one fallback)
 	queryServers := servers
 	if v.quickMode && len(servers) > 2 {
@@ -1637,7 +1881,6 @@ func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, se
 	results := make([]AddressResult, len(queryServers))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	disagreements := make([]Disagreement, 0)
 
 	// Limit concurrency
 	semaphore := make(chan struct{}, v.maxConcurrent)
@@ -1652,7 +1895,7 @@ func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, se
 			queryResult, _ := v.resolver.QueryDNSKEYAuthoritative(ctx, srv, zone)
 			result := AddressResult{
 				IP:     srv,
-				Status: StatusSecure,
+				Status: StatusValidating,
 			}
 
 			if queryResult == nil {
@@ -1676,50 +1919,102 @@ func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, se
 	}
 
 	wg.Wait()
-
-	// Check for disagreements
-	// Compare DNSKEY responses across servers
-	var referenceKeys []dnspkg.DNSKEYRecord
-	for _, r := range results {
-		if r.Response != nil && len(r.Response.DNSKEY) > 0 {
-			if referenceKeys == nil {
-				referenceKeys = r.Response.DNSKEY
-			} else {
-				// Compare with reference
-				if !compareDNSKEYSets(referenceKeys, r.Response.DNSKEY) {
-					disagreements = append(disagreements, Disagreement{
-						IP:       r.IP,
-						Issue:    "DNSKEY mismatch",
-						Expected: fmt.Sprintf("%d keys", len(referenceKeys)),
-						Got:      fmt.Sprintf("%d keys", len(r.Response.DNSKEY)),
-					})
-				}
-			}
-		}
-	}
-
-	return results, disagreements
+	return results
 }
 
-// compareDNSKEYSets compares two sets of DNSKEY records
-func compareDNSKEYSets(a, b []dnspkg.DNSKEYRecord) bool {
-	if len(a) != len(b) {
+// dnskeyMaterialSet returns the canonical identity of each key in keys
+// (owner, flags, protocol, algorithm, public key) as a set. Key tags are a
+// 16-bit hint that collides; consensus must compare the complete material
+// (RA6X-018).
+func dnskeyMaterialSet(keys []dnspkg.DNSKEYRecord) map[string]bool {
+	set := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		set[fmt.Sprintf("%s/%d/%d/%d/%s", dns.CanonicalName(k.Owner), k.Flags, k.Protocol, k.Algorithm, k.PublicKey)] = true
+	}
+	return set
+}
+
+// sameDNSKEYMaterial reports whether two DNSKEY sets hold exactly the same
+// key material.
+func sameDNSKEYMaterial(a, b []dnspkg.DNSKEYRecord) bool {
+	sa, sb := dnskeyMaterialSet(a), dnskeyMaterialSet(b)
+	if len(sa) != len(sb) {
 		return false
 	}
-
-	// Create map of key tags
-	aKeys := make(map[uint16]bool)
-	for _, k := range a {
-		aKeys[k.KeyTag] = true
-	}
-
-	for _, k := range b {
-		if !aKeys[k.KeyTag] {
+	for k := range sa {
+		if !sb[k] {
 			return false
 		}
 	}
-
 	return true
+}
+
+// keyTagSummary describes a key set briefly for a disagreement message.
+func keyTagSummary(keys []dnspkg.DNSKEYRecord) string {
+	if len(keys) == 0 {
+		return "no DNSKEY"
+	}
+	tags := make([]string, 0, len(keys))
+	for _, k := range keys {
+		tags = append(tags, fmt.Sprintf("%d", k.KeyTag))
+	}
+	return fmt.Sprintf("%d keys (tags %s)", len(keys), strings.Join(tags, ","))
+}
+
+// judgeDNSKEYServers assigns every queried server a per-server verdict against
+// the authenticated chain (RA6X-018): its Answer-section DNSKEY RRset must
+// hold exactly the authenticated key material and its RRSIG must verify under
+// the authenticated keys. A server that answered but failed either check is
+// bogus and recorded as a disagreement; a server that did not answer stays
+// indeterminate. Disagreement is diagnostic: the zone's own verdict already
+// rests on the one valid path that was found, and one dissenting server never
+// changes it, but every dissent is visible per address and in Disagreements.
+func (v *Validator) judgeDNSKEYServers(result *ZoneResult, serverResults []AddressResult, zone string, authenticatedRRset, authenticatedKeys []dnspkg.DNSKEYRecord) {
+	for i := range serverResults {
+		sr := &serverResults[i]
+		if sr.Response == nil {
+			continue
+		}
+		keys := answerDNSKEYsOwnedBy(sr.Response.DNSKEY, zone)
+		if !sameDNSKEYMaterial(keys, authenticatedRRset) {
+			sr.Status = StatusBogus
+			if len(keys) == 0 {
+				sr.Error = "served no DNSKEY RRset while the zone's authenticated DNSKEY RRset exists"
+			} else {
+				sr.Error = "served a DNSKEY RRset that differs from the authenticated RRset"
+			}
+			result.Disagreements = append(result.Disagreements, Disagreement{
+				Server:   sr.IP,
+				IP:       sr.IP,
+				Issue:    "DNSKEY RRset differs from the authenticated RRset",
+				Expected: keyTagSummary(authenticatedRRset),
+				Got:      keyTagSummary(keys),
+			})
+			continue
+		}
+		if len(sr.Response.RawResponse) == 0 {
+			sr.Status = StatusIndeterminate
+			sr.Error = "DNSKEY response could not be retained in wire form"
+			continue
+		}
+		if _, err := VerifyDNSKEYRRsetFromResponse(sr.Response.RawResponse, zone, authenticatedKeys); err != nil {
+			sr.Status = StatusBogus
+			sr.Error = fmt.Sprintf("DNSKEY RRSIG verification failed: %v", err)
+			result.Disagreements = append(result.Disagreements, Disagreement{
+				Server:   sr.IP,
+				IP:       sr.IP,
+				Issue:    "DNSKEY RRSIG does not verify under the authenticated keys",
+				Expected: "valid signature",
+				Got:      err.Error(),
+			})
+			continue
+		}
+		sr.Status = StatusSecure
+		sr.Error = ""
+	}
+	for _, d := range result.Disagreements {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("Nameserver %s: %s (expected %s, got %s)", d.IP, d.Issue, d.Expected, d.Got))
+	}
 }
 
 // queryRDAPSecureDNS queries RDAP for secureDNS information and compares with DNS DS records
