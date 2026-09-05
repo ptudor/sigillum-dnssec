@@ -986,3 +986,12 @@ select:focus-visible {
         outline-offset: 2px;
     }
 }
+
+/* Per-address verdict detail (RA6X-018): why a nameserver did not verify. */
+.ns-error {
+    display: block;
+    width: 100%;
+    margin-left: 1.75rem;
+    color: var(--warning);
+    font-size: 0.85em;
+}
