@@ -49,6 +49,28 @@ func acquireStateLock(dataDir string, timeout time.Duration) (*stateLock, error)
 	}
 }
 
+// acquireInstanceLock takes the daemon-instance lock <dataDir>/serve.lock
+// without waiting. A second `serve` against the same data_dir is refused here,
+// before it has loaded or touched any shared state — port binding alone is not
+// what authorizes a daemon to write (RA6X-006). CLI commands do not take this
+// lock; they serialize against the daemon through the state lock as before.
+func acquireInstanceLock(dataDir string) (*stateLock, error) {
+	lockPath := filepath.Join(dataDir, "serve.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("opening instance lock %s: %w", lockPath, err)
+	}
+	fsutil.ChownToTarget(lockPath)
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if err == syscall.EWOULDBLOCK {
+			return nil, fmt.Errorf("another dnssec-tudor serve already holds %s; refusing to start a second instance against the same data_dir", lockPath)
+		}
+		return nil, fmt.Errorf("locking %s: %w", lockPath, err)
+	}
+	return &stateLock{f: f}, nil
+}
+
 // release unlocks and closes the lock file. Safe to call multiple times / on nil.
 func (l *stateLock) release() {
 	if l == nil || l.f == nil {

@@ -40,6 +40,23 @@ type Daemon struct {
 	tickerReset     chan time.Duration // signals the signing loop to reset its ticker
 	signingLoopDead atomic.Bool        // true if signing loop goroutine has exited
 	lastSigningRun  atomic.Int64       // unix timestamp of last signing loop iteration
+	// stateFault holds the reason the authoritative state could not be loaded
+	// in the most recent signing cycle ("" when healthy). While set, signing
+	// cycles are skipped and readiness reports the failure (RA6X-026).
+	stateFault atomic.Pointer[string]
+}
+
+// setStateFault records (or clears, with "") the persistent state-load failure.
+func (d *Daemon) setStateFault(msg string) {
+	d.stateFault.Store(&msg)
+}
+
+// StateFault returns the current state-load failure, or "" when healthy.
+func (d *Daemon) StateFault() string {
+	if p := d.stateFault.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // NewDaemon creates a new daemon instance
@@ -251,13 +268,33 @@ func (d *Daemon) validateStartup() error {
 		return err
 	}
 
-	// Verify state file is accessible
-	if err := d.state.Save(); err != nil {
-		return fmt.Errorf("cannot write state file: %w", err)
+	// Verify the state file is accessible WITHOUT writing it (RA6X-006): a
+	// startup snapshot written here could overwrite a state a concurrent CLI
+	// command or an already-running daemon committed after we loaded ours,
+	// and it happens before the ports are bound, so even a duplicate daemon
+	// that then fails to start would have clobbered live state. Writability
+	// of data_dir was checked above; an existing file must merely be
+	// openable for writing.
+	if err := checkStateFileAccessible(d.cfg.StatePath()); err != nil {
+		return fmt.Errorf("cannot access state file: %w", err)
 	}
 
 	slog.Debug("[DAEMON] Startup validation passed")
 	return nil
+}
+
+// checkStateFileAccessible verifies an existing state file can be opened for
+// writing without truncating or modifying it; a missing file is fine (the
+// first Save creates it in the already-checked data_dir).
+func checkStateFileAccessible(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // checkDirWritable verifies a directory is writable by creating and removing a
@@ -361,10 +398,20 @@ func (d *Daemon) signAllZones() {
 	}
 	defer lock.release()
 
-	// Reload state from disk to pick up any zones added by CLI commands
+	// Reload state from disk to pick up any zones added by CLI commands. If
+	// the authoritative state cannot be loaded or validated, fail this cycle
+	// CLOSED (RA6X-026): signing on a stale in-memory snapshot could publish
+	// a key set that a CLI transition has already moved past, and the final
+	// Save would overwrite the newer/unreadable file with the stale snapshot.
+	// Nothing is mutated; the failure is exposed via readiness and the read
+	// is retried next cycle.
 	if err := snap.state.ReloadFromDisk(); err != nil {
-		slog.Warn("[DAEMON] Failed to reload state from disk", "error", err)
+		msg := fmt.Sprintf("authoritative state could not be loaded: %v", err)
+		d.setStateFault(msg)
+		slog.Error("[DAEMON] Skipping signing cycle: state on disk is unreadable or invalid; no zone, key or state file will be mutated until it is repaired", "error", err)
+		return
 	}
+	d.setStateFault("")
 
 	slog.Debug("[DAEMON] Checking zones for signing", "count", len(snap.cfg.Zones))
 
@@ -411,13 +458,15 @@ rolloverLoop:
 
 	// Defense-in-depth: re-reload immediately before Save to adopt any CLI write that
 	// slipped in (the merge keeps our fresher-signed zones and adopts a disk zone whose
-	// rollover differs — see ReloadFromDisk), then persist the merged whole map.
+	// rollover differs — see ReloadFromDisk), then persist the merged whole map. If
+	// the file became unreadable/invalid during the cycle, do NOT overwrite it with
+	// our snapshot (RA6X-026): keep the disk evidence, surface the fault, and let the
+	// next cycle retry. The signed output already written this cycle stays in place.
 	if err := snap.state.ReloadFromDisk(); err != nil {
-		slog.Warn("[DAEMON] Failed to reload state from disk before save", "error", err)
-	}
-
-	// Save state
-	if err := snap.state.Save(); err != nil {
+		msg := fmt.Sprintf("authoritative state could not be re-loaded before save: %v", err)
+		d.setStateFault(msg)
+		slog.Error("[DAEMON] Not saving state this cycle: state on disk is unreadable or invalid", "error", err)
+	} else if err := snap.state.Save(); err != nil {
 		slog.Error("[DAEMON] Failed to save state", "error", err)
 	}
 

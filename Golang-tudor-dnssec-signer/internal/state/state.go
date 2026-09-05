@@ -2,20 +2,32 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
+
+// ErrStateFileMissing is returned by ReloadFromDisk when the state file that
+// existed at the last successful load is gone. A missing file is not an
+// empty update: the daemon fails the cycle closed and the operator recovers
+// explicitly (restore the file, or restart the daemon to rebuild state from
+// the key files on disk) (RA6X-026).
+var ErrStateFileMissing = errors.New("state file is missing")
 
 // State represents the daemon's persistent state
 type State struct {
 	mu    sync.RWMutex
 	path  string
 	Zones map[string]*ZoneState `json:"zones"`
+	// fileSeen records that the state file existed at the last successful
+	// load or save, so a later disappearance is detected (RA6X-026).
+	fileSeen bool
 }
 
 // ZoneState represents the state of a single zone
@@ -166,7 +178,11 @@ func NewState(path string) *State {
 	}
 }
 
-// LoadState loads state from a JSON file
+// LoadState loads state from a JSON file. The document is validated and
+// normalized before it is exposed (RA6X-036): a missing/null zone map becomes
+// an empty map, while null zone entries, invalid names or paths, unsupported
+// rollover type/phase combinations and inconsistent key identities are
+// rejected with an actionable error. The file is never rewritten on failure.
 func LoadState(path string) (*State, error) {
 	state := NewState(path)
 
@@ -182,19 +198,156 @@ func LoadState(path string) (*State, error) {
 	if err := json.Unmarshal(data, state); err != nil {
 		return nil, fmt.Errorf("parsing state file: %w", err)
 	}
+	if err := state.validateAndNormalize(); err != nil {
+		return nil, fmt.Errorf("state file %s is invalid (left unchanged): %w", path, err)
+	}
+	state.fileSeen = true
 
 	return state, nil
 }
 
+// Validate checks the in-memory state against the persistence schema rules
+// LoadState enforces (RA6X-036) and normalizes a nil zone map to an empty one.
+func (s *State) Validate() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.validateAndNormalize()
+}
+
+// validateAndNormalize is Validate without locking (caller holds the lock or
+// owns the value exclusively).
+func (s *State) validateAndNormalize() error {
+	if s.Zones == nil {
+		// {"zones": null} — explicitly allowed as "no zones" (RA6X-036).
+		s.Zones = make(map[string]*ZoneState)
+	}
+	for name, zone := range s.Zones {
+		if err := validateZoneEntry(name, zone); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateZoneEntry checks one persisted zone entry.
+func validateZoneEntry(name string, z *ZoneState) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("zone entry with an empty name")
+	}
+	if _, ok := dns.IsDomainName(name); !ok {
+		return fmt.Errorf("zone %q: not a valid domain name", name)
+	}
+	if z == nil {
+		return fmt.Errorf("zone %q: null entry", name)
+	}
+	if strings.ContainsRune(z.Path, 0) {
+		return fmt.Errorf("zone %q: path contains a NUL byte", name)
+	}
+	if !z.LastSigned.IsZero() && strings.TrimSpace(z.Path) == "" {
+		return fmt.Errorf("zone %q: signed zone has an empty source path", name)
+	}
+	if err := validateKeyState("ksk", z.KSK); err != nil {
+		return fmt.Errorf("zone %q: %w", name, err)
+	}
+	if err := validateKeyState("zsk", z.ZSK); err != nil {
+		return fmt.Errorf("zone %q: %w", name, err)
+	}
+	if z.Rollover != nil {
+		if err := validateRolloverState(z); err != nil {
+			return fmt.Errorf("zone %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// validateKeyState checks a persisted key record (nil is allowed: a zone whose
+// key initialization has not yet succeeded is a keyless placeholder).
+func validateKeyState(role string, k *KeyState) error {
+	if k == nil {
+		return nil
+	}
+	if strings.TrimSpace(k.Algorithm) == "" {
+		return fmt.Errorf("%s key %d has no algorithm", role, k.ID)
+	}
+	return nil
+}
+
+// validateRolloverState rejects rollover records the signer has no defined
+// interpretation for (RA6X-036). Only the persisted phases are accepted, and
+// the key identities the record names must agree with the zone's live keys:
+// during a KSK or algorithm rollover the live KSK is the new key; during a
+// ZSK pre-publish the live ZSK is still the old key; during ZSK signing it is
+// the new key. Anything else is ambiguous and must not be signed through.
+func validateRolloverState(z *ZoneState) error {
+	r := z.Rollover
+	switch {
+	case r.Type == "ksk" && r.State == KSKRolloverStateDSAddWait:
+		if r.OldKeyID == r.NewKeyID {
+			return fmt.Errorf("ksk rollover names the same key %d as old and new", r.OldKeyID)
+		}
+		if z.KSK == nil {
+			return fmt.Errorf("ksk rollover recorded but the zone has no KSK")
+		}
+		if z.KSK.ID != r.NewKeyID {
+			return fmt.Errorf("ksk rollover: live KSK %d is neither the new key %d the rollover expects", z.KSK.ID, r.NewKeyID)
+		}
+	case r.Type == "zsk" && r.State == ZSKRolloverStatePrePublish:
+		if r.OldKeyID == r.NewKeyID {
+			return fmt.Errorf("zsk rollover names the same key %d as old and new", r.OldKeyID)
+		}
+		if z.ZSK == nil {
+			return fmt.Errorf("zsk rollover recorded but the zone has no ZSK")
+		}
+		if z.ZSK.ID != r.OldKeyID {
+			return fmt.Errorf("zsk pre_publish: live ZSK %d is not the old key %d still expected to sign", z.ZSK.ID, r.OldKeyID)
+		}
+	case r.Type == "zsk" && r.State == ZSKRolloverStateSigning:
+		if r.OldKeyID == r.NewKeyID {
+			return fmt.Errorf("zsk rollover names the same key %d as old and new", r.OldKeyID)
+		}
+		if z.ZSK == nil {
+			return fmt.Errorf("zsk rollover recorded but the zone has no ZSK")
+		}
+		if z.ZSK.ID != r.NewKeyID {
+			return fmt.Errorf("zsk signing: live ZSK %d is not the new key %d expected to sign", z.ZSK.ID, r.NewKeyID)
+		}
+	case r.Type == "algorithm" && r.State == AlgoRolloverStateDSAddWait:
+		if r.OldKeyID == r.NewKeyID || r.OldZSKID == r.NewZSKID {
+			return fmt.Errorf("algorithm rollover names the same key as old and new (ksk %d/%d, zsk %d/%d)", r.OldKeyID, r.NewKeyID, r.OldZSKID, r.NewZSKID)
+		}
+		if strings.TrimSpace(r.OldAlgorithm) == "" || strings.TrimSpace(r.NewAlgorithm) == "" || r.OldAlgorithm == r.NewAlgorithm {
+			return fmt.Errorf("algorithm rollover has invalid algorithms (old %q, new %q)", r.OldAlgorithm, r.NewAlgorithm)
+		}
+		if z.KSK == nil || z.ZSK == nil {
+			return fmt.Errorf("algorithm rollover recorded but the zone lacks a KSK or ZSK")
+		}
+		if z.KSK.ID != r.NewKeyID || z.ZSK.ID != r.NewZSKID {
+			return fmt.Errorf("algorithm rollover: live keys (ksk %d, zsk %d) are not the new keys (ksk %d, zsk %d)", z.KSK.ID, z.ZSK.ID, r.NewKeyID, r.NewZSKID)
+		}
+	default:
+		return fmt.Errorf("unsupported rollover type/state %q/%q (no defined signing behaviour; refusing to guess)", r.Type, r.State)
+	}
+	return nil
+}
+
 // ReloadFromDisk reloads the state from disk, merging any new zones added by CLI commands.
 // This preserves zones added by CLI while keeping daemon's in-memory updates for managed zones.
+//
+// The disk document is validated before anything is merged (RA6X-036); an
+// unreadable or invalid file leaves the in-memory state untouched and returns
+// an error the caller must treat as fail-closed (RA6X-026). A file that
+// existed at the last successful load/save and is now missing returns
+// ErrStateFileMissing rather than being treated as an empty update.
 func (s *State) ReloadFromDisk() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
-		// No state file yet, nothing to merge
+		if s.fileSeen {
+			return fmt.Errorf("%w: %s existed at the last successful load and is gone; restore it, or restart the daemon to rebuild state from the key files if the removal was intentional", ErrStateFileMissing, s.path)
+		}
+		// Never existed yet: a fresh start, nothing to merge.
 		return nil
 	}
 	if err != nil {
@@ -205,6 +358,10 @@ func (s *State) ReloadFromDisk() error {
 	if err := json.Unmarshal(data, diskState); err != nil {
 		return fmt.Errorf("parsing state file: %w", err)
 	}
+	if err := diskState.validateAndNormalize(); err != nil {
+		return fmt.Errorf("state file %s is invalid (left unchanged, in-memory state not merged): %w", s.path, err)
+	}
+	s.fileSeen = true
 
 	// Merge zones from disk:
 	// - Add zones that only exist on disk (CLI additions via "add" command)
@@ -258,8 +415,19 @@ func (s *State) Save() error {
 	if err := fsutil.WriteFileAtomicOwned(s.path, data, 0600); err != nil {
 		return fmt.Errorf("writing state file: %w", err)
 	}
+	s.markFileSeen()
 
 	return nil
+}
+
+// markFileSeen records that the state file now exists on disk. Save holds the
+// read lock, so the flag is set under its own short write lock afterwards.
+func (s *State) markFileSeen() {
+	s.mu.RUnlock()
+	s.mu.Lock()
+	s.fileSeen = true
+	s.mu.Unlock()
+	s.mu.RLock()
 }
 
 // GetZone returns the state for a zone, or nil if not found.

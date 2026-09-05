@@ -99,6 +99,7 @@ func TestRolloverState_PhaseFirstSignedRoundTrip(t *testing.T) {
 	orig := statepkg.NewState(path)
 	orig.SetZone("example.com", &statepkg.ZoneState{
 		Path: "/z/example.zone",
+		ZSK:  &statepkg.KeyState{ID: 222, Algorithm: "ED25519"},
 		Rollover: &statepkg.RolloverState{
 			Type: "zsk", State: statepkg.ZSKRolloverStatePrePublish,
 			OldKeyID: 222, NewKeyID: 333,
@@ -136,6 +137,7 @@ func TestRolloverState_OldSchemaNoPhaseFirstSigned(t *testing.T) {
           "serial": 2024010101,
           "last_signed": "2024-01-15T10:00:00Z",
           "signatures_expire": "2024-01-29T10:00:00Z",
+          "zsk": {"id": 222, "algorithm": "ED25519", "created": "2024-01-01T00:00:00Z", "expires": "2024-04-01T00:00:00Z"},
           "rollover": {
             "type": "zsk",
             "state": "pre_publish",

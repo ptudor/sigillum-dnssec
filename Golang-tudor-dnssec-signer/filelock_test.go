@@ -40,6 +40,7 @@ func TestReloadFromDisk_AdoptsRolloverAtEqualLastSigned(t *testing.T) {
 	disk := statepkg.NewState(statePath)
 	disk.SetZone("example.com", &statepkg.ZoneState{
 		Path: "/x", LastSigned: ts,
+		KSK:      &statepkg.KeyState{ID: 2, Algorithm: "ED25519"},
 		Rollover: &statepkg.RolloverState{Type: "ksk", State: statepkg.KSKRolloverStateDSAddWait, OldKeyID: 1, NewKeyID: 2, Started: ts},
 	})
 	if err := disk.Save(); err != nil {
@@ -48,7 +49,7 @@ func TestReloadFromDisk_AdoptsRolloverAtEqualLastSigned(t *testing.T) {
 
 	// Stale in-memory snapshot: same zone, same LastSigned, no rollover.
 	mem := statepkg.NewState(statePath)
-	mem.SetZone("example.com", &statepkg.ZoneState{Path: "/x", LastSigned: ts})
+	mem.SetZone("example.com", &statepkg.ZoneState{Path: "/x", LastSigned: ts, KSK: &statepkg.KeyState{ID: 1, Algorithm: "ED25519"}})
 
 	if err := mem.ReloadFromDisk(); err != nil {
 		t.Fatal(err)

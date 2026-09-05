@@ -484,8 +484,43 @@ func unwindAdd(cfg *config.Config, state *statepkg.State, domain string, removeK
 }
 
 // runServe runs the daemon
+// loadStateLocked loads the state file under the cross-process state lock so
+// the daemon's startup (and SIGHUP) snapshot is never taken mid-write and is
+// as fresh as any concurrent CLI commit (RA6X-006). The lock is released
+// immediately; each signing cycle takes it again around its own load-save span.
+func loadStateLocked(cfg *config.Config) (*statepkg.State, error) {
+	lock, err := acquireStateLock(cfg.DataDir, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring state lock: %w", err)
+	}
+	defer lock.release()
+	state, err := statepkg.LoadState(cfg.StatePath())
+	if err != nil {
+		return nil, fmt.Errorf("loading state: %w", err)
+	}
+	return state, nil
+}
+
 func runServe(cmd *cobra.Command, args []string) error {
-	cfg, state, err := loadConfigAndState()
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	fsutil.InitOwnershipTarget(cfg.DataDir)
+	if err := signerpkg.EnsureDir(cfg.DataDir); err != nil {
+		return fmt.Errorf("ensuring data_dir: %w", err)
+	}
+
+	// Refuse a duplicate daemon before touching any shared state (RA6X-006):
+	// the instance lock is held for the life of the process.
+	instance, err := acquireInstanceLock(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer instance.release()
+
+	// Load the startup snapshot under the state lock, never before it.
+	state, err := loadStateLocked(cfg)
 	if err != nil {
 		return err
 	}
@@ -553,7 +588,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 					slog.Error("[DAEMON] Reload rejected: --web override fails the loopback guard", "error", err)
 					continue
 				}
-				newState, err := statepkg.LoadState(newCfg.StatePath())
+				newState, err := loadStateLocked(newCfg)
 				if err != nil {
 					slog.Error("[DAEMON] Failed to reload state", "error", err)
 					continue
