@@ -249,6 +249,14 @@ func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState,
 	if res.dnskeyTTL == 0 {
 		res.dnskeyTTL = s.getSOATTL(records) // Use SOA record TTL as convention
 	}
+	// Generated denial records and the DNSKEY RRset carry signatures too; the
+	// cache lifetime of a signature by the retiring ZSK covers them (RA6X-027).
+	if soaMinTTL > res.maxRRSIGTTL {
+		res.maxRRSIGTTL = soaMinTTL
+	}
+	if res.dnskeyTTL > res.maxRRSIGTTL {
+		res.maxRRSIGTTL = res.dnskeyTTL
+	}
 
 	// Add all DNSKEY records with appropriate TTL (may include rollover keys)
 	for _, k := range keys.dnskeys {
@@ -313,16 +321,19 @@ func (s *Signer) recordSignedZone(domain string, zoneState *statepkg.ZoneState, 
 		}
 		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
 		zoneState.ForceResign = false
-		// R-006: record the DNSKEY RRset TTL actually published (config value, or the
-		// SOA TTL when dnskey_ttl = 0) so rollover phase gating waits for the TTL
-		// resolvers really cache. Never shorten a previously-established wait while a
-		// rollover is active — only raise it (a mid-phase SOA TTL decrease must not
-		// let the phase advance early).
-		if zoneState.Rollover == nil || res.dnskeyTTL > zoneState.PublishedDNSKEYTTL {
-			zoneState.PublishedDNSKEYTTL = res.dnskeyTTL
-		}
-		if zoneState.Rollover == nil || res.maxRRSIGTTL > zoneState.PublishedMaxRRSIGTTL {
-			zoneState.PublishedMaxRRSIGTTL = res.maxRRSIGTTL
+		// R-006/R-007: the TTLs of the generation just written. Cache horizons
+		// (RA6X-027) are raised from the previously served generation's TTLs at
+		// confirmation time, so recording the actual value here never shortens a
+		// safety wait.
+		zoneState.PublishedDNSKEYTTL = res.dnskeyTTL
+		zoneState.PublishedMaxRRSIGTTL = res.maxRRSIGTTL
+		// RA6X-004: writing the file is not publication unless the deployment
+		// model says so. Hook and probe modes confirm later; immediate mode
+		// treats the write as served.
+		if s.cfg.PublicationMode() == config.PublicationImmediate {
+			zoneState.ConfirmPublication(now, now)
+		} else {
+			zoneState.PendingPublication = true
 		}
 		zoneState.ClearTransientWarnings()
 		if durabilityUncertain != "" {
@@ -537,7 +548,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 	// Handle rollover scenarios
 	if zoneState.Rollover != nil {
 		switch {
-		case zoneState.Rollover.Type == "ksk" && zoneState.Rollover.State == statepkg.KSKRolloverStateDSAddWait:
+		case zoneState.Rollover.Type == "ksk" && (zoneState.Rollover.State == statepkg.KSKRolloverStateDSAddWait || zoneState.Rollover.State == statepkg.KSKRolloverStateDSPropagation):
 			// KSK rollover: load old KSK too, sign with both. FATAL on failure (R-003):
 			// during ds_add_wait the parent DS still references the old KSK, so publishing
 			// a DNSKEY RRset without it makes every resolver validating via the old DS go
@@ -593,7 +604,7 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 				"old_key_id", zoneState.Rollover.OldKeyID,
 				"new_key_id", zoneState.Rollover.NewKeyID)
 
-		case zoneState.Rollover.Type == "algorithm" && zoneState.Rollover.State == statepkg.AlgoRolloverStateDSAddWait:
+		case zoneState.Rollover.Type == "algorithm" && zoneState.Rollover.State != statepkg.AlgoRolloverStateRetiring:
 			// Algorithm rollover: publish and sign with BOTH algorithms' keys. FATAL on
 			// failure (R-003): dropping an old-algorithm key mid-rollover leaves RRsets
 			// unsigned for a signaled algorithm, violating RFC 4035 §2.2 / RFC 6840 §5.11.

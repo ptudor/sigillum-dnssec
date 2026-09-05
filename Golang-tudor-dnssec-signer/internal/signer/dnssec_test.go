@@ -659,15 +659,31 @@ ns1	IN	A	192.0.2.1
 		t.Error("Should not be able to start another rollover while one is in progress")
 	}
 
-	// Complete the rollover
-	err = rolloverMgr.CompleteKSKRollover("example.com")
+	// Complete the rollover: the new DS was seen at the parent long ago with a
+	// 1s DS TTL, so the propagation wait is already over (RA6X-003).
+	err = rolloverMgr.CompleteKSKRollover("example.com", time.Now().Add(-2*time.Hour), 1)
 	if err != nil {
 		t.Fatalf("CompleteKSKRollover failed: %v", err)
 	}
-
 	zoneState = state.GetZone("example.com")
+	if zoneState.Rollover == nil || zoneState.Rollover.State != statepkg.KSKRolloverStateDSPropagation {
+		t.Fatalf("completion must enter the DS propagation wait, got %+v", zoneState.Rollover)
+	}
+	if err := rolloverMgr.CheckKSKRollover("example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if zoneState.Rollover == nil || zoneState.Rollover.State != statepkg.KSKRolloverStateRetiring {
+		t.Fatalf("after the DS TTL the old KSK must be retired, got %+v", zoneState.Rollover)
+	}
+	// The retiring generation is served (immediate publication mode) → done.
+	if err := NewSigner(cfg, state).SignZone("example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rolloverMgr.CheckKSKRollover("example.com"); err != nil {
+		t.Fatal(err)
+	}
 	if zoneState.Rollover != nil {
-		t.Error("Rollover state should be nil after completion")
+		t.Error("Rollover state should be nil once the retiring generation is served")
 	}
 }
 
@@ -2022,11 +2038,14 @@ ns1	IN	A	192.0.2.1
 		t.Fatal("successful SignZone must clear ForceResign")
 	}
 
-	if err := rm.CompleteKSKRollover("example.com"); err != nil {
+	if err := rm.CompleteKSKRollover("example.com", time.Now().Add(-2*time.Hour), 1); err != nil {
 		t.Fatalf("CompleteKSKRollover: %v", err)
 	}
+	if err := rm.CheckKSKRollover("example.com"); err != nil {
+		t.Fatal(err)
+	}
 	if !zoneState.ForceResign {
-		t.Fatal("CompleteKSKRollover must set ForceResign so the old KSK is dropped from the next signed zone")
+		t.Fatal("retiring the old KSK must set ForceResign so it is dropped from the next signed zone")
 	}
 }
 

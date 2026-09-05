@@ -68,12 +68,29 @@ type ZoneState struct {
 	// remain cached this long — longer than the DNSKEY RRset. ZSK retirement waits
 	// max(DNSKEY-TTL, this) so the old ZSK is not dropped while a cached
 	// signature by it is still verifiable (R-007). Not decreased during a rollover.
-	PublishedMaxRRSIGTTL uint32         `json:"published_max_rrsig_ttl,omitempty"`
-	KSK                  *KeyState      `json:"ksk,omitempty"`
-	ZSK                  *KeyState      `json:"zsk,omitempty"`
-	Rollover             *RolloverState `json:"rollover,omitempty"`
-	Warnings             []string       `json:"warnings,omitempty"`
-	Errors               []string       `json:"errors,omitempty"`
+	PublishedMaxRRSIGTTL uint32 `json:"published_max_rrsig_ttl,omitempty"`
+	// Publication tracking (RA6X-004). LastSigned only means the output file
+	// was written; these record whether and when that generation was confirmed
+	// served (hook success, an authoritative probe, or the immediate-mode
+	// assumption). Rollover phase timers start from PublishedAt.
+	PendingPublication          bool      `json:"pending_publication,omitempty"`
+	PublishedAt                 time.Time `json:"published_at,omitempty"`
+	PublishedGenerationSignedAt time.Time `json:"published_generation_signed_at,omitempty"`
+	// ServedDNSKEYTTL/ServedMaxRRSIGTTL are the TTLs of the confirmed
+	// generation; DNSKEYCacheHorizon/RRSIGCacheHorizon are the latest times a
+	// resolver may still hold an earlier generation's DNSKEY RRset or data
+	// signatures (RA6X-027): raised on every confirmation to
+	// confirmation time + the previous generation's TTL, never lowered, so a
+	// TTL decrease before a rollover cannot shorten the safety wait.
+	ServedDNSKEYTTL    uint32         `json:"served_dnskey_ttl,omitempty"`
+	ServedMaxRRSIGTTL  uint32         `json:"served_max_rrsig_ttl,omitempty"`
+	DNSKEYCacheHorizon time.Time      `json:"dnskey_cache_horizon,omitempty"`
+	RRSIGCacheHorizon  time.Time      `json:"rrsig_cache_horizon,omitempty"`
+	KSK                *KeyState      `json:"ksk,omitempty"`
+	ZSK                *KeyState      `json:"zsk,omitempty"`
+	Rollover           *RolloverState `json:"rollover,omitempty"`
+	Warnings           []string       `json:"warnings,omitempty"`
+	Errors             []string       `json:"errors,omitempty"`
 	// ForceResign is set whenever a rollover transition changes which keys
 	// must be published or used for signing, and cleared on the next
 	// successful sign. It replaces the old "re-sign every cycle while a
@@ -151,7 +168,55 @@ type RolloverState struct {
 	// rollover check that sees the phase signed (at most one poll interval
 	// late), and reset on the pre_publish→signing transition.
 	PhaseFirstSigned time.Time `json:"phase_first_signed,omitempty"`
-	Action           string    `json:"action"` // Human-readable next step
+	// PhaseHorizon is the cache horizon snapshotted when the phase's key set
+	// was first confirmed published (RA6X-027): the phase may advance only
+	// after it, and later re-signs of the same set do not move it.
+	PhaseHorizon time.Time `json:"phase_horizon,omitempty"`
+	// KSK/algorithm retirement gates (RA6X-003): when the new DS was seen at
+	// every parent server, the parent's DS TTL, and when the old DS was seen
+	// gone at every parent server (algorithm rollover). Retirement of the key
+	// the old DS set authenticated waits ParentDSTTL after the observation.
+	DSObservedAt   time.Time `json:"ds_observed_at,omitempty"`
+	ParentDSTTL    uint32    `json:"parent_ds_ttl,omitempty"`
+	OldDSRemovedAt time.Time `json:"old_ds_removed_at,omitempty"`
+	Action         string    `json:"action"` // Human-readable next step
+}
+
+// ConfirmPublication records that the generation signed at signedAt is
+// confirmed served as of now (RA6X-004) and raises the cache horizons
+// (RA6X-027): resolvers may hold the previously served generation until
+// now + its TTL. A confirmation for a generation older than the one already
+// confirmed is ignored.
+func (z *ZoneState) ConfirmPublication(signedAt, now time.Time) {
+	if signedAt.Before(z.PublishedGenerationSignedAt) {
+		return
+	}
+	prevDNSKEY, prevRRSIG := z.ServedDNSKEYTTL, z.ServedMaxRRSIGTTL
+	if prevDNSKEY == 0 {
+		prevDNSKEY = z.PublishedDNSKEYTTL
+	}
+	if prevRRSIG == 0 {
+		prevRRSIG = z.PublishedMaxRRSIGTTL
+	}
+	if h := now.Add(time.Duration(prevDNSKEY) * time.Second); h.After(z.DNSKEYCacheHorizon) {
+		z.DNSKEYCacheHorizon = h
+	}
+	if h := now.Add(time.Duration(prevRRSIG) * time.Second); h.After(z.RRSIGCacheHorizon) {
+		z.RRSIGCacheHorizon = h
+	}
+	z.ServedDNSKEYTTL = z.PublishedDNSKEYTTL
+	z.ServedMaxRRSIGTTL = z.PublishedMaxRRSIGTTL
+	z.PublishedAt = now
+	z.PublishedGenerationSignedAt = signedAt
+	if !z.LastSigned.After(signedAt) {
+		z.PendingPublication = false
+	}
+}
+
+// PublishedSince reports whether a generation signed after t has been
+// confirmed served.
+func (z *ZoneState) PublishedSince(t time.Time) bool {
+	return z.PublishedGenerationSignedAt.After(t)
 }
 
 // ZSK rollover states (automatic)
@@ -168,13 +233,30 @@ const (
 const (
 	KSKRolloverStateActive    = "active"      // Normal operation
 	KSKRolloverStateDSAddWait = "ds_add_wait" // Waiting for new DS at registrar
-	KSKRolloverStateComplete  = "complete"    // Rollover finished
+	// KSKRolloverStateDSPropagation: the new DS was seen at every parent
+	// server; both KSKs stay published until the parent's DS TTL has elapsed
+	// so no resolver still holds an old-only DS set (RA6X-003).
+	KSKRolloverStateDSPropagation = "ds_propagation_wait"
+	// KSKRolloverStateRetiring: the old KSK has been dropped from the zone;
+	// the rollover ends once that generation is confirmed served.
+	KSKRolloverStateRetiring = "retiring"
+	KSKRolloverStateComplete = "complete" // Rollover finished
 )
 
 // Algorithm rollover states (manual, requires DS update). Same single-step
 // completion as KSK — no separate ds_remove_wait phase.
 const (
 	AlgoRolloverStateDSAddWait = "algo_ds_add_wait" // New algorithm keys published, waiting for DS
+	// AlgoRolloverStateDSPropagation: the new-algorithm DS was seen at every
+	// parent server; wait the parent's DS TTL (RFC 6781 §4.1.4, RA6X-003).
+	AlgoRolloverStateDSPropagation = "algo_ds_propagation_wait"
+	// AlgoRolloverStateOldDSRemoval: the old-algorithm DS must disappear from
+	// every parent server, then the parent's DS TTL must elapse, before the
+	// old-algorithm keys and signatures may be dropped.
+	AlgoRolloverStateOldDSRemoval = "algo_old_ds_removal_wait"
+	// AlgoRolloverStateRetiring: the old-algorithm keys are gone from the
+	// zone; the rollover ends once that generation is confirmed served.
+	AlgoRolloverStateRetiring = "algo_retiring"
 )
 
 // NewState creates a new empty state
@@ -296,7 +378,7 @@ func validateKeyState(role string, k *KeyState) error {
 func validateRolloverState(z *ZoneState) error {
 	r := z.Rollover
 	switch {
-	case r.Type == "ksk" && r.State == KSKRolloverStateDSAddWait:
+	case r.Type == "ksk" && (r.State == KSKRolloverStateDSAddWait || r.State == KSKRolloverStateDSPropagation || r.State == KSKRolloverStateRetiring):
 		if r.OldKeyID == r.NewKeyID {
 			return fmt.Errorf("ksk rollover names the same key %d as old and new", r.OldKeyID)
 		}
@@ -326,7 +408,7 @@ func validateRolloverState(z *ZoneState) error {
 		if z.ZSK.ID != r.NewKeyID {
 			return fmt.Errorf("zsk signing: live ZSK %d is not the new key %d expected to sign", z.ZSK.ID, r.NewKeyID)
 		}
-	case r.Type == "algorithm" && r.State == AlgoRolloverStateDSAddWait:
+	case r.Type == "algorithm" && (r.State == AlgoRolloverStateDSAddWait || r.State == AlgoRolloverStateDSPropagation || r.State == AlgoRolloverStateOldDSRemoval || r.State == AlgoRolloverStateRetiring):
 		if r.OldKeyID == r.NewKeyID || r.OldZSKID == r.NewZSKID {
 			return fmt.Errorf("algorithm rollover names the same key as old and new (ksk %d/%d, zsk %d/%d)", r.OldKeyID, r.NewKeyID, r.OldZSKID, r.NewZSKID)
 		}
@@ -638,12 +720,25 @@ func (z *ZoneState) Status() string {
 		return "error"
 	}
 	if z.Rollover != nil && z.Rollover.State != "" && z.Rollover.Type != "zsk" {
-		return "action_required"
+		if z.Rollover.NeedsOperator() {
+			return "action_required"
+		}
+		return "warning" // an automatic safety wait is in progress
 	}
 	if len(z.Warnings) > 0 {
 		return "warning"
 	}
 	return "healthy"
+}
+
+// NeedsOperator reports whether the rollover phase waits on an operator (a
+// DS change at the registrar) rather than on an automatic timer or probe.
+func (r *RolloverState) NeedsOperator() bool {
+	switch r.State {
+	case KSKRolloverStateDSAddWait, AlgoRolloverStateDSAddWait, AlgoRolloverStateOldDSRemoval:
+		return true
+	}
+	return false
 }
 
 // SnapshotZones returns a deep-copied, point-in-time view of every zone's

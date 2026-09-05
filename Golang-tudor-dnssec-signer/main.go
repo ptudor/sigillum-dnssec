@@ -419,16 +419,43 @@ func preflightConfigAppend(path string) error {
 // runPostSignHook fires the configured post-sign hook synchronously for one
 // zone a CLI command just signed, under the same contract the daemon uses
 // (RA6X-043): a batch invocation naming the single domain when coalescing is
-// on, the per-zone invocation otherwise. Failures are logged; the command's
-// signing result stands. Callers that must surface the failure use
-// firePostSignHooks directly.
-func runPostSignHook(cfg *config.Config, domain, zonePath string) {
+// on, the per-zone invocation otherwise. A successful hook confirms the
+// generation as published and persists that (RA6X-004); a failure is logged,
+// the zone stays pending (the daemon retries the deployment) and false is
+// returned so callers can hold back steps that assume the zone is served.
+// With no hook configured the signing result already counts as published.
+func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath string) bool {
 	if !hookConfigured(&cfg.Hooks) {
-		return
+		return true
+	}
+	zs := state.GetZone(domain)
+	if zs == nil {
+		return false
 	}
 	slog.Info("[CLI] Executing post-sign hook", "domain", domain)
-	if err := firePostSignHooks(&cfg.Hooks, cfg.OutputDir, []SignedZoneRef{signedRef(cfg, domain, zonePath)}, nil); err != nil {
-		slog.Error("[CLI] Post-sign hook failed", "domain", domain, "error", err)
+	ref := signedRef(cfg, domain, zonePath, zs.LastSigned)
+	if err := firePostSignHooks(&cfg.Hooks, cfg.OutputDir, []SignedZoneRef{ref}, nil, nil); err != nil {
+		slog.Error("[CLI] Post-sign hook failed; the zone is not confirmed served and stays pending deployment", "domain", domain, "error", err)
+		fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; the signed zone is written but not confirmed served (the daemon retries the hook)\n", domain)
+		return false
+	}
+	confirmPublicationCLI(state, []SignedZoneRef{ref})
+	return true
+}
+
+// confirmPublicationCLI records hook-confirmed publication for the given
+// generations and persists the state (RA6X-004).
+func confirmPublicationCLI(state *statepkg.State, zones []SignedZoneRef) {
+	now := time.Now().UTC()
+	for _, z := range zones {
+		zs := state.GetZone(z.Domain)
+		if zs == nil {
+			continue
+		}
+		state.Mutate(func() { zs.ConfirmPublication(z.SignedAt, now) })
+	}
+	if err := persistState(state); err != nil {
+		slog.Error("[CLI] Failed to persist publication confirmation; the daemon will re-run the hook", "error", err)
 	}
 }
 
@@ -702,7 +729,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 	// checkRolloverWarnings promises — otherwise the ZSK never rolls and the
 	// warning eventually becomes "expired" (R-036). Mirrors the daemon's
 	// per-zone post-sign rollover check; the advanced state is persisted below.
-	rollover := signerpkg.NewRolloverManager(cfg, state)
+	rollover := newRolloverManager(cfg, state)
 	for domain := range cfg.Zones {
 		zoneState := state.GetZone(domain)
 		if zoneState == nil || zoneState.ZSK == nil {
@@ -710,6 +737,12 @@ func runSign(cmd *cobra.Command, args []string) error {
 		}
 		if err := rollover.CheckZSKRollover(domain); err != nil {
 			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
+		}
+		if err := rollover.CheckKSKRollover(domain); err != nil {
+			slog.Error("[ROLLOVER] KSK rollover check failed", "domain", domain, "error", err)
+		}
+		if err := rollover.CheckAlgorithmRollover(domain); err != nil {
+			slog.Error("[ROLLOVER] algorithm rollover check failed", "domain", domain, "error", err)
 		}
 	}
 	if err := persistState(state); err != nil {
@@ -726,10 +759,23 @@ func runSign(cmd *cobra.Command, args []string) error {
 		slog.Info("[CLI] Executing post-sign hook", "signed", len(signedDomains))
 		refs := make([]SignedZoneRef, 0, len(signedDomains))
 		for _, domain := range signedDomains {
-			refs = append(refs, signedRef(cfg, domain, cfg.Zones[domain].Path))
+			signedAt := time.Time{}
+			if zs := state.GetZone(domain); zs != nil {
+				signedAt = zs.LastSigned
+			}
+			refs = append(refs, signedRef(cfg, domain, cfg.Zones[domain].Path, signedAt))
 		}
-		if hookErr = firePostSignHooks(&cfg.Hooks, cfg.OutputDir, refs, nil); hookErr != nil {
+		var confirmed []SignedZoneRef
+		hookErr = firePostSignHooks(&cfg.Hooks, cfg.OutputDir, refs, nil, func(zones []SignedZoneRef, err error) {
+			if err == nil {
+				confirmed = append(confirmed, zones...)
+			}
+		})
+		if hookErr != nil {
 			slog.Error("[CLI] Post-sign hook failed", "error", hookErr)
+		}
+		if len(confirmed) > 0 {
+			confirmPublicationCLI(state, confirmed)
 		}
 	}
 
@@ -783,7 +829,7 @@ func runResign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	runPostSignHook(cfg, domain, zoneCfg.Path)
+	_ = runPostSignHook(cfg, state, domain, zoneCfg.Path)
 
 	fmt.Printf("Zone %s re-signed successfully.\n", domain)
 	fmt.Printf("Signed zone written to: %s\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
@@ -1040,11 +1086,17 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("Note: a running daemon picks up the new zone after SIGHUP (config reload).")
 
-	runPostSignHook(cfg, domain, zonePath)
+	hookOK := runPostSignHook(cfg, state, domain, zonePath)
 
 	// If a registrar is configured for this zone and auto-publish is on,
-	// push the DS record automatically. Failures are non-fatal.
-	MaybeAutoPublishDS(cfg, state, domain, "add")
+	// push the DS record automatically. Failures are non-fatal. A DS is only
+	// published for a zone that is confirmed served (RA6X-004): publishing it
+	// while the hook failed would point the parent at a zone nobody answers for.
+	if hookOK {
+		MaybeAutoPublishDS(cfg, state, domain, "add")
+	} else {
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed. Once the zone is served, run `dnssec-tudor registrar push %s`.\n", domain)
+	}
 
 	return nil
 }
@@ -1158,7 +1210,7 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	runPostSignHook(cfg, domain, zoneState.Path)
+	hookOK := runPostSignHook(cfg, state, domain, zoneState.Path)
 
 	// Print new DS
 	fmt.Printf("KSK rollover started for %s.\n\n", domain)
@@ -1171,7 +1223,11 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 	fmt.Println(signerpkg.FormatDSRecordsFromKey(domain, kskKey))
 	fmt.Printf("\nOnce the new DS is published, run: dnssec-tudor rollover complete %s\n", domain)
 
-	MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
+	if hookOK {
+		MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
+	} else {
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed, so the new KSK is not confirmed served yet. Once it is, run `dnssec-tudor registrar push %s`.\n", domain)
+	}
 
 	return nil
 }
@@ -1203,26 +1259,6 @@ func runRolloverStatus(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runRolloverComplete finalizes a KSK or algorithm rollover
-// verifyNewKSKDSAtParent performs a live parent-DS query and reports whether the
-// zone's current (new) KSK's DS is present there. Used to gate rollover
-// completion so the old KSK isn't retired before the new DS is live (R-037). The
-// parent's live DS is the ground truth resolvers see, so this works for both
-// registrar-automated and manual zones.
-func verifyNewKSKDSAtParent(cfg *config.Config, state *statepkg.State, domain string) (bool, string) {
-	keyGen := signerpkg.NewKeyGenerator(cfg)
-	newKSK, err := keyGen.LoadPublicKey(domain, "ksk")
-	if err != nil {
-		return false, fmt.Sprintf("could not load the new KSK to verify its DS: %v", err)
-	}
-	v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
-	res := v.CheckDSAtParent(domain, []*dns.DNSKEY{newKSK}, false)
-	if res.MatchesKSK {
-		return true, res.Details
-	}
-	return false, res.Details
-}
-
 func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	domain := args[0]
 
@@ -1240,50 +1276,72 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	if zoneState.Rollover == nil {
 		return fmt.Errorf("no rollover in progress for %s", domain)
 	}
-
-	// Before retiring the old KSK, require the new KSK's DS to be live at the
-	// parent — otherwise completion drops the old KSK while the parent still
-	// references only it, and every validating resolver SERVFAILs. --force is the
-	// explicit escape hatch for operators who have verified propagation another
-	// way (R-037). Only KSK/algorithm rollovers touch the parent DS.
-	force, _ := cmd.Flags().GetBool("force")
-	if t := zoneState.Rollover.Type; t == "ksk" || t == "algorithm" {
-		if force {
-			fmt.Println("Warning: --force set; skipping the parent-DS check. If the new DS is not yet live, the zone will SERVFAIL until it propagates.")
-		} else {
-			present, details := verifyNewKSKDSAtParent(cfg, state, domain)
-			if !present {
-				return fmt.Errorf("refusing to complete: the new KSK's DS is not visible at the parent yet (%s).\n"+
-					"Publish the new DS at your registrar and wait for it to propagate, then retry — or pass --force if you have verified it another way", details)
-			}
-			fmt.Printf("Verified new KSK's DS is present at the parent (%s).\n", details)
-		}
+	rollover := zoneState.Rollover
+	if rollover.Type != "ksk" && rollover.Type != "algorithm" {
+		return fmt.Errorf("cannot complete rollover type %q manually", rollover.Type)
+	}
+	if !rollover.NeedsOperator() || rollover.State == statepkg.AlgoRolloverStateOldDSRemoval {
+		return fmt.Errorf("rollover for %s is in phase %s: retirement continues automatically (the daemon or `dnssec-tudor sign` advances it); current action: %s", domain, rollover.State, rollover.Action)
 	}
 
-	rolloverMgr := signerpkg.NewRolloverManager(cfg, state)
+	// Before the old KSK can ever be retired, the new KSK's DS must be live at
+	// EVERY parent server and the parent's DS TTL must elapse (RA6X-003): a
+	// resolver that fetched the old-only DS set just before the new DS appeared
+	// holds it that long, and would go bogus if the old KSK vanished from the
+	// DNSKEY RRset earlier. Completion therefore records the observation and
+	// starts the propagation wait; the daemon retires the old key afterwards.
+	// --force is the explicit escape hatch for operators who verified
+	// propagation another way (R-037): the wait then starts now with the
+	// configured parent_ds_ttl.
+	force, _ := cmd.Flags().GetBool("force")
+	now := time.Now().UTC()
+	var parentDSTTL uint32
+	if force {
+		fmt.Println("Warning: --force set; skipping the parent-DS check. The old key is retired after the configured parent_ds_ttl from now.")
+	} else {
+		keyGen := signerpkg.NewKeyGenerator(cfg)
+		newKSK, err := keyGen.LoadPublicKey(domain, "ksk")
+		if err != nil {
+			return fmt.Errorf("loading the new KSK to verify its DS: %w", err)
+		}
+		v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+		obs, err := v.ProbeParentDS(domain, []*dns.DNSKEY{newKSK})
+		if err != nil {
+			return fmt.Errorf("refusing to complete: could not query every parent server for the new DS (%v); retry, or pass --force if you have verified it another way", err)
+		}
+		if !obs.PresentOnAll[newKSK.KeyTag()] {
+			return fmt.Errorf("refusing to complete: the new KSK's DS (tag %d) is not visible at every parent server yet (%d server(s) checked).\n"+
+				"Publish the new DS at your registrar and wait for it to propagate, then retry — or pass --force if you have verified it another way", newKSK.KeyTag(), len(obs.Servers))
+		}
+		parentDSTTL = obs.TTL
+		fmt.Printf("Verified the new KSK's DS is present at all %d parent server(s) (DS TTL %ds).\n", len(obs.Servers), obs.TTL)
+	}
+	if parentDSTTL == 0 {
+		parentDSTTL = uint32(cfg.ParentDSTTLFallback() / time.Second)
+	}
 
-	switch zoneState.Rollover.Type {
+	rolloverMgr := newRolloverManager(cfg, state)
+	switch rollover.Type {
 	case "ksk":
 		slog.Info("[CLI] Completing KSK rollover", "domain", domain)
-		if err := rolloverMgr.CompleteKSKRollover(domain); err != nil {
+		if err := rolloverMgr.CompleteKSKRollover(domain, now, parentDSTTL); err != nil {
 			return fmt.Errorf("completing KSK rollover: %w", err)
 		}
-		fmt.Printf("KSK rollover completed for %s.\n", domain)
-		fmt.Println("You may now remove the OLD DS record from your registrar.")
-
+		fmt.Printf("KSK rollover for %s is entering its retirement wait.\n", domain)
+		fmt.Printf("Both KSKs stay published until %s (parent DS TTL); the old KSK is then retired automatically by the daemon or the next `dnssec-tudor sign`.\n",
+			now.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339))
+		fmt.Println("You may remove the OLD DS record from your registrar now.")
 	case "algorithm":
 		slog.Info("[CLI] Completing algorithm rollover", "domain", domain)
-		if err := rolloverMgr.CompleteAlgorithmRollover(domain); err != nil {
+		if err := rolloverMgr.CompleteAlgorithmRollover(domain, now, parentDSTTL); err != nil {
 			return fmt.Errorf("completing algorithm rollover: %w", err)
 		}
-		fmt.Printf("Algorithm rollover completed for %s.\n", domain)
-		fmt.Println("You may now remove the OLD DS record (old algorithm) from your registrar.")
-
-	default:
-		return fmt.Errorf("cannot complete rollover type %q manually", zoneState.Rollover.Type)
+		fmt.Printf("Algorithm rollover for %s is entering its retirement sequence.\n", domain)
+		fmt.Printf("Both algorithms stay published until %s (parent DS TTL). Then remove the OLD DS record (old algorithm) at your registrar; the old-algorithm keys are retired one DS TTL after it is gone from every parent server.\n",
+			now.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339))
 	}
 
-	// Re-sign without old keys
+	// The key set does not change yet; re-sign so state and output stay coherent.
 	signer := signerpkg.NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
 		return fmt.Errorf("signing zone: %w", err)
@@ -1293,9 +1351,16 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	runPostSignHook(cfg, domain, zoneState.Path)
+	hookOK := runPostSignHook(cfg, state, domain, zoneState.Path)
 
-	MaybeAutoPublishDS(cfg, state, domain, "rollover_complete")
+	// Removing the old DS at the parent is safe from here: every resolver
+	// validates through a DS that matches a served KSK. Only the old KEY's
+	// retirement waits (above).
+	if hookOK {
+		MaybeAutoPublishDS(cfg, state, domain, "rollover_complete")
+	} else {
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed. Run `dnssec-tudor registrar push %s` once the zone is served.\n", domain)
+	}
 
 	return nil
 }
@@ -1341,7 +1406,7 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	runPostSignHook(cfg, domain, zoneState.Path)
+	hookOK := runPostSignHook(cfg, state, domain, zoneState.Path)
 
 	// Get new DS record
 	keyGen := signerpkg.NewKeyGenerator(cfg)
@@ -1361,7 +1426,11 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Printf("After the new DS propagates, run: dnssec-tudor rollover complete %s\n", domain)
 
-	MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
+	if hookOK {
+		MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
+	} else {
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed, so the new KSK is not confirmed served yet. Once it is, run `dnssec-tudor registrar push %s`.\n", domain)
+	}
 
 	return nil
 }
@@ -1698,7 +1767,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	fmt.Println(dsOutput)
 	fmt.Println("Note: a running daemon picks up the new zone after SIGHUP (config reload).")
 
-	runPostSignHook(cfg, domain, zonePath)
+	_ = runPostSignHook(cfg, state, domain, zonePath)
 
 	return nil
 }

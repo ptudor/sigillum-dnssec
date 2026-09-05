@@ -87,6 +87,17 @@ type Validator struct {
 	state    *statepkg.State
 	resolver string
 	timeout  time.Duration
+	// authPort is the port authoritative servers are queried on ("53");
+	// tests point it at hermetic servers.
+	authPort string
+}
+
+// portOr returns the configured authoritative port.
+func (v *Validator) portOr() string {
+	if v.authPort == "" {
+		return "53"
+	}
+	return v.authPort
 }
 
 // NewValidator creates a Validator with the given configuration.
@@ -615,11 +626,11 @@ func (v *Validator) resolveNS(zone string) (string, error) {
 			switch addr := rr.(type) {
 			case *dns.A:
 				if dns.CanonicalName(addr.Hdr.Name) == dns.CanonicalName(nsName) {
-					return net.JoinHostPort(addr.A.String(), "53"), nil
+					return net.JoinHostPort(addr.A.String(), v.portOr()), nil
 				}
 			case *dns.AAAA:
 				if dns.CanonicalName(addr.Hdr.Name) == dns.CanonicalName(nsName) {
-					return net.JoinHostPort(addr.AAAA.String(), "53"), nil
+					return net.JoinHostPort(addr.AAAA.String(), v.portOr()), nil
 				}
 			}
 		}
@@ -637,9 +648,9 @@ func (v *Validator) resolveNS(zone string) (string, error) {
 			for _, rr := range ar.Answer {
 				switch addr := rr.(type) {
 				case *dns.A:
-					return net.JoinHostPort(addr.A.String(), "53"), nil
+					return net.JoinHostPort(addr.A.String(), v.portOr()), nil
 				case *dns.AAAA:
-					return net.JoinHostPort(addr.AAAA.String(), "53"), nil
+					return net.JoinHostPort(addr.AAAA.String(), v.portOr()), nil
 				}
 			}
 		}

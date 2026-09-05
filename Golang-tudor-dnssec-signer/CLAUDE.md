@@ -162,6 +162,14 @@ nsec_version = "nsec3"         # "nsec" or "nsec3"
 # the unsigned file; date-format serials (YYYYMMDDnn) are rejected at sign
 # time. Per-zone override: serial_policy on the zone entry.
 serial_policy = "keep"
+# What counts as "served" for rollover timers: "hook" (default with a
+# post_sign hook), "immediate" (default without one) or "probe" (all
+# authoritative servers answer the published serial; needs serial_policy =
+# "epoch"). See "Publication, not just signing".
+# publication = "hook"
+# DS TTL assumed for the parent when it cannot be observed (`rollover
+# complete --force`); retirement waits at least this long after a DS change.
+# parent_ds_ttl = "24h"
 
 # Optional web UI
 [web]
@@ -299,30 +307,72 @@ Digest: E2D3C916F6DEEAC73294E8268FB5885044A833FC5459588F4A9184CF
 
 ## Key Rollover Process
 
+### Publication, not just signing (RA6X-004)
+
+Writing the signed file is not the same as the nameserver serving it. Each
+zone tracks `pending_publication` / `published_at` in state; every rollover
+timer starts from the *confirmed* publication of the phase's key set:
+
+- `dnssec.publication = "hook"` (default when a post-sign hook is configured):
+  the hook completing successfully for that generation confirms it. A failed
+  hook leaves the zone pending; the daemon re-runs the hook every cycle (and
+  after a restart) without re-signing, and CLI commands skip DS automation
+  while the zone is unconfirmed.
+- `"immediate"` (default without a hook): the write is the publication — the
+  documented assumption for a nameserver that reads `output_dir` directly.
+- `"probe"`: every authoritative server of the zone must answer SOA with the
+  published serial (requires `serial_policy = "epoch"`).
+
+### Cache horizons (RA6X-027)
+
+State keeps `dnskey_cache_horizon` / `rrsig_cache_horizon`: the latest time a
+resolver may still hold an earlier generation's DNSKEY RRset or signatures,
+raised at every confirmed publication by the *previously served* TTL and
+never lowered. Lowering a TTL therefore lengthens nothing and shortens
+nothing that resolvers already cached; a rollover phase snapshots the horizon
+(`phase_horizon`) when its key set is first confirmed served and advances
+only after it.
+
 ### ZSK Rollover (Automatic)
 ZSK rolls use pre-publish method, fully automatic:
 1. 14 days before ZSK expiry: Generate new ZSK, publish in zone
-2. 7 days before expiry: Start signing with new ZSK
-3. On expiry: Remove old ZSK
+2. Once that DNSKEY RRset is confirmed served and the cache horizon has
+   passed (never earlier than 7 days before expiry): start signing with the
+   new ZSK
+3. Once those signatures are confirmed served and every cached DNSKEY RRset
+   and old-ZSK signature (data and denial records) has expired: remove old ZSK
 
 No human intervention required. Status JSON shows this happening.
 
-### KSK Rollover (Semi-automatic)
-KSK rolls require DS update at registrar:
+### KSK Rollover (Semi-automatic, RFC 6781 §4.1.2 / RA6X-003)
+KSK rolls require a DS update at the registrar, then a cache-safe wait:
 
 ```bash
-# 1. Start rollover (generates new KSK, adds to zone)
+# 1. Start rollover (generates new KSK with the zone's algorithm, adds it to the zone)
 $ dnssec-tudor rollover start example.com
 New KSK generated. Both keys now in zone.
 Update DS record at registrar. New DS:
   example.com. IN DS 22222 13 2 ABC123...
 
-# 2. Wait for DS to propagate, then complete
+# 2. Once the new DS is at EVERY parent server, record that. Both KSKs keep
+#    signing until the parent's DS TTL has elapsed (a resolver that fetched
+#    the old-only DS set just before the change holds it that long); the
+#    daemon — or the next `sign` — then retires the old KSK, and the rollover
+#    ends once that zone is confirmed served. The old DS may be removed at the
+#    registrar as soon as step 2 succeeds.
 $ dnssec-tudor rollover complete example.com
-Old KSK removed. Rollover complete.
 ```
 
-The daemon will remind you (in status output) if a rollover is pending.
+Phases: `ds_add_wait` (operator) → `ds_propagation_wait` (automatic) →
+`retiring` (automatic). `--force` skips the all-parents probe and starts the
+wait now with `dnssec.parent_ds_ttl` (default 24h). Algorithm rollovers use
+the conservative sequence: `algo_ds_add_wait` (operator adds the new DS) →
+`algo_ds_propagation_wait` → `algo_old_ds_removal_wait` (operator removes the
+old DS; observed at every parent server) → one more DS TTL → `algo_retiring`.
+Every wait is an absolute persisted time that survives restarts and cannot be
+shortened by a later TTL change.
+
+The daemon will remind you (in status output) if a rollover needs you.
 
 ## Registrar API Integration (Optional)
 

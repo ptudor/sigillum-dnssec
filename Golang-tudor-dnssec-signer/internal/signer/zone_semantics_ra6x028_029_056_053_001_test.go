@@ -772,12 +772,7 @@ func TestKSKRollover_KeepsExistingAlgorithm(t *testing.T) {
 	if err := z.signer.SignZone(z.domain); err != nil {
 		t.Fatalf("signing during rollover: %v", err)
 	}
-	if err := rm.CompleteKSKRollover(z.domain); err != nil {
-		t.Fatal(err)
-	}
-	if err := z.signer.SignZone(z.domain); err != nil {
-		t.Fatalf("signing after completion: %v", err)
-	}
+	retireKSK(t, rm, z.signer, z.domain)
 	independentVerify(t, parseSigned(t, z.outputPath(), z.domain), nil)
 
 	// After an explicit ED25519→ECDSA... here ECDSA→ED25519 algorithm rollover
@@ -790,12 +785,7 @@ func TestKSKRollover_KeepsExistingAlgorithm(t *testing.T) {
 	if err := z.signer.SignZone(z.domain); err != nil {
 		t.Fatalf("signing during algorithm rollover: %v", err)
 	}
-	if err := rm.CompleteAlgorithmRollover(z.domain); err != nil {
-		t.Fatal(err)
-	}
-	if err := z.signer.SignZone(z.domain); err != nil {
-		t.Fatal(err)
-	}
+	retireAlgorithm(t, rm, z.signer, z.domain)
 	if err := rm.StartKSKRollover(z.domain); err != nil {
 		t.Fatal(err)
 	}
@@ -850,5 +840,71 @@ func TestVerifySignedZone_RequiresEveryAlgorithmToSign(t *testing.T) {
 	err = s.verifySignedZone("example.com", input, signed, keys)
 	if err == nil || !strings.Contains(err.Error(), "RFC 6840") {
 		t.Fatalf("an advertised algorithm that signs nothing must be rejected, got %v", err)
+	}
+}
+
+// fakeDSProbe answers parent-DS questions for tests.
+type fakeDSProbe struct {
+	present, absent bool
+	ttl             uint32
+}
+
+func (f fakeDSProbe) ProbeParentDS(domain string, ksks []*dns.DNSKEY) (ParentDSObservation, error) {
+	obs := ParentDSObservation{PresentOnAll: map[uint16]bool{}, AbsentOnAll: map[uint16]bool{}, TTL: f.ttl, Servers: []string{"fake"}}
+	for _, k := range ksks {
+		obs.PresentOnAll[k.KeyTag()] = f.present
+		obs.AbsentOnAll[k.KeyTag()] = f.absent
+	}
+	return obs, nil
+}
+
+// retireKSK drives a KSK rollover from ds_add_wait to completion with the
+// propagation waits already elapsed (RA6X-003).
+func retireKSK(t *testing.T, rm *RolloverManager, s *Signer, domain string) {
+	t.Helper()
+	if err := rm.CompleteKSKRollover(domain, time.Now().Add(-2*time.Hour), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := rm.CheckKSKRollover(domain); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SignZone(domain); err != nil {
+		t.Fatalf("signing the retiring generation: %v", err)
+	}
+	if err := rm.CheckKSKRollover(domain); err != nil {
+		t.Fatal(err)
+	}
+	if r := rm.state.GetZone(domain).Rollover; r != nil {
+		t.Fatalf("KSK rollover must be complete, got %+v", r)
+	}
+}
+
+// retireAlgorithm drives an algorithm rollover from algo_ds_add_wait to
+// completion with the old DS already gone and every wait elapsed.
+func retireAlgorithm(t *testing.T, rm *RolloverManager, s *Signer, domain string) {
+	t.Helper()
+	rm.SetParentDSProbe(fakeDSProbe{absent: true, ttl: 1})
+	if err := rm.CompleteAlgorithmRollover(domain, time.Now().Add(-2*time.Hour), 1); err != nil {
+		t.Fatal(err)
+	}
+	zs := rm.state.GetZone(domain)
+	if err := rm.CheckAlgorithmRollover(domain); err != nil { // → old DS removal wait
+		t.Fatal(err)
+	}
+	if err := rm.CheckAlgorithmRollover(domain); err != nil { // probe: old DS gone
+		t.Fatal(err)
+	}
+	rm.state.Mutate(func() { zs.Rollover.OldDSRemovedAt = time.Now().Add(-2 * time.Hour) })
+	if err := rm.CheckAlgorithmRollover(domain); err != nil { // → retiring
+		t.Fatal(err)
+	}
+	if err := s.SignZone(domain); err != nil {
+		t.Fatalf("signing the retiring generation: %v", err)
+	}
+	if err := rm.CheckAlgorithmRollover(domain); err != nil {
+		t.Fatal(err)
+	}
+	if r := rm.state.GetZone(domain).Rollover; r != nil {
+		t.Fatalf("algorithm rollover must be complete, got %+v", r)
 	}
 }
