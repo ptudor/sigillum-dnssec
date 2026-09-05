@@ -25,6 +25,13 @@ type State struct {
 	mu    sync.RWMutex
 	path  string
 	Zones map[string]*ZoneState `json:"zones"`
+	// Removed holds deletion markers: zones a CLI `remove` took out of
+	// management, keyed by zone name with the removal time. A daemon whose
+	// in-memory configuration predates the removal must not re-initialize
+	// such a zone from that stale configuration (RA6X-025); the marker is
+	// cleared when the zone is added again, or when a configuration loaded
+	// after the removal still lists the zone (the operator re-added it).
+	Removed map[string]time.Time `json:"removed,omitempty"`
 	// fileSeen records that the state file existed at the last successful
 	// load or save, so a later disappearance is detected (RA6X-026).
 	fileSeen bool
@@ -221,6 +228,14 @@ func (s *State) validateAndNormalize() error {
 		// {"zones": null} — explicitly allowed as "no zones" (RA6X-036).
 		s.Zones = make(map[string]*ZoneState)
 	}
+	if s.Removed == nil {
+		s.Removed = make(map[string]time.Time)
+	}
+	for name := range s.Removed {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("removal marker with an empty zone name")
+		}
+	}
 	for name, zone := range s.Zones {
 		if err := validateZoneEntry(name, zone); err != nil {
 			return err
@@ -330,6 +345,72 @@ func validateRolloverState(z *ZoneState) error {
 	return nil
 }
 
+// ReplaceFromDisk adopts the on-disk state WHOLESALE: every zone and removal
+// marker in memory is replaced by the validated disk document. It is the
+// authoritative reload a signing cycle performs under the process lock before
+// mutating anything (RA6X-025): with the lock held, the disk carries every
+// mutation any CLI command committed since the daemon's last save — warnings
+// added or cleared, removals, phase metadata that did not sign — and none of
+// the merge heuristics of ReloadFromDisk are needed. Callers must not use it
+// while unsaved in-memory results exist (see ReloadFromDisk for that case).
+// A missing file that existed at the last successful load/save is
+// ErrStateFileMissing; an invalid document leaves memory untouched.
+func (s *State) ReplaceFromDisk() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		if s.fileSeen {
+			return fmt.Errorf("%w: %s existed at the last successful load and is gone; restore it, or restart the daemon to rebuild state from the key files if the removal was intentional", ErrStateFileMissing, s.path)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading state file: %w", err)
+	}
+	diskState := &State{Zones: make(map[string]*ZoneState)}
+	if err := json.Unmarshal(data, diskState); err != nil {
+		return fmt.Errorf("parsing state file: %w", err)
+	}
+	if err := diskState.validateAndNormalize(); err != nil {
+		return fmt.Errorf("state file %s is invalid (left unchanged, in-memory state not replaced): %w", s.path, err)
+	}
+	s.Zones = diskState.Zones
+	s.Removed = diskState.Removed
+	s.fileSeen = true
+	return nil
+}
+
+// MarkRemoved takes a zone out of management and records a deletion marker so
+// a daemon holding a configuration that predates the removal does not
+// re-create the zone from it (RA6X-025).
+func (s *State) MarkRemoved(domain string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.Zones, domain)
+	if s.Removed == nil {
+		s.Removed = make(map[string]time.Time)
+	}
+	s.Removed[domain] = time.Now().UTC()
+}
+
+// ClearRemoved drops the deletion marker for a zone that is being managed again.
+func (s *State) ClearRemoved(domain string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.Removed, domain)
+}
+
+// RemovedAt returns when a zone was removed by a CLI command, if a deletion
+// marker exists for it.
+func (s *State) RemovedAt(domain string) (time.Time, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.Removed[domain]
+	return t, ok
+}
+
 // ReloadFromDisk reloads the state from disk, merging any new zones added by CLI commands.
 // This preserves zones added by CLI while keeping daemon's in-memory updates for managed zones.
 //
@@ -362,6 +443,33 @@ func (s *State) ReloadFromDisk() error {
 		return fmt.Errorf("state file %s is invalid (left unchanged, in-memory state not merged): %w", s.path, err)
 	}
 	s.fileSeen = true
+
+	// Deletion markers (RA6X-025): adopt the disk's markers, and drop a
+	// marker for any zone that has since been re-added on disk. A zone the
+	// disk no longer holds but memory does, with a disk marker newer than
+	// memory's last signing, was removed by a CLI command: drop it.
+	if s.Removed == nil {
+		s.Removed = make(map[string]time.Time)
+	}
+	for domain, at := range diskState.Removed {
+		if _, onDisk := diskState.Zones[domain]; onDisk {
+			continue
+		}
+		if memZone, exists := s.Zones[domain]; exists {
+			if memZone.LastSigned.After(at) {
+				// Re-added and signed after the removal: the disk marker is stale.
+				delete(s.Removed, domain)
+				continue
+			}
+			delete(s.Zones, domain)
+		}
+		s.Removed[domain] = at
+	}
+	for domain := range s.Removed {
+		if _, onDisk := diskState.Zones[domain]; onDisk {
+			delete(s.Removed, domain)
+		}
+	}
 
 	// Merge zones from disk:
 	// - Add zones that only exist on disk (CLI additions via "add" command)

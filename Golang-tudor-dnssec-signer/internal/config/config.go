@@ -30,6 +30,11 @@ type Config struct {
 	Zones        map[string]ZoneConfig `toml:"zones"`
 	Hooks        HooksConfig           `toml:"hooks"`
 	Registrar    RegistrarConfig       `toml:"registrar"`
+	// LoadedAt is when this configuration was read from its file. The daemon
+	// uses it to tell a zone removed AFTER the configuration was loaded (a
+	// stale entry that must not be re-created) from one the operator re-added
+	// and reloaded (RA6X-025). Not a TOML field.
+	LoadedAt time.Time `toml:"-"`
 }
 
 // RegistrarConfig groups all registrar adapter settings. Each sub-struct is
@@ -303,6 +308,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	warnIfConfigWorldReadable(path, cfg)
+	cfg.LoadedAt = time.Now().UTC()
 
 	return cfg, nil
 }

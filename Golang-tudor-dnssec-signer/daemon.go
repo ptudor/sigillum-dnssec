@@ -51,6 +51,11 @@ type Daemon struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 	starting  atomic.Bool // Run has begun its startup sequence
+	// lastSaveFailed records that the previous cycle could not persist its
+	// results, so the next cycle merges rather than adopting the disk state
+	// wholesale (RA6X-025: newer unsaved signing results are never replaced
+	// by older disk data).
+	lastSaveFailed atomic.Bool
 }
 
 // markReady publishes the ready lifecycle state (idempotent).
@@ -470,10 +475,23 @@ func (d *Daemon) signAllZones() {
 	// Save would overwrite the newer/unreadable file with the stale snapshot.
 	// Nothing is mutated; the failure is exposed via readiness and the read
 	// is retried next cycle.
-	if err := snap.state.ReloadFromDisk(); err != nil {
-		msg := fmt.Sprintf("authoritative state could not be loaded: %v", err)
+	//
+	// Under the lock the disk is authoritative (RA6X-025): it holds every CLI
+	// mutation since our last save, including ones the merge heuristics could
+	// not see (warnings added/cleared, removals, phase metadata). Adopt it
+	// wholesale — unless the previous cycle failed to persist its results, in
+	// which case memory holds newer signing results that must not be replaced
+	// by older disk data, and the merge is used instead.
+	var reloadErr error
+	if d.lastSaveFailed.Load() {
+		reloadErr = snap.state.ReloadFromDisk()
+	} else {
+		reloadErr = snap.state.ReplaceFromDisk()
+	}
+	if reloadErr != nil {
+		msg := fmt.Sprintf("authoritative state could not be loaded: %v", reloadErr)
 		d.setStateFault(msg)
-		slog.Error("[DAEMON] Skipping signing cycle: state on disk is unreadable or invalid; no zone, key or state file will be mutated until it is repaired", "error", err)
+		slog.Error("[DAEMON] Skipping signing cycle: state on disk is unreadable or invalid; no zone, key or state file will be mutated until it is repaired", "error", reloadErr)
 		return
 	}
 	d.setStateFault("")
@@ -534,14 +552,19 @@ rolloverLoop:
 	if err := snap.state.ReloadFromDisk(); err != nil {
 		msg := fmt.Sprintf("authoritative state could not be re-loaded before save: %v", err)
 		d.setStateFault(msg)
+		d.lastSaveFailed.Store(true)
 		slog.Error("[DAEMON] Not saving state this cycle: state on disk is unreadable or invalid", "error", err)
 	} else if err := snap.state.Save(); err != nil {
 		if fsutil.IsCommitted(err) {
 			// The state file is in place; only its durability is uncertain (RA6X-049).
+			d.lastSaveFailed.Store(false)
 			slog.Warn("[DAEMON] State saved but its durability across power loss is uncertain", "error", err)
 		} else {
+			d.lastSaveFailed.Store(true)
 			slog.Error("[DAEMON] Failed to save state", "error", err)
 		}
+	} else {
+		d.lastSaveFailed.Store(false)
 	}
 
 	// Fire the coalesced post-sign hook after state is saved — this way
@@ -598,6 +621,20 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// Re-running the init branch for a placeholder (nil KSK/ZSK) mirrors
 	// SignAll (R-033): the daemon heals it instead of erroring every cycle
 	// until a CLI `sign` runs.
+	if zoneState == nil {
+		// RA6X-025: a zone a CLI `remove` took out of management after THIS
+		// configuration was loaded is a stale entry, not a new zone; do not
+		// re-create it from the old configuration. A configuration loaded after
+		// the removal that still lists the zone means the operator re-added it.
+		if removedAt, removed := snap.state.RemovedAt(domain); removed {
+			if !snap.cfg.LoadedAt.After(removedAt) {
+				slog.Info("[DAEMON] Zone was removed from management after this configuration was loaded; skipping until the configuration is reloaded",
+					"domain", domain, "removed_at", removedAt.Format(time.RFC3339))
+				return false, nil
+			}
+			snap.state.ClearRemoved(domain)
+		}
+	}
 	if zoneState == nil || zoneState.KSK == nil || zoneState.ZSK == nil {
 		keyGen := signerpkg.NewKeyGenerator(snap.cfg)
 		ksk, zsk, err := signerpkg.RecoverOrGenerateKeys(keyGen, domain)
