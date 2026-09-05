@@ -114,6 +114,14 @@ type CNAMERecord struct {
 	Target  string `json:"target"`            // The canonical name
 }
 
+// DNAMERecord represents a DNAME record (RFC 6672)
+type DNAMERecord struct {
+	Owner   string `json:"owner"`             // The redirected subtree's apex
+	Class   uint16 `json:"class,omitempty"`   // DNS class (1 = IN)
+	Section string `json:"section,omitempty"` // Message section the record came from
+	Target  string `json:"target"`            // The substituted suffix
+}
+
 // QueryResult represents the result of a DNS query
 type QueryResult struct {
 	Server        string         `json:"server"`
@@ -131,6 +139,7 @@ type QueryResult struct {
 	NSEC3         []NSEC3Record  `json:"nsec3,omitempty"`
 	NS            []NSRecord     `json:"ns,omitempty"`
 	CNAME         []CNAMERecord  `json:"cname,omitempty"`
+	DNAME         []DNAMERecord  `json:"dname,omitempty"` // RFC 6672 redirections (RA6X-014)
 	// AnswerTypes lists the distinct RR types present in the ANSWER section, in
 	// response order. The per-type fields above merge all message sections, so
 	// this is what lets a caller tell a positive answer (which may carry

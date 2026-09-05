@@ -307,10 +307,73 @@ func verifyNSECNODATA(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 						owner, typeName),
 				}, nil
 			}
+			return nil, fmt.Errorf("NSEC at %s lists type %s: NODATA is not proven", owner, typeName)
 		}
 	}
 
-	return nil, fmt.Errorf("no NSEC record proves type %s doesn't exist for %s", typeName, qname)
+	// No NSEC owned by qname. Two further NODATA shapes are valid (RA6X-014):
+	// an empty non-terminal, which has no NSEC of its own but is proven to
+	// exist by an NSEC whose next name lies below it (RFC 7129 §5.5), and a
+	// wildcard NODATA, where qname has no exact match and the wildcard at its
+	// closest encloser exists without the type (RFC 4035 §5.4, RFC 7129 §5.6).
+	var covering *dnspkg.NSECRecord
+	for i := range nsecRecords {
+		owner := canonicalizeName(nsecRecords[i].Owner)
+		next := canonicalizeName(nsecRecords[i].NextDomain)
+		if canonicallyBetween(qname, owner, next) {
+			covering = &nsecRecords[i]
+			break
+		}
+	}
+	if covering == nil {
+		return nil, fmt.Errorf("no NSEC record proves type %s doesn't exist for %s", typeName, qname)
+	}
+	owner := canonicalizeName(covering.Owner)
+	next := canonicalizeName(covering.NextDomain)
+
+	// An empty non-terminal is covered by a NORMAL interval: owner < qname <
+	// next with next below qname, so owner < next as well. A wrapping record
+	// (owner > next) whose next name happens to lie below qname is malformed
+	// (only the apex may be wrapped to) and proves nothing.
+	if nsecEndpointBelow(qname, next) && compareCanonicalNames(owner, next) < 0 {
+		// qname exists as an empty non-terminal: it holds no data of any type.
+		return &NSECProof{
+			ProofType:       "nodata",
+			CoveringNSEC:    fmt.Sprintf("%s -> %s", owner, next),
+			ClosestEncloser: qname,
+			Explanation: fmt.Sprintf("NSEC %s -> %s proves %s exists as an empty non-terminal (next name is below it), which has no %s data (RFC 7129 §5.5)",
+				owner, next, qname, typeName),
+		}, nil
+	}
+
+	// Wildcard NODATA: the closest encloser proven by the covering NSEC must
+	// own the wildcard that matched, and that wildcard's NSEC must lack qtype.
+	ce := closestEncloserFromNSEC(qname, owner, next)
+	wildcard := wildcardName(ce)
+	for _, nsec := range nsecRecords {
+		if canonicalizeName(nsec.Owner) != wildcard {
+			continue
+		}
+		if HasTypeInBitmap("CNAME", nsec.TypeBitmap) {
+			return nil, fmt.Errorf("NSEC at %s has the CNAME bit set: a CNAME was expected, not NODATA for %s (RFC 6840 §4.3)", wildcard, typeName)
+		}
+		if HasTypeInBitmap("NS", nsec.TypeBitmap) && !HasTypeInBitmap("SOA", nsec.TypeBitmap) {
+			return nil, fmt.Errorf("NSEC at %s is a delegation point (NS set, SOA clear): not authoritative NODATA for %s", wildcard, typeName)
+		}
+		if HasTypeInBitmap(typeName, nsec.TypeBitmap) {
+			return nil, fmt.Errorf("NSEC at %s lists type %s: wildcard NODATA is not proven for %s", wildcard, typeName, qname)
+		}
+		return &NSECProof{
+			ProofType:       "nodata",
+			CoveringNSEC:    fmt.Sprintf("%s types: %v", wildcard, nsec.TypeBitmap),
+			ClosestEncloser: ce,
+			NextCloser:      nextCloserName(qname, ce),
+			Explanation: fmt.Sprintf("NSEC %s -> %s proves %s has no exact match (closest encloser %s); NSEC at %s proves the matching wildcard has no type %s (RFC 7129 §5.6)",
+				owner, next, qname, ce, wildcard, typeName),
+		}, nil
+	}
+
+	return nil, fmt.Errorf("no NSEC record proves type %s doesn't exist for %s (no exact match, empty non-terminal, or wildcard NODATA proof)", typeName, qname)
 }
 
 // VerifyNSEC3DenialWithRRSIG verifies NSEC3 records prove non-existence with full RRSIG verification.
@@ -727,7 +790,40 @@ func verifyNSEC3NODATAInChain(c *nsec3Chain, qname string, qtype uint16) (*NSECP
 		return nil, fmt.Errorf("NSEC3 at %s lists type %s: NODATA is not proven for %s", nsec3.HashedOwner, typeName, qname)
 	}
 
-	return nil, fmt.Errorf("no NSEC3 record proves type %s doesn't exist for %s", typeName, qname)
+	// Wildcard NODATA (RFC 5155 §8.7, RA6X-014): a closest-encloser proof for
+	// qname (closest encloser matched, next closer covered) plus an NSEC3
+	// matching the wildcard at the closest encloser whose bitmap lacks qtype.
+	ce, nextCloser, _, ncRec, err := c.closestEncloser(qname)
+	if err != nil {
+		return nil, fmt.Errorf("no NSEC3 record proves type %s doesn't exist for %s (%v)", typeName, qname, err)
+	}
+	wildcard := wildcardName(ce)
+	wcRec := c.match(c.hash(wildcard))
+	if wcRec == nil {
+		return nil, fmt.Errorf("no NSEC3 record proves type %s doesn't exist for %s: no exact match and no NSEC3 for wildcard %s", typeName, qname, wildcard)
+	}
+	if HasTypeInBitmap("CNAME", wcRec.TypeBitmap) {
+		return nil, fmt.Errorf("NSEC3 for wildcard %s has the CNAME bit set: a CNAME was expected, not NODATA for %s (RFC 6840 §4.3)", wildcard, typeName)
+	}
+	if HasTypeInBitmap("NS", wcRec.TypeBitmap) && !HasTypeInBitmap("SOA", wcRec.TypeBitmap) {
+		return nil, fmt.Errorf("NSEC3 for wildcard %s is a delegation point (NS set, SOA clear): not authoritative NODATA for %s", wildcard, typeName)
+	}
+	if HasTypeInBitmap(typeName, wcRec.TypeBitmap) {
+		return nil, fmt.Errorf("NSEC3 for wildcard %s lists type %s: wildcard NODATA is not proven for %s", wildcard, typeName, qname)
+	}
+	proof := &NSECProof{
+		ProofType:       "nodata",
+		CoveringNSEC:    fmt.Sprintf("NSEC3 %s (wildcard %s) types: %v", wcRec.HashedOwner, wildcard, wcRec.TypeBitmap),
+		ClosestEncloser: ce,
+		NextCloser:      nextCloser,
+		Explanation: fmt.Sprintf("NSEC3 proves %s has no exact match (closest encloser %s, next closer %s covered) and the matching wildcard %s has no type %s (RFC 5155 §8.7)",
+			qname, ce, nextCloser, wildcard, typeName),
+	}
+	if isOptOut(ncRec) {
+		proof.OptOut = true
+		proof.Explanation += "; the next closer name is covered by an opt-out NSEC3, so an unsigned delegation may exist there: the conclusion is insecure, not secure (RFC 5155 §9.2)"
+	}
+	return proof, nil
 }
 
 // nsec3IterationsOverCap returns the first NSEC3 iteration count exceeding the

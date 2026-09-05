@@ -312,6 +312,27 @@ func dsRecordsFromVerified(v *VerifiedRRset) []dnspkg.DSRecord {
 	return out
 }
 
+// answerHasTypeAt reports whether the Answer section of a raw response holds
+// at least one record of qtype owned by owner. A CNAME/DNAME chain answer
+// carries the target's records at OTHER owners, so a section-wide type check
+// cannot decide whether the queried name itself was answered (RA6X-014).
+func answerHasTypeAt(rawResponse []byte, qtype uint16, owner string) bool {
+	if len(rawResponse) == 0 {
+		return false
+	}
+	var msg dns.Msg
+	if err := msg.Unpack(rawResponse); err != nil {
+		return false
+	}
+	want := dns.CanonicalName(owner)
+	for _, rr := range msg.Answer {
+		if rr.Header().Rrtype == qtype && dns.CanonicalName(rr.Header().Name) == want {
+			return true
+		}
+	}
+	return false
+}
+
 // answerDNSKEYsOwnedBy returns the parsed DNSKEY records that came from the
 // Answer section and are owned by zone: the served DNSKEY RRset candidates.
 // Keys in Authority/Additional or at another owner are diagnostics only.
