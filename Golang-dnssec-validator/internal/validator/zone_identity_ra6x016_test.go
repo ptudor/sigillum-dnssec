@@ -157,11 +157,10 @@ func TestRA6X016_DenialEvidenceIsZoneBound(t *testing.T) {
 		t.Fatalf("zone B's own denial must verify: %v", err)
 	}
 	recB := dnspkg.NSECFromRR(nsecB, dnspkg.SectionAuthority)
-	sigRecB := []dnspkg.RRSIGRecord{dnspkg.RRSIGFromRR(sigB, dnspkg.SectionAuthority, time.Now())}
-	if proof := VerifyNSECDenialWithRRSIG("y.b.test.", dns.TypeA, []dnspkg.NSECRecord{recB}, sigRecB, b.keyRecords(), b.name, rawB, dns.RcodeNameError); !proof.Verified {
+	if proof := VerifyNSECDenialWithRRSIG("y.b.test.", dns.TypeA, []dnspkg.NSECRecord{recB}, b.keyRecords(), b.name, rawB, dns.RcodeNameError); !proof.Verified {
 		t.Fatalf("zone B's own NXDOMAIN proof must verify: %s", proof.Error)
 	}
-	if proof := VerifyNSECDenialWithRRSIG("y.b.test.", dns.TypeA, []dnspkg.NSECRecord{recB}, sigRecB, b.keyRecords(), b.name, rawBAtA, dns.RcodeNameError); proof.Verified {
+	if proof := VerifyNSECDenialWithRRSIG("y.b.test.", dns.TypeA, []dnspkg.NSECRecord{recB}, b.keyRecords(), b.name, rawBAtA, dns.RcodeNameError); proof.Verified {
 		t.Fatal("NXDOMAIN proof signed at another zone was accepted")
 	}
 }

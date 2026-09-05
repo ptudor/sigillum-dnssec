@@ -99,6 +99,46 @@ func ComputeDSDigestFromDNSKEY(zone string, dnskey dnspkg.DNSKEYRecord, digestTy
 	return strings.ToUpper(hex.EncodeToString(digest)), nil
 }
 
+// SupportedDNSKEYAlgorithm reports whether this validator can verify
+// signatures made with the given DNSSEC algorithm number (the set the
+// underlying crypto library implements: RSA/SHA-1, RSA/SHA-256, RSA/SHA-512,
+// ECDSA P-256/P-384 and Ed25519).
+func SupportedDNSKEYAlgorithm(alg uint8) bool {
+	switch alg {
+	case dns.RSASHA1, dns.RSASHA1NSEC3SHA1, dns.RSASHA256, dns.RSASHA512,
+		dns.ECDSAP256SHA256, dns.ECDSAP384SHA384, dns.ED25519:
+		return true
+	}
+	return false
+}
+
+// SupportedDSDigestType reports whether this validator can compute the given
+// DS digest type (SHA-1, SHA-256, SHA-384).
+func SupportedDSDigestType(dt uint8) bool {
+	switch dt {
+	case 1, 2, 4:
+		return true
+	}
+	return false
+}
+
+// SupportedDSRecords partitions an authenticated DS RRset into the records
+// this validator can act on (supported algorithm AND digest type) and those it
+// cannot. RFC 4035 §5.2 / RFC 6840 §5.2: a DS whose algorithm or digest type
+// is unsupported offers no authentication path; if NO DS in the authenticated
+// RRset is supported the delegation is treated as unsigned (insecure) rather
+// than bogus, whereas a supported DS that fails to match is bogus (RA6X-017).
+func SupportedDSRecords(ds []dnspkg.DSRecord) (supported, unsupported []dnspkg.DSRecord) {
+	for _, d := range ds {
+		if SupportedDNSKEYAlgorithm(d.Algorithm) && SupportedDSDigestType(d.DigestType) {
+			supported = append(supported, d)
+		} else {
+			unsupported = append(unsupported, d)
+		}
+	}
+	return supported, unsupported
+}
+
 // EligibleKeysByKeyTag returns every DNSKEY carrying keyTag that is eligible to
 // verify signatures (R-043 eligibility). A key tag is only a 16-bit hint that can
 // collide (RFC 4034 Appendix B / RFC 6840), so callers MUST try each returned

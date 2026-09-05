@@ -536,7 +536,7 @@ func TestNSEC3IterationCap(t *testing.T) {
 	}
 
 	// The RRSIG-gated and wildcard entry points reject as well (before crypto/hashing).
-	proof := VerifyNSEC3DenialWithRRSIG("nx.example.com.", 1, over, nil, nil, "example.com.", nil, 3)
+	proof := VerifyNSEC3DenialWithRRSIG("nx.example.com.", 1, over, nil, "example.com.", nil, 3)
 	if proof == nil || proof.Error == "" || !strings.Contains(proof.Error, "9276") {
 		t.Errorf("VerifyNSEC3DenialWithRRSIG should flag the iteration cap, got %+v", proof)
 	}

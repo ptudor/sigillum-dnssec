@@ -38,8 +38,10 @@ var base32ExtendedHex = base32.HexEncoding.WithPadding(base32.NoPadding)
 // Per RFC 4035 Section 5.4. rawResponse is the raw wire-format DNS response containing the NSEC
 // records; it is required so the NSEC RRset signatures can be cryptographically verified before
 // the proof is reported as verified. zone is the zone whose keys dnskeys are: every NSEC used
-// must be owned within it and signed by it (RA6X-016).
-func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecord, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
+// must be owned within it and signed by it (RA6X-016). Every covering RRSIG in the
+// response is evaluated as a whole by the crypto layer; an expired or unknown-key
+// signature does not stop a valid alternative from authenticating the RRset (RA6X-017).
+func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
 	proof := &NSECProof{
 		ProofType: "NSEC",
 		Records:   make([]string, 0),
@@ -53,29 +55,6 @@ func VerifyNSECDenialWithRRSIG(qname string, qtype uint16, nsecRecords []dnspkg.
 
 	if len(nsecRecords) == 0 {
 		proof.Error = "no NSEC records in response"
-		return proof
-	}
-
-	// Verify NSEC RRSIG first
-	rrsigRecord := findRRSIGForType(47, rrsigs) // TypeNSEC = 47
-	if rrsigRecord == nil {
-		proof.Error = "no RRSIG for NSEC records"
-		return proof
-	}
-
-	// Check RRSIG time validity
-	if !verifyRRSIGTimeValid(*rrsigRecord) {
-		if rrsigRecord.IsExpired {
-			proof.Error = "NSEC RRSIG expired"
-		} else {
-			proof.Error = "NSEC RRSIG not yet valid"
-		}
-		return proof
-	}
-
-	// Find signing key (fast fail with a clear message before the cryptographic check)
-	if signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys); signingKey == nil {
-		proof.Error = "NSEC signing key not found"
 		return proof
 	}
 
@@ -224,8 +203,10 @@ func verifyNSECNODATA(qname string, qtype uint16, nsecRecords []dnspkg.NSECRecor
 // VerifyNSEC3DenialWithRRSIG verifies NSEC3 records prove non-existence with full RRSIG verification.
 // Per RFC 5155 Section 8. rawResponse is the raw wire-format DNS response containing the NSEC3
 // records; it is required so the NSEC3 RRset signatures can be cryptographically verified before
-// the proof is reported as verified.
-func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, rrsigs []dnspkg.RRSIGRecord, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
+// the proof is reported as verified. Every covering RRSIG in the response is evaluated
+// as a whole by the crypto layer; an expired or unknown-key signature does not stop a
+// valid alternative from authenticating the RRset (RA6X-017).
+func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspkg.NSEC3Record, dnskeys []dnspkg.DNSKEYRecord, zone string, rawResponse []byte, rcode int) *NSECProof {
 	proof := &NSECProof{
 		ProofType: "NSEC3",
 		Records:   make([]string, 0),
@@ -246,29 +227,6 @@ func VerifyNSEC3DenialWithRRSIG(qname string, qtype uint16, nsec3Records []dnspk
 	// (bounded, but still wasteful) RRSIG crypto below (R-088).
 	if iters, over := nsec3IterationsOverCap(nsec3Records); over {
 		proof.Error = fmt.Sprintf("NSEC3 iterations=%d exceeds RFC 9276 cap of %d; refusing (CPU-amplification DoS vector)", iters, NSEC3MaxRecommendedIterations)
-		return proof
-	}
-
-	// Verify NSEC3 RRSIG first
-	rrsigRecord := findRRSIGForType(50, rrsigs) // TypeNSEC3 = 50
-	if rrsigRecord == nil {
-		proof.Error = "no RRSIG for NSEC3 records"
-		return proof
-	}
-
-	// Check RRSIG time validity
-	if !verifyRRSIGTimeValid(*rrsigRecord) {
-		if rrsigRecord.IsExpired {
-			proof.Error = "NSEC3 RRSIG expired"
-		} else {
-			proof.Error = "NSEC3 RRSIG not yet valid"
-		}
-		return proof
-	}
-
-	// Find signing key (fast fail with a clear message before the cryptographic check)
-	if signingKey := findDNSKEYByTag(rrsigRecord.KeyTag, dnskeys); signingKey == nil {
-		proof.Error = "NSEC3 signing key not found"
 		return proof
 	}
 
@@ -877,28 +835,3 @@ func HasTypeInBitmap(typeName string, bitmap []string) bool {
 	return false
 }
 
-// findRRSIGForType finds an RRSIG covering a specific type
-func findRRSIGForType(rrtype uint16, rrsigs []dnspkg.RRSIGRecord) *dnspkg.RRSIGRecord {
-	for i, rrsig := range rrsigs {
-		if rrsig.TypeCovered == rrtype {
-			return &rrsigs[i]
-		}
-	}
-	return nil
-}
-
-// verifyRRSIGTimeValid checks if an RRSIG is currently valid time-wise.
-// Uses VerifyRRSIGValid for consistency with clock skew tolerance per RFC 4035 §5.3.1.
-func verifyRRSIGTimeValid(rrsig dnspkg.RRSIGRecord) bool {
-	return VerifyRRSIGValid(rrsig)
-}
-
-// findDNSKEYByTag finds a DNSKEY by its key tag
-func findDNSKEYByTag(keyTag uint16, dnskeys []dnspkg.DNSKEYRecord) *dnspkg.DNSKEYRecord {
-	for i, key := range dnskeys {
-		if key.KeyTag == keyTag {
-			return &dnskeys[i]
-		}
-	}
-	return nil
-}

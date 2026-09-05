@@ -638,7 +638,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		// Check for denial proofs if this is NXDOMAIN or NODATA
 		if len(nsecCands) > 0 {
 			// Verify NSEC denial proof with full RRSIG verification
-			proof := VerifyNSECDenialWithRRSIG(domain, v.leafType(), nsecCands, queryResult.RRSIG, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
+			proof := VerifyNSECDenialWithRRSIG(domain, v.leafType(), nsecCands, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
 			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
@@ -648,7 +648,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 			return validation
 		} else if len(nsec3Cands) > 0 {
 			// Verify NSEC3 denial proof with full RRSIG verification
-			proof := VerifyNSEC3DenialWithRRSIG(domain, v.leafType(), nsec3Cands, queryResult.RRSIG, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
+			proof := VerifyNSEC3DenialWithRRSIG(domain, v.leafType(), nsec3Cands, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
 			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
@@ -661,93 +661,50 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 
 	// Positive data is authenticated from the Answer section at the queried
 	// owner only; signatures and aliases parked in other sections or at other
-	// owners are diagnostics, never candidates (RA6X-007).
-	leafSigs := answerRRSIGsOwnedBy(queryResult.RRSIG, domain)
+	// owners are diagnostics, never candidates (RA6X-007). Every covering
+	// signature at that owner is tried as an indivisible candidate against
+	// every eligible zone key sharing its tag (RA6X-009/017): a signature that
+	// is expired, names an unknown key, or fails cryptographically does not
+	// prevent a later valid one from authenticating the RRset, and only the
+	// signature that actually verified supplies the metadata used below.
 	leafCNAMEs := answerCNAMEsOwnedBy(queryResult.CNAME, domain)
 
-	// Find RRSIG for the leaf record type
-	rrsigA := FindRRSIGForType(v.leafType(), leafSigs)
-	if rrsigA == nil {
-		// Maybe it's a CNAME - check for CNAME RRSIG
-		if len(leafCNAMEs) > 0 {
-			rrsigCNAME := FindRRSIGForType(dns.TypeCNAME, leafSigs)
-			if rrsigCNAME != nil {
-				validation.RecordType = "CNAME"
-				if !VerifyRRSIGValid(*rrsigCNAME) {
-					if rrsigCNAME.IsExpired {
-						validation.Error = fmt.Sprintf("CNAME RRSIG expired at %s", rrsigCNAME.Expiration.Format("2006-01-02T15:04:05Z"))
-					} else {
-						validation.Error = fmt.Sprintf("CNAME RRSIG not yet valid")
-					}
-					return validation
-				}
-				// Find signing-key candidates: every eligible key sharing the tag
-				// (R-043 eligibility, R-044 collision-safe iteration).
-				candidates := EligibleKeysByKeyTag(rrsigCNAME.KeyTag, dnskeys)
-				switch {
-				case len(candidates) == 0:
-					validation.Error = fmt.Sprintf("CNAME signing key (tag %d) not found", rrsigCNAME.KeyTag)
-				case !leafSignerMatchesZone(rrsigCNAME.SignerName, zone):
-					// Defense-in-depth: the signature must be by a key in THIS
-					// zone, mirroring the A-record path's signer-name check (R-096).
-					validation.Error = fmt.Sprintf("CNAME RRSIG signer %s does not match zone %s", rrsigCNAME.SignerName, zone)
-				default:
-					// RA6X-016: the CNAME RRset at the queried owner must be signed by
-					// THIS zone with a key owned by this zone; the original wire records
-					// are verified, never a reconstruction.
-					verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, dns.TypeCNAME, candidates, domain, zone, true)
-					if err == nil {
-						validation.RRSIGVerified = true
-						validation.SigningKeyTag = rrsigCNAME.KeyTag
-						validation.RecordCount = len(verified.Records)
-						v.verifyWildcard(validation, domain, zone, *rrsigCNAME, queryResult, dnskeys)
-					} else {
-						validation.Error = fmt.Sprintf("CNAME RRSIG cryptographic verification failed: %v", err)
-					}
-				}
-				return validation
-			}
+	if answerContainsType(queryResult, v.leafType()) {
+		verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, v.leafType(), dnskeys, domain, zone, true)
+		if err != nil {
+			validation.Error = fmt.Sprintf("%s record RRSIG verification failed: %v", v.leafTypeName(), err)
+			return validation
 		}
-		validation.Error = "no RRSIG for A record"
+		v.recordVerifiedLeaf(validation, verified, domain, zone, queryResult, dnskeys)
 		return validation
 	}
 
-	// Verify RRSIG time validity
-	if !VerifyRRSIGValid(*rrsigA) {
-		if rrsigA.IsExpired {
-			validation.Error = fmt.Sprintf("A record RRSIG expired at %s", rrsigA.Expiration.Format("2006-01-02T15:04:05Z"))
-		} else {
-			validation.Error = fmt.Sprintf("A record RRSIG not yet valid")
+	if len(leafCNAMEs) > 0 {
+		// The answer is an alias: authenticate the CNAME RRset at the owner.
+		validation.RecordType = "CNAME"
+		verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
+		if err != nil {
+			validation.Error = fmt.Sprintf("CNAME RRSIG verification failed: %v", err)
+			return validation
 		}
+		v.recordVerifiedLeaf(validation, verified, domain, zone, queryResult, dnskeys)
 		return validation
 	}
 
-	// Find signing-key candidates: every eligible key sharing the tag
-	// (R-043 eligibility, R-044 collision-safe iteration).
-	candidates := EligibleKeysByKeyTag(rrsigA.KeyTag, dnskeys)
-	if len(candidates) == 0 {
-		validation.Error = fmt.Sprintf("A record signing key (tag %d) not found in zone DNSKEY", rrsigA.KeyTag)
-		return validation
-	}
-
-	if leafSignerMatchesZone(rrsigA.SignerName, zone) {
-		// RA6X-016: the leaf RRset at the queried owner must be signed by THIS
-		// zone with a key owned by this zone; the original wire records are
-		// verified, never a reconstruction.
-		verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, v.leafType(), candidates, domain, zone, true)
-		if err == nil {
-			validation.RRSIGVerified = true
-			validation.SigningKeyTag = rrsigA.KeyTag
-			validation.RecordCount = len(verified.Records)
-			v.verifyWildcard(validation, domain, zone, *rrsigA, queryResult, dnskeys)
-		} else {
-			validation.Error = fmt.Sprintf("A record RRSIG cryptographic verification failed: %v", err)
-		}
-	} else {
-		validation.Error = fmt.Sprintf("RRSIG signer %s does not match zone %s", rrsigA.SignerName, zone)
-	}
-
+	validation.Error = fmt.Sprintf("no %s RRset or CNAME for %s in the answer and no NSEC/NSEC3 denial records", v.leafTypeName(), domain)
 	return validation
+}
+
+// recordVerifiedLeaf records a cryptographically verified leaf (or CNAME) RRset
+// on validation. Every field it derives — signing key tag, record count and the
+// wildcard decision — comes from the exact signature that verified, never from
+// another signature in the response (RA6X-009).
+func (v *Validator) recordVerifiedLeaf(validation *RecordValidation, verified *VerifiedRRset, domain, zone string, queryResult *dnspkg.QueryResult, dnskeys []dnspkg.DNSKEYRecord) {
+	validation.RRSIGVerified = true
+	validation.SigningKeyTag = verified.Signature.KeyTag
+	validation.RecordCount = len(verified.Records)
+	sig := dnspkg.RRSIGFromRR(verified.Signature, dnspkg.SectionAnswer, time.Now())
+	v.verifyWildcard(validation, domain, zone, sig, queryResult, dnskeys)
 }
 
 // isDenialForType reports whether qr is a denial of existence (NXDOMAIN or
@@ -1125,9 +1082,30 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			return result, nil
 		}
 
+		// RA6X-017: classify the AUTHENTICATED DS RRset by supported algorithm and
+		// digest type before matching (RFC 4035 §5.2, RFC 6840 §5.2). A DS this
+		// validator cannot act on is not an authentication path; if none is
+		// supported the delegation is treated as unsigned (insecure), not bogus.
+		// This classification runs only after the parent authenticated the RRset,
+		// so an injected unknown-algorithm DS can never downgrade a signed zone.
+		supportedDS, unsupportedDS := SupportedDSRecords(ds.Authenticated)
+		for _, d := range unsupportedDS {
+			result.Warnings = append(result.Warnings, fmt.Sprintf(
+				"parent DS (key tag %d, algorithm %d, digest type %d) uses an algorithm or digest type this validator does not support; it cannot serve as an authentication path",
+				d.KeyTag, d.Algorithm, d.DigestType))
+		}
+		if len(supportedDS) == 0 {
+			result.Status = StatusInsecure
+			result.Warnings = append(result.Warnings,
+				"the authenticated DS RRset contains only unsupported algorithms/digest types: no supported authentication path, so the zone is treated as unsigned (RFC 4035 §5.2 / RFC 6840 §5.2)")
+			result.QueryTimeNs = time.Since(start).Nanoseconds()
+			return result, nil
+		}
+
 		// Validate DS matches DNSKEY (digest) and record the chain link, using
-		// ONLY the exact DS RRset the parent's signature authenticated (RA6X-007).
-		link, err := ValidateChainLink(ds.Authenticated, result.DNSKEY, zone)
+		// ONLY the exact DS RRset the parent's signature authenticated (RA6X-007)
+		// and this validator can act on (RA6X-017).
+		link, err := ValidateChainLink(supportedDS, result.DNSKEY, zone)
 		if err != nil {
 			result.Status = StatusBogus
 			result.AddError(fmt.Sprintf("chain of trust validation failed: %v", err))
@@ -1136,7 +1114,7 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		result.ChainLink = link
 
 		// R-080: the DNSKEY RRset must be signed by a key the DS actually authenticates.
-		authenticatedKeys = CollectDSMatchedKeys(ds.Authenticated, result.DNSKEY, zone)
+		authenticatedKeys = CollectDSMatchedKeys(supportedDS, result.DNSKEY, zone)
 
 		// Query RDAP for out-of-band DS verification (only for registrable domains)
 		if v.rdapClient != nil && IsRegistrableDomain(zone) {
