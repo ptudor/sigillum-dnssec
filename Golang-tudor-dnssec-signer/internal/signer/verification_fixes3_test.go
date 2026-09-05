@@ -14,7 +14,7 @@ import (
 // one RRset's owner with divergent letter case: `www` and `WWW` A records.
 // DNSSEC canonical form (RFC 4034 §6.2) lowercases owner names, so these are
 // one RRset on the wire and the signature over them is valid.
-func signMixedCaseZone(t *testing.T) (*Signer, []dns.RR, *signingKeys) {
+func signMixedCaseZone(t *testing.T) (*Signer, []dns.RR, []dns.RR, *signingKeys) {
 	t.Helper()
 	dataDir := t.TempDir()
 	cfg := dnssectest.Config(t, dataDir)
@@ -59,13 +59,14 @@ func signMixedCaseZone(t *testing.T) (*Signer, []dns.RR, *signingKeys) {
 		records = append(records, k)
 	}
 	s := NewSigner(cfg, nil)
+	input := append([]dns.RR(nil), records...)
 	records = append(records, s.generateNSECChain("example.com", records, 3600)...)
 
 	signed, err := s.signRecordsWithKeys("example.com", records, keys)
 	if err != nil {
 		t.Fatalf("signRecordsWithKeys: %v", err)
 	}
-	return s, signed, keys
+	return s, input, signed, keys
 }
 
 // A zone spelling one owner in different letter case within an RRset signs
@@ -75,8 +76,8 @@ func signMixedCaseZone(t *testing.T) (*Signer, []dns.RR, *signingKeys) {
 // mixed-case RRset is still rejected.
 func TestVerifySignedZone_MixedCaseOwnerRRset(t *testing.T) {
 	t.Run("mixed-case owner spellings pass verification", func(t *testing.T) {
-		s, signed, keys := signMixedCaseZone(t)
-		if err := s.verifySignedZone("example.com", signed, keys); err != nil {
+		s, input, signed, keys := signMixedCaseZone(t)
+		if err := s.verifySignedZone("example.com", input, signed, keys); err != nil {
 			t.Fatalf("a signed zone with mixed-case owner spellings must pass verification, got: %v", err)
 		}
 		// Verification works on copies: the records that will be written keep
@@ -94,7 +95,7 @@ func TestVerifySignedZone_MixedCaseOwnerRRset(t *testing.T) {
 	})
 
 	t.Run("corrupt RRSIG over the mixed-case RRset is still rejected", func(t *testing.T) {
-		s, signed, keys := signMixedCaseZone(t)
+		s, input, signed, keys := signMixedCaseZone(t)
 		corrupted := false
 		for _, rr := range signed {
 			if sig, ok := rr.(*dns.RRSIG); ok && sig.TypeCovered == dns.TypeA {
@@ -113,7 +114,7 @@ func TestVerifySignedZone_MixedCaseOwnerRRset(t *testing.T) {
 		if !corrupted {
 			t.Fatal("no A RRSIG found to corrupt")
 		}
-		if err := s.verifySignedZone("example.com", signed, keys); err == nil {
+		if err := s.verifySignedZone("example.com", input, signed, keys); err == nil {
 			t.Fatal("a corrupt RRSIG over a mixed-case RRset must still fail verification")
 		}
 	})

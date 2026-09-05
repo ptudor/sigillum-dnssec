@@ -9,7 +9,7 @@ import (
 
 // signValidZone builds and signs a small NSEC-signed zone and returns the signed records
 // plus the signing keys, for exercising verifySignedZone.
-func signValidZone(t *testing.T) (*Signer, []dns.RR, *signingKeys) {
+func signValidZone(t *testing.T) (*Signer, []dns.RR, []dns.RR, *signingKeys) {
 	t.Helper()
 	dataDir := t.TempDir()
 	cfg := dnssectest.Config(t, dataDir)
@@ -53,26 +53,27 @@ func signValidZone(t *testing.T) (*Signer, []dns.RR, *signingKeys) {
 		records = append(records, k)
 	}
 	s := NewSigner(cfg, nil)
+	input := append([]dns.RR(nil), records...)
 	records = append(records, s.generateNSECChain("example.com", records, 3600)...)
 
 	signed, err := s.signRecordsWithKeys("example.com", records, keys)
 	if err != nil {
 		t.Fatalf("signRecordsWithKeys: %v", err)
 	}
-	return s, signed, keys
+	return s, input, signed, keys
 }
 
 // R-001: a valid signed zone passes the self-verification gate.
 func TestVerifySignedZone_Valid(t *testing.T) {
-	s, signed, keys := signValidZone(t)
-	if err := s.verifySignedZone("example.com", signed, keys); err != nil {
+	s, input, signed, keys := signValidZone(t)
+	if err := s.verifySignedZone("example.com", input, signed, keys); err != nil {
 		t.Fatalf("valid signed zone must pass verification, got: %v", err)
 	}
 }
 
 // R-001 check (1): a corrupted RRSIG signature is caught.
 func TestVerifySignedZone_CorruptRRSIG(t *testing.T) {
-	s, signed, keys := signValidZone(t)
+	s, input, signed, keys := signValidZone(t)
 	corrupted := false
 	for _, rr := range signed {
 		if sig, ok := rr.(*dns.RRSIG); ok && sig.TypeCovered == dns.TypeSOA {
@@ -91,14 +92,14 @@ func TestVerifySignedZone_CorruptRRSIG(t *testing.T) {
 	if !corrupted {
 		t.Fatal("no SOA RRSIG found to corrupt")
 	}
-	if err := s.verifySignedZone("example.com", signed, keys); err == nil {
+	if err := s.verifySignedZone("example.com", input, signed, keys); err == nil {
 		t.Fatal("a corrupted RRSIG must fail post-sign verification")
 	}
 }
 
 // R-001 check (2): an authoritative RRset with no covering RRSIG is caught.
 func TestVerifySignedZone_MissingRRSIG(t *testing.T) {
-	s, signed, keys := signValidZone(t)
+	s, input, signed, keys := signValidZone(t)
 	var dropped []dns.RR
 	removed := false
 	for _, rr := range signed {
@@ -111,14 +112,14 @@ func TestVerifySignedZone_MissingRRSIG(t *testing.T) {
 	if !removed {
 		t.Fatal("no A RRSIG found to drop")
 	}
-	if err := s.verifySignedZone("example.com", dropped, keys); err == nil {
+	if err := s.verifySignedZone("example.com", input, dropped, keys); err == nil {
 		t.Fatal("an authoritative RRset missing its RRSIG must fail post-sign verification")
 	}
 }
 
 // R-001 check (3): a broken NSEC chain is caught.
 func TestVerifySignedZone_BrokenNSECChain(t *testing.T) {
-	s, signed, keys := signValidZone(t)
+	s, input, signed, keys := signValidZone(t)
 	// Drop the www NSEC and its RRSIG: the apex NSEC still points at www, so the chain
 	// no longer closes.
 	var broken []dns.RR
@@ -132,7 +133,7 @@ func TestVerifySignedZone_BrokenNSECChain(t *testing.T) {
 		}
 		broken = append(broken, rr)
 	}
-	if err := s.verifySignedZone("example.com", broken, keys); err == nil {
+	if err := s.verifySignedZone("example.com", input, broken, keys); err == nil {
 		t.Fatal("a broken NSEC chain must fail post-sign verification")
 	}
 }

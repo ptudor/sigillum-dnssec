@@ -26,6 +26,10 @@ import (
 type Signer struct {
 	cfg   *config.Config
 	state *statepkg.State
+	// mutateBeforeVerify is a test-only seam that rewrites the freshly signed
+	// records before the self-verification gate, so a generator regression can
+	// be driven through the real publication boundary; nil in production.
+	mutateBeforeVerify func([]dns.RR) []dns.RR
 }
 
 // NewSigner creates a new signer
@@ -214,29 +218,37 @@ func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState,
 		records = append(records, k)
 	}
 
+	// The immutable input snapshot (data + DNSKEY) and its canonical index,
+	// shared by chain generation, signing and self-verification (RA6X-053).
+	input := append([]dns.RR(nil), records...)
+	model := newZoneModel(domain, input)
+
 	// Generate NSEC/NSEC3 chain
 	if s.cfg.DNSSEC.NSECVersion == "nsec3" {
-		nsec3Records, err := s.generateNSEC3Chain(domain, records, soaMinTTL)
+		nsec3Records, err := s.generateNSEC3ChainWithModel(model, domain, records, soaMinTTL)
 		if err != nil {
 			return nil, fmt.Errorf("generating NSEC3 chain: %w", err)
 		}
 		records = append(records, nsec3Records...)
 	} else {
-		nsecRecords := s.generateNSECChain(domain, records, soaMinTTL)
+		nsecRecords := s.generateNSECChainWithModel(model, domain, records, soaMinTTL)
 		records = append(records, nsecRecords...)
 	}
 
 	// Sign all RRsets
-	signedRecords, err := s.signRecordsWithKeys(domain, records, keys)
+	signedRecords, err := s.signRecordsWithModel(model, domain, records, keys)
 	if err != nil {
 		return nil, fmt.Errorf("signing records: %w", err)
+	}
+	if s.mutateBeforeVerify != nil {
+		signedRecords = s.mutateBeforeVerify(signedRecords)
 	}
 
 	// R-001: self-verify the produced records before publishing. If signing produced
 	// something internally inconsistent (an RRSIG that doesn't verify, an unsigned
 	// authoritative RRset, a broken NSEC/NSEC3 chain), fail here so the previous signed
 	// output keeps serving instead of shipping a zone that SERVFAILs at every resolver.
-	if err := s.verifySignedZone(domain, signedRecords, keys); err != nil {
+	if err := s.verifySignedZoneWithModel(model, domain, input, signedRecords, keys); err != nil {
 		return nil, fmt.Errorf("post-sign verification failed (previous signed zone kept): %w", err)
 	}
 	res.records = signedRecords
@@ -568,7 +580,33 @@ func (s *Signer) loadKeysForSigning(domain string, keyGen *KeyGenerator, zoneSta
 	if err := keys.validateConsistency(); err != nil {
 		return nil, fmt.Errorf("internal key state for %s: %w", domain, err)
 	}
+	if err := keys.validateAlgorithms(zoneState); err != nil {
+		return nil, fmt.Errorf("key algorithms for %s: %w", domain, err)
+	}
 	return keys, nil
+}
+
+// validateAlgorithms rejects a key set whose members use different algorithms
+// unless an explicit algorithm rollover is in progress (RA6X-001). Publishing
+// a DNSKEY RRset that advertises an algorithm no key of the right role signs
+// with produces an algorithm-incomplete zone (RFC 6840 §5.11); only the
+// dedicated `rollover algorithm` flow may introduce a second algorithm, and it
+// signs everything with both.
+func (k *signingKeys) validateAlgorithms(zoneState *statepkg.ZoneState) error {
+	if zoneState.Rollover != nil && zoneState.Rollover.Type == "algorithm" {
+		return nil
+	}
+	if len(k.dnskeys) == 0 {
+		return nil
+	}
+	alg := k.dnskeys[0].Algorithm
+	for _, dk := range k.dnskeys[1:] {
+		if dk.Algorithm != alg {
+			return fmt.Errorf("live keys use different algorithms (%s key tag %d, %s key tag %d) with no algorithm rollover in progress; refusing to publish an algorithm-incomplete zone — use `dnssec-tudor rollover algorithm` to change algorithms",
+				AlgorithmName(alg), k.dnskeys[0].KeyTag(), AlgorithmName(dk.Algorithm), dk.KeyTag())
+		}
+	}
+	return nil
 }
 
 // expectedLiveKeyTags returns the key tags the live KSK and ZSK slots must hold
@@ -735,7 +773,7 @@ func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
 // with the input's records or signing a stray RRSIG RRset. DS records at
 // delegations are legitimate and preserved. R-034.
 func stripInputDNSSEC(domain string, records []dns.RR) []dns.RR {
-	apexLower := strings.ToLower(dns.Fqdn(domain))
+	apex := canonicalName(domain)
 	out := make([]dns.RR, 0, len(records))
 	stripped := 0
 	for _, rr := range records {
@@ -745,7 +783,7 @@ func stripInputDNSSEC(domain string, records []dns.RR) []dns.RR {
 			continue
 		case dns.TypeDNSKEY:
 			// The signer manages the apex DNSKEY RRset; drop any in the input.
-			if strings.ToLower(rr.Header().Name) == apexLower {
+			if canonicalName(rr.Header().Name) == apex {
 				stripped++
 				continue
 			}
@@ -759,40 +797,37 @@ func stripInputDNSSEC(domain string, records []dns.RR) []dns.RR {
 	return out
 }
 
-// validateZoneRecords is the single source of truth for the structural sanity
-// rules a zone must satisfy before signing: exactly one SOA at the apex, at
-// least one NS at the apex, and every authoritative owner name at or below the
-// apex (R-035). Both the in-memory signing path (Signer.validateZone) and the
-// file-based CLI path (ValidateZoneFile) call this so the rules can't drift
-// between `add`/`import` and signing (R-075).
+// validateZoneRecords is the single source of truth for the rules a zone must
+// satisfy before signing: exactly one SOA at the apex, at least one NS at the
+// apex, every owner at or below the apex (R-035), and the semantic owner/type
+// constraints an authoritative server enforces when loading the output
+// (RA6X-029): a CNAME is the only record at its owner apart from DNSSEC
+// metadata, and there is only one; a DNAME is singular, never beside a CNAME,
+// and nothing exists beneath it (RFC 6672 §2.4); a delegation point holds only
+// NS, DS and glue A/AAAA; DS appears only at delegation points. Owners are
+// compared by canonical wire identity (RA6X-028). Both the in-memory signing
+// path (Signer.validateZone) and the file-based CLI path (ValidateZoneFile)
+// call this so the rules can't drift between `add`/`import` and signing (R-075).
 func validateZoneRecords(domain string, records []dns.RR) error {
 	apex := dns.Fqdn(domain)
-	apexLower := strings.ToLower(apex)
+	m := newZoneModel(domain, records)
 
 	var soaCount int
-	var nsAtApex bool
-
 	for _, rr := range records {
-		name := strings.ToLower(rr.Header().Name)
+		name := m.canon(rr)
 
 		// Every authoritative owner name must be at or below the apex. An
 		// out-of-zone owner (a typo, or the wrong file) would otherwise be signed
 		// and inserted into the NSEC/NSEC3 chain, breaking canonical ordering and
 		// the denial-of-existence proofs (the chain would "cover" names outside
 		// the zone). Reject rather than emit a subtly broken zone (R-035).
-		if !dns.IsSubDomain(apex, rr.Header().Name) {
+		if !m.within(name) {
 			return fmt.Errorf("record owner %s is not within zone %s", rr.Header().Name, apex)
 		}
-
-		switch rr.Header().Rrtype {
-		case dns.TypeSOA:
+		if rr.Header().Rrtype == dns.TypeSOA {
 			soaCount++
-			if name != apexLower {
-				return fmt.Errorf("SOA record at %s not at zone apex %s", name, apex)
-			}
-		case dns.TypeNS:
-			if name == apexLower {
-				nsAtApex = true
+			if name != m.apex {
+				return fmt.Errorf("SOA record at %s not at zone apex %s", rr.Header().Name, apex)
 			}
 		}
 	}
@@ -803,11 +838,66 @@ func validateZoneRecords(domain string, records []dns.RR) error {
 	if soaCount > 1 {
 		return fmt.Errorf("zone has %d SOA records (must have exactly 1)", soaCount)
 	}
-	if !nsAtApex {
+	if apexInfo := m.owners[m.apex]; apexInfo == nil || apexInfo.types[dns.TypeNS] == 0 {
 		return fmt.Errorf("zone has no NS records at apex")
 	}
 
+	names := make([]string, 0, len(m.owners))
+	for name := range m.owners {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool { return canonicalLess(names[i], names[j]) })
+	for _, name := range names {
+		oi := m.owners[name]
+		if n := oi.types[dns.TypeCNAME]; n > 0 {
+			if name == m.apex {
+				return fmt.Errorf("CNAME at the zone apex %s cannot coexist with the SOA and NS records (RFC 1034 §3.6.2)", apex)
+			}
+			if n > 1 {
+				return fmt.Errorf("owner %s has %d CNAME records; a CNAME must be the only CNAME at its owner (RFC 1034 §3.6.2)", name, n)
+			}
+			for t := range oi.types {
+				if t != dns.TypeCNAME && !isDNSSECMetadataType(t) {
+					return fmt.Errorf("owner %s has both CNAME and %s records; a CNAME must not coexist with other data (RFC 1034 §3.6.2)", name, dns.TypeToString[t])
+				}
+			}
+		}
+		if n := oi.types[dns.TypeDNAME]; n > 0 {
+			if n > 1 {
+				return fmt.Errorf("owner %s has %d DNAME records; only one is allowed (RFC 6672 §2.4)", name, n)
+			}
+			if oi.types[dns.TypeCNAME] > 0 {
+				return fmt.Errorf("owner %s has both DNAME and CNAME records (RFC 6672 §2.4)", name)
+			}
+		}
+		if dn, ok := m.occludingDNAME(name); ok {
+			return fmt.Errorf("records at %s lie beneath the DNAME at %s; names beneath a DNAME must not exist (RFC 6672 §2.4)", name, dn)
+		}
+		if m.isDelegation(name) {
+			for t := range oi.types {
+				switch t {
+				case dns.TypeNS, dns.TypeDS, dns.TypeA, dns.TypeAAAA, dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3:
+				default:
+					return fmt.Errorf("owner %s is a delegation point but holds %s records; only NS, DS and glue A/AAAA may appear at a zone cut (RFC 4035 §2.2)", name, dns.TypeToString[t])
+				}
+			}
+		} else if oi.types[dns.TypeDS] > 0 {
+			return fmt.Errorf("owner %s has DS records but is not a delegation point (no NS RRset); DS belongs only at a zone cut (RFC 4035 §2.4)", name)
+		}
+	}
+
 	return nil
+}
+
+// isDNSSECMetadataType reports whether a type is DNSSEC metadata that may sit
+// beside a CNAME (RFC 4035 §2.5): the signer generates these itself, and a
+// previously signed file fed as input carries them.
+func isDNSSECMetadataType(t uint16) bool {
+	switch t {
+	case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3:
+		return true
+	}
+	return false
 }
 
 // validateZone performs sanity checks on a parsed zone.
@@ -839,59 +929,16 @@ func ValidateZoneFile(domain, path string) error {
 	return validateZoneRecords(domain, records)
 }
 
-// delegationInfo holds information about delegation points in a zone
-type delegationInfo struct {
-	delegationPoints map[string]bool // lowercase FQDNs with NS records (not at apex)
-}
-
-// findDelegationPoints identifies delegation points (NS RRsets below the apex)
-// per RFC 4035 §2.2
-func (s *Signer) findDelegationPoints(domain string, records []dns.RR) *delegationInfo {
-	apexLower := strings.ToLower(dns.Fqdn(domain))
-	info := &delegationInfo{
-		delegationPoints: make(map[string]bool),
-	}
-
-	for _, rr := range records {
-		if rr.Header().Rrtype == dns.TypeNS {
-			name := strings.ToLower(rr.Header().Name)
-			if name != apexLower {
-				info.delegationPoints[name] = true
-			}
-		}
-	}
-
-	if len(info.delegationPoints) > 0 {
-		slog.Debug("[SIGN] Found delegation points", "count", len(info.delegationPoints))
-	}
-
-	return info
-}
-
-// isOccluded reports whether a (lowercase, fully-qualified) name sits
-// strictly below a delegation point. Everything at such names — glue address
-// records and any other stray data — is not authoritative in this zone:
-// it is never signed and never appears in the NSEC/NSEC3 chain.
-func (di *delegationInfo) isOccluded(name string) bool {
-	for dp := range di.delegationPoints {
-		if strings.HasSuffix(name, "."+dp) {
-			return true
-		}
-	}
-	return false
-}
-
-// signRecordsWithKeys signs all RRsets using the provided keys, handling rollover scenarios
+// signRecordsWithKeys signs all RRsets using the provided keys, handling
+// rollover scenarios. RRsets are formed by canonical owner identity (RA6X-028)
+// so every spelling of one wire name is signed as one RRset.
 func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *signingKeys) ([]dns.RR, error) {
-	// Find delegation points (RFC 4035 §2.2)
-	delInfo := s.findDelegationPoints(domain, records)
+	return s.signRecordsWithModel(newZoneModel(domain, records), domain, records, keys)
+}
 
-	// Group records by RRset (name + type)
-	rrsets := make(map[string][]dns.RR)
-	for _, rr := range records {
-		key := fmt.Sprintf("%s:%d", strings.ToLower(rr.Header().Name), rr.Header().Rrtype)
-		rrsets[key] = append(rrsets[key], rr)
-	}
+func (s *Signer) signRecordsWithModel(m *zoneModel, domain string, records []dns.RR, keys *signingKeys) ([]dns.RR, error) {
+	rrsets, _ := groupRRsets(records)
+	keysInOrder := sortedRRsetKeys(rrsets)
 
 	inception := time.Now().UTC().Add(-1 * time.Hour) // 1 hour in the past for clock skew
 	expiration := time.Now().UTC().Add(s.cfg.DNSSEC.SignatureValidity.Duration)
@@ -900,34 +947,28 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 	signedRecords = append(signedRecords, records...)
 
 	// Sign each RRset
-	for _, rrset := range rrsets {
+	for _, k := range keysInOrder {
+		rrset := rrsets[k]
 		if len(rrset) == 0 {
 			continue
 		}
 
-		name := strings.ToLower(rrset[0].Header().Name)
-		rrtype := rrset[0].Header().Rrtype
-
-		// RFC 4035 §2.2: data below a zone cut (glue and anything else
-		// occluded) is not authoritative in this zone — never sign it.
-		if delInfo.isOccluded(name) {
-			slog.Debug("[SIGN] Skipping signature for occluded name", "name", name, "type", dns.TypeToString[rrtype])
+		// RFC 4035 §2.2: data below a zone cut (glue and anything else occluded)
+		// is not authoritative in this zone — never sign it; at a delegation
+		// point the parent is authoritative only for DS and the NSEC record.
+		if !m.signable(k.name, k.rrtype) {
+			slog.Debug("[SIGN] Skipping signature for non-authoritative RRset", "name", k.name, "type", dns.TypeToString[k.rrtype])
 			continue
 		}
 
-		// RFC 4035 §2.2: at a delegation point the parent is authoritative
-		// only for DS and the NSEC record — the NS RRset and any glue
-		// address records at the cut itself stay unsigned.
-		if delInfo.delegationPoints[name] && rrtype != dns.TypeDS && rrtype != dns.TypeNSEC {
-			slog.Debug("[SIGN] Skipping signature at delegation point", "name", name, "type", dns.TypeToString[rrtype])
-			continue
-		}
-
-		if rrtype == dns.TypeDNSKEY {
+		// The signature covers the wire-format RRset (RFC 4034 §6.2): sign over
+		// copies with the canonical owner so divergent spellings form one RRset.
+		wire := canonicalRRset(rrset)
+		if k.rrtype == dns.TypeDNSKEY {
 			// DNSKEY RRset is signed with ALL KSKs (for rollover support)
 			for i, ksk := range keys.signingKSKs {
-				rrsig := s.createRRSIG(rrset, ksk, domain, inception, expiration)
-				if err := s.signRRSIG(rrsig, rrset, ksk, keys.signingKSKPs[i]); err != nil {
+				rrsig := s.createRRSIG(wire, ksk, domain, inception, expiration)
+				if err := s.signRRSIG(rrsig, wire, ksk, keys.signingKSKPs[i]); err != nil {
 					return nil, fmt.Errorf("signing DNSKEY RRset with key %d: %w", ksk.KeyTag(), err)
 				}
 				signedRecords = append(signedRecords, rrsig)
@@ -936,8 +977,8 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 			// All other RRsets are signed with the ZSK(s)
 			// Multiple ZSKs during algorithm rollover
 			for i, zsk := range keys.signingZSKs {
-				rrsig := s.createRRSIG(rrset, zsk, domain, inception, expiration)
-				if err := s.signRRSIG(rrsig, rrset, zsk, keys.signingZSKPs[i]); err != nil {
+				rrsig := s.createRRSIG(wire, zsk, domain, inception, expiration)
+				if err := s.signRRSIG(rrsig, wire, zsk, keys.signingZSKPs[i]); err != nil {
 					return nil, fmt.Errorf("signing RRset %s with key %d: %w", rrset[0].Header().Name, zsk.KeyTag(), err)
 				}
 				signedRecords = append(signedRecords, rrsig)
@@ -948,209 +989,298 @@ func (s *Signer) signRecordsWithKeys(domain string, records []dns.RR, keys *sign
 	return signedRecords, nil
 }
 
-// verifySignedZone self-verifies the freshly produced records before they are published
-// (R-001). It works entirely in-memory on the exact records that will be written, reusing
-// the signer's own delegation model so verifier and signer share one view of what is
-// authoritative (no differential parsing). Any inconsistency returns an error, which keeps
-// the previous signed output serving rather than shipping a zone that SERVFAILs.
-//
-// Checks: (1) every RRSIG cryptographically verifies against a published DNSKEY of the
-// matching keytag/algorithm (catches wrong Labels/OrigTtl, key mixups, corrupt sigs);
-// (2) every non-occluded, non-delegation authoritative RRset (plus DS/NSEC at delegation
-// points) has at least one covering RRSIG; (3) the NSEC/NSEC3 Next pointers form a single
-// closed cycle over every emitted owner.
-func (s *Signer) verifySignedZone(domain string, signedRecords []dns.RR, keys *signingKeys) error {
-	delInfo := s.findDelegationPoints(domain, signedRecords)
+// sortedRRsetKeys returns RRset keys in a deterministic order.
+func sortedRRsetKeys(rrsets map[rrsetKey][]dns.RR) []rrsetKey {
+	keys := make([]rrsetKey, 0, len(rrsets))
+	for k := range rrsets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].name != keys[j].name {
+			return canonicalLess(keys[i].name, keys[j].name)
+		}
+		return keys[i].rrtype < keys[j].rrtype
+	})
+	return keys
+}
 
+// verifySignedZone self-verifies the freshly produced records before they are
+// published (R-001). It works entirely in memory on the exact records that will
+// be written. `input` is the immutable data snapshot (zone data plus the
+// DNSKEY RRset) the chain and signatures were produced from; every expectation
+// is derived from it, never from what the generator emitted (RA6X-056). Any
+// inconsistency returns an error, which keeps the previous signed output
+// serving rather than shipping a zone that SERVFAILs.
+//
+// Checks: (1) every RRSIG cryptographically verifies against a published DNSKEY
+// of the matching key tag and algorithm over the canonical RRset; (2) every
+// RRset of the input survives, every signable RRset has a verifying RRSIG, and
+// for every algorithm in the published DNSKEY RRset a key of the appropriate
+// role (KSK for DNSKEY, ZSK otherwise) signs it (RFC 6840 §5.11, RA6X-001);
+// (3) the denial chain for the configured mode is exactly the expected one:
+// one NSEC per authoritative owner (or one NSEC3 per authoritative owner and
+// empty non-terminal, with consistent parameters matching the apex
+// NSEC3PARAM), in canonical/hash order, closed, with the type bitmap the
+// input data dictates, and no records of the other denial mode.
+func (s *Signer) verifySignedZone(domain string, input, signedRecords []dns.RR, keys *signingKeys) error {
+	return s.verifySignedZoneWithModel(newZoneModel(domain, input), domain, input, signedRecords, keys)
+}
+
+func (s *Signer) verifySignedZoneWithModel(m *zoneModel, domain string, input, signedRecords []dns.RR, keys *signingKeys) error {
 	dnskeysByTag := make(map[uint16][]*dns.DNSKEY)
+	algorithms := make(map[uint8]bool)
 	for _, dk := range keys.dnskeys {
 		dnskeysByTag[dk.KeyTag()] = append(dnskeysByTag[dk.KeyTag()], dk)
+		algorithms[dk.Algorithm] = true
 	}
 
-	type rrsetKey struct {
-		name   string
-		rrtype uint16
-	}
-	rrsets := make(map[rrsetKey][]dns.RR)
-	var rrsigs []*dns.RRSIG
+	rrsets, rrsigs := groupRRsets(signedRecords)
 	var nsecs []*dns.NSEC
 	var nsec3s []*dns.NSEC3
+	var nsec3params []*dns.NSEC3PARAM
 	for _, rr := range signedRecords {
-		if sig, ok := rr.(*dns.RRSIG); ok {
-			rrsigs = append(rrsigs, sig)
-			continue
-		}
-		name := strings.ToLower(rr.Header().Name)
-		k := rrsetKey{name, rr.Header().Rrtype}
-		rrsets[k] = append(rrsets[k], rr)
 		switch v := rr.(type) {
 		case *dns.NSEC:
 			nsecs = append(nsecs, v)
 		case *dns.NSEC3:
 			nsec3s = append(nsec3s, v)
+		case *dns.NSEC3PARAM:
+			nsec3params = append(nsec3params, v)
 		}
 	}
 
-	// (1) Every RRSIG must verify against a published DNSKEY.
-	covered := make(map[rrsetKey]bool)
+	// (1) Every RRSIG must verify against a published DNSKEY. Remember which
+	// algorithm and key role produced a verifying signature per RRset.
+	const roleKSK, roleZSK = 1, 2
+	covered := make(map[rrsetKey]map[uint8]int)
 	for _, sig := range rrsigs {
-		k := rrsetKey{strings.ToLower(sig.Hdr.Name), sig.TypeCovered}
-		rrset := rrsetForVerify(rrsets[k])
+		k := rrsetKey{canonicalName(sig.Hdr.Name), sig.TypeCovered}
+		rrset := rrsets[k]
 		if len(rrset) == 0 {
 			return fmt.Errorf("RRSIG for %s %s covers no RRset in the signed zone", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered])
 		}
+		wire := canonicalRRset(rrset)
 		candidates := dnskeysByTag[sig.KeyTag]
 		if len(candidates) == 0 {
 			return fmt.Errorf("RRSIG for %s %s references keytag %d absent from the published DNSKEY RRset", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered], sig.KeyTag)
 		}
-		verified := false
+		var signer *dns.DNSKEY
 		var lastErr error
 		for _, dk := range candidates {
 			if dk.Algorithm != sig.Algorithm {
 				continue
 			}
-			if err := sig.Verify(dk, rrset); err == nil {
-				verified = true
+			if err := sig.Verify(dk, wire); err == nil {
+				signer = dk
 				break
 			} else {
 				lastErr = err
 			}
 		}
-		if !verified {
+		if signer == nil {
 			return fmt.Errorf("RRSIG for %s %s (keytag %d) does not verify against the published DNSKEY: %v", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered], sig.KeyTag, lastErr)
 		}
-		covered[k] = true
+		if covered[k] == nil {
+			covered[k] = make(map[uint8]int)
+		}
+		role := roleZSK
+		if signer.Flags&1 == 1 {
+			role = roleKSK
+		}
+		covered[k][sig.Algorithm] |= role
 	}
 
-	// (2) Every authoritative RRset must have a covering RRSIG. Mirror signRecordsWithKeys:
-	// skip occluded names and, at a delegation point, everything but DS and NSEC.
-	for k := range rrsets {
-		if k.rrtype == dns.TypeRRSIG {
+	// (2) Every input RRset survives and every signable RRset is signed by every
+	// published algorithm with the appropriate role.
+	inputSets, _ := groupRRsets(input)
+	for k, in := range inputSets {
+		if len(rrsets[k]) < len(in) {
+			return fmt.Errorf("RRset %s %s from the input is missing or incomplete in the signed zone", k.name, dns.TypeToString[k.rrtype])
+		}
+	}
+	for _, k := range sortedRRsetKeys(rrsets) {
+		if !m.signable(k.name, k.rrtype) {
 			continue
 		}
-		if delInfo.isOccluded(k.name) {
-			continue
-		}
-		if delInfo.delegationPoints[k.name] && k.rrtype != dns.TypeDS && k.rrtype != dns.TypeNSEC {
-			continue
-		}
-		if !covered[k] {
+		if len(covered[k]) == 0 {
 			return fmt.Errorf("authoritative RRset %s %s has no covering RRSIG", k.name, dns.TypeToString[k.rrtype])
 		}
-	}
-
-	// (3) NSEC/NSEC3 chain must be a single closed cycle over every emitted owner.
-	if len(nsecs) > 0 {
-		if err := verifyNSECChainClosure(nsecs); err != nil {
-			return err
+		want := roleZSK
+		roleName := "ZSK"
+		if k.rrtype == dns.TypeDNSKEY {
+			want = roleKSK
+			roleName = "KSK"
+		}
+		for alg := range algorithms {
+			if covered[k][alg]&want == 0 {
+				return fmt.Errorf("RRset %s %s is not signed by a %s of algorithm %s although the DNSKEY RRset advertises that algorithm (RFC 6840 §5.11)", k.name, dns.TypeToString[k.rrtype], roleName, AlgorithmName(alg))
+			}
 		}
 	}
-	if len(nsec3s) > 0 {
-		if err := verifyNSEC3ChainClosure(nsec3s); err != nil {
-			return err
-		}
-	}
 
-	return nil
+	// (3) The denial chain must be exactly the one the input dictates.
+	if s.cfg.DNSSEC.NSECVersion == "nsec3" {
+		if len(nsecs) > 0 {
+			return fmt.Errorf("NSEC records present in an NSEC3-signed zone")
+		}
+		return verifyNSEC3Expectations(m, nsec3s, nsec3params, uint16(s.cfg.DNSSEC.NSEC3Iterations), s.cfg.DNSSEC.NSEC3Salt)
+	}
+	if len(nsec3s) > 0 || len(nsec3params) > 0 {
+		return fmt.Errorf("NSEC3 records present in an NSEC-signed zone")
+	}
+	return verifyNSECExpectations(m, nsecs)
 }
 
-// rrsetForVerify returns the RRset slice to hand to dns.RRSIG.Verify. miekg's
-// Verify rejects an RRset whose owner names differ in letter case (its IsRRset
-// compares Header().Name byte-for-byte), but DNSSEC canonical form (RFC 4034
-// §6.2) lowercases owner names before signing, so a signature over a
-// mixed-case RRset (`www` and `WWW` A records) is valid on the wire. When the
-// group's spellings diverge — the records were grouped by lowercased name, so
-// any divergence is case-only — verify against copies with the owner name
-// lowercased; the records that will be written are never mutated. Uniform-case
-// groups (the normal case) are returned as-is, uncopied.
-func rrsetForVerify(rrset []dns.RR) []dns.RR {
-	if len(rrset) == 0 {
-		return rrset
+// verifyNSECExpectations checks an NSEC chain against the owners and types the
+// input snapshot dictates (RFC 4035 §2.3): one NSEC per authoritative owner in
+// canonical order, each pointing at the next (the last at the first), and a
+// type bitmap equal to the data at the owner plus NSEC and RRSIG.
+func verifyNSECExpectations(m *zoneModel, nsecs []*dns.NSEC) error {
+	expected := m.authoritativeOwners()
+	if len(nsecs) == 0 {
+		return fmt.Errorf("NSEC chain is missing: expected %d NSEC records, found none", len(expected))
 	}
-	first := rrset[0].Header().Name
-	mixed := false
-	for _, rr := range rrset[1:] {
-		if rr.Header().Name != first {
-			mixed = true
-			break
-		}
-	}
-	if !mixed {
-		return rrset
-	}
-	lowered := make([]dns.RR, len(rrset))
-	for i, rr := range rrset {
-		cp := dns.Copy(rr)
-		cp.Header().Name = strings.ToLower(cp.Header().Name)
-		lowered[i] = cp
-	}
-	return lowered
-}
-
-// verifyNSECChainClosure asserts the NSEC Next pointers form one closed cycle.
-func verifyNSECChainClosure(nsecs []*dns.NSEC) error {
-	next := make(map[string]string, len(nsecs))
+	byOwner := make(map[string]*dns.NSEC, len(nsecs))
 	for _, n := range nsecs {
-		owner := strings.ToLower(dns.Fqdn(n.Hdr.Name))
-		if _, dup := next[owner]; dup {
+		owner := canonicalName(n.Hdr.Name)
+		if _, dup := byOwner[owner]; dup {
 			return fmt.Errorf("NSEC chain has a duplicate owner %s", owner)
 		}
-		next[owner] = strings.ToLower(dns.Fqdn(n.NextDomain))
+		byOwner[owner] = n
 	}
-	return walkDenialChain("NSEC", next)
-}
-
-// verifyNSEC3ChainClosure asserts the NSEC3 Next-hash pointers form one closed cycle over
-// the hashed owner names (the first label of each NSEC3 owner).
-func verifyNSEC3ChainClosure(nsec3s []*dns.NSEC3) error {
-	next := make(map[string]string, len(nsec3s))
-	for _, n := range nsec3s {
-		labels := dns.SplitDomainName(n.Hdr.Name)
-		if len(labels) == 0 {
-			return fmt.Errorf("NSEC3 owner %s has no hash label", n.Hdr.Name)
-		}
-		owner := strings.ToUpper(labels[0])
-		if _, dup := next[owner]; dup {
-			return fmt.Errorf("NSEC3 chain has a duplicate owner hash %s", owner)
-		}
-		next[owner] = strings.ToUpper(n.NextDomain)
-	}
-	return walkDenialChain("NSEC3", next)
-}
-
-// walkDenialChain follows next pointers from a deterministic start and asserts every owner
-// is visited exactly once and the chain closes back to the start (a single cycle).
-func walkDenialChain(kind string, next map[string]string) error {
-	total := len(next)
-	if total == 0 {
-		return nil
-	}
-	var start string
-	for k := range next {
-		if start == "" || k < start {
-			start = k
+	// Membership first (the most actionable diagnostics), then order and bitmaps.
+	for _, owner := range expected {
+		if byOwner[owner] == nil {
+			return fmt.Errorf("NSEC chain is missing the record for authoritative owner %s", owner)
 		}
 	}
-	visited := make(map[string]bool, total)
-	cur := start
-	for i := 0; i < total; i++ {
-		if visited[cur] {
-			return fmt.Errorf("%s chain has a premature cycle at %s", kind, cur)
+	for owner := range byOwner {
+		if m.owners[owner] == nil || m.isOccluded(owner) {
+			return fmt.Errorf("NSEC chain has a record at %s, which is not an authoritative owner of the zone", owner)
 		}
-		visited[cur] = true
-		nxt, ok := next[cur]
-		if !ok {
-			return fmt.Errorf("%s chain: owner %s points at a name with no %s record (dangling)", kind, cur, kind)
+	}
+	for i, owner := range expected {
+		n := byOwner[owner]
+		next := expected[(i+1)%len(expected)]
+		if got := canonicalName(n.NextDomain); got != next {
+			return fmt.Errorf("NSEC at %s points at %s, expected %s (canonical order)", owner, got, next)
 		}
-		cur = nxt
-	}
-	if cur != start {
-		return fmt.Errorf("%s chain does not close: after %d hops from %s it ended at %s", kind, total, start, cur)
-	}
-	if len(visited) != total {
-		return fmt.Errorf("%s chain does not cover all %d owners (visited %d)", kind, total, len(visited))
+		if err := compareTypeBitmap(owner, n.TypeBitMap, m.denialTypes(owner, false)); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// verifyNSEC3Expectations checks an NSEC3 chain against the input snapshot
+// (RFC 5155 §7.1): exactly one NSEC3PARAM at the apex carrying the configured
+// parameters, every NSEC3 using the same parameters, one NSEC3 per
+// authoritative owner and empty non-terminal (hashed with those parameters)
+// and none other, in hash order and closed, each with the type bitmap the
+// data at its owner dictates.
+func verifyNSEC3Expectations(m *zoneModel, nsec3s []*dns.NSEC3, params []*dns.NSEC3PARAM, iterations uint16, salt string) error {
+	salt = strings.ToUpper(salt)
+	if salt == "" {
+		salt = "-"
+	}
+	normSalt := func(v string) string {
+		v = strings.ToUpper(v)
+		if v == "" {
+			return "-"
+		}
+		return v
+	}
+	if len(params) != 1 {
+		return fmt.Errorf("expected exactly one NSEC3PARAM at the apex, found %d", len(params))
+	}
+	p := params[0]
+	if canonicalName(p.Hdr.Name) != m.apex {
+		return fmt.Errorf("NSEC3PARAM is at %s, not at the apex %s", p.Hdr.Name, m.apex)
+	}
+	if p.Hash != dns.SHA1 || p.Flags != 0 || p.Iterations != iterations || normSalt(p.Salt) != salt {
+		return fmt.Errorf("NSEC3PARAM (hash %d, flags %d, iterations %d, salt %s) does not match the configured parameters (hash 1, flags 0, iterations %d, salt %s)", p.Hash, p.Flags, p.Iterations, normSalt(p.Salt), iterations, salt)
+	}
+
+	type expect struct {
+		owner string
+		hash  string
+	}
+	var expected []expect
+	for _, owner := range append(m.authoritativeOwners(), m.emptyNonTerminals()...) {
+		expected = append(expected, expect{owner: owner, hash: strings.ToUpper(dns.HashName(owner, dns.SHA1, iterations, strings.TrimSuffix(salt, "-")))})
+	}
+	sort.Slice(expected, func(i, j int) bool { return expected[i].hash < expected[j].hash })
+	if len(nsec3s) == 0 {
+		return fmt.Errorf("NSEC3 chain is missing: expected %d NSEC3 records, found none", len(expected))
+	}
+
+	byHash := make(map[string]*dns.NSEC3, len(nsec3s))
+	for _, n := range nsec3s {
+		labels := dns.SplitDomainName(n.Hdr.Name)
+		if len(labels) < 2 || joinLabels(labels[1:]) != m.apex {
+			return fmt.Errorf("NSEC3 owner %s is not <hash>.%s", n.Hdr.Name, m.apex)
+		}
+		if n.Hash != dns.SHA1 || n.Flags != 0 || n.Iterations != iterations || normSalt(n.Salt) != salt {
+			return fmt.Errorf("NSEC3 at %s (hash %d, flags %d, iterations %d, salt %s) does not match the NSEC3PARAM parameters", n.Hdr.Name, n.Hash, n.Flags, n.Iterations, normSalt(n.Salt))
+		}
+		hash := strings.ToUpper(labels[0])
+		if _, dup := byHash[hash]; dup {
+			return fmt.Errorf("NSEC3 chain has a duplicate owner hash %s", hash)
+		}
+		byHash[hash] = n
+	}
+	hashToOwner := make(map[string]string, len(expected))
+	for _, e := range expected {
+		hashToOwner[e.hash] = e.owner
+	}
+	for _, e := range expected {
+		if byHash[e.hash] == nil {
+			return fmt.Errorf("NSEC3 chain is missing the record for %s (hash %s)", e.owner, e.hash)
+		}
+	}
+	for hash := range byHash {
+		if _, ok := hashToOwner[hash]; !ok {
+			return fmt.Errorf("NSEC3 chain has a record for hash %s, which is not the hash of any authoritative owner or empty non-terminal", hash)
+		}
+	}
+	for i, e := range expected {
+		n := byHash[e.hash]
+		next := expected[(i+1)%len(expected)].hash
+		if got := strings.ToUpper(n.NextDomain); got != next {
+			return fmt.Errorf("NSEC3 for %s points at %s, expected %s (hash order)", e.owner, got, next)
+		}
+		if err := compareTypeBitmap(e.owner, n.TypeBitMap, m.denialTypes(e.owner, true)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// compareTypeBitmap requires a denial record's type bitmap to equal the
+// expected set exactly.
+func compareTypeBitmap(owner string, got, want []uint16) error {
+	g := append([]uint16(nil), got...)
+	sort.Slice(g, func(i, j int) bool { return g[i] < g[j] })
+	if len(g) != len(want) {
+		return fmt.Errorf("denial record for %s lists types %s, expected %s", owner, typeList(g), typeList(want))
+	}
+	for i := range g {
+		if g[i] != want[i] {
+			return fmt.Errorf("denial record for %s lists types %s, expected %s", owner, typeList(g), typeList(want))
+		}
+	}
+	return nil
+}
+
+func typeList(types []uint16) string {
+	names := make([]string, len(types))
+	for i, t := range types {
+		names[i] = dns.TypeToString[t]
+		if names[i] == "" {
+			names[i] = fmt.Sprintf("TYPE%d", t)
+		}
+	}
+	return "[" + strings.Join(names, " ") + "]"
 }
 
 // createRRSIG creates an RRSIG record for signing
@@ -1159,8 +1289,9 @@ func (s *Signer) createRRSIG(rrset []dns.RR, signingKey *dns.DNSKEY, domain stri
 	labels := dns.CountLabel(name)
 
 	// RFC 4035 §5.3.1: For wildcards, the Labels field excludes the wildcard label
-	// So *.example.com has 2 labels, not 3
-	if strings.HasPrefix(name, "*.") {
+	// So *.example.com has 2 labels, not 3. Judged on the canonical spelling so
+	// an escaped asterisk is a wildcard too (RA6X-028).
+	if strings.HasPrefix(canonicalName(name), "*.") {
 		labels--
 	}
 
@@ -1250,20 +1381,23 @@ func (s *Signer) getSOATTL(records []dns.RR) uint32 {
 }
 
 func (s *Signer) generateNSECChain(domain string, records []dns.RR, soaMinTTL uint32) []dns.RR {
-	delInfo := s.findDelegationPoints(domain, records)
+	return s.generateNSECChainWithModel(newZoneModel(domain, records), domain, records, soaMinTTL)
+}
 
+func (s *Signer) generateNSECChainWithModel(m *zoneModel, domain string, records []dns.RR, soaMinTTL uint32) []dns.RR {
 	// Collect unique owner names that hold authoritative data or a
 	// delegation NS RRset. Occluded names (below a zone cut) get no NSEC
 	// (RFC 4035 §2.3), and neither do empty non-terminals: an NSEC (plus
 	// its RRSIG) MUST NOT be the only RRset at any owner name (RFC 4035
 	// §2.3) — ENT nonexistence-of-data is proven by the covering NSEC of
-	// the next existing descendant name.
+	// the next existing descendant name. Owners are canonical wire
+	// identities (RA6X-028), so every spelling of a name is one owner.
 	names := make(map[string]bool)
 	typesByName := make(map[string]map[uint16]bool)
 
 	for _, rr := range records {
-		name := strings.ToLower(rr.Header().Name)
-		if delInfo.isOccluded(name) {
+		name := canonicalName(rr.Header().Name)
+		if m.isOccluded(name) {
 			continue
 		}
 		names[name] = true
@@ -1293,7 +1427,7 @@ func (s *Signer) generateNSECChain(domain string, records []dns.RR, soaMinTTL ui
 		// (RFC 4035 §2.3; compare the root zone's insecure delegations:
 		// "NS RRSIG NSEC").
 		var types []uint16
-		if delInfo.delegationPoints[name] {
+		if m.isDelegation(name) {
 			types = append(types, dns.TypeNS)
 			if typesByName[name][dns.TypeDS] {
 				types = append(types, dns.TypeDS)
@@ -1324,21 +1458,20 @@ func (s *Signer) generateNSECChain(domain string, records []dns.RR, soaMinTTL ui
 	return nsecRecords
 }
 
-// addEmptyNonTerminals adds empty non-terminal names to the name set
+// addEmptyNonTerminals adds empty non-terminal names (canonical) to the name set
 func (s *Signer) addEmptyNonTerminals(names map[string]bool, typesByName map[string]map[uint16]bool, apex string) {
 	// Collect all names first to avoid modifying map while iterating
 	var allNames []string
 	for name := range names {
 		allNames = append(allNames, name)
 	}
+	apexLabels := dns.SplitDomainName(canonicalName(apex))
 
 	for _, name := range allNames {
 		// Walk up the tree to apex, adding empty non-terminals
 		labels := dns.SplitDomainName(name)
-		apexLabels := dns.SplitDomainName(apex)
-
-		for i := 1; i < len(labels)-len(apexLabels)+1; i++ {
-			parent := strings.Join(labels[i:], ".") + "."
+		for i := 1; i < len(labels)-len(apexLabels); i++ {
+			parent := joinLabels(labels[i:])
 			if !names[parent] {
 				names[parent] = true
 				typesByName[parent] = make(map[uint16]bool) // Empty
@@ -1409,23 +1542,25 @@ func canonicalLess(a, b string) bool {
 }
 
 func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL uint32) ([]dns.RR, error) {
+	return s.generateNSEC3ChainWithModel(newZoneModel(domain, records), domain, records, soaMinTTL)
+}
+
+func (s *Signer) generateNSEC3ChainWithModel(m *zoneModel, domain string, records []dns.RR, soaMinTTL uint32) ([]dns.RR, error) {
 	// NSEC3 parameters
 	iterations := uint16(s.cfg.DNSSEC.NSEC3Iterations)
 	salt := s.cfg.DNSSEC.NSEC3Salt
-	apex := dns.Fqdn(domain)
-	apexLower := strings.ToLower(apex)
-
-	delInfo := s.findDelegationPoints(domain, records)
+	apex := m.apex
 
 	// Collect unique owner names and their types. Occluded names (below a
 	// zone cut) get no NSEC3 (RFC 5155 §7.1 covers only names with
-	// authoritative data or at delegation points).
+	// authoritative data or at delegation points). Owners are canonical wire
+	// identities (RA6X-028).
 	names := make(map[string]bool)
 	typesByName := make(map[string]map[uint16]bool)
 
 	for _, rr := range records {
-		name := strings.ToLower(rr.Header().Name)
-		if delInfo.isOccluded(name) {
+		name := canonicalName(rr.Header().Name)
+		if m.isOccluded(name) {
 			continue
 		}
 		names[name] = true
@@ -1437,8 +1572,8 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL u
 
 	// The NSEC3PARAM record (appended below) lives at the apex, so the
 	// apex bitmap must list it (RFC 5155 §7.1).
-	if typesByName[apexLower] != nil {
-		typesByName[apexLower][dns.TypeNSEC3PARAM] = true
+	if typesByName[apex] != nil {
+		typesByName[apex][dns.TypeNSEC3PARAM] = true
 	}
 
 	// Add empty non-terminals (RFC 5155 §7.1)
@@ -1467,7 +1602,7 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL u
 	// Add NSEC3PARAM at zone apex
 	nsec3param := &dns.NSEC3PARAM{
 		Hdr: dns.RR_Header{
-			Name:   apex,
+			Name:   dns.Fqdn(domain),
 			Rrtype: dns.TypeNSEC3PARAM,
 			Class:  dns.ClassINET,
 			Ttl:    0, // RFC 5155 §4.2: SHOULD be zero
@@ -1492,7 +1627,7 @@ func (s *Signer) generateNSEC3Chain(domain string, records []dns.RR, soaMinTTL u
 		// not at insecure delegations, and not at empty non-terminals,
 		// which keep an empty bitmap (RFC 5155 §7.1).
 		var types []uint16
-		if delInfo.delegationPoints[hn.original] {
+		if m.isDelegation(hn.original) {
 			types = append(types, dns.TypeNS)
 			if typesByName[hn.original][dns.TypeDS] {
 				types = append(types, dns.TypeDS, dns.TypeRRSIG)
@@ -1618,7 +1753,7 @@ func sortZoneRecords(domain string, records []dns.RR) []dns.RR {
 	var keys []rrKey
 
 	for _, rr := range records {
-		key := rrKey{name: strings.ToLower(rr.Header().Name), rrtype: rr.Header().Rrtype}
+		key := rrKey{name: canonicalName(rr.Header().Name), rrtype: rr.Header().Rrtype}
 		if _, exists := groups[key]; !exists {
 			keys = append(keys, key)
 		}
@@ -1626,10 +1761,9 @@ func sortZoneRecords(domain string, records []dns.RR) []dns.RR {
 	}
 
 	// Sort keys: apex first, then by name, then by type (SOA, NS, DNSKEY, then others).
-	// Lowercase the apex to match the lowercased key names above — otherwise a
-	// mixed-case zone key in config (e.g. "Example.COM") breaks apex-first
-	// ordering (R-063).
-	apex := strings.ToLower(dns.Fqdn(domain))
+	// Keys are canonical owner identities (RA6X-028), so a mixed-case zone key
+	// in config (e.g. "Example.COM") still sorts apex-first (R-063).
+	apex := canonicalName(domain)
 	sort.Slice(keys, func(i, j int) bool {
 		// Apex comes first
 		iApex := keys[i].name == apex
