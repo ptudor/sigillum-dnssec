@@ -121,7 +121,7 @@ path = "/etc/nsd/zones/example.com.zone"
 [zones."example.org"]
 path = "/etc/nsd/zones/example.org.zone"
 ksk_lifetime = "5y"             # Per-zone override
-algorithm = "ECDSAP256SHA256"   # Per-zone algorithm (for algorithm rollover)
+algorithm = "ECDSAP256SHA256"   # Algorithm for keys generated in the future; existing keys are NOT migrated — use `rollover algorithm`
 serial_policy = "epoch"         # Per-zone override — zone MUST use epoch serials
 
 [hooks]
@@ -225,6 +225,16 @@ cycle, and a changed `output_dir` is populated on the next cycle after reload.
 ### Migrating from BIND
 
 If you have existing BIND-style DNSSEC keys (from `dnssec-keygen` or similar), you can import them without changing your DS records at the registrar:
+
+The key files dnssec-tudor writes are in the same BIND private-key format
+(`Private-key-format: v1.3`), with ED25519 keys stored as the 32-byte seed
+that BIND, ldns and RFC 8080 use, so they can be read back by those tools for
+recovery or migration; the DNSKEY and DS never change. Files written by older
+versions stored Go's 64-byte expanded ED25519 key and remain readable by
+dnssec-tudor; they are not rewritten in place. A key passes through the seed
+serialization when it is imported or when a rollover stages its successor, so
+to hand a legacy file to another tool, convert its `PrivateKey:` value to the
+first 32 bytes (the seed) — the DNSKEY and DS stay the same.
 
 ```bash
 # Import existing keys

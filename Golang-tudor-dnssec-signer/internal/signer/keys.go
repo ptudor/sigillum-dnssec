@@ -314,8 +314,19 @@ func uniqueBackupBase(prefix string) (string, error) {
 	return "", fmt.Errorf("could not allocate a unique backup path for %s", prefix)
 }
 
-// formatPrivateKey formats a private key in BIND-compatible format
+// formatPrivateKey formats a private key in BIND-compatible format. An
+// ED25519 key is written as the 32-byte seed the BIND/ldns/RFC 8080 format
+// carries (RA6X-047), so the file is readable by standard tools for recovery
+// or migration; Go's 64-byte expanded form is reduced to its seed only when
+// the embedded public suffix is consistent with it (RA6X-030). Files written
+// earlier in the 64-byte form remain readable by this signer.
 func formatPrivateKey(dnskey *dns.DNSKEY, privateKey []byte) string {
+	if dnskey.Algorithm == dns.ED25519 && len(privateKey) == ed25519.PrivateKeySize {
+		seed := privateKey[:ed25519.SeedSize]
+		if bytes.Equal(ed25519.NewKeyFromSeed(seed)[ed25519.SeedSize:], privateKey[ed25519.SeedSize:]) {
+			privateKey = seed
+		}
+	}
 	return fmt.Sprintf(`Private-key-format: v1.3
 Algorithm: %d (%s)
 PrivateKey: %s
