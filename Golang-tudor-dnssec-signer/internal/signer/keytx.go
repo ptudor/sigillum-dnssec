@@ -442,3 +442,37 @@ func (kg *KeyGenerator) EnsureLiveKey(domain, keyType string, expected uint16) (
 	}
 	return dnskey, priv, nil
 }
+
+// ValidateKeyForImport applies every check an imported key must pass before
+// any live artifact changes (RA6X-024): canonical owner, protocol 3, a
+// supported algorithm, the flags of the requested role, private/public
+// correspondence, and actual signing capability — a signature made with the
+// private key must verify under the public key.
+func ValidateKeyForImport(domain, keyType string, dnskey *dns.DNSKEY, privateKey []byte) error {
+	if dnskey == nil {
+		return fmt.Errorf("%s for %s: no DNSKEY", keyType, domain)
+	}
+	if err := validateLoadedKey(dnskey, domain, keyType); err != nil {
+		return fmt.Errorf("%s for %s: %w", keyType, domain, err)
+	}
+	if dnskey.Protocol != 3 {
+		return fmt.Errorf("%s for %s: DNSKEY protocol %d is not 3 (RFC 4034 §2.1.2)", keyType, domain, dnskey.Protocol)
+	}
+	if err := VerifyKeyPairCorrespondence(dnskey, privateKey); err != nil {
+		return fmt.Errorf("%s for %s: %w", keyType, domain, err)
+	}
+	probe := []dns.RR{&dns.TXT{
+		Hdr: dns.RR_Header{Name: dns.Fqdn(domain), Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 60},
+		Txt: []string{"dnssec-tudor import signing probe"},
+	}}
+	s := &Signer{}
+	now := time.Now().UTC()
+	rrsig := s.createRRSIG(probe, dnskey, dns.Fqdn(domain), now.Add(-time.Hour), now.Add(time.Hour))
+	if err := s.signRRSIG(rrsig, probe, dnskey, privateKey); err != nil {
+		return fmt.Errorf("%s for %s cannot sign: %w", keyType, domain, err)
+	}
+	if err := rrsig.Verify(dnskey, probe); err != nil {
+		return fmt.Errorf("%s for %s: a signature made with the private key does not verify under the public key: %w", keyType, domain, err)
+	}
+	return nil
+}

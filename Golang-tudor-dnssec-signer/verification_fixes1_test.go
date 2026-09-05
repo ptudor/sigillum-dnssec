@@ -260,18 +260,18 @@ func TestIsZoneTableHeader(t *testing.T) {
 }
 
 // When the parsed config confirms the zone is present but the rewriter cannot
-// locate its table header (here: TOML-valid whitespace inside the brackets,
-// which the anchored matcher deliberately does not chase), runRemove must
-// return an error — never print success while the entry survives in the file.
+// locate its table header (here: the zone is defined by a top-level dotted key
+// with no [zones."…"] table at all — RA6X-038 made every table-header spelling
+// rewritable, so only a header-less definition remains unlocatable), runRemove
+// must return an error — never print success while the entry survives in the
+// file.
 func TestRunRemove_ErrorsWhenHeaderNotRewritable(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 	zonePath := filepath.Join(dir, "gone.example.com.db")
 	content := fmt.Sprintf(`output_dir = %q
 data_dir = %q
-
-[ zones . "gone.example.com" ]
-path = %q
+zones."gone.example.com".path = %q
 `, filepath.Join(dir, "signed"), dir, zonePath)
 	if err := os.WriteFile(cfgPath, []byte(content), 0600); err != nil {
 		t.Fatal(err)
@@ -311,7 +311,7 @@ path = %q
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
-	if !strings.Contains(string(out), `[ zones . "gone.example.com" ]`) {
+	if !strings.Contains(string(out), `zones."gone.example.com".path`) {
 		t.Errorf("config entry must be left intact on failure:\n%s", out)
 	}
 	reloaded, lerr := statepkg.LoadState(filepath.Join(dir, "state.json"))

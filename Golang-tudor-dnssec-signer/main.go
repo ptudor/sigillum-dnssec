@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -1536,19 +1538,18 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	slog.Info("[CLI] Importing keys for domain", "domain", domain, "ksk", kskPath, "zsk", zskPath)
 
-	// Read and validate KSK
+	// Read both pairs. Nothing below this point writes anything until every
+	// check on the imported material has passed (RA6X-024).
 	ksk, kskPriv, err := loadBindKeyPair(kskPath)
 	if err != nil {
 		return fmt.Errorf("loading KSK from %s: %w", kskPath, err)
 	}
-	if ksk.Flags != 257 {
-		return fmt.Errorf("KSK has wrong flags %d (expected 257 for KSK)", ksk.Flags)
-	}
-
-	// Read and validate ZSK
 	zsk, zskPriv, err := loadBindKeyPair(zskPath)
 	if err != nil {
 		return fmt.Errorf("loading ZSK from %s: %w", zskPath, err)
+	}
+	if ksk.Flags != 257 {
+		return fmt.Errorf("KSK has wrong flags %d (expected 257 for KSK)", ksk.Flags)
 	}
 	if zsk.Flags != 256 {
 		return fmt.Errorf("ZSK has wrong flags %d (expected 256 for ZSK)", zsk.Flags)
@@ -1566,6 +1567,15 @@ func runImport(cmd *cobra.Command, args []string) error {
 			signerpkg.AlgorithmName(ksk.Algorithm), signerpkg.AlgorithmName(zsk.Algorithm))
 	}
 
+	// Canonical owner, protocol, supported algorithm, role flags, correspondence
+	// and real signing capability — all before any live artifact changes.
+	if err := signerpkg.ValidateKeyForImport(domain, "ksk", ksk, kskPriv); err != nil {
+		return fmt.Errorf("refusing to import: %w", err)
+	}
+	if err := signerpkg.ValidateKeyForImport(domain, "zsk", zsk, zskPriv); err != nil {
+		return fmt.Errorf("refusing to import: %w", err)
+	}
+
 	// Preflight the config append before writing any key material (R-023, mirroring add):
 	// fail now if the config file isn't writable, rather than after converting keys and
 	// signing, which would leave state and config diverged with retry blocked.
@@ -1573,20 +1583,11 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("config file %s not writable (needed to register the imported zone): %w", configPath, err)
 	}
 
-	// Save keys in our format
-	keyGen := signerpkg.NewKeyGenerator(cfg)
-	if err := keyGen.SaveKeyFiles(domain, "ksk", ksk, kskPriv); err != nil {
-		return fmt.Errorf("saving KSK: %w", err)
-	}
-	if err := keyGen.SaveKeyFiles(domain, "zsk", zsk, zskPriv); err != nil {
-		return fmt.Errorf("saving ZSK: %w", err)
-	}
-
-	// Create zone state
+	// Zone state and in-memory config for signing; the zone is not registered in
+	// state until the commit step.
 	now := time.Now().UTC()
 	kskLifetime := cfg.GetZoneKSKLifetime(domain)
 	zskLifetime := cfg.GetZoneZSKLifetime(domain)
-
 	zoneState := &statepkg.ZoneState{
 		Path: zonePath,
 		KSK: &statepkg.KeyState{
@@ -1604,47 +1605,88 @@ func runImport(cmd *cobra.Command, args []string) error {
 			RolloverDue: now.Add(time.Duration(float64(zskLifetime) * 0.75)),
 		},
 	}
-	state.ClearRemoved(domain)
-	state.SetZone(domain, zoneState)
-
-	// Add to in-memory config
 	cfg.Zones[domain] = config.ZoneConfig{Path: zonePath}
 
-	// Sign the zone
+	keyGen := signerpkg.NewKeyGenerator(cfg)
+	tx, err := beginImportTx(cfg, state, keyGen, domain)
+	if err != nil {
+		delete(cfg.Zones, domain)
+		return err
+	}
+
+	// Stage: tag-named copies of both imported pairs (verified by reloading),
+	// then the complete signed zone from exactly those keys, in a staging file.
+	// The live key slots and the served output are untouched so far.
+	if err = importFail("stage:ksk"); err == nil {
+		_, err = keyGen.StageKeyPair(domain, "ksk", ksk, kskPriv)
+	}
+	if err != nil {
+		return tx.fail(fmt.Errorf("staging KSK: %w", err))
+	}
+	if err = importFail("stage:zsk"); err == nil {
+		_, err = keyGen.StageKeyPair(domain, "zsk", zsk, zskPriv)
+	}
+	if err != nil {
+		return tx.fail(fmt.Errorf("staging ZSK: %w", err))
+	}
 	signer := signerpkg.NewSigner(cfg, state)
-	if err := signer.SignZone(domain); err != nil {
-		state.RemoveZone(domain)
-		return fmt.Errorf("signing zone: %w", err)
+	if err := importFail("sign"); err != nil {
+		return tx.fail(fmt.Errorf("signing zone: %w", err))
 	}
-
-	// Save state first — if this fails, config file is untouched
-	if err := persistState(state); err != nil {
-		return fmt.Errorf("saving state: %w", err)
+	staged, err := signer.StageZoneWithKeys(domain, zoneState, ksk, kskPriv, zsk, zskPriv, tx.stagingPath())
+	if err != nil {
+		return tx.fail(fmt.Errorf("signing zone: %w", err))
 	}
+	tx.staged = staged
 
-	// Config file is written last — state is already consistent. If it fails despite the
-	// preflight (e.g. a race), unwind the state so it doesn't diverge from config and a
-	// retry isn't blocked at "already managed". Converted key files are left in place (a
-	// registrar DS may reference them) with a note (R-023).
-	if err := commitConfigEdit(config.AddZoneToConfigFile(configPath, domain, zonePath)); err != nil {
-		state.RemoveZone(domain)
-		if serr := persistState(state); serr != nil {
-			slog.Error("[CLI] Rollback: failed to remove zone from state after config-append failure",
-				"domain", domain, "error", serr)
+	// Commit, in an order every failure can undo: activate the live keys
+	// (prior pairs preserved and restorable), publish the staged output over
+	// the served one (prior bytes restorable), record the zone in state, then
+	// register it in the config file.
+	for _, role := range []string{"ksk", "zsk"} {
+		tag := ksk.KeyTag()
+		if role == "zsk" {
+			tag = zsk.KeyTag()
 		}
-		signedPath := filepath.Join(cfg.OutputDir, domain+".zone.signed")
-		if rerr := os.Remove(signedPath); rerr != nil && !os.IsNotExist(rerr) {
-			slog.Warn("[CLI] Rollback: failed to remove signed zone", "path", signedPath, "error", rerr)
+		if err = importFail("activate:" + role); err == nil {
+			err = keyGen.ActivateKeyPair(domain, role, tag)
 		}
-		fmt.Fprintf(os.Stderr, "note: converted key files for %s were left in %s (a registrar DS may reference them); re-run import after fixing the config file\n", domain, cfg.KeysDir())
-		return fmt.Errorf("adding zone to config file: %w", err)
+		if err != nil {
+			return tx.fail(fmt.Errorf("activating imported %s: %w", strings.ToUpper(role), err))
+		}
+		tx.activated = append(tx.activated, role)
+		tx.tags[role] = tag
+	}
+	if err = importFail("publish"); err == nil {
+		err = staged.Publish()
+	}
+	if err != nil {
+		return tx.fail(fmt.Errorf("publishing signed zone: %w", err))
+	}
+	tx.published = true
+
+	state.ClearRemoved(domain)
+	state.SetZone(domain, zoneState)
+	if err = importFail("save"); err == nil {
+		err = persistState(state)
+	}
+	if err != nil {
+		return tx.fail(fmt.Errorf("saving state: %w", err))
+	}
+	tx.stateSaved = true
+
+	if err = importFail("config"); err == nil {
+		err = commitConfigEdit(config.AddZoneToConfigFile(configPath, domain, zonePath))
+	}
+	if err != nil {
+		return tx.fail(fmt.Errorf("adding zone to config file: %w", err))
 	}
 
 	fmt.Printf("\nDomain %s imported successfully.\n", domain)
 	fmt.Printf("  KSK: %d (%s)\n", ksk.KeyTag(), signerpkg.AlgorithmName(ksk.Algorithm))
 	fmt.Printf("  ZSK: %d (%s)\n", zsk.KeyTag(), signerpkg.AlgorithmName(zsk.Algorithm))
 	fmt.Printf("  Config updated: %s\n", configPath)
-	fmt.Printf("  Signed zone:    %s\n\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
+	fmt.Printf("  Signed zone:    %s\n\n", signer.OutputPath(domain))
 	fmt.Println("DS record (verify this matches what's at your registrar):")
 	dsOutput := signerpkg.FormatDSRecordsFromKey(domain, ksk)
 	fmt.Println(dsOutput)
@@ -1653,6 +1695,202 @@ func runImport(cmd *cobra.Command, args []string) error {
 	runPostSignHook(cfg, domain, zonePath)
 
 	return nil
+}
+
+// importFailpoint is a test-only fault-injection seam consulted at each
+// import transaction boundary; nil in production.
+var importFailpoint func(step string) error
+
+func importFail(step string) error {
+	if importFailpoint == nil {
+		return nil
+	}
+	return importFailpoint(step)
+}
+
+// priorFile is a snapshot of an artifact an import may replace, so a failed
+// transaction restores its exact bytes and mode.
+type priorFile struct {
+	path    string
+	data    []byte
+	mode    os.FileMode
+	existed bool
+}
+
+func snapshotFile(path string) (*priorFile, error) {
+	pf := &priorFile{path: path}
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return pf, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspecting %s: %w", path, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s for rollback: %w", path, err)
+	}
+	pf.data, pf.mode, pf.existed = data, info.Mode().Perm(), true
+	return pf, nil
+}
+
+// restore puts the snapshot back: the exact prior bytes and mode, or removal
+// of a file that did not exist before (callers apply the key rule first — see
+// importTx.rollback).
+func (pf *priorFile) restore() error {
+	if pf.existed {
+		if err := fsutil.WriteFileAtomicOwned(pf.path, pf.data, pf.mode); err != nil && !fsutil.IsCommitted(err) {
+			return err
+		}
+		return nil
+	}
+	if err := os.Remove(pf.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// importTx records the prior artifacts an import may replace and which commit
+// steps have run, so a failure at any step restores the exact prior state
+// (RA6X-024): live key pairs, the served signed output, the zone's absence from
+// state and its removal marker. Staged tag-named key copies are left in place
+// (key material is never deleted; a retry reuses them).
+type importTx struct {
+	cfg        *config.Config
+	state      *statepkg.State
+	keyGen     *signerpkg.KeyGenerator
+	domain     string
+	priorKeys  map[string][2]*priorFile // role → {.key, .private}
+	priorOut   *priorFile
+	removedAt  time.Time
+	wasRemoved bool
+	staged     *signerpkg.StagedZone
+	activated  []string
+	tags       map[string]uint16 // role → key tag activated there
+	published  bool
+	stateSaved bool
+}
+
+func beginImportTx(cfg *config.Config, state *statepkg.State, keyGen *signerpkg.KeyGenerator, domain string) (*importTx, error) {
+	tx := &importTx{cfg: cfg, state: state, keyGen: keyGen, domain: domain, priorKeys: map[string][2]*priorFile{}, tags: map[string]uint16{}}
+	keysDir := cfg.KeysDir()
+	for _, role := range []string{"ksk", "zsk"} {
+		base := filepath.Join(keysDir, domain+"."+role)
+		k, err := snapshotFile(base + ".key")
+		if err != nil {
+			return nil, err
+		}
+		p, err := snapshotFile(base + ".private")
+		if err != nil {
+			return nil, err
+		}
+		tx.priorKeys[role] = [2]*priorFile{k, p}
+	}
+	out, err := snapshotFile(filepath.Join(cfg.OutputDir, domain+".zone.signed"))
+	if err != nil {
+		return nil, err
+	}
+	tx.priorOut = out
+	tx.removedAt, tx.wasRemoved = state.RemovedAt(domain)
+	if err := signerpkg.EnsureDir(cfg.OutputDir); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+// stagingPath is the staged signed zone: a dotfile beside the output so the
+// final publish is a same-directory rename.
+func (tx *importTx) stagingPath() string {
+	return filepath.Join(tx.cfg.OutputDir, "."+tx.domain+".zone.signed.import")
+}
+
+// fail rolls the transaction back and returns the causing error, annotated
+// with anything that could not be restored.
+func (tx *importTx) fail(cause error) error {
+	problems := tx.rollback()
+	if len(problems) == 0 {
+		return cause
+	}
+	return fmt.Errorf("%w (rollback incomplete: %s)", cause, strings.Join(problems, "; "))
+}
+
+func (tx *importTx) rollback() []string {
+	var problems []string
+	note := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		slog.Error("[CLI] Import rollback: "+msg, "domain", tx.domain)
+		problems = append(problems, msg)
+	}
+
+	delete(tx.cfg.Zones, tx.domain)
+
+	// State: undo the registration, restore the removal marker, and persist the
+	// undo only if the registration itself was persisted.
+	tx.state.RemoveZone(tx.domain)
+	if tx.wasRemoved {
+		tx.state.RestoreRemoved(tx.domain, tx.removedAt)
+	}
+	if tx.stateSaved {
+		if err := persistState(tx.state); err != nil {
+			note("could not remove the zone from state.json (%v); run `dnssec-tudor remove %s` before retrying", err, tx.domain)
+		}
+	}
+
+	// Output: the exact prior bytes, or nothing if there were none. A file that
+	// existed before the import is never deleted.
+	if tx.published {
+		if err := tx.priorOut.restore(); err != nil {
+			note("could not restore the previous signed output %s: %v", tx.priorOut.path, err)
+		}
+	} else if tx.staged != nil {
+		tx.staged.Discard()
+	}
+
+	// Live keys: the exact prior pair for every activated role. A slot that was
+	// empty before is emptied again only when its halves are byte-identical to
+	// the staged tag-named copies, so no key material is ever lost.
+	for _, role := range tx.activated {
+		pair := tx.priorKeys[role]
+		for i, pf := range pair {
+			if pf.existed {
+				if err := pf.restore(); err != nil {
+					note("could not restore the previous %s key file %s: %v", role, pf.path, err)
+				}
+				continue
+			}
+			ext := ".key"
+			if i == 1 {
+				ext = ".private"
+			}
+			if !tx.liveMatchesStaged(role, ext) {
+				note("left %s in place: it does not match the staged copy", pf.path)
+				continue
+			}
+			if err := os.Remove(pf.path); err != nil && !os.IsNotExist(err) {
+				note("could not remove %s: %v", pf.path, err)
+			}
+		}
+	}
+	if len(tx.activated) > 0 {
+		fmt.Fprintf(os.Stderr, "note: staged copies of the imported keys were left in %s (a registrar DS may reference them); a retry reuses them\n", tx.cfg.KeysDir())
+	}
+	return problems
+}
+
+// liveMatchesStaged reports whether the live half for role is byte-identical to
+// the tag-named staged copy of the key the import activated there.
+func (tx *importTx) liveMatchesStaged(role, ext string) bool {
+	live := filepath.Join(tx.cfg.KeysDir(), tx.domain+"."+role+ext)
+	liveData, err := os.ReadFile(live)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	staged := filepath.Join(tx.cfg.KeysDir(), fmt.Sprintf("%s.%s.%d%s", tx.domain, role, tx.tags[role], ext))
+	stagedData, err := os.ReadFile(staged)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(liveData, stagedData)
 }
 
 // loadBindKeyPair loads a BIND-style key pair from the given base path
