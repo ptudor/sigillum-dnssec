@@ -12,11 +12,14 @@ import (
 
 // DNSKEYRecord represents a DNSKEY record
 type DNSKEYRecord struct {
-	Flags     uint16 `json:"flags"`      // 256=ZSK, 257=KSK
-	Protocol  uint8  `json:"protocol"`   // Always 3
-	Algorithm uint8  `json:"algorithm"`  // 8, 13, 15, etc.
-	PublicKey string `json:"public_key"` // Base64
-	KeyTag    uint16 `json:"key_tag"`    // Computed identifier
+	Owner     string `json:"owner,omitempty"`   // Owner name (from RR header) — RA6X-007
+	Class     uint16 `json:"class,omitempty"`   // DNS class (1 = IN)
+	Section   string `json:"section,omitempty"` // Message section the record came from
+	Flags     uint16 `json:"flags"`             // 256=ZSK, 257=KSK
+	Protocol  uint8  `json:"protocol"`          // Always 3
+	Algorithm uint8  `json:"algorithm"`         // 8, 13, 15, etc.
+	PublicKey string `json:"public_key"`        // Base64
+	KeyTag    uint16 `json:"key_tag"`           // Computed identifier
 	IsKSK     bool   `json:"is_ksk"`
 	IsZSK     bool   `json:"is_zsk"`
 	IsRevoked bool   `json:"is_revoked,omitempty"` // RFC 5011 REVOKE bit set
@@ -44,6 +47,9 @@ func (k DNSKEYRecord) EligibleForVerification() bool {
 
 // DSRecord represents a DS record
 type DSRecord struct {
+	Owner      string `json:"owner,omitempty"`   // Owner name (the child zone) — RA6X-007
+	Class      uint16 `json:"class,omitempty"`   // DNS class (1 = IN)
+	Section    string `json:"section,omitempty"` // Message section the record came from
 	KeyTag     uint16 `json:"key_tag"`
 	Algorithm  uint8  `json:"algorithm"`
 	DigestType uint8  `json:"digest_type"` // 2=SHA-256, 4=SHA-384
@@ -52,6 +58,9 @@ type DSRecord struct {
 
 // RRSIGRecord represents an RRSIG record
 type RRSIGRecord struct {
+	Owner       string    `json:"owner,omitempty"`   // Owner name of the signed RRset — RA6X-007
+	Class       uint16    `json:"class,omitempty"`   // DNS class (1 = IN)
+	Section     string    `json:"section,omitempty"` // Message section the record came from
 	TypeCovered uint16    `json:"type_covered"`
 	Algorithm   uint8     `json:"algorithm"`
 	Labels      uint8     `json:"labels"`
@@ -67,15 +76,19 @@ type RRSIGRecord struct {
 
 // NSECRecord represents an NSEC record
 type NSECRecord struct {
-	Owner      string   `json:"owner"` // Owner name (from RR header)
+	Owner      string   `json:"owner"`             // Owner name (from RR header)
+	Class      uint16   `json:"class,omitempty"`   // DNS class (1 = IN) — RA6X-007
+	Section    string   `json:"section,omitempty"` // Message section the record came from
 	NextDomain string   `json:"next_domain"`
 	TypeBitmap []string `json:"type_bitmap"` // Type names covered
 }
 
 // NSEC3Record represents an NSEC3 record
 type NSEC3Record struct {
-	Owner       string   `json:"owner"`        // Full owner name (hashed.zone.)
-	HashedOwner string   `json:"hashed_owner"` // Just the hashed portion (base32)
+	Owner       string   `json:"owner"`             // Full owner name (hashed.zone.)
+	Class       uint16   `json:"class,omitempty"`   // DNS class (1 = IN) — RA6X-007
+	Section     string   `json:"section,omitempty"` // Message section the record came from
+	HashedOwner string   `json:"hashed_owner"`      // Just the hashed portion (base32)
 	Algorithm   uint8    `json:"algorithm"`
 	Flags       uint8    `json:"flags"`
 	Iterations  uint16   `json:"iterations"`
@@ -86,14 +99,19 @@ type NSEC3Record struct {
 
 // NSRecord represents a nameserver record
 type NSRecord struct {
+	Owner     string   `json:"owner,omitempty"`   // Owner name the NS RRset belongs to — RA6X-007
+	Class     uint16   `json:"class,omitempty"`   // DNS class (1 = IN)
+	Section   string   `json:"section,omitempty"` // Message section the record came from
 	Name      string   `json:"name"`
 	Addresses []net.IP `json:"addresses,omitempty"`
 }
 
 // CNAMERecord represents a CNAME record
 type CNAMERecord struct {
-	Name   string `json:"name"`   // The alias name
-	Target string `json:"target"` // The canonical name
+	Name    string `json:"name"`              // The alias name (owner)
+	Class   uint16 `json:"class,omitempty"`   // DNS class (1 = IN) — RA6X-007
+	Section string `json:"section,omitempty"` // Message section the record came from
+	Target  string `json:"target"`            // The canonical name
 }
 
 // QueryResult represents the result of a DNS query

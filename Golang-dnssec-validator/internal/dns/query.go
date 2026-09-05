@@ -3,33 +3,42 @@ package dns
 import (
 	"context"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-// dialAddr returns the address to dial for a DNS server. Servers are normally
-// named without a port ("198.41.0.4", "::1") and get the default :53; an address
-// that already carries a port is passed through, which keeps a resolver on a
-// non-standard port working instead of silently dialling "host:port:53".
-func dialAddr(server string) string {
-	if _, _, err := net.SplitHostPort(server); err == nil {
-		return server
-	}
-	return net.JoinHostPort(server, "53")
-}
-
 // Querier handles DNS queries
 type Querier struct {
 	timeout time.Duration
+	// port is the port dialled for a server named without one (default 53).
+	// It exists so a hermetic authoritative fixture on an ephemeral port can be
+	// driven through the real query/validation path (RA6X-050).
+	port string
 }
 
 // NewQuerier creates a new DNS querier
 func NewQuerier(timeout time.Duration) *Querier {
 	return &Querier{
 		timeout: timeout,
+		port:    "53",
 	}
+}
+
+// dial returns the address to dial for a DNS server. Servers are normally
+// named without a port ("198.41.0.4", "::1") and get the querier's default
+// port (53); an address that already carries a port is passed through, which
+// keeps a resolver on a non-standard port working instead of silently
+// dialling "host:port:53".
+func (q *Querier) dial(server string) string {
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server
+	}
+	port := q.port
+	if port == "" {
+		port = "53"
+	}
+	return net.JoinHostPort(server, port)
 }
 
 // Query performs a DNS query to the specified server
@@ -62,14 +71,14 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 	}
 
 	// Try UDP first
-	resp, rtt, err := client.ExchangeContext(ctx, msg, dialAddr(server))
+	resp, rtt, err := client.ExchangeContext(ctx, msg, q.dial(server))
 	result.RTT = rtt
 
 	// If truncated, retry with TCP
 	if err == nil && resp.Truncated {
 		result.Truncated = true
 		client.Net = "tcp"
-		resp, rtt, err = client.ExchangeContext(ctx, msg, dialAddr(server))
+		resp, rtt, err = client.ExchangeContext(ctx, msg, q.dial(server))
 		result.RTT = rtt
 	}
 
@@ -121,105 +130,35 @@ func (q *Querier) parseResponse(resp *dns.Msg, result *QueryResult) {
 		}
 	}
 
-	// Parse all sections: Answer, Ns (Authority), Extra
-	allRRs := append(resp.Answer, resp.Ns...)
-	allRRs = append(allRRs, resp.Extra...)
+	// Parse all sections: Answer, Ns (Authority), Extra. Each record keeps its
+	// owner, class and section (RA6X-007) so consumers can tell positive
+	// Answer data from Authority denial records and never promote anything
+	// from Additional to authenticated data.
+	now := time.Now()
+	q.parseSection(resp.Answer, SectionAnswer, now, result)
+	q.parseSection(resp.Ns, SectionAuthority, now, result)
+	q.parseSection(resp.Extra, SectionAdditional, now, result)
+}
 
-	for _, rr := range allRRs {
+// parseSection converts one message section's DNSSEC-relevant records into the
+// per-type display slices on result, tagging each with its section.
+func (q *Querier) parseSection(rrs []dns.RR, section string, now time.Time, result *QueryResult) {
+	for _, rr := range rrs {
 		switch v := rr.(type) {
 		case *dns.DNSKEY:
-			// RFC 4034 §2.1.1 DNSKEY flags, classified by BIT rather than exact
-			// equality so a key carrying the REVOKE bit (RFC 5011) or any extra
-			// flag is still recognized (R-095):
-			//   Zone Key  (0x0100 = 256): the key signs zone data
-			//   SEP       (0x0001 =   1): Secure Entry Point (conventionally the KSK)
-			//   REVOKE    (0x0080 = 128): RFC 5011 revoked
-			// KSK = Zone Key + SEP; ZSK = Zone Key without SEP.
-			isZoneKey := v.Flags&0x0100 != 0
-			isSEP := v.Flags&0x0001 != 0
-			dnskey := DNSKEYRecord{
-				Flags:     v.Flags,
-				Protocol:  v.Protocol,
-				Algorithm: v.Algorithm,
-				PublicKey: v.PublicKey, // miekg/dns already provides base64
-				KeyTag:    v.KeyTag(),
-				IsKSK:     isZoneKey && isSEP,
-				IsZSK:     isZoneKey && !isSEP,
-				IsRevoked: v.Flags&0x0080 != 0,
-			}
-			result.DNSKEY = append(result.DNSKEY, dnskey)
-
+			result.DNSKEY = append(result.DNSKEY, DNSKEYFromRR(v, section))
 		case *dns.DS:
-			ds := DSRecord{
-				KeyTag:     v.KeyTag,
-				Algorithm:  v.Algorithm,
-				DigestType: v.DigestType,
-				Digest:     strings.ToUpper(v.Digest),
-			}
-			result.DS = append(result.DS, ds)
-
+			result.DS = append(result.DS, DSFromRR(v, section))
 		case *dns.RRSIG:
-			rrsig := RRSIGRecord{
-				TypeCovered: v.TypeCovered,
-				Algorithm:   v.Algorithm,
-				Labels:      v.Labels,
-				OriginalTTL: v.OrigTtl,
-				Expiration:  time.Unix(int64(v.Expiration), 0),
-				Inception:   time.Unix(int64(v.Inception), 0),
-				KeyTag:      v.KeyTag,
-				SignerName:  v.SignerName,
-				Signature:   v.Signature, // miekg/dns already provides base64
-			}
-			// Check validity
-			now := time.Now()
-			rrsig.IsExpired = now.After(rrsig.Expiration)
-			rrsig.IsValid = now.After(rrsig.Inception) && now.Before(rrsig.Expiration)
-			result.RRSIG = append(result.RRSIG, rrsig)
-
+			result.RRSIG = append(result.RRSIG, RRSIGFromRR(v, section, now))
 		case *dns.NSEC:
-			nsec := NSECRecord{
-				Owner:      v.Hdr.Name,
-				NextDomain: v.NextDomain,
-				TypeBitmap: make([]string, 0),
-			}
-			for _, t := range v.TypeBitMap {
-				nsec.TypeBitmap = append(nsec.TypeBitmap, TypeName(t))
-			}
-			result.NSEC = append(result.NSEC, nsec)
-
+			result.NSEC = append(result.NSEC, NSECFromRR(v, section))
 		case *dns.NSEC3:
-			// Extract hashed owner (first label before zone)
-			hashedOwner := ""
-			if idx := strings.Index(v.Hdr.Name, "."); idx > 0 {
-				hashedOwner = strings.ToUpper(v.Hdr.Name[:idx])
-			}
-			nsec3 := NSEC3Record{
-				Owner:       v.Hdr.Name,
-				HashedOwner: hashedOwner,
-				Algorithm:   v.Hash,
-				Flags:       v.Flags,
-				Iterations:  v.Iterations,
-				Salt:        strings.ToUpper(v.Salt),
-				NextHashed:  strings.ToUpper(v.NextDomain),
-				TypeBitmap:  make([]string, 0),
-			}
-			for _, t := range v.TypeBitMap {
-				nsec3.TypeBitmap = append(nsec3.TypeBitmap, TypeName(t))
-			}
-			result.NSEC3 = append(result.NSEC3, nsec3)
-
+			result.NSEC3 = append(result.NSEC3, NSEC3FromRR(v, section))
 		case *dns.NS:
-			ns := NSRecord{
-				Name: v.Ns,
-			}
-			result.NS = append(result.NS, ns)
-
+			result.NS = append(result.NS, NSFromRR(v, section))
 		case *dns.CNAME:
-			cname := CNAMERecord{
-				Name:   v.Hdr.Name,
-				Target: v.Target,
-			}
-			result.CNAME = append(result.CNAME, cname)
+			result.CNAME = append(result.CNAME, CNAMEFromRR(v, section))
 		}
 	}
 }

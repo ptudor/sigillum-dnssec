@@ -232,8 +232,8 @@ func TestVerifyDSRRSIGSet_DoubleSignature(t *testing.T) {
 	_, rogueSigner, rogueRec := genTestDNSKEY(t, parentZone, 256)
 	ds := dnpkgDS(t, zone)
 
-	rogueSig, rogueRRSIG := signDSRRSIGRecord(t, zone, parentZone, ds, rogueSigner, rogueRec.KeyTag)
-	genuineSig, genuineRRSIG := signDSRRSIGRecord(t, zone, parentZone, ds, genuineSigner, genuineRec.KeyTag)
+	rogueSig, _ := signDSRRSIGRecord(t, zone, parentZone, ds, rogueSigner, rogueRec.KeyTag)
+	genuineSig, _ := signDSRRSIGRecord(t, zone, parentZone, ds, genuineSigner, genuineRec.KeyTag)
 
 	msg := new(miekgdns.Msg)
 	msg.SetQuestion(zone, miekgdns.TypeDS)
@@ -245,9 +245,10 @@ func TestVerifyDSRRSIGSet_DoubleSignature(t *testing.T) {
 	parentKeys := []dnspkg.DNSKEYRecord{genuineRec}
 
 	// Non-matching RRSIG first (double-signature rollover shape): the DS RRset
-	// must verify via the second signature.
+	// must verify via the second signature, and the authenticated DS RRset is
+	// exactly the signed record (RA6X-007).
 	v1 := &DSValidation{ParentZone: parentZone}
-	verifyDSRRSIGSet(v1, zone, []dnspkg.RRSIGRecord{rogueRRSIG, genuineRRSIG}, parentKeys, raw)
+	authed := verifyDSRRSIGSet(v1, zone, parentZone, parentKeys, raw)
 	if !v1.RRSIGVerified {
 		t.Fatalf("DS RRset with any one RRSIG under the parent's keys must verify, got error: %s", v1.Error)
 	}
@@ -257,22 +258,49 @@ func TestVerifyDSRRSIGSet_DoubleSignature(t *testing.T) {
 	if v1.Error != "" {
 		t.Fatalf("verified DS RRset should carry no error, got: %s", v1.Error)
 	}
+	if len(authed) != 1 || authed[0].KeyTag != ds.KeyTag || !strings.EqualFold(authed[0].Digest, ds.Digest) {
+		t.Fatalf("authenticated DS RRset = %+v, want exactly the signed DS (tag %d)", authed, ds.KeyTag)
+	}
 
-	// Both RRSIGs by keys the parent does not hold: fail with an aggregate error.
+	// The parent holds neither signing key: nothing verifies, nothing is returned.
+	_, _, strangerRec := genTestDNSKEY(t, parentZone, 256)
 	v2 := &DSValidation{ParentZone: parentZone}
-	verifyDSRRSIGSet(v2, zone, []dnspkg.RRSIGRecord{rogueRRSIG, rogueRRSIG}, parentKeys, raw)
-	if v2.RRSIGVerified {
-		t.Fatal("DS RRset with no verifiable RRSIG must not read verified")
+	if got := verifyDSRRSIGSet(v2, zone, parentZone, []dnspkg.DNSKEYRecord{strangerRec}, raw); got != nil {
+		t.Fatalf("DS RRset with no verifiable RRSIG must return no authenticated DS, got %+v", got)
 	}
-	if !strings.Contains(v2.Error, "none of 2") {
-		t.Fatalf("expected an aggregate error over both RRSIGs, got: %s", v2.Error)
+	if v2.RRSIGVerified || v2.Error == "" {
+		t.Fatalf("DS RRset with no verifiable RRSIG must not read verified and must carry an error, got verified=%v error=%q", v2.RRSIGVerified, v2.Error)
 	}
 
-	// No covering RRSIG at all: same error as before.
+	// No covering RRSIG at all.
+	unsigned := new(miekgdns.Msg)
+	unsigned.SetQuestion(zone, miekgdns.TypeDS)
+	unsigned.Answer = []miekgdns.RR{ds}
+	rawUnsigned, err := unsigned.Pack()
+	if err != nil {
+		t.Fatalf("pack unsigned DS response: %v", err)
+	}
 	v3 := &DSValidation{ParentZone: parentZone}
-	verifyDSRRSIGSet(v3, zone, nil, parentKeys, raw)
-	if v3.RRSIGVerified || v3.Error != "no RRSIG for DS record" {
-		t.Fatalf("expected 'no RRSIG for DS record', got verified=%v error=%q", v3.RRSIGVerified, v3.Error)
+	if got := verifyDSRRSIGSet(v3, zone, parentZone, parentKeys, rawUnsigned); got != nil || v3.RRSIGVerified {
+		t.Fatalf("unsigned DS RRset must not authenticate, got %+v verified=%v", got, v3.RRSIGVerified)
+	}
+	if !strings.Contains(v3.Error, "no RRSIG") {
+		t.Fatalf("expected a 'no RRSIG' error, got: %s", v3.Error)
+	}
+
+	// A signature by the right key but naming another zone as signer must not
+	// authenticate the DS RRset for this parent (RA6X-007 parent-signer binding).
+	wrongSigner, _ := signDSRRSIGRecord(t, zone, "other.example.", ds, genuineSigner, genuineRec.KeyTag)
+	ws := new(miekgdns.Msg)
+	ws.SetQuestion(zone, miekgdns.TypeDS)
+	ws.Answer = []miekgdns.RR{ds, wrongSigner}
+	rawWS, err := ws.Pack()
+	if err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	v4 := &DSValidation{ParentZone: parentZone}
+	if got := verifyDSRRSIGSet(v4, zone, parentZone, parentKeys, rawWS); got != nil || v4.RRSIGVerified {
+		t.Fatalf("DS RRSIG naming another zone as signer must not authenticate, got %+v verified=%v", got, v4.RRSIGVerified)
 	}
 }
 

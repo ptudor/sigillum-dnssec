@@ -442,87 +442,17 @@ func rrsigWireTimeValid(sig *dns.RRSIG) bool {
 // indivisible unit, so a valid-time-but-bad signature can never let a
 // crypto-valid-but-expired signature slip through.
 func VerifyRRsetRRSIGFromResponse(rawResponse []byte, typeCovered uint16, signingKeyRecord dnspkg.DNSKEYRecord, keyTag uint16, expectedOwner string, answerOnly bool) (int, error) {
-	if len(rawResponse) == 0 {
-		return 0, fmt.Errorf("raw DNS response unavailable")
+	// A key handed in directly is the trusted key for this check; only its
+	// tag-matching signatures can verify under it, which is what the keyTag
+	// argument selected before the candidate engine took over (RA6X-007/009).
+	if signingKeyRecord.KeyTag != keyTag {
+		return 0, fmt.Errorf("signing key tag %d does not match requested RRSIG key tag %d", signingKeyRecord.KeyTag, keyTag)
 	}
-
-	var msg dns.Msg
-	if err := msg.Unpack(rawResponse); err != nil {
-		return 0, fmt.Errorf("failed to unpack DNS response: %w", err)
+	verified, err := VerifyRRsetFromResponse(rawResponse, typeCovered, []dnspkg.DNSKEYRecord{signingKeyRecord}, expectedOwner, "", answerOnly)
+	if err != nil {
+		return 0, err
 	}
-
-	// R-027: positive leaf/CNAME/DS data must come from the Answer section, never a
-	// replayed RRset placed in Authority/Additional.
-	var scan []dns.RR
-	if answerOnly {
-		scan = msg.Answer
-	} else {
-		scan = append(append(append([]dns.RR{}, msg.Answer...), msg.Ns...), msg.Extra...)
-	}
-
-	wantOwner := ""
-	if expectedOwner != "" {
-		wantOwner = dns.CanonicalName(expectedOwner)
-	}
-
-	rrsetByOwner := make(map[string][]dns.RR)
-	candidates := make([]*dns.RRSIG, 0)
-	for _, rr := range scan {
-		switch v := rr.(type) {
-		case *dns.RRSIG:
-			if v.TypeCovered == typeCovered && v.KeyTag == keyTag {
-				candidates = append(candidates, v)
-			}
-		default:
-			if rr.Header().Rrtype == typeCovered {
-				owner := dns.CanonicalName(rr.Header().Name)
-				rrsetByOwner[owner] = append(rrsetByOwner[owner], rr)
-			}
-		}
-	}
-
-	if len(candidates) == 0 {
-		return 0, fmt.Errorf("no RRSIG found in response for type %d with key tag %d", typeCovered, keyTag)
-	}
-
-	var lastErr error
-	for _, sig := range candidates {
-		owner := dns.CanonicalName(sig.Hdr.Name)
-		// R-027: the signed RRset must be at the queried owner.
-		if wantOwner != "" && owner != wantOwner {
-			lastErr = fmt.Errorf("RRSIG owner %s does not match queried owner %s", sig.Hdr.Name, expectedOwner)
-			continue
-		}
-		rrset := rrsetByOwner[owner]
-		if len(rrset) == 0 {
-			lastErr = fmt.Errorf("no RRset found for owner %s and type %d", sig.Hdr.Name, typeCovered)
-			continue
-		}
-
-		// R-028: bind the time check to THIS candidate before its crypto check.
-		if !rrsigWireTimeValid(sig) {
-			lastErr = fmt.Errorf("RRSIG (owner %s, key tag %d) outside its validity period", sig.Hdr.Name, sig.KeyTag)
-			continue
-		}
-
-		signingKey, err := reconstructDNSKEY(sig.SignerName, signingKeyRecord)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to reconstruct signing key: %w", err)
-			continue
-		}
-
-		if err := sig.Verify(signingKey, rrset); err != nil {
-			lastErr = fmt.Errorf("cryptographic RRset verification failed: %w", err)
-			continue
-		}
-
-		return len(rrset), nil
-	}
-
-	if lastErr != nil {
-		return 0, lastErr
-	}
-	return 0, fmt.Errorf("no verifiable RRSIG candidate for type %d", typeCovered)
+	return len(verified.Records), nil
 }
 
 // VerifyDenialRRSIGFromResponse performs full cryptographic verification of EVERY
@@ -548,10 +478,11 @@ func VerifyDenialRRSIGFromResponse(rawResponse []byte, typeCovered uint16, dnske
 	rrsetByOwner := make(map[string][]dns.RR)
 	sigsByOwner := make(map[string][]*dns.RRSIG)
 
-	allRRs := make([]dns.RR, 0, len(msg.Answer)+len(msg.Ns)+len(msg.Extra))
+	// Denial records live in the Authority section (or Answer for a direct
+	// NSEC/NSEC3 query); nothing in Additional is denial evidence (RA6X-007).
+	allRRs := make([]dns.RR, 0, len(msg.Answer)+len(msg.Ns))
 	allRRs = append(allRRs, msg.Answer...)
 	allRRs = append(allRRs, msg.Ns...)
-	allRRs = append(allRRs, msg.Extra...)
 
 	for _, rr := range allRRs {
 		switch v := rr.(type) {
