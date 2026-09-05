@@ -45,17 +45,18 @@ func (h *HealthChecker) Check(ctx context.Context) *HealthStatus {
 	var degraded bool
 
 	// Check root anchors availability. Readiness must reflect whether a
-	// currently-ACTIVE anchor exists, not merely that the raw set is nonempty:
-	// a set consisting only of future-dated, expired, or invalid-date anchors
-	// cannot validate the root and must fail readiness (R-039).
+	// currently-ACTIVE, PINNED anchor exists, not merely that the raw set is
+	// nonempty: a set consisting only of future-dated, expired, invalid-date or
+	// unpinned anchors cannot validate the root and must fail readiness
+	// (R-039, RA6X-008).
 	if h.anchorsStore != nil {
 		anchors := h.anchorsStore.Get()
 		switch {
 		case anchors == nil || len(anchors.Anchors) == 0:
 			status.Checks["root_anchors"] = "unavailable"
 			degraded = true
-		case len(dns.GetActiveAnchors(anchors)) == 0:
-			status.Checks["root_anchors"] = "no active anchor (all future/expired/invalid)"
+		case len(dns.GetActivePinnedAnchors(anchors)) == 0:
+			status.Checks["root_anchors"] = "no active pinned anchor (all future/expired/invalid/unpinned)"
 			degraded = true
 		default:
 			status.Checks["root_anchors"] = "available"

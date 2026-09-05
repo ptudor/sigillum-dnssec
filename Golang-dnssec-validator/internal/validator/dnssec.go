@@ -292,12 +292,21 @@ func CollectDSMatchedKeys(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKE
 }
 
 // CollectAnchorMatchedKeys returns every root DNSKEY whose computed DS digest matches
-// a trust anchor. These are the anchor-authenticated keys for the root zone; the root
-// DNSKEY RRset must be signed by one of them.
+// an authoritative PINNED trust anchor. These are the anchor-authenticated keys for
+// the root zone; the root DNSKEY RRset must be signed by one of them.
+//
+// The pinned-anchor filter is applied here, at the final trust decision, and not
+// only in VerifyRootTrustAnchor: a loaded anchor document that keeps the genuine
+// pinned anchor and adds an attacker's entry would otherwise pass the existential
+// root check and then let the attacker's key authenticate the DNSKEY RRset
+// (RA6X-008). Unpinned anchors never contribute a key.
 func CollectAnchorMatchedKeys(dnskeys []dnspkg.DNSKEYRecord, anchors []dnspkg.Anchor) []dnspkg.DNSKEYRecord {
 	matched := make([]dnspkg.DNSKEYRecord, 0)
 	seen := make(map[int]bool)
 	for _, anchor := range anchors {
+		if !dnspkg.IsPinnedRootAnchor(anchor) {
+			continue
+		}
 		for i := range dnskeys {
 			if seen[i] {
 				continue

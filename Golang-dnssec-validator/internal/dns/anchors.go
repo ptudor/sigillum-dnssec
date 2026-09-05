@@ -246,6 +246,25 @@ func LoadAnchorsWithFallback(path, url string) (*RootAnchors, error) {
 	return anchors, nil
 }
 
+// GetActivePinnedAnchors returns the anchors that may establish root trust
+// right now: currently valid (GetActiveAnchors) AND exactly matching an
+// authoritative pinned root anchor. This is the only anchor set any root
+// authentication path may consume. A loaded document is allowed to carry
+// additional unpinned entries as diagnostic data, but they can never
+// authenticate a signature, so the filter is applied at the final trust
+// decision rather than relying on the existential check at ingestion
+// (RA6X-008).
+func GetActivePinnedAnchors(anchors *RootAnchors) []Anchor {
+	active := GetActiveAnchors(anchors)
+	pinned := make([]Anchor, 0, len(active))
+	for _, a := range active {
+		if IsPinnedRootAnchor(a) {
+			pinned = append(pinned, a)
+		}
+	}
+	return pinned
+}
+
 // GetActiveAnchors returns anchors that are currently valid
 func GetActiveAnchors(anchors *RootAnchors) []Anchor {
 	if anchors == nil {
