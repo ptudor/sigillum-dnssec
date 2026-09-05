@@ -15,7 +15,12 @@ type Querier struct {
 	// It exists so a hermetic authoritative fixture on an ephemeral port can be
 	// driven through the real query/validation path (RA6X-050).
 	port string
+	// egress is consulted before every dial (RA6X-054); nil permits all.
+	egress *EgressPolicy
 }
+
+// SetEgressPolicy installs the destination policy consulted before every dial.
+func (q *Querier) SetEgressPolicy(p *EgressPolicy) { q.egress = p }
 
 // NewQuerier creates a new DNS querier
 func NewQuerier(timeout time.Duration) *Querier {
@@ -46,6 +51,12 @@ func (q *Querier) dial(server string) string {
 // is never silently treated as complete (RA6X-019). truncated reports that the
 // UDP answer was truncated (the returned message is then the TCP answer).
 func (q *Querier) exchange(ctx context.Context, server string, msg *dns.Msg) (resp *dns.Msg, rtt time.Duration, truncated bool, err error) {
+	// The egress policy is enforced here, at the single boundary every query
+	// — UDP and its TCP retry, authoritative and recursive — passes through
+	// (RA6X-054).
+	if err := q.egress.Permit(server); err != nil {
+		return nil, 0, false, err
+	}
 	client := &dns.Client{
 		Net:     "udp",
 		Timeout: q.timeout,

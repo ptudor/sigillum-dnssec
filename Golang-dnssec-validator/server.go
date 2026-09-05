@@ -28,7 +28,10 @@ type Server struct {
 	server        *http.Server
 }
 
-const nonSSEWriteTimeout = 30 * time.Second
+// nonSSEWriteTimeout is the socket write deadline armed at handler entry for
+// non-SSE routes; a completed validation result re-arms its own delivery
+// budget (RA6X-020). A variable so tests can shorten it.
+var nonSSEWriteTimeout = 30 * time.Second
 
 // NewServer creates a new HTTP server
 func NewServer(config *config.Config, anchorsStore *AnchorsStore) *Server {

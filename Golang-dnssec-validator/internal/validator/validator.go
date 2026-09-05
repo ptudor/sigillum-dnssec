@@ -70,6 +70,12 @@ func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, a
 	}
 }
 
+// SetEgressPolicy installs the outbound destination policy for every DNS
+// query the validation sends (RA6X-054).
+func (v *Validator) SetEgressPolicy(p *dnspkg.EgressPolicy) {
+	v.resolver.SetEgressPolicy(p)
+}
+
 // SetQuickMode enables quick mode (query first responding NS only)
 func (v *Validator) SetQuickMode(quick bool) {
 	v.quickMode = quick

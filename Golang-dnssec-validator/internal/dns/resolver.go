@@ -32,6 +32,16 @@ func NewResolver(timeout time.Duration, recursiveServer string) *Resolver {
 // hermetic DNS fixture listening on an ephemeral loopback port can stand in
 // for the recursive resolver and the authoritative servers it names, driving
 // the real resolution and validation code paths (RA6X-050).
+// SetEgressPolicy installs the destination policy for every query this
+// resolver sends (RA6X-054). The configured recursive resolver is always
+// trusted by the policies the service builds.
+func (r *Resolver) SetEgressPolicy(p *EgressPolicy) {
+	r.querier.SetEgressPolicy(p)
+}
+
+// RecursiveServer returns the configured recursive resolver address.
+func (r *Resolver) RecursiveServer() string { return r.recursive }
+
 func (r *Resolver) SetDefaultPort(port string) {
 	r.querier.port = port
 }

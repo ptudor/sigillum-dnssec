@@ -15,6 +15,16 @@ total_timeout_seconds = 30      # Total validation timeout
 max_concurrent = 10             # Max concurrent DNS queries
 recursive_resolver = "127.0.0.1"  # Local recursive resolver for NS lookups (never a public/ad DNS)
 
+# Outbound DNS egress policy (RA6X-054). Authoritative-server addresses come
+# from DNS data the requesting client controls, so by default only public
+# unicast destinations are dialled: loopback, link-local, private (RFC 1918,
+# ULA, CGNAT), multicast and reserved addresses are refused. The
+# recursive_resolver above is always allowed. Add CIDRs here for a private
+# diagnostic deployment that must reach internal nameservers, or set
+# allow_private_destinations = true for a deliberately internal instance.
+# private_destination_allowlist = ["10.0.0.0/8", "fd00::/8"]
+# allow_private_destinations = false
+
 # Static files and URL base path
 static_dir = "./static"
 base_path = ""                  # Base path for reverse proxy (e.g., "/dnssec")

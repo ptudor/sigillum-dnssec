@@ -68,6 +68,17 @@ type Config struct {
 	// Base path (for reverse proxy, e.g., "/dnssec")
 	BasePath string `toml:"base_path"`
 
+	// Outbound DNS egress policy (RA6X-054). The addresses of authoritative
+	// servers come from DNS data a client of the public service controls, so
+	// by default only public unicast destinations are dialled: loopback,
+	// link-local, private, CGNAT, multicast and reserved addresses are
+	// refused (the configured recursive_resolver is always allowed).
+	// private_destination_allowlist lists CIDRs that may be dialled anyway
+	// (a private diagnostic deployment); allow_private_destinations = true
+	// disables the check for a deliberately internal deployment.
+	AllowPrivateDestinations    bool     `toml:"allow_private_destinations"`
+	PrivateDestinationAllowlist []string `toml:"private_destination_allowlist"`
+
 	// Trusted proxy CIDRs for honoring X-Forwarded-For / X-Real-IP.
 	// Only requests coming from these CIDRs will have proxy headers trusted.
 	TrustedProxyCIDRs []string `toml:"trusted_proxy_cidrs"`
@@ -389,6 +400,17 @@ func (c *Config) Validate() error {
 		}
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("invalid trusted_proxy_cidrs entry %q: %w", cidr, err)
+		}
+	}
+
+	// Validate the egress allowlist CIDRs
+	for _, cidr := range c.PrivateDestinationAllowlist {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid private_destination_allowlist entry %q: %w", cidr, err)
 		}
 	}
 

@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"expvar"
+	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -123,8 +124,25 @@ func RecordValidation(status string, durationSec float64) {
 
 // RecordAPIRequest records an API request
 func RecordAPIRequest(endpoint, method, status string, durationSec float64) {
-	promAPIRequests.WithLabelValues(endpoint, method, status).Inc()
+	promAPIRequests.WithLabelValues(endpoint, NormalizeMethod(method), status).Inc()
 	promAPIRequestDuration.WithLabelValues(endpoint).Observe(durationSec)
+}
+
+// knownMethods is the fixed set of HTTP method label values. Any other token
+// a client sends as the method is recorded as "OTHER" (RA6X-021): the method
+// is a persistent Prometheus label, and an unauthenticated caller could
+// otherwise create an unbounded number of series by inventing methods.
+var knownMethods = map[string]bool{
+	http.MethodGet: true, http.MethodHead: true, http.MethodPost: true, http.MethodPut: true,
+	http.MethodDelete: true, http.MethodOptions: true, http.MethodPatch: true,
+}
+
+// NormalizeMethod maps an HTTP method to one of the known label values or "OTHER".
+func NormalizeMethod(method string) string {
+	if knownMethods[method] {
+		return method
+	}
+	return "OTHER"
 }
 
 // RecordRateLimitHit records a rate limit rejection

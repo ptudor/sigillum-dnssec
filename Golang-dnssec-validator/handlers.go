@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/ptudor/dnssec-validator/internal/metrics"
 
 	"github.com/ptudor/dnssec-validator/internal/config"
+	dnspkg "github.com/ptudor/dnssec-validator/internal/dns"
 	"github.com/ptudor/dnssec-validator/internal/rdap"
 	"github.com/ptudor/dnssec-validator/internal/validator"
 )
@@ -30,6 +32,12 @@ type Handlers struct {
 	config       *config.Config
 	rdapClient   *rdap.Client
 	activity     activityObserver // optional (R-052)
+	// egress is the outbound DNS destination policy applied to every
+	// validator the handlers build (RA6X-054).
+	egress *dnspkg.EgressPolicy
+	// validateFn runs a JSON validation; nil means the real validator. Tests
+	// replace it to control timing (RA6X-020).
+	validateFn func(ctx context.Context, domain, mode string, qtype uint16, anchors *dnspkg.RootAnchors) (*validator.ValidationResult, error)
 
 	// validationSem globally caps concurrent validations (R-086). Each extended
 	// validation fans out to every authoritative NS of every zone in the chain,
@@ -57,6 +65,7 @@ func NewHandlers(anchorsStore *AnchorsStore, config *config.Config) *Handlers {
 		config:        config,
 		rdapClient:    rdapClient,
 		validationSem: make(chan struct{}, max),
+		egress:        egressPolicyFromConfig(config),
 	}
 }
 
@@ -243,6 +252,8 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		h.config.RecursiveResolver,
 	)
 
+	v.SetEgressPolicy(h.egress)
+
 	// Set RDAP client for out-of-band DS verification
 	if h.rdapClient != nil {
 		v.SetRDAPClient(h.rdapClient)
@@ -350,34 +361,12 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create validator
-	v := validator.NewValidator(
-		h.config.QueryTimeout,
-		h.config.TotalTimeout,
-		h.config.MaxConcurrent,
-		anchors,
-		h.config.RecursiveResolver,
-	)
-
-	// Set RDAP client for out-of-band DS verification
-	if h.rdapClient != nil {
-		v.SetRDAPClient(h.rdapClient)
-	}
-
-	// Set validation mode (quick = first responding NS, extended = all NS)
-	if mode == "quick" {
-		v.SetQuickMode(true)
-	}
-
-	// Set the leaf record type to validate (R-083).
-	v.SetQueryType(qtype)
-
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), h.config.TotalTimeout)
 	defer cancel()
 
 	// Run validation
-	result, err := v.Validate(ctx, domain)
+	result, err := h.runJSONValidation(ctx, domain, mode, qtype, anchors)
 	if err != nil && result == nil {
 		LogError("handlers", err, "action", "validate_json", "request_id", requestID, "domain", domain)
 		writeProblemDetails(w, ErrTypeValidationFailed, "Validation Failed",
@@ -390,12 +379,74 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	metrics.RecordValidation(string(result.Result), float64(result.DurationMs)/1000.0)
 	LogValidation(requestID, domain, string(result.Result), result.DurationMs)
 
-	// Write JSON response
+	// Write JSON response. The socket write deadline armed at handler entry
+	// covered the whole request; validation may legitimately take longer than
+	// that (total_timeout_seconds is configurable and defaults to exactly the
+	// entry deadline), so the completed result gets its own bounded delivery
+	// budget from now (RA6X-020). A failed write is logged and counted as such,
+	// never as a delivered 200.
+	armResponseWriteDeadline(w, r)
 	setSecurityHeaders(w)
 	setNoStore(w)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		LogWarn("handlers", "failed to write validation response", "request_id", requestID, "domain", domain, "error", err.Error())
+		metrics.RecordAPIRequest("/api/validate", r.Method, "write_failed", time.Since(startTime).Seconds())
+		return
+	}
 	metrics.RecordAPIRequest("/api/validate", r.Method, "200", time.Since(startTime).Seconds())
+}
+
+// runJSONValidation builds a validator for one JSON request and runs it, or
+// delegates to the test seam.
+func (h *Handlers) runJSONValidation(ctx context.Context, domain, mode string, qtype uint16, anchors *dnspkg.RootAnchors) (*validator.ValidationResult, error) {
+	if h.validateFn != nil {
+		return h.validateFn(ctx, domain, mode, qtype, anchors)
+	}
+	v := validator.NewValidator(
+		h.config.QueryTimeout,
+		h.config.TotalTimeout,
+		h.config.MaxConcurrent,
+		anchors,
+		h.config.RecursiveResolver,
+	)
+	v.SetEgressPolicy(h.egress)
+	if h.rdapClient != nil {
+		v.SetRDAPClient(h.rdapClient)
+	}
+	if mode == "quick" {
+		v.SetQuickMode(true)
+	}
+	v.SetQueryType(qtype)
+	return v.Validate(ctx, domain)
+}
+
+// responseWriteBudget bounds the delivery of a completed non-SSE result.
+const responseWriteBudget = 10 * time.Second
+
+// armResponseWriteDeadline re-arms the socket write deadline for delivering a
+// completed result, so a slow validation cannot expire the deadline before
+// the response is written while a stalled client is still cut off.
+func armResponseWriteDeadline(w http.ResponseWriter, r *http.Request) {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(responseWriteBudget)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		LogWarn("handlers", "failed to arm response write deadline", "path", r.URL.Path, "error", err.Error())
+	}
+}
+
+// egressPolicyFromConfig builds the outbound DNS policy (RA6X-054): public
+// destinations only unless the operator allows private ones, with the
+// configured recursive resolver always trusted.
+func egressPolicyFromConfig(cfg *config.Config) *dnspkg.EgressPolicy {
+	p := dnspkg.PublicOnlyPolicy(cfg.RecursiveResolver)
+	p.AllowPrivate = cfg.AllowPrivateDestinations
+	allow, err := dnspkg.ParseEgressAllowlist(cfg.PrivateDestinationAllowlist)
+	if err != nil {
+		// Validate() rejects invalid entries at load; this is defensive.
+		LogWarn("handlers", "ignoring invalid private_destination_allowlist", "error", err.Error())
+	}
+	p.Allow = allow
+	return p
 }
 
 // HandleAnchors returns the current root trust anchors
