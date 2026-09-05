@@ -428,7 +428,9 @@ on a transient API error.
 │   ├── ptudor.com.zsk.private
 │   ├── ptudor.com.zsk.key
 │   ├── ptudor.net.ksk.private
-│   └── ptudor.net.zsk.key
+│   ├── ptudor.net.zsk.key
+│   ├── ptudor.com.ksk.12345.key      # tag-named copy of one key generation
+│   └── ptudor.com.ksk.12345.private  # (staged before activation; rollover backup)
 └── signed/                       # Flat output — NSD includes these
     ├── ptudor.com.zone.signed
     ├── ptudor.net.zone.signed
@@ -436,6 +438,20 @@ on a transient API error.
 ```
 
 Zone files can live anywhere — the path is explicit in config or provided via `dnssec-tudor add`. The hierarchical layout is a convention, not a requirement.
+
+**Key files are a two-slot transaction.** Every generation is written to its
+tag-named slot (`<domain>.<role>.<tag>.{key,private}`) first, verified by
+reloading it, and only then copied over the live slot (`<domain>.<role>.{key,private}`).
+Rollover start saves the state record naming both generations *before*
+activating the new pair, and signing checks the live pair's key tag against the
+persisted identity (`KeyState.ID`, or `Rollover.NewKeyID` for a pre-published
+ZSK), re-activating the recorded generation from its tag-named copy when they
+differ and failing closed when it cannot. The tag-named copy of the live key is
+also the rollover backup loaded by ID; it is verified (both halves, owner/role/
+algorithm, private↔public correspondence) before any live overwrite, a damaged
+private half is repaired from the live pair with the damaged file set aside as
+`*.private.invalid.N`, and a slot holding a different key is never overwritten.
+No key file is ever deleted; unverifiable material is preserved as `*.bak.N`.
 
 ## NSD Integration
 

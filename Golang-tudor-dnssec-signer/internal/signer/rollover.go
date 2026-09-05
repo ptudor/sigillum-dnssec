@@ -1,11 +1,9 @@
 package signer
 
 import (
-	"bytes"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ptudor/dnssec-tudor/internal/fsutil"
@@ -19,6 +17,16 @@ import (
 type RolloverManager struct {
 	cfg   *config.Config
 	state *statepkg.State
+	// failpoint is a test-only fault-injection seam propagated to the key
+	// generator's transaction steps (see keytx.go); nil in production.
+	failpoint func(step string) error
+}
+
+// keyGen returns a KeyGenerator sharing this manager's fault-injection seam.
+func (rm *RolloverManager) keyGen() *KeyGenerator {
+	kg := NewKeyGenerator(rm.cfg)
+	kg.failpoint = rm.failpoint
+	return kg
 }
 
 // NewRolloverManager creates a new rollover manager
@@ -29,7 +37,16 @@ func NewRolloverManager(cfg *config.Config, state *statepkg.State) *RolloverMana
 	}
 }
 
-// StartKSKRollover begins a KSK rollover for a domain
+// StartKSKRollover begins a KSK rollover for a domain.
+//
+// The rollover is one recoverable transaction (RA6X-002): the old KSK's
+// tag-named backup is verified first (RA6X-023), the replacement is staged and
+// verified at its own tag-named slot without touching the live pair, the
+// rollover record naming both generations is saved durably, and only then is
+// the new pair activated over the live slot. A failure before the save leaves
+// the old generation live with no record; a failure or crash after it is
+// repaired deterministically by the next signing run, which re-activates the
+// recorded generation from its tag-named copy.
 func (rm *RolloverManager) StartKSKRollover(domain string) error {
 	zoneState := rm.state.GetZone(domain)
 	if zoneState == nil {
@@ -47,23 +64,21 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 
 	slog.Info("[ROLLOVER] Starting KSK rollover", "domain", domain, "old_key_id", oldKSK.ID)
 
-	// Generate new KSK
-	keyGen := NewKeyGenerator(rm.cfg)
+	keyGen := rm.keyGen()
 
-	// Save old KSK to backup file. A backup failure is FATAL (R-027): the rollover-signing
-	// path and DS recovery both depend on the old KSK's backup, so proceeding without it
-	// risks an unrecoverable SERVFAIL. Abort before generating the new key.
+	// A verified backup of the old KSK is required before anything else (R-027,
+	// RA6X-023): the rollover-signing path and DS recovery both load it by ID.
 	if err := rm.BackupKey(domain, "ksk", oldKSK.ID); err != nil {
 		return fmt.Errorf("backing up old KSK before rollover: %w", err)
 	}
 
-	// Generate new KSK
-	newKSK, err := keyGen.GenerateKSK(domain)
+	// Stage the replacement; the live pair is untouched until the record below
+	// is on disk.
+	newKSK, err := keyGen.StageKSK(domain, "")
 	if err != nil {
 		return fmt.Errorf("generating new KSK: %w", err)
 	}
 
-	// Set up rollover state
 	rm.state.Mutate(func() {
 		zoneState.Rollover = &statepkg.RolloverState{
 			Type:     "ksk",
@@ -81,27 +96,34 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 
 	metrics.RecordRolloverOperation(domain, "ksk", "start")
 	if err := rm.state.Save(); err != nil {
-		if fsutil.IsCommitted(err) {
-			// The rollover record IS on disk; only its durability is uncertain.
-			// Rolling the keys back now would create the very divergence the
-			// rollback below exists to prevent (RA6X-049).
-			slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
-			return nil
+		if !fsutil.IsCommitted(err) {
+			// Nothing live has changed. Drop the in-memory record; the staged
+			// pair stays on disk (key material is never deleted) and is reused
+			// by a retry, since it is keyed by tag.
+			rm.state.Mutate(func() {
+				zoneState.KSK = oldKSK
+				zoneState.Rollover = nil
+				zoneState.ForceResign = false
+			})
+			return fmt.Errorf("saving KSK rollover state (no live key was changed; staged key %d left at %s): %w",
+				newKSK.ID, keyGen.taggedBase(domain, "ksk", newKSK.ID), err)
 		}
-		// R-038: the key files are already rotated (live = new KSK) but the state
-		// did not persist. Revert the in-memory rollover and restore the old KSK
-		// files so the next sign doesn't publish a KSK the parent DS doesn't
-		// reference (→ SERVFAIL) with no rollover record to recover from.
-		rm.state.Mutate(func() {
-			zoneState.KSK = oldKSK
-			zoneState.Rollover = nil
-			zoneState.ForceResign = false
-		})
-		if rerr := rm.restoreKeyFromBackup(domain, "ksk", oldKSK.ID); rerr != nil {
-			slog.Error("[ROLLOVER] CRITICAL: could not restore old KSK files after a failed rollover-start save; manual recovery required",
-				"domain", domain, "save_error", err, "restore_error", rerr)
-		}
-		return fmt.Errorf("saving KSK rollover state (key rotation rolled back): %w", err)
+		// The rollover record IS on disk; only its durability is uncertain
+		// (RA6X-049). Continue with activation against the visible record.
+		slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
+	}
+
+	return rm.activateRecorded(domain, keyGen, "ksk", newKSK.ID)
+}
+
+// activateRecorded activates a generation the persisted state already names as
+// live. A failure here leaves the record in place: the next signing run
+// re-activates the tag-named copy (EnsureLiveKey), so the operator is told to
+// sign rather than to retry the rollover.
+func (rm *RolloverManager) activateRecorded(domain string, keyGen *KeyGenerator, keyType string, tag uint16) error {
+	if err := keyGen.ActivateKeyPair(domain, keyType, tag); err != nil {
+		return fmt.Errorf("activating new %s %d (the rollover is recorded; run `dnssec-tudor sign` to retry activation from %s): %w",
+			strings.ToUpper(keyType), tag, keyGen.taggedBase(domain, keyType, tag), err)
 	}
 	return nil
 }
@@ -209,25 +231,24 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *statepkg.Z
 	oldZSK := zoneState.ZSK
 	slog.Info("[ROLLOVER] Starting automatic ZSK rollover", "domain", domain, "old_key_id", oldZSK.ID)
 
-	// Backup old key. Fatal on failure (R-027): the pre-publish/signing phases load the
-	// old ZSK from this backup, and a missing backup would drop it from the published
-	// DNSKEY RRset while resolvers still hold its cached RRSIGs.
+	// Verified backup of the old key first (R-027, RA6X-023): the pre-publish and
+	// signing phases load the old ZSK from it by ID.
 	if err := rm.BackupKey(domain, "zsk", oldZSK.ID); err != nil {
 		return fmt.Errorf("backing up old ZSK before rollover: %w", err)
 	}
 
-	// Generate the new ZSK with the EXISTING ZSK's algorithm, not the current
+	// Stage the new ZSK with the EXISTING ZSK's algorithm, not the current
 	// config default (R-039). If the operator changed [dnssec].algorithm after
-	// the zone was signed, GenerateZSK would mint a new ZSK in the new algorithm
+	// the zone was signed, the default would mint a new ZSK in the new algorithm
 	// while the KSK stays the old one — an unintended algorithm mismatch that
-	// must instead go through the dedicated `rollover algorithm` flow.
-	keyGen := NewKeyGenerator(rm.cfg)
-	newZSK, err := keyGen.GenerateZSKWithAlgorithm(domain, oldZSK.Algorithm)
+	// must instead go through the dedicated `rollover algorithm` flow. The live
+	// pair is untouched until the record below is on disk (RA6X-002).
+	keyGen := rm.keyGen()
+	newZSK, err := keyGen.StageZSK(domain, oldZSK.Algorithm)
 	if err != nil {
 		return fmt.Errorf("generating new ZSK: %w", err)
 	}
 
-	// Set up rollover state
 	rm.state.Mutate(func() {
 		zoneState.Rollover = &statepkg.RolloverState{
 			Type:     "zsk",
@@ -243,7 +264,21 @@ func (rm *RolloverManager) startZSKRollover(domain string, zoneState *statepkg.Z
 	})
 
 	metrics.RecordRolloverOperation(domain, "zsk", "start")
-	return rm.state.Save()
+	if err := rm.state.Save(); err != nil {
+		if !fsutil.IsCommitted(err) {
+			rm.state.Mutate(func() {
+				zoneState.Rollover = nil
+				zoneState.ForceResign = false
+			})
+			return fmt.Errorf("saving ZSK rollover state (no live key was changed; staged key %d left at %s): %w",
+				newZSK.ID, keyGen.taggedBase(domain, "zsk", newZSK.ID), err)
+		}
+		slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
+	}
+
+	// The live ZSK slot holds the NEW key during pre-publish (signing loads the
+	// old one by ID from its tag-named copy).
+	return rm.activateRecorded(domain, keyGen, "zsk", newZSK.ID)
 }
 
 // humanizeRolloverDelay renders a rollover delay for the operator-facing Action
@@ -341,8 +376,7 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *stat
 		}
 
 		slog.Info("[ROLLOVER] ZSK rollover: switching to new key", "domain", domain, "new_key_id", rollover.NewKeyID)
-		keyGen := NewKeyGenerator(rm.cfg)
-		newZSK, _, err := keyGen.LoadKeyPair(domain, "zsk")
+		newZSK, _, err := rm.keyGen().EnsureLiveKey(domain, "zsk", rollover.NewKeyID)
 		if err != nil {
 			return fmt.Errorf("loading new ZSK: %w", err)
 		}
@@ -420,63 +454,23 @@ func (rm *RolloverManager) handleZSKRolloverState(domain string, zoneState *stat
 	return nil
 }
 
+// BackupKey guarantees a complete, verified tag-named copy of the live key for
+// the role before a rollover replaces it (RA6X-023): both halves present and
+// parseable, owner/role/algorithm as expected, the private half corresponding
+// to the public one, and durably written. A missing or damaged private half is
+// repaired atomically from the verified live pair with the damaged file set
+// aside; a slot holding a different key (tag collision) is never overwritten.
+// keyID is the identity the persisted state records for the live key; a live
+// pair with any other tag is refused so a rollover never backs up — and then
+// replaces — a key the state does not name (RA6X-002).
 func (rm *RolloverManager) BackupKey(domain, keyType string, keyID uint16) error {
-	// Create backup by renaming with key ID suffix
-	keysDir := rm.cfg.KeysDir()
-	baseName := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
-	backupName := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
-
-	// Refuse to clobber an existing backup that holds DIFFERENT key material. A
-	// key-tag collision (R-029) would otherwise overwrite another key's backup
-	// under the same <type>.<tag> name, destroying the only copy of that key. An
-	// identical existing backup is fine (idempotent re-backup).
-	if existing, err := os.ReadFile(backupName + ".key"); err == nil {
-		src, err := os.ReadFile(baseName + ".key")
-		if err != nil {
-			return fmt.Errorf("reading %s key for backup: %w", keyType, err)
-		}
-		if !bytes.Equal(existing, src) {
-			return fmt.Errorf("backup %s already exists with different key material (key-tag collision?); refusing to overwrite", backupName+".key")
-		}
-		// The .key half matches — but a crash between the two copies below can
-		// leave the backup without its .private. Treating that artifact as
-		// "already backed up" would let the caller proceed to overwrite the live
-		// .private, destroying its only copy. Complete the pair from the live
-		// .private before declaring success.
-		if !FileExists(backupName + ".private") {
-			if err := fsutil.CopyFile(baseName+".private", backupName+".private"); err != nil {
-				return fmt.Errorf("completing half-written %s backup (.key present, .private missing): %w", keyType, err)
-			}
-			slog.Warn("[ROLLOVER] Completed a half-written key backup with the live private key",
-				"domain", domain, "type", keyType, "key_id", keyID, "backup", backupName)
-		}
-		return nil // already backed up with identical content
-	}
-
-	// Copy key file to backup (don't move, in case rollover fails)
-	if err := fsutil.CopyFile(baseName+".key", backupName+".key"); err != nil {
+	live, err := rm.keyGen().ensureVerifiedBackup(domain, keyType)
+	if err != nil {
 		return err
 	}
-	if err := fsutil.CopyFile(baseName+".private", backupName+".private"); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// restoreKeyFromBackup copies the tag-suffixed backup of a key back over the
-// live key files, undoing an in-place rotation. Used to roll back a rollover
-// start whose state Save failed, so state.json and the on-disk keys do not
-// diverge into a published-key-without-matching-DS SERVFAIL (R-038).
-func (rm *RolloverManager) restoreKeyFromBackup(domain, keyType string, keyID uint16) error {
-	keysDir := rm.cfg.KeysDir()
-	base := filepath.Join(keysDir, fmt.Sprintf("%s.%s", domain, keyType))
-	backup := filepath.Join(keysDir, fmt.Sprintf("%s.%s.%d", domain, keyType, keyID))
-	if err := fsutil.CopyFile(backup+".private", base+".private"); err != nil {
-		return err
-	}
-	if err := fsutil.CopyFile(backup+".key", base+".key"); err != nil {
-		return err
+	if live.KeyTag() != keyID {
+		return fmt.Errorf("live %s key for %s has key tag %d but the recorded state names key %d; refusing to roll over an unrecorded key (run `dnssec-tudor sign` to reconcile first)",
+			keyType, domain, live.KeyTag(), keyID)
 	}
 	return nil
 }
@@ -490,8 +484,14 @@ func (rm *RolloverManager) GetRolloverStatus(domain string) *statepkg.RolloverSt
 	return zoneState.Rollover
 }
 
-// StartAlgorithmRollover begins an algorithm rollover for a domain
-// This generates new KSK and ZSK with the target algorithm and signs with both
+// StartAlgorithmRollover begins an algorithm rollover for a domain: it
+// generates a new KSK and ZSK with the target algorithm and signs with both
+// algorithms until completion. Both new pairs form ONE transaction (RA6X-002):
+// each is staged and verified before the single rollover record naming all
+// four generations is saved, and neither live pair changes before that save. A
+// failure staging the ZSK after the KSK leaves the old generation live and
+// unrecorded; a failure or crash after the save is repaired by the next signing
+// run, which re-activates whichever recorded pair is not yet live.
 func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string) error {
 	zoneState := rm.state.GetZone(domain)
 	if zoneState == nil {
@@ -514,7 +514,6 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 	if oldAlgorithm == targetAlgorithm {
 		return fmt.Errorf("zone already using algorithm %s", targetAlgorithm)
 	}
-	// Capture the old key states for rollback if the state Save fails (R-038).
 	oldKSKState := zoneState.KSK
 	oldZSKState := zoneState.ZSK
 
@@ -523,35 +522,37 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 		"old_algorithm", oldAlgorithm,
 		"new_algorithm", targetAlgorithm)
 
-	// Backup old keys. Fatal on failure (R-027): an algorithm rollover must sign with both
-	// old and new algorithm keys (RFC 6840 §5.11), so losing the old keys' backup would
-	// emit a zone missing signatures for a signaled algorithm.
-	if err := rm.BackupKey(domain, "ksk", zoneState.KSK.ID); err != nil {
+	// Verified backups of both old keys first (R-027, RA6X-023): an algorithm
+	// rollover must sign with both old and new algorithm keys (RFC 6840 §5.11),
+	// so losing either old key would emit a zone missing signatures for a
+	// signaled algorithm.
+	if err := rm.BackupKey(domain, "ksk", oldKSKState.ID); err != nil {
 		return fmt.Errorf("backing up old KSK before algorithm rollover: %w", err)
 	}
-	if err := rm.BackupKey(domain, "zsk", zoneState.ZSK.ID); err != nil {
+	if err := rm.BackupKey(domain, "zsk", oldZSKState.ID); err != nil {
 		return fmt.Errorf("backing up old ZSK before algorithm rollover: %w", err)
 	}
 
-	// Generate new keys with target algorithm (using explicit algorithm to avoid race conditions)
-	keyGen := NewKeyGenerator(rm.cfg)
-	newKSK, err := keyGen.GenerateKSKWithAlgorithm(domain, targetAlgorithm)
+	// Stage both new pairs; nothing live changes until both are verified and the
+	// record is saved.
+	keyGen := rm.keyGen()
+	newKSK, err := keyGen.StageKSK(domain, targetAlgorithm)
 	if err != nil {
 		return fmt.Errorf("generating new KSK: %w", err)
 	}
-	newZSK, err := keyGen.GenerateZSKWithAlgorithm(domain, targetAlgorithm)
+	newZSK, err := keyGen.StageZSK(domain, targetAlgorithm)
 	if err != nil {
-		return fmt.Errorf("generating new ZSK: %w", err)
+		return fmt.Errorf("generating new ZSK (old keys remain live; staged KSK %d left at %s): %w",
+			newKSK.ID, keyGen.taggedBase(domain, "ksk", newKSK.ID), err)
 	}
 
-	// Set up rollover state
 	rm.state.Mutate(func() {
 		zoneState.Rollover = &statepkg.RolloverState{
 			Type:         "algorithm",
 			State:        statepkg.AlgoRolloverStateDSAddWait,
-			OldKeyID:     zoneState.KSK.ID,
+			OldKeyID:     oldKSKState.ID,
 			NewKeyID:     newKSK.ID,
-			OldZSKID:     zoneState.ZSK.ID,
+			OldZSKID:     oldZSKState.ID,
 			NewZSKID:     newZSK.ID,
 			OldAlgorithm: oldAlgorithm,
 			NewAlgorithm: targetAlgorithm,
@@ -567,34 +568,23 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 
 	metrics.RecordRolloverOperation(domain, "algorithm", "start")
 	if err := rm.state.Save(); err != nil {
-		if fsutil.IsCommitted(err) {
-			slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
-			return nil
+		if !fsutil.IsCommitted(err) {
+			rm.state.Mutate(func() {
+				zoneState.KSK = oldKSKState
+				zoneState.ZSK = oldZSKState
+				zoneState.Rollover = nil
+				zoneState.ForceResign = false
+			})
+			return fmt.Errorf("saving algorithm rollover state (no live key was changed; staged keys left at %s and %s): %w",
+				keyGen.taggedBase(domain, "ksk", newKSK.ID), keyGen.taggedBase(domain, "zsk", newZSK.ID), err)
 		}
-		// R-038: both key pairs are already rotated on disk but the state did not
-		// persist. Revert in-memory and restore the old KSK+ZSK files so the next
-		// sign doesn't publish new-algorithm keys with no rollover record (the
-		// parent DS still references the old algorithm → SERVFAIL).
-		rm.state.Mutate(func() {
-			zoneState.KSK = oldKSKState
-			zoneState.ZSK = oldZSKState
-			zoneState.Rollover = nil
-			zoneState.ForceResign = false
-		})
-		var rerr error
-		if e := rm.restoreKeyFromBackup(domain, "ksk", oldKSKState.ID); e != nil {
-			rerr = e
-		}
-		if e := rm.restoreKeyFromBackup(domain, "zsk", oldZSKState.ID); e != nil {
-			rerr = e
-		}
-		if rerr != nil {
-			slog.Error("[ROLLOVER] CRITICAL: could not restore old key files after a failed algorithm-rollover-start save; manual recovery required",
-				"domain", domain, "save_error", err, "restore_error", rerr)
-		}
-		return fmt.Errorf("saving algorithm rollover state (key rotation rolled back): %w", err)
+		slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
 	}
-	return nil
+
+	if err := rm.activateRecorded(domain, keyGen, "ksk", newKSK.ID); err != nil {
+		return err
+	}
+	return rm.activateRecorded(domain, keyGen, "zsk", newZSK.ID)
 }
 
 // CompleteAlgorithmRollover finalizes an algorithm rollover
