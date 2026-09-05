@@ -36,7 +36,16 @@
 #                                   it shows the call site's intent: this is a DS, not
 #                                   a DNSKEY-form set_dnssec request.
 #
-# Requires: bash, openssl, curl, awk, xxd or python3 (for UUID gen).
+# Requires: bash 3.2+, curl, python3 (HMAC via a protected descriptor) or
+# openssl (fallback; see hmac_b64), awk.
+#
+# Secrets never appear in child-process arguments (RA6X-055): the HMAC key is
+# handed to python3 on a private file descriptor, and the Authorization header
+# reaches curl through a config file on a private descriptor (`-K`). Shell
+# tracing is disabled around every secret-handling step so `bash -x` cannot
+# echo an expanded secret. The bytes signed are built with `printf -v`, which
+# keeps trailing newline separators that command substitution would strip
+# (RA6X-039), so GET/DELETE (empty body) sign exactly what the Go adapter signs.
 
 set -euo pipefail
 
@@ -75,9 +84,25 @@ gen_uuid() {
   fi
 }
 
-# sign STRING_TO_SIGN — emits base64(HMAC-SHA256(secret, stdin)).
+# hmac_b64 STRING_TO_SIGN — emits base64(HMAC-SHA256(secret, STRING_TO_SIGN)).
+# The secret is passed to python3 on file descriptor 3 (a pipe from process
+# substitution), never as an argument. openssl's `dgst -hmac` can only take the
+# key as an argument, so it is used only when python3 is absent, with a warning
+# about the exposure. The message is written on stdin so trailing newline bytes
+# survive intact.
 hmac_b64() {
-  printf '%s' "$1" | openssl dgst -sha256 -hmac "$API_SECRET" -binary | openssl base64 -A
+  { set +x; } 2>/dev/null
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c '
+import base64, hashlib, hmac, os, sys
+secret = os.fdopen(3, "rb").read()
+msg = sys.stdin.buffer.read()
+sys.stdout.write(base64.b64encode(hmac.new(secret, msg, hashlib.sha256).digest()).decode())
+' 3< <(printf '%s' "$API_SECRET")
+  else
+    echo "warning: python3 not found; falling back to openssl, which exposes the HMAC secret in its process arguments" >&2
+    printf '%s' "$1" | openssl dgst -sha256 -hmac "$API_SECRET" -binary | openssl base64 -A
+  fi
 }
 
 # build_body_put KEY_TAG ALG DIGEST_TYPE DIGEST  — selects shape by $VARIANT.
@@ -134,9 +159,13 @@ call() {
     req_id="$(gen_uuid)"
   fi
 
-  # The Go adapter uses fullPathAndQuery here; for /dnssec there is no query.
+  # The Go adapter signs apiKey "\n" fullPathAndQuery "\n" requestID "\n" body
+  # (for /dnssec there is no query). Built with printf -v: command substitution
+  # would strip the trailing newline separators of an empty request ID and an
+  # empty body, so GET/DELETE would sign different bytes than the adapter
+  # (RA6X-039).
   local string_to_sign
-  string_to_sign=$(printf '%s\n%s\n%s\n%s' "$API_KEY" "$path" "$req_id" "$body")
+  printf -v string_to_sign '%s\n%s\n%s\n%s' "$API_KEY" "$path" "$req_id" "$body"
   local sig
   sig=$(hmac_b64 "$string_to_sign")
 
@@ -152,17 +181,18 @@ call() {
   # to paste into a bug report. The real key still goes into the HMAC above and
   # the Authorization header below.
   local redacted_sts
-  redacted_sts=$(printf '%s\n%s\n%s\n%s' "<api_key>" "$path" "$req_id" "$body")
-  echo "string_to_sign (api key redacted; each newline shown as \\n):"
+  printf -v redacted_sts '%s\n%s\n%s\n%s' "<api_key>" "$path" "$req_id" "$body"
+  echo "string_to_sign (api key redacted; each newline shown as \\n, exactly the bytes signed):"
   printf '  %s\n' "${redacted_sts//$'\n'/\\n}"
   echo "signature:  $sig"
   echo
 
+  # The Authorization header goes to curl through a config file on a private
+  # descriptor rather than an argument (RA6X-055); everything else is plain argv.
   local -a curl_args=(
     -sS -i
     -X "$method"
     -H "Accept: application/json"
-    -H "Authorization: Bearer $API_KEY"
     -H "X-Signature: $sig"
     -H "User-Agent: dynadot-probe/1.0"
   )
@@ -174,7 +204,8 @@ call() {
   fi
 
   echo "----- response -----"
-  curl "${curl_args[@]}" "$HOST$path"
+  { set +x; } 2>/dev/null
+  curl -K <(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY") "${curl_args[@]}" "$HOST$path"
   echo
   echo
 }
