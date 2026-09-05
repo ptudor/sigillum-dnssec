@@ -72,9 +72,13 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 		return fmt.Errorf("backing up old KSK before rollover: %w", err)
 	}
 
-	// Stage the replacement; the live pair is untouched until the record below
-	// is on disk.
-	newKSK, err := keyGen.StageKSK(domain, "")
+	// Stage the replacement with the EXISTING KSK's algorithm (RA6X-001), not
+	// the current config default: an ordinary KSK rollover must never change
+	// the zone's algorithm, or the retired old KSK leaves data signed only by
+	// the old-algorithm ZSK behind a new-algorithm DS (RFC 6840 §5.11). Only
+	// the explicit `rollover algorithm` flow introduces another algorithm. The
+	// live pair is untouched until the record below is on disk.
+	newKSK, err := keyGen.StageKSK(domain, oldKSK.Algorithm)
 	if err != nil {
 		return fmt.Errorf("generating new KSK: %w", err)
 	}
