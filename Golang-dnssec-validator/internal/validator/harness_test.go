@@ -70,9 +70,11 @@ func newMockDNS(t *testing.T) *mockDNS {
 			resp = new(dns.Msg)
 			resp.SetReply(req)
 		} else {
+			// SetReply fixes up the header fields but also resets Rcode to
+			// NOERROR; keep the handler's rcode and sections.
+			rcode := resp.Rcode
 			resp.SetReply(req)
-			// SetReply resets the section slices only when they are nil; keep
-			// the handler's answer and just fix up the header fields.
+			resp.Rcode = rcode
 		}
 		resp.Authoritative = true
 		if opt := req.IsEdns0(); opt != nil {

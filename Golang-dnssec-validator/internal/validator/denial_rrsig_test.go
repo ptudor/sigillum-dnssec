@@ -151,10 +151,10 @@ func TestVerifyDenialRRSIGFromResponse_EmptyAndMalformed(t *testing.T) {
 }
 
 func TestVerifyNSECDenialWithRRSIG_VerifiesSignature(t *testing.T) {
-	raw, key, nsec, rrsig := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "zzz.example.com.")
+	raw, key, nsec, _ := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "zzz.example.com.")
 
 	proof := VerifyNSECDenialWithRRSIG("nonexistent.example.com.", miekgdns.TypeA,
-		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, "example.com.", raw, 3)
+		[]dnspkg.NSECRecord{nsec}, []dnspkg.DNSKEYRecord{key}, "example.com.", raw, 3)
 
 	if !proof.Verified {
 		t.Fatalf("expected a genuine denial proof to verify, got error: %q", proof.Error)
@@ -165,10 +165,10 @@ func TestVerifyNSECDenialWithRRSIG_RejectsForgedSignature(t *testing.T) {
 	// The served NSEC (next=yyy) still covers the qname for the range proof, but its
 	// signature is over a different record (next=zzz). The old code reported this as
 	// verified on key-tag + timestamp alone; it must now be rejected.
-	raw, key, nsec, rrsig := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "yyy.example.com.")
+	raw, key, nsec, _ := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "yyy.example.com.")
 
 	proof := VerifyNSECDenialWithRRSIG("nonexistent.example.com.", miekgdns.TypeA,
-		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, "example.com.", raw, 3)
+		[]dnspkg.NSECRecord{nsec}, []dnspkg.DNSKEYRecord{key}, "example.com.", raw, 3)
 
 	if proof.Verified {
 		t.Fatal("forged NSEC signature was incorrectly reported as cryptographically verified")
@@ -179,11 +179,11 @@ func TestVerifyNSECDenialWithRRSIG_RejectsForgedSignature(t *testing.T) {
 }
 
 func TestVerifyNSECDenialWithRRSIG_RequiresRawResponse(t *testing.T) {
-	_, key, nsec, rrsig := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "zzz.example.com.")
+	_, key, nsec, _ := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "zzz.example.com.")
 
 	// No raw response means the signature cannot be checked; the proof must not verify.
 	proof := VerifyNSECDenialWithRRSIG("nonexistent.example.com.", miekgdns.TypeA,
-		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, "example.com.", nil, 3)
+		[]dnspkg.NSECRecord{nsec}, []dnspkg.DNSKEYRecord{key}, "example.com.", nil, 3)
 
 	if proof.Verified {
 		t.Fatal("denial proof reported verified without a raw response to check the signature")
@@ -200,19 +200,11 @@ func TestVerifyNSEC3DenialWithRRSIG_RequiresRawResponse(t *testing.T) {
 		Algorithm:   1,
 		TypeBitmap:  []string{"A"},
 	}
-	rrsig := dnspkg.RRSIGRecord{
-		TypeCovered: 50,
-		KeyTag:      123,
-		SignerName:  "example.com.",
-		Inception:   time.Now().Add(-time.Hour),
-		Expiration:  time.Now().Add(time.Hour),
-		IsValid:     true,
-	}
 	key := dnspkg.DNSKEYRecord{Flags: 256, Protocol: 3, Algorithm: 13, KeyTag: 123, PublicKey: "AAAAAAAA", IsZSK: true}
 
 	// Fail closed: with no raw response, NSEC3 denial cannot be cryptographically proven.
 	proof := VerifyNSEC3DenialWithRRSIG("x.example.com.", miekgdns.TypeA,
-		[]dnspkg.NSEC3Record{nsec3}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, "example.com.", nil, 3)
+		[]dnspkg.NSEC3Record{nsec3}, []dnspkg.DNSKEYRecord{key}, "example.com.", nil, 3)
 
 	if proof.Verified {
 		t.Fatal("NSEC3 denial reported verified without a raw response to check the signature")
