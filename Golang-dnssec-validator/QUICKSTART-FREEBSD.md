@@ -6,15 +6,21 @@ Deploy the DNSSEC validator at `/dnssec/` on www.any53.com and internet.any53.co
 
 ```sh
 cd /path/to/Golang-dnssec-validator
-make build-freebsd
+make build-freebsd          # writes build/dnssec-validator-freebsd-amd64
 ```
 
-## 2. Install Binary and Wrapper
+## 2. Install Binary
+
+Install the artifact the build just produced (not a stale `dnssec-validator`
+that may sit in the checkout) under the name the rc.d script runs:
 
 ```sh
-install -m 755 dnssec-validator /usr/local/sbin/
-install -m 755 freebsd/dnssec-validator.sh /usr/local/sbin/
+install -m 755 build/dnssec-validator-freebsd-amd64 /usr/local/sbin/dnssec-validator
+file /usr/local/sbin/dnssec-validator        # ELF 64-bit ... FreeBSD, i.e. the artifact just built
 ```
+
+No wrapper script is needed: the rc.d script drops privileges itself and the
+binary reads its TOML configuration directly.
 
 ## 3. Create Service User
 
@@ -23,28 +29,36 @@ pw useradd dnssec-validator -c "DNSSEC Validator Service" -d /nonexistent -s /us
 install -d -o dnssec-validator /var/log/tudordns
 ```
 
-## 4. Create Environment File
+## 4. Create the Configuration File
+
+The binary auto-discovers `/usr/local/etc/tudordns/dnssec-validator.toml`
+(the rc.d script passes nothing else). Start from the shipped example and
+keep the listener on loopback — Apache proxies to it in step 6:
 
 ```sh
 mkdir -p /usr/local/etc/tudordns
-cat > /usr/local/etc/tudordns/dnssec-validator.env << 'EOF'
-LISTEN_ADDR=127.0.0.1:8791
-ROOT_ANCHORS_PATH=/var/www/internet.any53.com/dns/anchors/root-anchors.json
-ROOT_ANCHORS_URL=https://internet.any53.com/dns/anchors/root-anchors.json
-QUERY_TIMEOUT_SECONDS=5
-TOTAL_TIMEOUT_SECONDS=30
-MAX_CONCURRENT=10
-RATE_LIMIT_PER_SEC=10
-RATE_LIMIT_BURST=30
-LOG_LEVEL=info
-LOG_FORMAT=json
-LOG_FILE=/var/log/tudordns/dnssec-validator.log
-SHUTDOWN_TIMEOUT_SECONDS=30
-EOF
-
-chown root:dnssec-validator /usr/local/etc/tudordns/dnssec-validator.env
-chmod 640 /usr/local/etc/tudordns/dnssec-validator.env
+install -m 640 -o root -g dnssec-validator dnssec-validator.toml.example \
+  /usr/local/etc/tudordns/dnssec-validator.toml
 ```
+
+Then set at least these keys in the installed file:
+
+```toml
+listen_addr = "127.0.0.1:8791"
+root_anchors_path = "/var/www/internet.any53.com/dns/anchors/root-anchors.json"
+root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
+recursive_resolver = "127.0.0.1"
+
+[logging]
+format = "json"
+level = "info"
+file = "/var/log/tudordns/dnssec-validator.log"
+```
+
+The file is decoded strictly: a misspelled or unknown key is a startup
+error, reported in the log named above (and on stderr when the binary is
+run by hand with `-config /usr/local/etc/tudordns/dnssec-validator.toml`),
+so check the log after the first start in step 5.
 
 ## 5. Install rc.d Script
 
@@ -60,10 +74,10 @@ echo 'dnssec_validator_enable="YES"' >> /etc/rc.conf
 
 ## 6. Apache Configuration
 
-Copy the include file:
+Install the include file under the basename the `Include` line below uses:
 
 ```sh
-install -m 644 freebsd/apache-dnssec-validator.conf /usr/local/etc/apache24/Includes/
+install -m 644 freebsd/apache-dnssec-validator.conf /usr/local/etc/apache24/Includes/dnssec-validator.conf
 ```
 
 Include in your VirtualHost (add to existing www.any53.com and internet.any53.com configs):
@@ -109,11 +123,10 @@ open https://www.any53.com/dnssec/
 
 | File | Destination |
 |------|-------------|
-| `dnssec-validator` | `/usr/local/sbin/dnssec-validator` |
-| `freebsd/dnssec-validator.sh` | `/usr/local/sbin/dnssec-validator.sh` |
+| `build/dnssec-validator-freebsd-amd64` | `/usr/local/sbin/dnssec-validator` |
 | `freebsd/dnssec_validator` | `/usr/local/etc/rc.d/dnssec_validator` |
 | `freebsd/apache-dnssec-validator.conf` | `/usr/local/etc/apache24/Includes/dnssec-validator.conf` |
-| `.env` | `/usr/local/etc/tudordns/dnssec-validator.env` |
+| `dnssec-validator.toml.example` | `/usr/local/etc/tudordns/dnssec-validator.toml` |
 
 ## Logs
 

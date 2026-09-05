@@ -636,13 +636,22 @@ go test ./...
 ./dnssec-tudor sign --config ./testdata/config.toml && ./dnssec-tudor status
 ```
 
-## Future Considerations (Out of Scope for v1)
+## Out of Scope
 
-- Algorithm rollover (e.g., ED25519 to ECDSA fallback, or future post-quantum)
+Implemented since the original scope note, and therefore no longer "future":
+algorithm rollover (`rollover algorithm`, conservative RFC 6781 §4.1.4
+sequence), the Prometheus/expvar metrics endpoint, registrar DS automation.
+Still out of scope:
+
 - CDS/CDNSKEY automatic DS publishing
-- Prometheus metrics endpoint
 - Multiple signing keys per algorithm
 - TSIG for zone transfers
+- NSEC3 opt-out
+
+Historical review documents in this repository (`RFC_COMPLIANCE_REVIEW.md`,
+`REVIEW_53.md`, the `REVIEW_*`/`FIXES_*` ledgers) are dated records, not
+pending instructions; the current contract is the code and the tests named
+after each finding.
 
 ## References
 

@@ -1,5 +1,15 @@
 # RFC Compliance Fixes — Implementation Guide
 
+> **Historical document — superseded (2026-09-05).** This was the implementation
+> guide for the 2026-01 compliance pass and is kept as a record. Several of its
+> prescriptions no longer describe the code and must not be re-applied:
+> Task #2's per-algorithm DS rule below was replaced by RFC 6840 §5.11's
+> *any valid path* behaviour (`ValidateChainLink`), and the denial-of-existence
+> checks it sketches were replaced by the full NSEC/NSEC3 proofs in
+> `internal/validator/nsec.go`. The current contract is the code plus its
+> regression tests (`internal/validator/*_test.go`, the `RA6X-*` cases in
+> particular) and the review ledger under `review/2026/09/`.
+
 ## Task #1: Add Clock Skew Tolerance (RFC 4035 §5.3.1)
 
 **Priority:** P0 — Critical (causes false validation failures)
@@ -67,6 +77,9 @@ func ValidateChainLink(parentDS []dnspkg.DSRecord, childDNSKEY []dnspkg.DNSKEYRe
         algorithmDS[ds.Algorithm] = append(algorithmDS[ds.Algorithm], ds)
     }
 
+    // SUPERSEDED: RFC 6840 §5.11 requires validators to accept ANY one valid
+    // DS→DNSKEY path; the current ValidateChainLink does exactly that. The
+    // per-algorithm loop below is the obsolete prescription, kept for history.
     // RFC 6840 §5.11: Each algorithm present MUST have at least one valid DS→DNSKEY chain
     var validatedAlgorithms []uint8
     var firstValidKSK *dnspkg.DNSKEYRecord
