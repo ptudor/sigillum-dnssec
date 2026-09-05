@@ -41,6 +41,24 @@ func (q *Querier) dial(server string) string {
 	return net.JoinHostPort(server, port)
 }
 
+// exchange is the shared transport for every query this package sends: UDP
+// first, retried over TCP when the UDP answer is truncated, so a large answer
+// is never silently treated as complete (RA6X-019). truncated reports that the
+// UDP answer was truncated (the returned message is then the TCP answer).
+func (q *Querier) exchange(ctx context.Context, server string, msg *dns.Msg) (resp *dns.Msg, rtt time.Duration, truncated bool, err error) {
+	client := &dns.Client{
+		Net:     "udp",
+		Timeout: q.timeout,
+	}
+	resp, rtt, err = client.ExchangeContext(ctx, msg, q.dial(server))
+	if err == nil && resp.Truncated {
+		truncated = true
+		client.Net = "tcp"
+		resp, rtt, err = client.ExchangeContext(ctx, msg, q.dial(server))
+	}
+	return resp, rtt, truncated, err
+}
+
 // Query performs a DNS query to the specified server
 func (q *Querier) Query(ctx context.Context, server, qname string, qtype uint16) (*QueryResult, error) {
 	return q.QueryWithRecursion(ctx, server, qname, qtype, false)
@@ -64,23 +82,9 @@ func (q *Querier) QueryWithRecursion(ctx context.Context, server, qname string, 
 	// Authoritative queries (recurse=false) ignore CD, so scope it to recursion.
 	msg.CheckingDisabled = recurse
 
-	// Create client
-	client := &dns.Client{
-		Net:     "udp",
-		Timeout: q.timeout,
-	}
-
-	// Try UDP first
-	resp, rtt, err := client.ExchangeContext(ctx, msg, q.dial(server))
+	resp, rtt, truncated, err := q.exchange(ctx, server, msg)
 	result.RTT = rtt
-
-	// If truncated, retry with TCP
-	if err == nil && resp.Truncated {
-		result.Truncated = true
-		client.Net = "tcp"
-		resp, rtt, err = client.ExchangeContext(ctx, msg, q.dial(server))
-		result.RTT = rtt
-	}
+	result.Truncated = truncated
 
 	if err != nil {
 		result.Error = err.Error()

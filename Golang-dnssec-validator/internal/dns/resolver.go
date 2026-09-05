@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -35,7 +36,13 @@ func (r *Resolver) SetDefaultPort(port string) {
 	r.querier.port = port
 }
 
-// exchangeRecursive sends a query to the configured recursive resolver.
+// maxAliasHops bounds CNAME following inside one recursive answer when
+// collecting a nameserver host's addresses.
+const maxAliasHops = 8
+
+// exchangeRecursive sends an infrastructure query to the configured recursive
+// resolver over the shared transport: UDP first, retried over TCP when the
+// answer is truncated (RA6X-019), with EDNS0 so large NS/address sets fit.
 //
 // The CD (checking-disabled) bit is always set. These lookups are infrastructure
 // queries — "which nameservers serve this zone, and at what addresses" — whose
@@ -51,75 +58,134 @@ func (r *Resolver) exchangeRecursive(ctx context.Context, qname string, qtype ui
 	msg.SetQuestion(dns.Fqdn(qname), qtype)
 	msg.RecursionDesired = true
 	msg.CheckingDisabled = true
+	msg.SetEdns0(4096, false)
 
-	client := &dns.Client{
-		Net:     "udp",
-		Timeout: r.querier.timeout,
+	resp, _, _, err := r.querier.exchange(ctx, r.recursive, msg)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s lookup at %s: %w", qname, TypeName(qtype), r.recursive, err)
 	}
-
-	resp, _, err := client.ExchangeContext(ctx, msg, r.querier.dial(r.recursive))
-	return resp, err
+	return resp, nil
 }
 
-// ResolveNS resolves the NS records for a zone using a recursive resolver
+// recordsOwnedBy returns the records of rrtype in rrs owned by owner.
+func recordsOwnedBy(rrs []dns.RR, owner string, rrtype uint16) []dns.RR {
+	want := dns.CanonicalName(owner)
+	out := make([]dns.RR, 0)
+	for _, rr := range rrs {
+		if rr.Header().Rrtype == rrtype && dns.CanonicalName(rr.Header().Name) == want {
+			out = append(out, rr)
+		}
+	}
+	return out
+}
+
+// ResolveNS resolves the NS records for a zone using a recursive resolver.
+//
+// Only NS records owned by the requested zone are accepted (RA6X-019): an NS
+// RRset reached through an alias or owned by another name says nothing about
+// this zone. Records in the Answer section are preferred; a delegation
+// returned in the Authority section for the same owner is accepted when the
+// Answer holds none. A non-success RCODE other than NXDOMAIN is an error, and
+// NXDOMAIN yields no nameservers.
 func (r *Resolver) ResolveNS(ctx context.Context, zone string) ([]NSRecord, error) {
-	// Query NS records from a recursive resolver
 	resp, err := r.exchangeRecursive(ctx, zone, dns.TypeNS)
 	if err != nil {
 		return nil, err
 	}
+	switch resp.Rcode {
+	case dns.RcodeSuccess:
+	case dns.RcodeNameError:
+		return nil, nil // the zone does not exist
+	default:
+		return nil, fmt.Errorf("%s NS lookup: recursive resolver answered %s", zone, RCodeName(resp.Rcode))
+	}
 
 	var nsRecords []NSRecord
-	for _, rr := range resp.Answer {
-		if ns, ok := rr.(*dns.NS); ok {
-			nsRecords = append(nsRecords, NSRecord{
-				Name: ns.Ns,
-			})
-		}
+	for _, rr := range recordsOwnedBy(resp.Answer, zone, dns.TypeNS) {
+		nsRecords = append(nsRecords, NSFromRR(rr.(*dns.NS), SectionAnswer))
 	}
-
-	// If no NS in answer, check authority section (for delegation)
 	if len(nsRecords) == 0 {
-		for _, rr := range resp.Ns {
-			if ns, ok := rr.(*dns.NS); ok {
-				nsRecords = append(nsRecords, NSRecord{
-					Name: ns.Ns,
-				})
-			}
+		for _, rr := range recordsOwnedBy(resp.Ns, zone, dns.TypeNS) {
+			nsRecords = append(nsRecords, NSFromRR(rr.(*dns.NS), SectionAuthority))
 		}
 	}
-
 	return nsRecords, nil
 }
 
-// ResolveAddresses resolves both A and AAAA records for a hostname
-func (r *Resolver) ResolveAddresses(ctx context.Context, hostname string) ([]net.IP, error) {
-	var addresses []net.IP
-
-	// Query A records
-	respA, err := r.exchangeRecursive(ctx, hostname, dns.TypeA)
-	if err == nil && respA.Rcode == dns.RcodeSuccess {
-		for _, rr := range respA.Answer {
-			if a, ok := rr.(*dns.A); ok {
-				addresses = append(addresses, a.A)
+// answerAddresses collects the A or AAAA records that answer host in msg,
+// following CNAMEs inside the Answer section from host (bounded), since a
+// nameserver host that is an alias is answered with the target's addresses.
+func answerAddresses(msg *dns.Msg, host string, rrtype uint16) []net.IP {
+	owner := dns.CanonicalName(host)
+	for hop := 0; hop < maxAliasHops; hop++ {
+		next := ""
+		for _, rr := range msg.Answer {
+			if c, ok := rr.(*dns.CNAME); ok && dns.CanonicalName(c.Hdr.Name) == owner {
+				next = dns.CanonicalName(c.Target)
+				break
 			}
 		}
+		if next == "" || next == owner {
+			break
+		}
+		owner = next
 	}
-
-	// Query AAAA records
-	respAAAA, err := r.exchangeRecursive(ctx, hostname, dns.TypeAAAA)
-	if err == nil && respAAAA.Rcode == dns.RcodeSuccess {
-		for _, rr := range respAAAA.Answer {
-			if aaaa, ok := rr.(*dns.AAAA); ok {
-				addresses = append(addresses, aaaa.AAAA)
-			}
+	var addrs []net.IP
+	for _, rr := range recordsOwnedBy(msg.Answer, owner, rrtype) {
+		switch v := rr.(type) {
+		case *dns.A:
+			addrs = append(addrs, v.A)
+		case *dns.AAAA:
+			addrs = append(addrs, v.AAAA)
 		}
 	}
-
-	return addresses, nil
+	return addrs
 }
 
-// ResolveNSWithAddresses resolves NS records and their addresses
+// ResolveAddressesDetailed resolves both A and AAAA records for a hostname.
+// A family that fails (transport error or a non-success RCODE other than
+// NXDOMAIN) is reported in problems while the other family's addresses are
+// still returned; err is set only when no family succeeded (RA6X-019). An
+// empty NOERROR or NXDOMAIN answer for a family is simply no address.
+func (r *Resolver) ResolveAddressesDetailed(ctx context.Context, hostname string) (addresses []net.IP, problems []string, err error) {
+	families := []struct {
+		name  string
+		qtype uint16
+	}{{"A", dns.TypeA}, {"AAAA", dns.TypeAAAA}}
+
+	failed := 0
+	for _, fam := range families {
+		resp, ferr := r.exchangeRecursive(ctx, hostname, fam.qtype)
+		if ferr != nil {
+			problems = append(problems, fmt.Sprintf("%s lookup failed: %v", fam.name, ferr))
+			failed++
+			continue
+		}
+		switch resp.Rcode {
+		case dns.RcodeSuccess:
+			addresses = append(addresses, answerAddresses(resp, hostname, fam.qtype)...)
+		case dns.RcodeNameError:
+			// The host does not exist: no addresses in either family.
+		default:
+			problems = append(problems, fmt.Sprintf("%s lookup: recursive resolver answered %s", fam.name, RCodeName(resp.Rcode)))
+			failed++
+		}
+	}
+	if failed == len(families) {
+		return nil, problems, fmt.Errorf("address lookup for %s failed: %s", hostname, strings.Join(problems, "; "))
+	}
+	return addresses, problems, nil
+}
+
+// ResolveAddresses resolves both A and AAAA records for a hostname. It fails
+// only when neither family could be looked up.
+func (r *Resolver) ResolveAddresses(ctx context.Context, hostname string) ([]net.IP, error) {
+	addrs, _, err := r.ResolveAddressesDetailed(ctx, hostname)
+	return addrs, err
+}
+
+// ResolveNSWithAddresses resolves NS records and their addresses. Per-host
+// lookup problems are carried on each NSRecord so callers can surface them.
 func (r *Resolver) ResolveNSWithAddresses(ctx context.Context, zone string) ([]NSRecord, error) {
 	nsRecords, err := r.ResolveNS(ctx, zone)
 	if err != nil {
@@ -128,9 +194,11 @@ func (r *Resolver) ResolveNSWithAddresses(ctx context.Context, zone string) ([]N
 
 	// Resolve addresses for each NS
 	for i := range nsRecords {
-		addrs, err := r.ResolveAddresses(ctx, nsRecords[i].Name)
-		if err == nil {
-			nsRecords[i].Addresses = addrs
+		addrs, problems, err := r.ResolveAddressesDetailed(ctx, nsRecords[i].Name)
+		nsRecords[i].Addresses = addrs
+		nsRecords[i].LookupErrors = problems
+		if err != nil && len(problems) == 0 {
+			nsRecords[i].LookupErrors = []string{err.Error()}
 		}
 	}
 
@@ -183,9 +251,11 @@ func (r *Resolver) QueryRecordRecursive(ctx context.Context, name string, qtype 
 }
 
 // CheckZoneCut checks if a domain is a zone cut (has NS records)
-// Returns true if the domain has its own NS records (is a delegation point)
+// Returns true if the domain has its own NS records (is a delegation point).
+// Only an NS RRset owned by the domain itself counts (RA6X-019); NS records
+// reached through an alias or in the Authority section are a referral to, or
+// the apex of, some other zone.
 func (r *Resolver) CheckZoneCut(ctx context.Context, domain string) (bool, error) {
-	// Query NS records for the domain
 	resp, err := r.exchangeRecursive(ctx, domain, dns.TypeNS)
 	if err != nil {
 		return false, err
@@ -198,16 +268,11 @@ func (r *Resolver) CheckZoneCut(ctx context.Context, domain string) (bool, error
 	if resp.Rcode == dns.RcodeServerFailure {
 		return true, nil
 	}
-
-	// Check if we got NS records in the answer section
-	// (not just in the authority section which would be a referral)
-	for _, rr := range resp.Answer {
-		if _, ok := rr.(*dns.NS); ok {
-			return true, nil
-		}
+	if resp.Rcode != dns.RcodeSuccess {
+		return false, nil
 	}
 
-	return false, nil
+	return len(recordsOwnedBy(resp.Answer, domain, dns.TypeNS)) > 0, nil
 }
 
 // DiscoverZoneCuts discovers actual zone cuts between root and domain
@@ -238,6 +303,11 @@ func (r *Resolver) DiscoverZoneCuts(ctx context.Context, domain string) ([]strin
 
 		isZone, err := r.CheckZoneCut(ctx, candidate)
 		if err != nil {
+			// A cancelled or expired context is not a zone-cut observation; stop
+			// so the caller reports the interruption rather than a guessed chain.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			// On error, assume it might be a zone (fail-safe)
 			zones = append(zones, candidate)
 			continue
