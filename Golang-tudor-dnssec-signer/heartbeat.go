@@ -62,9 +62,32 @@ func NewHeartbeatClient(cfg *config.HeartbeatConfig) *HeartbeatClient {
 		cancel: cancel,
 		events: make(chan string, heartbeatEventQueueSize),
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:       10 * time.Second,
+			CheckRedirect: heartbeatRedirectPolicy,
 		},
 	}
+}
+
+// heartbeatRedirectPolicy is the redirect policy for the credential-bearing
+// heartbeat POST (RA6X-037). The API key travels in the form body, which a
+// 307/308 replays to the redirect target, so a redirect may only stay on the
+// configured origin (same scheme, host and port) and may never downgrade
+// HTTPS to another scheme; the count is bounded. The explicit allow_insecure
+// development override only permits an initial http:// URL — it does not
+// relax the same-origin rule. Neither the key nor the URL is logged. This is
+// the same policy the sibling validator's heartbeat client applies.
+func heartbeatRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	orig := via[0].URL
+	if orig.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing heartbeat redirect from %s to %s scheme (a downgrade would leak the api_key)", orig.Scheme, req.URL.Scheme)
+	}
+	if !strings.EqualFold(req.URL.Scheme, orig.Scheme) || !strings.EqualFold(req.URL.Host, orig.Host) {
+		return fmt.Errorf("refusing cross-origin heartbeat redirect (the api_key must not be replayed to another origin)")
+	}
+	return nil
 }
 
 // enqueue queues a per-event heartbeat for asynchronous delivery so the signing
