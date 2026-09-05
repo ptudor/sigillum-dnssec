@@ -1,12 +1,14 @@
 package main
 
 import (
+	"github.com/miekg/dns"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+	"github.com/ptudor/dnssec-tudor/internal/validate"
 
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
@@ -71,8 +73,9 @@ func TestZSKRollover_PhaseGating(t *testing.T) {
 		t.Fatalf("must NOT advance before the pre-published set was signed; state=%q (R-011)", got)
 	}
 
-	// Now the zone was signed in-phase and the TTL floor has elapsed.
-	state.GetZone(domain).LastSigned = time.Now().UTC().Add(-10 * time.Second)
+	// Now the zone was signed in-phase, CONFIRMED served (RA6X-004), and the
+	// TTL floor has elapsed.
+	markPublished(state.GetZone(domain), time.Now().UTC().Add(-10*time.Second))
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover (2): %v", err)
 	}
@@ -158,8 +161,23 @@ func TestVerifyNewKSKDSAtParent_UnreachableIsNotPresent(t *testing.T) {
 	cfg.Validation.Resolver = "192.0.2.1:53"
 	cfg.Validation.Timeout = config.Duration{Duration: 500 * time.Millisecond}
 
-	present, _ := verifyNewKSKDSAtParent(cfg, state, domain)
-	if present {
-		t.Error("an unconfirmable parent DS must report not-present so completion refuses (R-037)")
+	v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
+	kg := signerpkg.NewKeyGenerator(cfg)
+	ksk, err := kg.LoadPublicKey(domain, "ksk")
+	if err != nil {
+		t.Fatal(err)
 	}
+	obs, err := v.ProbeParentDS(domain, []*dns.DNSKEY{ksk})
+	if err == nil && obs.PresentOnAll[ksk.KeyTag()] {
+		t.Error("an unconfirmable parent DS must not report present so completion refuses (R-037)")
+	}
+}
+
+// markPublished records that the generation signed at t was confirmed served
+// at t (RA6X-004): rollover gates key on confirmed publication.
+func markPublished(zs *statepkg.ZoneState, t time.Time) {
+	zs.LastSigned = t
+	zs.PublishedAt = t
+	zs.PublishedGenerationSignedAt = t
+	zs.PendingPublication = false
 }

@@ -37,9 +37,10 @@ func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 		OldKeyID: zs.ZSK.ID, NewKeyID: zs.ZSK.ID,
 		Started: now.Add(-3 * time.Hour),
 	}
-	// The pre-published key set was first signed 50 minutes into the phase.
+	// The pre-published key set was first signed — and confirmed served — 50
+	// minutes into the phase.
 	firstSign := now.Add(-50 * time.Minute)
-	zs.LastSigned = firstSign
+	markPublished(zs, firstSign)
 
 	// First check observing the in-phase sign: the publish time is stamped,
 	// and the floor (measured from it) has not elapsed — no transition.
@@ -58,7 +59,7 @@ func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 	// Frequent edits keep re-signing the zone; each check stays blocked (the
 	// floor has not elapsed since FIRST publish) and the stamp is untouched.
 	for _, age := range []time.Duration{30 * time.Minute, 10 * time.Minute, 10 * time.Second} {
-		zs.LastSigned = now.Add(-age)
+		markPublished(zs, now.Add(-age))
 		if err := rm.CheckZSKRollover(domain); err != nil {
 			t.Fatalf("CheckZSKRollover (re-sign %s ago): %v", age, err)
 		}
@@ -74,7 +75,8 @@ func TestZSKRollover_FrequentResignDoesNotStall(t *testing.T) {
 	// being re-signed well inside it. Pre-fix (now - LastSigned >= floor) this
 	// check never fired; now it must.
 	zs.Rollover.PhaseFirstSigned = now.Add(-2 * time.Hour)
-	zs.LastSigned = now.Add(-5 * time.Second)
+	zs.Rollover.PhaseHorizon = now.Add(-time.Hour) // the cache horizon snapshotted at that publication has passed too (RA6X-027)
+	markPublished(zs, now.Add(-5*time.Second))
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover (floor elapsed): %v", err)
 	}
@@ -194,7 +196,7 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 		// Floor already satisfied, so the dwell gate is the only blocker.
 		PhaseFirstSigned: now.Add(-10 * time.Second),
 	}
-	zs.LastSigned = now.Add(-500 * time.Millisecond) // signed after the switch
+	markPublished(zs, now.Add(-500*time.Millisecond)) // signed and served after the switch
 
 	// (1) Everything satisfied except the signing-phase dwell → no completion.
 	if err := rm.CheckZSKRollover(domain); err != nil {
@@ -209,7 +211,7 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 	zs = state.GetZone(domain)
 	zs.Rollover.PhaseStarted = now.Add(-2 * time.Hour)
 	zs.Rollover.PhaseFirstSigned = time.Time{} // as reset at the switch
-	zs.LastSigned = now.Add(-3 * time.Hour)    // before the switch
+	markPublished(zs, now.Add(-3*time.Hour))   // served only before the switch
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover (unsigned gate): %v", err)
 	}
@@ -223,7 +225,7 @@ func TestZSKRollover_SigningPhaseGating(t *testing.T) {
 	// (3) All gates pass: dwell elapsed, signed after the switch, floor elapsed
 	// since that first sign → completes.
 	zs = state.GetZone(domain)
-	zs.LastSigned = now.Add(-90 * time.Minute) // after PhaseStarted (-2h)
+	markPublished(zs, now.Add(-90*time.Minute)) // served after PhaseStarted (-2h)
 	zs.AddWarning("stale rollover warning")
 	if err := rm.CheckZSKRollover(domain); err != nil {
 		t.Fatalf("CheckZSKRollover (complete): %v", err)

@@ -102,15 +102,20 @@ type SignedZoneRef struct {
 	Domain     string
 	ZonePath   string
 	SignedPath string
+	// SignedAt identifies the generation the hook deploys (the zone's
+	// LastSigned when the hook was fired); a successful hook confirms exactly
+	// that generation as published (RA6X-004).
+	SignedAt time.Time
 }
 
-// signedRef builds the hook reference for a zone from its source path and the
-// configured output directory.
-func signedRef(cfg *config.Config, domain, zonePath string) SignedZoneRef {
+// signedRef builds the hook reference for a zone from its source path, the
+// configured output directory and the generation being deployed.
+func signedRef(cfg *config.Config, domain, zonePath string, signedAt time.Time) SignedZoneRef {
 	return SignedZoneRef{
 		Domain:     domain,
 		ZonePath:   zonePath,
 		SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
+		SignedAt:   signedAt,
 	}
 }
 
@@ -233,8 +238,10 @@ func logHookResult(kind, identity string, attrs []any, stderr string, err error,
 // invocation with its exact source and output paths. When wg is non-nil the
 // invocations run asynchronously and are tracked on it (the daemon); when it
 // is nil they run synchronously and the first failure is returned (the CLI).
+// onDone, when set, is called after each invocation with the zones it covered
+// and its result, so the caller can confirm their publication (RA6X-004).
 // A pass that signed nothing runs no hook.
-func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []SignedZoneRef, wg *sync.WaitGroup) error {
+func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []SignedZoneRef, wg *sync.WaitGroup, onDone func([]SignedZoneRef, error)) error {
 	if !hookConfigured(hooks) || len(signed) == 0 {
 		return nil
 	}
@@ -244,6 +251,7 @@ func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []Sig
 		kind  string
 		env   []string
 		attrs []any
+		zones []SignedZoneRef
 	}
 	var invocations []invocation
 	if hooks.CoalescePostSign {
@@ -255,6 +263,7 @@ func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []Sig
 			kind:  "post_sign_batch",
 			env:   hookEnviron(batchVars(domains, outputDir)...),
 			attrs: []any{"batch_size", len(domains)},
+			zones: signed,
 		})
 	} else {
 		for _, z := range signed {
@@ -262,6 +271,7 @@ func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []Sig
 				kind:  "post_sign",
 				env:   hookEnviron(perZoneVars(&HookEnv{Domain: z.Domain, ZonePath: z.ZonePath, SignedPath: z.SignedPath, OutputDir: outputDir})...),
 				attrs: []any{"domain", z.Domain},
+				zones: []SignedZoneRef{z},
 			})
 		}
 	}
@@ -271,6 +281,9 @@ func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []Sig
 		slog.Debug("[HOOK] Executing hook", append([]any{"hook", identity}, inv.attrs...)...)
 		stderr, err := runHook(hooks, inv.env, stdout)
 		logHookResult(inv.kind, identity, inv.attrs, stderr, err, start)
+		if onDone != nil {
+			onDone(inv.zones, err)
+		}
 		return err
 	}
 

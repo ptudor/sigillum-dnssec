@@ -123,6 +123,51 @@ type DNSSECConfig struct {
 	//             (YYYYMMDDnn) are rejected at signing time because they
 	//             exceed the current epoch and would move serials backwards.
 	SerialPolicy string `toml:"serial_policy"`
+	// Publication says what counts as a signed zone being served (RA6X-004):
+	//   ""          — auto: "hook" when a post-sign hook is configured, else "immediate"
+	//   "hook"      — the post-sign hook completing successfully for the zone
+	//   "immediate" — writing the signed file (the nameserver reads it directly)
+	//   "probe"     — every authoritative server of the zone answers SOA with
+	//                 the published serial (requires serial_policy = "epoch")
+	// Rollover timers start from confirmed publication, never from the write.
+	Publication string `toml:"publication"`
+	// ParentDSTTL is the DS TTL assumed for the parent's DS RRset when it
+	// cannot be observed (a `rollover complete --force`). Rollover retirement
+	// waits at least this long after a DS change before dropping the key the
+	// old DS set authenticated (RA6X-003). Default 24h.
+	ParentDSTTL Duration `toml:"parent_ds_ttl"`
+}
+
+// Publication modes (see DNSSECConfig.Publication).
+const (
+	PublicationHook      = "hook"
+	PublicationImmediate = "immediate"
+	PublicationProbe     = "probe"
+)
+
+// HookConfigured reports whether a post-sign hook is set.
+func (c *Config) HookConfigured() bool {
+	return len(c.Hooks.PostSignCmd) > 0 || strings.TrimSpace(c.Hooks.PostSign) != ""
+}
+
+// PublicationMode resolves the effective publication mode.
+func (c *Config) PublicationMode() string {
+	switch c.DNSSEC.Publication {
+	case PublicationHook, PublicationImmediate, PublicationProbe:
+		return c.DNSSEC.Publication
+	}
+	if c.HookConfigured() {
+		return PublicationHook
+	}
+	return PublicationImmediate
+}
+
+// ParentDSTTLFallback is the DS TTL assumed when the parent's cannot be observed.
+func (c *Config) ParentDSTTLFallback() time.Duration {
+	if c.DNSSEC.ParentDSTTL.Duration > 0 {
+		return c.DNSSEC.ParentDSTTL.Duration
+	}
+	return 24 * time.Hour
 }
 
 // WebConfig holds web UI settings
@@ -249,6 +294,7 @@ func DefaultConfig() *Config {
 			RolloverPrepublish: Duration{14 * 24 * time.Hour}, // 14 days before expiry
 			RolloverSwitch:     Duration{7 * 24 * time.Hour},  // 7 days to switch signing
 			SerialPolicy:       "keep",
+			ParentDSTTL:        Duration{Duration: 24 * time.Hour},
 		},
 		Web: WebConfig{
 			Enabled: false,
@@ -409,6 +455,26 @@ func (c *Config) Validate() error {
 		// ok
 	default:
 		return fmt.Errorf("registrar digest_type must be 2 (SHA-256) or 4 (SHA-384), got %d", c.Registrar.DigestTypeVal)
+	}
+
+	// Publication mode (RA6X-004)
+	switch c.DNSSEC.Publication {
+	case "", PublicationHook, PublicationImmediate, PublicationProbe:
+	default:
+		return fmt.Errorf("dnssec.publication must be \"hook\", \"immediate\" or \"probe\", got %q", c.DNSSEC.Publication)
+	}
+	if c.DNSSEC.Publication == PublicationHook && !c.HookConfigured() {
+		return fmt.Errorf("dnssec.publication = \"hook\" requires a post_sign hook")
+	}
+	if c.DNSSEC.Publication == PublicationProbe {
+		for domain := range c.Zones {
+			if c.GetZoneSerialPolicy(domain) != "epoch" {
+				return fmt.Errorf("dnssec.publication = \"probe\" requires serial_policy = \"epoch\" (zone %q uses %q): a re-signed zone is only distinguishable at the authoritative servers by its serial", domain, c.GetZoneSerialPolicy(domain))
+			}
+		}
+	}
+	if c.DNSSEC.ParentDSTTL.Duration < 0 {
+		return fmt.Errorf("dnssec.parent_ds_ttl must not be negative")
 	}
 
 	// Validate serial policy (global and per-zone)

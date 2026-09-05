@@ -55,7 +55,7 @@ func TestHookTimeout_BoundsDescendantsHoldingStderr(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), "child.pid")
 			hooks := mk(pidFile)
 			start := time.Now()
-			err := firePostSignHooks(hooks, "/tmp", []SignedZoneRef{{Domain: "x.example"}}, nil)
+			err := firePostSignHooks(hooks, "/tmp", []SignedZoneRef{{Domain: "x.example"}}, nil, nil)
 			elapsed := time.Since(start)
 			if err == nil || !strings.Contains(err.Error(), "timed out") {
 				t.Fatalf("hook must report a timeout, got %v", err)
@@ -85,7 +85,7 @@ func TestHookTimeout_BoundsDescendantsHoldingStderr(t *testing.T) {
 func TestHook_WithinBudgetAndStderrPrefix(t *testing.T) {
 	shortHookTimeouts(t)
 	hooks := &config.HooksConfig{PostSignCmd: []string{"/bin/sh", "-c", "sleep 0.2; exit 0"}}
-	if err := firePostSignHooks(hooks, "/tmp", []SignedZoneRef{{Domain: "x.example"}}, nil); err != nil {
+	if err := firePostSignHooks(hooks, "/tmp", []SignedZoneRef{{Domain: "x.example"}}, nil, nil); err != nil {
 		t.Fatalf("a hook within budget must succeed: %v", err)
 	}
 	stderr, err := runHook(&config.HooksConfig{PostSignCmd: []string{"/bin/sh", "-c", "echo boom >&2; exit 3"}}, hookEnviron(), os.Stdout)

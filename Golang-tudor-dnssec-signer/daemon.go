@@ -13,6 +13,7 @@ import (
 	"time"
 
 	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
+	"github.com/ptudor/dnssec-tudor/internal/validate"
 
 	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 	"github.com/ptudor/dnssec-tudor/internal/metrics"
@@ -82,7 +83,7 @@ func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 		cfg:         cfg,
 		state:       state,
 		signer:      signerpkg.NewSigner(cfg, state),
-		rollover:    signerpkg.NewRolloverManager(cfg, state),
+		rollover:    newRolloverManager(cfg, state),
 		heartbeat:   NewHeartbeatClient(&cfg.Heartbeat),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -264,7 +265,7 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 	d.cfg = cfg
 	d.state = state
 	d.signer = signerpkg.NewSigner(cfg, state)
-	d.rollover = signerpkg.NewRolloverManager(cfg, state)
+	d.rollover = newRolloverManager(cfg, state)
 	d.heartbeat = newHeartbeat
 	d.mu.Unlock()
 
@@ -531,8 +532,40 @@ signLoop:
 		default:
 		}
 		if d.checkAndSignZoneSafe(snap, domain) {
-			signedZones = append(signedZones, signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path))
+			if zs := snap.state.GetZone(domain); zs != nil {
+				signedZones = append(signedZones, signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs.LastSigned))
+			}
 		}
+	}
+
+	// RA6X-004: a generation whose deployment never got confirmed (hook
+	// failure, restart, probe not yet satisfied) is retried every cycle until
+	// it is, without re-signing.
+	signedSet := map[string]bool{}
+	for _, z := range signedZones {
+		signedSet[z.Domain] = true
+	}
+	switch snap.cfg.PublicationMode() {
+	case config.PublicationHook:
+		for domain := range snap.cfg.Zones {
+			zs := snap.state.GetZone(domain)
+			if zs == nil || !zs.PendingPublication || signedSet[domain] || snap.cfg.Hooks.CoalescePostSign {
+				continue
+			}
+			slog.Info("[DAEMON] Retrying deployment hook for a zone whose publication is not yet confirmed", "domain", domain)
+			_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir,
+				[]SignedZoneRef{signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs.LastSigned)}, &d.hookWG, d.confirmPublication)
+		}
+		if snap.cfg.Hooks.CoalescePostSign {
+			for domain := range snap.cfg.Zones {
+				zs := snap.state.GetZone(domain)
+				if zs != nil && zs.PendingPublication && !signedSet[domain] {
+					signedZones = append(signedZones, signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs.LastSigned))
+				}
+			}
+		}
+	case config.PublicationProbe:
+		d.probePendingPublications(snap)
 	}
 
 	// Check for automatic ZSK rollovers
@@ -547,11 +580,17 @@ rolloverLoop:
 		if zoneState == nil || zoneState.ZSK == nil {
 			continue
 		}
-		if err := snap.rollover.CheckZSKRollover(domain); err != nil {
-			if fsutil.IsCommitted(err) {
-				slog.Warn("[ROLLOVER] ZSK rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
-			} else {
-				slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
+		for name, check := range map[string]func(string) error{
+			"ZSK":       snap.rollover.CheckZSKRollover,
+			"KSK":       snap.rollover.CheckKSKRollover,
+			"algorithm": snap.rollover.CheckAlgorithmRollover,
+		} {
+			if err := check(domain); err != nil {
+				if fsutil.IsCommitted(err) {
+					slog.Warn("[ROLLOVER] rollover state saved but its durability across power loss is uncertain", "domain", domain, "rollover", name, "error", err)
+				} else {
+					slog.Error("[ROLLOVER] rollover check failed", "domain", domain, "rollover", name, "error", err)
+				}
 			}
 		}
 	}
@@ -583,7 +622,7 @@ rolloverLoop:
 	// Fire the coalesced post-sign hook after state is saved — this way
 	// any consumer that introspects state.json sees the just-signed zones.
 	if snap.cfg.Hooks.CoalescePostSign && len(signedZones) > 0 {
-		_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir, signedZones, &d.hookWG)
+		_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir, signedZones, &d.hookWG, d.confirmPublication)
 	}
 
 	// Update Prometheus metrics
@@ -685,7 +724,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// will fire one batched hook at end-of-cycle when coalesce is on.
 	if !snap.cfg.Hooks.CoalescePostSign {
 		_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir,
-			[]SignedZoneRef{signedRef(snap.cfg, domain, zoneCfg.Path)}, &d.hookWG)
+			[]SignedZoneRef{signedRef(snap.cfg, domain, zoneCfg.Path, zoneState.LastSigned)}, &d.hookWG, d.confirmPublication)
 	}
 
 	return true, nil
@@ -782,5 +821,78 @@ func (d *Daemon) runHealthServer(ln net.Listener) {
 	slog.Debug("[WEB] Starting health server", "listen", ln.Addr().String())
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		slog.Error("[WEB] Health server error", "error", err)
+	}
+}
+
+// newRolloverManager builds a rollover manager wired to the validator's
+// all-parent-servers DS probe (RA6X-003).
+func newRolloverManager(cfg *config.Config, state *statepkg.State) *signerpkg.RolloverManager {
+	rm := signerpkg.NewRolloverManager(cfg, state)
+	rm.SetParentDSProbe(validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration))
+	return rm
+}
+
+// confirmPublication records, under the cross-process state lock, that the
+// hook deployed the given generations successfully (RA6X-004). It runs from
+// the hook goroutine after the cycle's Save, so it re-adopts the on-disk state
+// first (a CLI may have written since), applies the confirmation to the exact
+// generation each hook covered, and persists. A hook failure leaves the zone
+// pending so the next cycle retries the deployment.
+func (d *Daemon) confirmPublication(zones []SignedZoneRef, hookErr error) {
+	if hookErr != nil {
+		return
+	}
+	snap := d.takeSnapshot()
+	lock, err := acquireStateLock(snap.cfg.DataDir, 10*time.Second)
+	if err != nil {
+		slog.Warn("[DAEMON] Could not acquire state lock to record publication; the deployment is retried next cycle", "error", err)
+		return
+	}
+	defer lock.release()
+	if err := snap.state.ReplaceFromDisk(); err != nil {
+		slog.Warn("[DAEMON] Could not reload state to record publication; the deployment is retried next cycle", "error", err)
+		return
+	}
+	now := time.Now().UTC()
+	changed := false
+	for _, z := range zones {
+		zs := snap.state.GetZone(z.Domain)
+		if zs == nil || z.SignedAt.IsZero() {
+			continue
+		}
+		snap.state.Mutate(func() { zs.ConfirmPublication(z.SignedAt, now) })
+		changed = true
+		slog.Info("[DAEMON] Publication confirmed by hook", "domain", z.Domain, "generation_signed_at", z.SignedAt.Format(time.RFC3339))
+	}
+	if !changed {
+		return
+	}
+	if err := snap.state.Save(); err != nil && !fsutil.IsCommitted(err) {
+		slog.Error("[DAEMON] Failed to persist publication confirmation; the deployment is retried next cycle", "error", err)
+	}
+}
+
+// probePendingPublications confirms pending generations by asking every
+// authoritative server of each zone for the published serial
+// (dnssec.publication = "probe", RA6X-004).
+func (d *Daemon) probePendingPublications(snap snapshot) {
+	v := validate.NewValidator(snap.cfg, snap.state, snap.cfg.Validation.Resolver, snap.cfg.Validation.Timeout.Duration)
+	now := time.Now().UTC()
+	for domain := range snap.cfg.Zones {
+		zs := snap.state.GetZone(domain)
+		if zs == nil || !zs.PendingPublication {
+			continue
+		}
+		ok, details, err := v.ProbePublishedSerial(domain, zs.PublishedSerial)
+		if err != nil {
+			slog.Warn("[DAEMON] Publication probe failed; retrying next cycle", "domain", domain, "error", err)
+			continue
+		}
+		if !ok {
+			slog.Info("[DAEMON] Published generation not yet served by every authoritative server", "domain", domain, "details", details)
+			continue
+		}
+		snap.state.Mutate(func() { zs.ConfirmPublication(zs.LastSigned, now) })
+		slog.Info("[DAEMON] Publication confirmed by authoritative probe", "domain", domain, "details", details)
 	}
 }

@@ -92,6 +92,8 @@ dnskey_ttl = 0                  # 0 = use SOA TTL (recommended)
 rollover_prepublish = "14d"     # Days before expiry to prepublish new key
 rollover_switch = "7d"          # Days to wait before switching to new key
 serial_policy = "keep"          # "keep" or "epoch" — see Serial Management
+# publication = "hook"          # what confirms a zone is served: "hook", "immediate" or "probe" (see Key Rollover)
+# parent_ds_ttl = "24h"         # parent DS TTL assumed by `rollover complete --force`
 
 [web]
 enabled = true
@@ -268,12 +270,28 @@ ZSK rollover is fully automatic. KSK rollover requires DS updates at your regist
 # Start KSK rollover (generates new key, shows new DS)
 dnssec-tudor rollover start example.com --config config.toml
 
-# After publishing new DS at registrar, complete rollover
+# After publishing the new DS at the registrar, record that it has propagated
 dnssec-tudor rollover complete example.com --config config.toml
 
 # Check rollover status
 dnssec-tudor rollover status example.com --config config.toml
 ```
+
+`rollover complete` checks that the new DS is present at **every** parent
+nameserver, then keeps both KSKs signing until the parent's DS TTL has
+elapsed — a resolver that fetched the old-only DS set just before your change
+holds it that long and would fail if the old key vanished earlier. The daemon
+(or the next `sign`) retires the old KSK automatically after that wait and
+ends the rollover once the retired zone is confirmed served. Pass `--force`
+to skip the probe and start the wait now using `parent_ds_ttl`.
+
+Rollover timers count from *confirmed* publication, not from the file write:
+with a post-sign hook the hook must succeed for that generation (the daemon
+re-runs a failed hook every cycle and after restarts); without one the write
+counts (`publication = "immediate"`); `publication = "probe"` asks every
+authoritative server for the published serial. Cache lifetimes of earlier,
+longer-TTL generations are remembered, so lowering a TTL just before a
+rollover never shortens the wait.
 
 ### Algorithm Rollover
 
@@ -287,7 +305,11 @@ dnssec-tudor rollover algorithm example.com ED25519 --config config.toml
 dnssec-tudor rollover complete example.com --config config.toml
 ```
 
-During algorithm rollover, the zone is signed with both the old and new algorithm keys until you complete the rollover.
+During algorithm rollover, the zone is signed with both the old and new
+algorithm keys. `rollover complete` records that the new DS is at every parent
+server; after the parent's DS TTL the status asks you to remove the OLD DS,
+and one more DS TTL after it is gone from every parent server the
+old-algorithm keys and signatures are retired automatically (RFC 6781 §4.1.4).
 
 ## NSD Integration
 
