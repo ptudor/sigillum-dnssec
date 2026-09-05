@@ -676,7 +676,18 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	// signature that actually verified supplies the metadata used below.
 	leafCNAMEs := answerCNAMEsOwnedBy(queryResult.CNAME, domain)
 
-	if answerContainsType(queryResult, v.leafType()) {
+	// RFC 6672 §2.2: a DNAME whose substitution would exceed the name length
+	// limit is answered with YXDOMAIN and no CNAME. The redirection itself may
+	// still be authenticated; the queried name simply cannot be resolved.
+	if queryResult.RCode == dns.RcodeYXDomain {
+		if dnameOwner := dnameAncestorInAnswer(queryResult, domain); dnameOwner != "" {
+			return v.verifyDNAMEAnswer(validation, domain, zone, dnameOwner, leafCNAMEs, queryResult, dnskeys)
+		}
+		validation.Error = fmt.Sprintf("YXDOMAIN for %s without a DNAME in the answer", domain)
+		return validation
+	}
+
+	if answerHasTypeAt(queryResult.RawResponse, v.leafType(), domain) {
 		verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, v.leafType(), dnskeys, domain, zone, true)
 		if err != nil {
 			validation.Error = fmt.Sprintf("%s record RRSIG verification failed: %v", v.leafTypeName(), err)
@@ -687,6 +698,11 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	if len(leafCNAMEs) > 0 {
+		// A CNAME synthesized from a DNAME (RFC 6672 §3.2) carries no signature
+		// of its own; the DNAME RRset is what is authenticated (RA6X-014).
+		if dnameOwner := dnameAncestorInAnswer(queryResult, domain); dnameOwner != "" {
+			return v.verifyDNAMEAnswer(validation, domain, zone, dnameOwner, leafCNAMEs, queryResult, dnskeys)
+		}
 		// The answer is an alias: authenticate the CNAME RRset at the owner.
 		validation.RecordType = "CNAME"
 		verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
@@ -703,15 +719,122 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 }
 
 // recordVerifiedLeaf records a cryptographically verified leaf (or CNAME) RRset
-// on validation. Every field it derives — signing key tag, record count and the
-// wildcard decision — comes from the exact signature that verified, never from
-// another signature in the response (RA6X-009).
+// on validation. Every field it derives — signing key tag, record count, the
+// alias target and the wildcard decision — comes from the exact records and
+// signature that verified, never from another record in the response
+// (RA6X-009, RA6X-015).
 func (v *Validator) recordVerifiedLeaf(validation *RecordValidation, verified *VerifiedRRset, domain, zone string, queryResult *dnspkg.QueryResult, dnskeys []dnspkg.DNSKEYRecord) {
 	validation.RRSIGVerified = true
 	validation.SigningKeyTag = verified.Signature.KeyTag
 	validation.RecordCount = len(verified.Records)
+	if verified.Type == dns.TypeCNAME {
+		for _, rr := range verified.Records {
+			if c, ok := rr.(*dns.CNAME); ok {
+				validation.Target = c.Target
+				break
+			}
+		}
+	}
 	sig := dnspkg.RRSIGFromRR(verified.Signature, dnspkg.SectionAnswer, time.Now())
 	v.verifyWildcard(validation, domain, zone, sig, queryResult, dnskeys)
+}
+
+// dnameAncestorInAnswer returns the owner of an Answer-section DNAME that is a
+// proper ancestor of qname, or "" when the answer carries no such redirection.
+func dnameAncestorInAnswer(qr *dnspkg.QueryResult, qname string) string {
+	want := dns.CanonicalName(qname)
+	for _, d := range qr.DNAME {
+		if !dnspkg.InSection(d.Section, dnspkg.SectionAnswer) {
+			continue
+		}
+		owner := dns.CanonicalName(d.Owner)
+		if owner != want && dns.IsSubDomain(owner, want) {
+			return owner
+		}
+	}
+	return ""
+}
+
+// substituteDNAME applies RFC 6672 §2.2 to qname: the DNAME owner suffix is
+// replaced by target. It fails when the result would exceed the DNS name
+// length limit (the YXDOMAIN condition).
+func substituteDNAME(qname, owner, target string) (string, error) {
+	qname = dns.CanonicalName(qname)
+	owner = dns.CanonicalName(owner)
+	if owner == qname || !dns.IsSubDomain(owner, qname) {
+		return "", fmt.Errorf("%s is not below DNAME owner %s", qname, owner)
+	}
+	qLabels := dns.SplitDomainName(qname)
+	oLabels := dns.SplitDomainName(owner)
+	prefix := qLabels[:len(qLabels)-len(oLabels)]
+	synthesized := dns.Fqdn(strings.Join(append(prefix, strings.TrimSuffix(dns.Fqdn(target), ".")), "."))
+	if target == "." || dns.Fqdn(target) == "." {
+		synthesized = dns.Fqdn(strings.Join(prefix, "."))
+	}
+	// Wire length is the presentation length plus the root label; RFC 1035
+	// §2.3.4 caps it at 255 octets.
+	if _, ok := dns.IsDomainName(synthesized); !ok || len(synthesized)+1 > 255 {
+		return "", fmt.Errorf("DNAME substitution of %s by %s -> %s exceeds the DNS name length limit (RFC 6672 §2.2, YXDOMAIN)", qname, owner, target)
+	}
+	return synthesized, nil
+}
+
+// verifyDNAMEAnswer authenticates a DNAME redirection: the DNAME RRset at
+// dnameOwner must verify under this zone's keys, and the CNAME served at the
+// queried name must be exactly the RFC 6672 substitution of the queried name
+// by that DNAME. The synthesized CNAME itself is unsigned by design; nothing
+// else in the answer may stand in for it (RA6X-014).
+func (v *Validator) verifyDNAMEAnswer(validation *RecordValidation, domain, zone, dnameOwner string, cnames []dnspkg.CNAMERecord, queryResult *dnspkg.QueryResult, dnskeys []dnspkg.DNSKEYRecord) *RecordValidation {
+	validation.RecordType = "DNAME"
+	validation.SynthesizedFrom = dnameOwner
+
+	verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, dns.TypeDNAME, dnskeys, dnameOwner, zone, true)
+	if err != nil {
+		validation.Error = fmt.Sprintf("DNAME RRSIG verification failed for %s: %v", dnameOwner, err)
+		return validation
+	}
+	var target string
+	for _, rr := range verified.Records {
+		if d, ok := rr.(*dns.DNAME); ok {
+			if target != "" {
+				validation.Error = fmt.Sprintf("DNAME RRset at %s holds more than one record (RFC 6672 §2.4)", dnameOwner)
+				return validation
+			}
+			target = d.Target
+		}
+	}
+	if target == "" {
+		validation.Error = fmt.Sprintf("verified DNAME RRset at %s holds no DNAME record", dnameOwner)
+		return validation
+	}
+
+	expected, err := substituteDNAME(domain, dnameOwner, target)
+	if err != nil {
+		// The DNAME RRset is authenticated but the redirection cannot be
+		// applied to this name; report the authenticated reason (YXDOMAIN).
+		validation.Error = fmt.Sprintf("authenticated DNAME %s -> %s cannot be applied: %v", dnameOwner, target, err)
+		return validation
+	}
+	if queryResult.RCode == dns.RcodeYXDomain {
+		validation.Error = fmt.Sprintf("authenticated DNAME %s -> %s answered YXDOMAIN although the substitution %s fits the name length limit", dnameOwner, target, expected)
+		return validation
+	}
+	if len(cnames) != 1 || dns.CanonicalName(cnames[0].Target) != dns.CanonicalName(expected) {
+		got := make([]string, 0, len(cnames))
+		for _, c := range cnames {
+			got = append(got, c.Target)
+		}
+		validation.Error = fmt.Sprintf("synthesized CNAME target %v does not match the DNAME substitution %s -> %s of %s (expected %s)", got, dnameOwner, target, domain, expected)
+		return validation
+	}
+
+	validation.RRSIGVerified = true
+	validation.SigningKeyTag = verified.Signature.KeyTag
+	validation.RecordCount = 1
+	validation.Target = expected
+	sig := dnspkg.RRSIGFromRR(verified.Signature, dnspkg.SectionAnswer, time.Now())
+	v.verifyWildcard(validation, dnameOwner, zone, sig, queryResult, dnskeys)
+	return validation
 }
 
 // isDenialForType reports whether qr is a denial of existence (NXDOMAIN or
@@ -884,7 +1007,10 @@ func recordValidationVerdict(rv *RecordValidation) (ValidationStatus, string) {
 // former is indeterminate; the latter is bogus.
 func isUnqueryableRecordError(errText string) bool {
 	return strings.HasPrefix(errText, "failed to resolve nameservers") ||
-		strings.HasPrefix(errText, "failed to query")
+		strings.HasPrefix(errText, "failed to query") ||
+		// An authenticated DNAME whose substitution cannot be formed (YXDOMAIN)
+		// is not a forgery; the name simply has no resolvable answer (RA6X-014).
+		strings.Contains(errText, "YXDOMAIN")
 }
 
 // validateZone validates a single zone

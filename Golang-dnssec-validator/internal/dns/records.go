@@ -140,6 +140,16 @@ func CNAMEFromRR(v *dns.CNAME, section string) CNAMERecord {
 	}
 }
 
+// DNAMEFromRR converts a wire DNAME into the validator's record type.
+func DNAMEFromRR(v *dns.DNAME, section string) DNAMERecord {
+	return DNAMERecord{
+		Owner:   v.Hdr.Name,
+		Class:   v.Hdr.Class,
+		Section: section,
+		Target:  v.Target,
+	}
+}
+
 // InSection reports whether a record's recorded section is one of the given
 // sections. A record whose section is unknown (constructed in-process rather
 // than parsed from a message) is treated as if it were in the first listed

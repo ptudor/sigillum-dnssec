@@ -159,6 +159,8 @@ func (q *Querier) parseSection(rrs []dns.RR, section string, now time.Time, resu
 			result.NS = append(result.NS, NSFromRR(v, section))
 		case *dns.CNAME:
 			result.CNAME = append(result.CNAME, CNAMEFromRR(v, section))
+		case *dns.DNAME:
+			result.DNAME = append(result.DNAME, DNAMEFromRR(v, section))
 		}
 	}
 }

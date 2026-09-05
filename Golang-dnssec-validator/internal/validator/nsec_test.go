@@ -325,7 +325,7 @@ func TestVerifyNSECNODATA(t *testing.T) {
 				},
 			},
 			wantProof:   false,
-			wantErrText: "no NSEC record proves type",
+			wantErrText: "NODATA is not proven",
 		},
 		{
 			name:  "NSEC at wrong name",
