@@ -876,19 +876,24 @@ func computeNSEC3Hash(name string, salt []byte, iterations uint16) string {
 	return strings.ToUpper(base32ExtendedHex.EncodeToString(digest))
 }
 
-// toWireFormat converts a domain name to DNS wire format.
-// E.g., "www.example.com." -> [3]www[7]example[3]com[0]
+// toWireFormat converts a presentation-form domain name to canonical DNS wire
+// format (RFC 4034 §6.2): each label's unescaped, lowercased octets behind a
+// length byte, then the terminating zero. E.g., "www.example.com." ->
+// [3]www[7]example[3]com[0]. Escape sequences (\DDD, \X, and an escaped dot
+// inside a label) denote octets and must be resolved, not hashed as the
+// literal characters, or the NSEC3 hash of any owner name that carries one
+// disagrees with the signer's (RA6X-050 vectors).
 func toWireFormat(name string) []byte {
-	name = strings.ToLower(strings.TrimSuffix(name, "."))
-	if name == "" {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." {
 		return []byte{0} // Root
 	}
 
-	labels := strings.Split(name, ".")
 	var result []byte
-	for _, label := range labels {
-		result = append(result, byte(len(label)))
-		result = append(result, []byte(label)...)
+	for _, label := range dns.SplitDomainName(dns.Fqdn(name)) {
+		octets := canonicalLabelBytes(label)
+		result = append(result, byte(len(octets)))
+		result = append(result, octets...)
 	}
 	result = append(result, 0) // Terminating zero
 	return result

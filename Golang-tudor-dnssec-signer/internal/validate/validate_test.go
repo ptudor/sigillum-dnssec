@@ -10,6 +10,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/ptudor/dnssec-tudor/internal/config"
+	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
 )
 
 func TestFindParentZone(t *testing.T) {
@@ -176,57 +177,53 @@ func TestDSCheck(t *testing.T) {
 }
 
 func TestDNSKEYCheck(t *testing.T) {
-	kskTag := uint16(12345)
-	zskTag := uint16(54321)
-
-	// Mock auth NS returning DNSKEY records
-	authAddr, authCleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		if r.Question[0].Qtype == dns.TypeDNSKEY {
-			// Return two DNSKEY records with known key tags
-			// Since key tag computation depends on the full record, we just
-			// verify the query path works correctly
-			m.Answer = append(m.Answer, &dns.DNSKEY{
-				Hdr: dns.RR_Header{
-					Name:   r.Question[0].Name,
-					Rrtype: dns.TypeDNSKEY,
-					Class:  dns.ClassINET,
-					Ttl:    3600,
-				},
-				Flags:     257,
-				Protocol:  3,
-				Algorithm: dns.ED25519,
-				PublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-			})
-		}
-		w.WriteMsg(m)
-	})
-	defer authCleanup()
-
-	// Query the mock server directly
-	msg, err := queryDirect(authAddr, "example.com.", dns.TypeDNSKEY, 2*time.Second)
+	// The check runs against a hermetic authoritative server reached through
+	// the mock recursive resolver — the real decision path — and every
+	// outcome is asserted (RA6X-050).
+	z := newServedZone(t)
+	kg := signerpkg.NewKeyGenerator(z.cfg)
+	zs := z.state.GetZone(z.domain)
+	localKSK, err := kg.LoadPublicKey(z.domain, "ksk")
 	if err != nil {
-		t.Fatalf("queryDirect failed: %v", err)
+		t.Fatal(err)
+	}
+	localZSK, err := kg.LoadPublicKey(z.domain, "zsk")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	var keyTags []uint16
-	for _, rr := range msg.Answer {
-		if dnskey, ok := rr.(*dns.DNSKEY); ok {
-			keyTags = append(keyTags, dnskey.KeyTag())
-		}
+	res := z.v.checkDNSKEYVisible(z.domain, zs.KSK.ID, zs.ZSK.ID, localKSK, localZSK)
+	if res.Status != "pass" || !res.KSKFound || !res.ZSKFound || !res.MaterialMatched {
+		t.Fatalf("both served keys must be found by material: %+v", res)
+	}
+	if z.queries(dns.TypeDNSKEY) == 0 {
+		t.Fatal("the authoritative server must have received the DNSKEY query")
 	}
 
-	if len(keyTags) == 0 {
-		t.Error("expected DNSKEY records in mock response")
+	// ZSK missing from the served set → partial.
+	z.edit(func() { z.dnskeys = []dns.RR{z.ksk} })
+	res = z.v.checkDNSKEYVisible(z.domain, zs.KSK.ID, zs.ZSK.ID, localKSK, localZSK)
+	if res.Status != "partial" || !res.KSKFound || res.ZSKFound {
+		t.Fatalf("a missing ZSK must be partial: %+v", res)
 	}
 
-	// Test checkDNSKEYVisible with the mock — it will fail on NS resolution
-	// since our mock doesn't serve NS records, but verify error handling
-	v := &Validator{timeout: 2 * time.Second}
-	result := v.checkDNSKEYVisible("example.com", kskTag, zskTag, nil, nil)
-	if result.Status != "error" {
-		t.Logf("DNSKEY check status: %s (details: %s)", result.Status, result.Details)
+	// A served key sharing nothing but the role with ours → fail.
+	impostor := newSignedFixture(t, dns.Fqdn(z.domain), 257)
+	z.edit(func() { z.dnskeys = []dns.RR{impostor.key} })
+	res = z.v.checkDNSKEYVisible(z.domain, zs.KSK.ID, zs.ZSK.ID, localKSK, localZSK)
+	if res.Status != "fail" || res.KSKFound || res.ZSKFound {
+		t.Fatalf("foreign keys must not be found: %+v", res)
+	}
+
+	// Empty DNSKEY RRset → fail; unreachable resolver → error.
+	z.edit(func() { z.dnskeys = nil })
+	if res = z.v.checkDNSKEYVisible(z.domain, zs.KSK.ID, zs.ZSK.ID, localKSK, localZSK); res.Status != "fail" {
+		t.Fatalf("no DNSKEY records must be a fail: %+v", res)
+	}
+	z.servers[1].Shutdown()
+	z.v.timeout = 300 * time.Millisecond
+	if res = z.v.checkDNSKEYVisible(z.domain, zs.KSK.ID, zs.ZSK.ID, localKSK, localZSK); res.Status != "error" {
+		t.Fatalf("an unreachable resolver must be an error, not a verdict: %+v", res)
 	}
 }
 
