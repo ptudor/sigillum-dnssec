@@ -32,13 +32,17 @@ type mockDNS struct {
 	ip   string
 	port string
 
+	tcp *dns.Server
+
 	mu       sync.Mutex
 	handlers map[qkey]func(req *dns.Msg) *dns.Msg
+	dropped  map[qkey]bool // questions that get no reply at all
+	truncate map[qkey]bool // questions answered truncated (empty) over UDP only
 	seen     []dns.Question
 }
 
-// newMockDNS starts a UDP DNS server on an ephemeral loopback port. Questions
-// without a registered handler get an empty NOERROR answer.
+// newMockDNS starts a DNS server on an ephemeral loopback port over both UDP
+// and TCP. Questions without a registered handler get an empty NOERROR answer.
 func newMockDNS(t *testing.T) *mockDNS {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -49,7 +53,16 @@ func newMockDNS(t *testing.T) *mockDNS {
 	if err != nil {
 		t.Fatalf("split addr: %v", err)
 	}
-	m := &mockDNS{t: t, ip: host, port: port, handlers: make(map[qkey]func(*dns.Msg) *dns.Msg)}
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	m := &mockDNS{
+		t: t, ip: host, port: port,
+		handlers: make(map[qkey]func(*dns.Msg) *dns.Msg),
+		dropped:  make(map[qkey]bool),
+		truncate: make(map[qkey]bool),
+	}
 
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", func(w dns.ResponseWriter, req *dns.Msg) {
@@ -57,10 +70,24 @@ func newMockDNS(t *testing.T) *mockDNS {
 			return
 		}
 		q := req.Question[0]
+		key := qkey{dns.CanonicalName(q.Name), q.Qtype}
 		m.mu.Lock()
 		m.seen = append(m.seen, q)
-		h := m.handlers[qkey{dns.CanonicalName(q.Name), q.Qtype}]
+		h := m.handlers[key]
+		drop := m.dropped[key]
+		trunc := m.truncate[key]
 		m.mu.Unlock()
+
+		if drop {
+			return // simulate a server that never answers
+		}
+		if trunc && w.RemoteAddr().Network() == "udp" {
+			resp := new(dns.Msg)
+			resp.SetReply(req)
+			resp.Truncated = true
+			_ = w.WriteMsg(resp)
+			return
+		}
 
 		var resp *dns.Msg
 		if h != nil {
@@ -91,8 +118,31 @@ func newMockDNS(t *testing.T) *mockDNS {
 	case <-time.After(5 * time.Second):
 		t.Fatal("mock DNS server did not start")
 	}
-	t.Cleanup(func() { _ = m.srv.Shutdown() })
+	startedTCP := make(chan struct{})
+	m.tcp = &dns.Server{Listener: ln, Handler: mux, NotifyStartedFunc: func() { close(startedTCP) }}
+	go func() { _ = m.tcp.ActivateAndServe() }()
+	select {
+	case <-startedTCP:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mock DNS TCP server did not start")
+	}
+	t.Cleanup(func() { _ = m.srv.Shutdown(); _ = m.tcp.Shutdown() })
 	return m
+}
+
+// drop makes the mock never answer the question (client-side timeout).
+func (m *mockDNS) drop(name string, qtype uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dropped[qkey{dns.CanonicalName(name), qtype}] = true
+}
+
+// truncateOverUDP makes the mock answer the question truncated and empty over
+// UDP while serving the registered handler's full answer over TCP.
+func (m *mockDNS) truncateOverUDP(name string, qtype uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.truncate[qkey{dns.CanonicalName(name), qtype}] = true
 }
 
 // on registers a handler for one question. The handler returns a message whose
@@ -147,11 +197,101 @@ func (m *mockDNS) questions() []dns.Question {
 // newValidator builds a Validator whose recursive resolver, authoritative
 // servers and root servers are all the mock, using the port seam.
 func (m *mockDNS) newValidator() *Validator {
-	v := NewValidator(2*time.Second, 20*time.Second, 4, &dnspkg.RootAnchors{Zone: "."}, m.ip)
+	return m.newValidatorWithTimeout(2 * time.Second)
+}
+
+// newValidatorWithTimeout is newValidator with an explicit per-query timeout.
+func (m *mockDNS) newValidatorWithTimeout(queryTimeout time.Duration) *Validator {
+	v := NewValidator(queryTimeout, 20*time.Second, 4, &dnspkg.RootAnchors{Zone: "."}, m.ip)
 	v.resolver.SetDefaultPort(m.port)
 	v.rootServers = []string{m.ip}
 	v.SetQuickMode(false)
 	return v
+}
+
+// chainFixture drives the full validateWithCache path hermetically. The root
+// and the TLD-like parent "test." are seeded into the validated-zone cache as
+// secure zones holding the fixture's keys (the cache is an existing seam of
+// the walk), so everything from the delegation to the leaf — DS at the parent,
+// DNSKEY, leaf records, aliases — is fetched and verified live from the mock.
+type chainFixture struct {
+	m      *mockDNS
+	root   *testZone
+	parent *testZone
+	v      *Validator
+	zones  map[string]*testZone
+}
+
+func newChainFixture(t *testing.T) *chainFixture {
+	t.Helper()
+	m := newMockDNS(t)
+	f := &chainFixture{
+		m:      m,
+		root:   newTestZone(t, "."),
+		parent: newTestZone(t, "test."),
+		zones:  make(map[string]*testZone),
+	}
+	m.serveInfra("test.")
+	f.useTimeout(2 * time.Second)
+	return f
+}
+
+// useTimeout rebuilds the fixture's validator with the given per-query timeout.
+func (f *chainFixture) useTimeout(d time.Duration) {
+	f.v = f.m.newValidatorWithTimeout(d)
+	// The walk refuses to start without an anchor set; the root itself is
+	// served from the cache below, so any pinned anchor satisfies the gate.
+	f.v.SetAnchors(&dnspkg.RootAnchors{Zone: ".", Anchors: []dnspkg.Anchor{
+		{ID: "KSK-2017", KeyTag: 20326, Algorithm: 8, DigestType: 2, Digest: realKSK2017Digest, ValidFrom: "2017-02-02T00:00:00Z"},
+	}})
+}
+
+// addChild delegates a signed child of test. and serves its DNSKEY.
+func (f *chainFixture) addChild(t *testing.T, name string) *testZone {
+	t.Helper()
+	z := newTestZone(t, name)
+	f.zones[dns.Fqdn(name)] = z
+	f.m.serveInfra(name)
+	f.parent.serveDS(t, f.m, z, nil, nil)
+	z.serveDNSKEY(t, f.m)
+	return z
+}
+
+// addInsecureChild delegates an unsigned child of test.: the parent proves DS
+// absence with a signed delegation NSEC.
+func (f *chainFixture) addInsecureChild(t *testing.T, name string) *testZone {
+	t.Helper()
+	z := newTestZone(t, name)
+	f.zones[dns.Fqdn(name)] = z
+	f.m.serveInfra(name)
+	deleg := nsecRR(name, "zzz.test.", dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC)
+	f.m.respond(name, dns.TypeDS, dns.RcodeSuccess, nil, f.parent.signedAuthority(t, deleg), nil)
+	return z
+}
+
+// seedCache returns a fresh validated-zone cache holding the secure root and
+// parent so each validation run starts from the same trusted state.
+func (f *chainFixture) seedCache() map[string]*ZoneResult {
+	mk := func(zone string, keys []dnspkg.DNSKEYRecord) *ZoneResult {
+		zr := NewZoneResult(zone)
+		zr.Status = StatusSecure
+		zr.DNSKEY = keys
+		return zr
+	}
+	return map[string]*ZoneResult{
+		".":     mk(".", f.root.keyRecords()),
+		"test.": mk("test.", f.parent.keyRecords()),
+	}
+}
+
+// validate runs the full validation for domain.
+func (f *chainFixture) validate(t *testing.T, domain string) *ValidationResult {
+	t.Helper()
+	res, err := f.v.validateWithCache(testCtx(t), domain, 0, make(map[string]bool), f.seedCache())
+	if err != nil && res == nil {
+		t.Fatalf("validate %s: %v", domain, err)
+	}
+	return res
 }
 
 func rrHdr(name string, rrtype uint16) dns.RR_Header {

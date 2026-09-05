@@ -316,7 +316,14 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 		}
 	}
 
-	// Verify actual record RRSIG at the leaf zone (only if chain is secure)
+	// Verify actual record RRSIG at the leaf zone (only if chain is secure).
+	// The authenticated alias target (CNAME or DNAME) comes out of this step;
+	// it is the ONLY thing alias traversal follows below (RA6X-015).
+	var aliasTarget string
+	leafZoneName := ""
+	if len(zones) > 0 {
+		leafZoneName = zones[len(zones)-1]
+	}
 	if lastStatus == StatusSecure && len(result.Chain) > 0 {
 		leafZone := &result.Chain[len(result.Chain)-1]
 		recordValidation := v.verifyActualRecord(ctx, domain, leafZone.Zone, leafZone.DNSKEY)
@@ -352,31 +359,44 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 					}
 				}
 			}
+			if lastStatus == StatusSecure && recordValidation.RRSIGVerified {
+				aliasTarget = recordValidation.Target
+			}
 		}
+	} else if lastStatus != StatusBogus && leafZoneName != "" {
+		// No authenticated leaf exists below an insecure or indeterminate chain;
+		// an alias there is still resolved (its target's status still bounds the
+		// answer) from the Answer-section CNAME at the queried owner only.
+		aliasTarget = v.discoverAliasTarget(ctx, domain, leafZoneName)
 	}
 
-	// Now check for CNAMEs at the target domain. checkAndFollowCNAME enforces the
-	// loop/depth guards internally (R-034), so it is always consulted.
-	{
-		cnameResult, err := v.checkAndFollowCNAME(ctx, domain, depth, maxCNAMEDepth, visited, validatedZones)
-		if err == nil && cnameResult != nil {
-			result.CNAMEChains = append(result.CNAMEChains, *cnameResult)
+	// Follow the alias, if any. An explicit CNAME query is complete once the
+	// requested RRset is authenticated; traversal is not part of its verdict.
+	// followAlias enforces the loop/depth guards internally (R-034), and a
+	// hop whose target cannot be validated is indeterminate, never a silent
+	// success (RA6X-015).
+	if aliasTarget != "" && v.leafType() != dns.TypeCNAME {
+		cnameResult := v.followAlias(ctx, domain, aliasTarget, depth, maxCNAMEDepth, visited, validatedZones)
+		result.CNAMEChains = append(result.CNAMEChains, *cnameResult)
 
-			// If the CNAME target is not secure, the overall result is not secure
-			switch cnameResult.Result {
-			case StatusBogus:
-				lastStatus = StatusBogus
-				result.Errors = append(result.Errors, fmt.Sprintf("CNAME target %s is bogus", cnameResult.Target))
-			case StatusInsecure:
-				if lastStatus == StatusSecure {
-					lastStatus = StatusInsecure
-					result.Warnings = append(result.Warnings, fmt.Sprintf("CNAME target %s is insecure", cnameResult.Target))
+		// If the CNAME target is not secure, the overall result is not secure
+		switch cnameResult.Result {
+		case StatusBogus:
+			lastStatus = StatusBogus
+			result.Errors = append(result.Errors, fmt.Sprintf("CNAME target %s is bogus", cnameResult.Target))
+		case StatusInsecure:
+			if lastStatus == StatusSecure {
+				lastStatus = StatusInsecure
+				result.Warnings = append(result.Warnings, fmt.Sprintf("CNAME target %s is insecure", cnameResult.Target))
+			}
+		case StatusIndeterminate:
+			if lastStatus == StatusSecure || lastStatus == StatusInsecure {
+				lastStatus = StatusIndeterminate
+				msg := fmt.Sprintf("CNAME target %s is indeterminate", cnameResult.Target)
+				if cnameResult.Error != "" {
+					msg = fmt.Sprintf("CNAME target %s could not be validated: %s", cnameResult.Target, cnameResult.Error)
 				}
-			case StatusIndeterminate:
-				if lastStatus == StatusSecure || lastStatus == StatusInsecure {
-					lastStatus = StatusIndeterminate
-					result.Warnings = append(result.Warnings, fmt.Sprintf("CNAME target %s is indeterminate", cnameResult.Target))
-				}
+				result.Warnings = append(result.Warnings, msg)
 			}
 		}
 	}
@@ -439,72 +459,25 @@ func cnameGuard(domain, target string, depth, maxDepth int, visited map[string]b
 	return nil, false
 }
 
-// checkAndFollowCNAME checks if the domain has a CNAME and validates the target.
-// It carries the canonical-name visited set and enforces loop and depth limits
-// (R-034): a repeated owner/target is a CNAME loop (bogus), and a chain that would
-// exceed maxDepth without resolving is depth-limited (indeterminate) — neither is
-// silently reported as secure.
-func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, depth, maxDepth int, visited map[string]bool, validatedZones map[string]*ZoneResult) (*CNAMEChainResult, error) {
+// followAlias validates the authenticated alias target of domain and returns
+// the hop's outcome. It follows exactly the target that leaf verification
+// authenticated — no second, unauthenticated DNS lookup decides where to go
+// (RA6X-015). It carries the canonical-name visited set and enforces loop and
+// depth limits (R-034): a repeated owner/target is a CNAME loop (bogus), and a
+// chain that would exceed maxDepth without resolving is depth-limited
+// (indeterminate). A target whose validation fails outright is indeterminate,
+// never reported as a successful completion.
+func (v *Validator) followAlias(ctx context.Context, domain, target string, depth, maxDepth int, visited map[string]bool, validatedZones map[string]*ZoneResult) *CNAMEChainResult {
 	// Record this owner name so a later hop back to it is detected as a loop.
 	visited[canonicalizeName(domain)] = true
 
-	// First, find the authoritative zone for this domain
-	// The zone is the closest ancestor that has NS records
-	zones, err := v.resolver.DiscoverZoneCuts(ctx, domain)
-	if err != nil || len(zones) == 0 {
-		return nil, err
-	}
-
-	// The last zone in the list is the authoritative zone for this domain
-	authZone := zones[len(zones)-1]
-
-	// Get nameservers for the authoritative zone
-	nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, authZone)
-	if err != nil || len(nsRecords) == 0 {
-		return nil, fmt.Errorf("no nameservers for zone %s", authZone)
-	}
-
-	// Collect NS addresses
-	var nsAddresses []string
-	for _, ns := range nsRecords {
-		for _, addr := range ns.Addresses {
-			nsAddresses = append(nsAddresses, addr.String())
-		}
-	}
-
-	// Query the leaf record type from authoritative servers to check for CNAME.
-	var queryResult *dnspkg.QueryResult
-	for _, addr := range nsAddresses {
-		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, v.leafType())
-		if err == nil && result.Error == "" {
-			queryResult = result
-			break
-		}
-	}
-
-	if queryResult == nil {
-		return nil, nil // Could not query authoritative servers
-	}
-
-	// Check for CNAME in the response
-	if len(queryResult.CNAME) == 0 {
-		return nil, nil // No CNAME, nothing to follow
-	}
-
-	// Found a CNAME
-	cname := queryResult.CNAME[0]
-	target := cname.Target
-
-	// Emit CNAME event
 	v.emitEvent("cname", CNAMEEvent{
 		Source: domain,
 		Target: target,
 	})
 
-	// R-034: stop on a CNAME loop (bogus) or depth-limit (indeterminate) rather than
-	// looping to the cap and reading secure.
 	if term, stop := cnameGuard(domain, target, depth, maxDepth, visited); stop {
-		return term, nil
+		return term
 	}
 
 	v.emitEvent("progress", ProgressEvent{
@@ -520,7 +493,8 @@ func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, dept
 			Target: target,
 			Result: StatusIndeterminate,
 			Chain:  nil,
-		}, nil
+			Error:  fmt.Sprintf("alias target validation failed: %v", err),
+		}
 	}
 
 	return &CNAMEChainResult{
@@ -528,7 +502,42 @@ func (v *Validator) checkAndFollowCNAME(ctx context.Context, domain string, dept
 		Target: target,
 		Result: targetResult.Result,
 		Chain:  targetResult.Chain,
-	}, nil
+	}
+}
+
+// discoverAliasTarget finds the alias target of domain when no authenticated
+// leaf exists (the chain is insecure or indeterminate). It asks the leaf
+// zone's servers for the queried type and accepts only an Answer-section
+// CNAME owned by the queried name; CNAMEs at other owners or in other
+// sections are never followed (RA6X-015). The result is unauthenticated,
+// which is fine: the answer can be no better than the chain above it.
+func (v *Validator) discoverAliasTarget(ctx context.Context, domain, leafZone string) string {
+	nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, leafZone)
+	if err != nil || len(nsRecords) == 0 {
+		return ""
+	}
+	var nsAddresses []string
+	for _, ns := range nsRecords {
+		for _, addr := range ns.Addresses {
+			nsAddresses = append(nsAddresses, addr.String())
+		}
+	}
+	for _, addr := range nsAddresses {
+		select {
+		case <-ctx.Done():
+			return ""
+		default:
+		}
+		qr, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, v.leafType())
+		if err != nil || qr == nil || qr.Error != "" || qr.RCode != dns.RcodeSuccess {
+			continue
+		}
+		if cnames := answerCNAMEsOwnedBy(qr.CNAME, domain); len(cnames) > 0 {
+			return cnames[0].Target
+		}
+		return ""
+	}
+	return ""
 }
 
 // queryLeafAllServers queries the leaf record from the authoritative servers.
@@ -1048,6 +1057,11 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			nsResult := NameserverResult{
 				Name:      ns.Name,
 				Addresses: make([]AddressResult, 0),
+			}
+			// RA6X-019: a nameserver whose address lookup partly failed is not
+			// fully enumerated; say so rather than silently querying less.
+			for _, problem := range ns.LookupErrors {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("nameserver %s: %s", ns.Name, problem))
 			}
 			for _, addr := range ns.Addresses {
 				nsAddresses = append(nsAddresses, addr.String())

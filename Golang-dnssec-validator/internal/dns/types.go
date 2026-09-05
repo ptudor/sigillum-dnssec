@@ -104,6 +104,10 @@ type NSRecord struct {
 	Section   string   `json:"section,omitempty"` // Message section the record came from
 	Name      string   `json:"name"`
 	Addresses []net.IP `json:"addresses,omitempty"`
+	// LookupErrors records address-family lookups for this host that failed
+	// (transport error or a failure RCODE), so a partially resolved nameserver
+	// is visible rather than silently treated as complete (RA6X-019).
+	LookupErrors []string `json:"lookup_errors,omitempty"`
 }
 
 // CNAMERecord represents a CNAME record
