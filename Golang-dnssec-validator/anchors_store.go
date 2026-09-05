@@ -24,7 +24,12 @@ func NewAnchorsStore(path, url string) *AnchorsStore {
 	}
 }
 
-// Load loads or reloads the trust anchors
+// Load loads or reloads the trust anchors. A failed refresh — every source
+// missing, malformed or unusable — leaves the last successfully loaded set
+// and its load time untouched (RA6X-041): the store keeps serving the
+// last-known-good anchors, and because activation dates are re-evaluated at
+// every use (GetActivePinnedAnchors), an anchor that has since expired is not
+// trusted merely to preserve availability; readiness reports the gap.
 func (s *AnchorsStore) Load() error {
 	anchors, err := dns.LoadAnchorsWithFallback(s.path, s.url)
 	if err != nil {

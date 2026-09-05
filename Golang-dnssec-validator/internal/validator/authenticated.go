@@ -46,6 +46,12 @@ func (v *VerifiedRRset) Labels() uint8 {
 // is true only the Answer section is considered, so a valid RRset replayed in
 // Authority/Additional cannot authenticate the queried name (R-027).
 func VerifyRRsetFromResponse(rawResponse []byte, typeCovered uint16, keys []dnspkg.DNSKEYRecord, expectedOwner, expectedSigner string, answerOnly bool) (*VerifiedRRset, error) {
+	return verifyRRsetFromResponseB(nil, rawResponse, typeCovered, keys, expectedOwner, expectedSigner, answerOnly)
+}
+
+// verifyRRsetFromResponseB is VerifyRRsetFromResponse charged against a
+// validation's work budget (nil = unbounded) (RA6X-052).
+func verifyRRsetFromResponseB(b *VerifyBudget, rawResponse []byte, typeCovered uint16, keys []dnspkg.DNSKEYRecord, expectedOwner, expectedSigner string, answerOnly bool) (*VerifiedRRset, error) {
 	if len(rawResponse) == 0 {
 		return nil, fmt.Errorf("raw DNS response unavailable")
 	}
@@ -59,11 +65,30 @@ func VerifyRRsetFromResponse(rawResponse []byte, typeCovered uint16, keys []dnsp
 	} else {
 		scan = append(append(append([]dns.RR{}, msg.Answer...), msg.Ns...), msg.Extra...)
 	}
-	return verifyRRsetInRecords(scan, typeCovered, keys, expectedOwner, expectedSigner)
+	return verifyRRsetInRecords(b, scan, typeCovered, keys, expectedOwner, expectedSigner)
+}
+
+// dedupeKeys drops keys with identical material (owner, flags, protocol,
+// algorithm, public key): repeated records must not multiply crypto work.
+func dedupeKeys(keys []dnspkg.DNSKEYRecord) []dnspkg.DNSKEYRecord {
+	seen := make(map[string]bool, len(keys))
+	out := make([]dnspkg.DNSKEYRecord, 0, len(keys))
+	for _, k := range keys {
+		id := fmt.Sprintf("%s/%d/%d/%d/%s", dns.CanonicalName(k.Owner), k.Flags, k.Protocol, k.Algorithm, k.PublicKey)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, k)
+	}
+	return out
 }
 
 // verifyRRsetInRecords is VerifyRRsetFromResponse over already-unpacked records.
-func verifyRRsetInRecords(scan []dns.RR, typeCovered uint16, keys []dnspkg.DNSKEYRecord, expectedOwner, expectedSigner string) (*VerifiedRRset, error) {
+// Every signature verification attempt is charged to b; identical signatures
+// and identical keys are collapsed first, and algorithm/tag/eligibility
+// filtering happens before any cryptography (RA6X-052).
+func verifyRRsetInRecords(b *VerifyBudget, scan []dns.RR, typeCovered uint16, keys []dnspkg.DNSKEYRecord, expectedOwner, expectedSigner string) (*VerifiedRRset, error) {
 	wantOwner := ""
 	if expectedOwner != "" {
 		wantOwner = dns.CanonicalName(expectedOwner)
@@ -75,10 +100,16 @@ func verifyRRsetInRecords(scan []dns.RR, typeCovered uint16, keys []dnspkg.DNSKE
 
 	rrsetByOwner := make(map[string][]dns.RR)
 	candidates := make([]*dns.RRSIG, 0)
+	seenSig := make(map[string]bool)
 	for _, rr := range scan {
 		switch v := rr.(type) {
 		case *dns.RRSIG:
 			if v.TypeCovered == typeCovered {
+				id := dns.CanonicalName(v.Hdr.Name) + "/" + dns.CanonicalName(v.SignerName) + "/" + fmt.Sprint(v.KeyTag, v.Labels, v.Inception, v.Expiration) + "/" + v.Signature
+				if seenSig[id] {
+					continue
+				}
+				seenSig[id] = true
 				candidates = append(candidates, v)
 			}
 		default:
@@ -88,6 +119,7 @@ func verifyRRsetInRecords(scan []dns.RR, typeCovered uint16, keys []dnspkg.DNSKE
 			}
 		}
 	}
+	keys = dedupeKeys(keys)
 
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no RRSIG found in response covering type %s", dnspkg.TypeName(typeCovered))
@@ -131,6 +163,9 @@ func verifyRRsetInRecords(scan []dns.RR, typeCovered uint16, keys []dnspkg.DNSKE
 			if err != nil {
 				lastErr = err
 				continue
+			}
+			if err := b.charge(1); err != nil {
+				return nil, err
 			}
 			if err := sig.Verify(signingKey, rrset); err != nil {
 				lastErr = fmt.Errorf("cryptographic RRset verification failed: %w", err)
@@ -176,10 +211,16 @@ func trustedKeyForSigner(key dnspkg.DNSKEYRecord, signerName string) (*dns.DNSKE
 // (RA6X-007). The signature must name zone as its signer and be produced by an
 // authenticated key (RFC 4035 §5.2, R-080).
 func VerifyDNSKEYRRsetFromResponse(rawResponse []byte, zone string, authenticatedKeys []dnspkg.DNSKEYRecord) (*VerifiedRRset, error) {
+	return verifyDNSKEYRRsetFromResponseB(nil, rawResponse, zone, authenticatedKeys)
+}
+
+// verifyDNSKEYRRsetFromResponseB is VerifyDNSKEYRRsetFromResponse charged
+// against a validation's work budget (RA6X-052).
+func verifyDNSKEYRRsetFromResponseB(b *VerifyBudget, rawResponse []byte, zone string, authenticatedKeys []dnspkg.DNSKEYRecord) (*VerifiedRRset, error) {
 	if len(authenticatedKeys) == 0 {
 		return nil, fmt.Errorf("no parent-authenticated (DS/anchor-matched) key available to verify the DNSKEY RRset")
 	}
-	return VerifyRRsetFromResponse(rawResponse, dns.TypeDNSKEY, authenticatedKeys, zone, zone, true)
+	return verifyRRsetFromResponseB(b, rawResponse, dns.TypeDNSKEY, authenticatedKeys, zone, zone, true)
 }
 
 // VerifyDenialRRsetsFromResponse cryptographically verifies every NSEC/NSEC3
@@ -195,6 +236,13 @@ func VerifyDNSKEYRRsetFromResponse(rawResponse []byte, zone string, authenticate
 // no RRset of the type verified. When expectedSigner is non-empty every
 // accepted signature must name that zone as its signer (RA6X-016).
 func VerifyDenialRRsetsFromResponse(rawResponse []byte, typeCovered uint16, keys []dnspkg.DNSKEYRecord, expectedSigner string) (verified []VerifiedRRset, rejected []string, err error) {
+	return verifyDenialRRsetsFromResponseB(nil, rawResponse, typeCovered, keys, expectedSigner)
+}
+
+// verifyDenialRRsetsFromResponseB is VerifyDenialRRsetsFromResponse charged
+// against a validation's work budget; an exhausted budget aborts the whole
+// call rather than being reported as an unverifiable RRset (RA6X-052).
+func verifyDenialRRsetsFromResponseB(b *VerifyBudget, rawResponse []byte, typeCovered uint16, keys []dnspkg.DNSKEYRecord, expectedSigner string) (verified []VerifiedRRset, rejected []string, err error) {
 	if len(rawResponse) == 0 {
 		return nil, nil, fmt.Errorf("raw DNS response unavailable")
 	}
@@ -249,8 +297,11 @@ func VerifyDenialRRsetsFromResponse(rawResponse []byte, typeCovered uint16, keys
 			continue
 		}
 		records := append(append([]dns.RR{}, rrset...), rrsToRRs(sigs)...)
-		v, verr := verifyRRsetInRecords(records, typeCovered, keys, owner, expectedSigner)
+		v, verr := verifyRRsetInRecords(b, records, typeCovered, keys, owner, expectedSigner)
 		if verr != nil {
+			if IsBudgetExhausted(verr) {
+				return nil, rejected, verr
+			}
 			rejected = append(rejected, fmt.Sprintf("%s RRset at %s: %v", dnspkg.TypeName(typeCovered), owner, verr))
 			continue
 		}

@@ -109,16 +109,26 @@ func finalizeAnchors(anchors *RootAnchors, source string) error {
 		return fmt.Errorf("anchors from %s declare zone %q, want the root zone \".\"", source, anchors.Zone)
 	}
 
-	// Filter to only valid anchors (ValidUntil is nil or in the future).
+	// Validate dates and drop expired anchors (RA6X-041). A malformed or
+	// missing ValidFrom/ValidUntil is a document error — such an anchor can
+	// never become active, and silently keeping it would let an unusable
+	// document count as a successful load. Future-dated anchors are retained
+	// so a pre-published successor becomes usable at its activation time.
 	validAnchors := make([]Anchor, 0, len(anchors.Anchors))
 	now := time.Now()
 	for _, a := range anchors.Anchors {
+		if _, err := time.Parse(time.RFC3339, a.ValidFrom); err != nil {
+			return fmt.Errorf("anchors from %s: anchor %q (tag %d) has an invalid validFrom %q: %w", source, a.ID, a.KeyTag, a.ValidFrom, err)
+		}
 		if a.ValidUntil == nil {
 			validAnchors = append(validAnchors, a)
 			continue
 		}
 		validUntil, err := time.Parse(time.RFC3339, *a.ValidUntil)
-		if err == nil && validUntil.After(now) {
+		if err != nil {
+			return fmt.Errorf("anchors from %s: anchor %q (tag %d) has an invalid validUntil %q: %w", source, a.ID, a.KeyTag, *a.ValidUntil, err)
+		}
+		if validUntil.After(now) {
 			validAnchors = append(validAnchors, a)
 		}
 	}
@@ -137,9 +147,22 @@ func finalizeAnchors(anchors *RootAnchors, source string) error {
 	}
 
 	// Reject an anchor set that carries no authoritative pinned anchor (possible
-	// wholesale swap). An empty set falls through to the URL fallback unchanged.
+	// wholesale swap).
 	if len(validAnchors) > 0 && !hasPinnedRootAnchor(validAnchors) {
 		return fmt.Errorf("anchors from %s carry no authoritative pinned root KSK; refusing possible wholesale anchor swap", source)
+	}
+
+	// A load is successful only if it yields at least one anchor that can
+	// establish root trust right now: currently active AND pinned. A document
+	// holding only future-dated, expired or unpinned entries is unusable and
+	// must fail so the caller tries its fallback instead of replacing a
+	// working set with one that validates nothing (RA6X-041).
+	candidate := &RootAnchors{Anchors: validAnchors}
+	if len(GetActivePinnedAnchors(candidate)) == 0 {
+		if len(validAnchors) == 0 {
+			return fmt.Errorf("anchors from %s contain no unexpired anchors", source)
+		}
+		return fmt.Errorf("anchors from %s contain no currently active pinned root anchor (all future-dated or unpinned); unusable for validation", source)
 	}
 
 	anchors.Anchors = validAnchors
@@ -229,18 +252,21 @@ func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
 	return &anchors, nil
 }
 
-// LoadAnchorsWithFallback tries to load from file first, then falls back to URL
+// LoadAnchorsWithFallback tries to load from file first, then falls back to
+// URL. A file that is missing, malformed or unusable (no currently active
+// pinned anchor — RA6X-041) triggers the fallback; when every source fails
+// the error names both, and the caller keeps whatever it already holds.
 func LoadAnchorsWithFallback(path, url string) (*RootAnchors, error) {
 	// Try file first
-	anchors, err := LoadAnchors(path)
-	if err == nil && len(anchors.Anchors) > 0 {
+	anchors, fileErr := LoadAnchors(path)
+	if fileErr == nil {
 		return anchors, nil
 	}
 
 	// Fall back to URL
-	anchors, err = LoadAnchorsFromURL(url)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load anchors from both file (%s) and URL (%s): %w", path, url, err)
+	anchors, urlErr := LoadAnchorsFromURL(url)
+	if urlErr != nil {
+		return nil, fmt.Errorf("failed to load anchors from both file (%s: %v) and URL (%s): %w", path, fileErr, url, urlErr)
 	}
 
 	return anchors, nil

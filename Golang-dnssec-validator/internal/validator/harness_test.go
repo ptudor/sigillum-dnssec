@@ -50,18 +50,7 @@ type mockDNS struct {
 // and TCP. Questions without a registered handler get an empty NOERROR answer.
 func newMockDNS(t *testing.T) *mockDNS {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	host, port, err := net.SplitHostPort(pc.LocalAddr().String())
-	if err != nil {
-		t.Fatalf("split addr: %v", err)
-	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		t.Fatalf("listen tcp: %v", err)
-	}
+	pc, ln, host, port := listenPair(t, "127.0.0.1")
 	m := &mockDNS{
 		t: t, ip: host, port: port,
 		handlers: make(map[qkey]func(*dns.Msg) *dns.Msg),
@@ -193,6 +182,30 @@ func (m *mockDNS) clearFamilyOverrides() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.byFamily = make(map[string]map[qkey]func(*dns.Msg) *dns.Msg)
+}
+
+// listenPair binds a UDP socket on an ephemeral port and a TCP listener on the
+// same port, retrying with a fresh port when the TCP side is already taken by
+// another process.
+func listenPair(t *testing.T, host string) (net.PacketConn, net.Listener, string, string) {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		pc, err := net.ListenPacket("udp", net.JoinHostPort(host, "0"))
+		if err != nil {
+			t.Fatalf("listen udp: %v", err)
+		}
+		h, port, err := net.SplitHostPort(pc.LocalAddr().String())
+		if err != nil {
+			t.Fatalf("split addr: %v", err)
+		}
+		ln, err := net.Listen("tcp", net.JoinHostPort(h, port))
+		if err == nil {
+			return pc, ln, h, port
+		}
+		_ = pc.Close()
+	}
+	t.Fatal("could not bind a UDP/TCP port pair")
+	return nil, nil, "", ""
 }
 
 // drop makes the mock never answer the question (client-side timeout).

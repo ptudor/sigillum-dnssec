@@ -31,6 +31,21 @@ type Validator struct {
 	// so a hermetic fixture can serve the root zone through the real
 	// validation path (RA6X-050); production leaves it nil.
 	rootServers []string
+	// verificationBudget bounds the cryptographic work of one validation and
+	// budget is the live accounting for the validation in progress (RA6X-052).
+	verificationBudget int64
+	budget             *VerifyBudget
+}
+
+// SetVerificationBudget sets the cryptographic work budget (signature
+// verification attempts plus DS digest comparisons) one validation may spend
+// before it stops with an indeterminate resource-limit result (RA6X-052). A
+// value <= 0 restores DefaultVerificationBudget.
+func (v *Validator) SetVerificationBudget(units int64) {
+	if units <= 0 {
+		units = DefaultVerificationBudget
+	}
+	v.verificationBudget = units
 }
 
 // rootServerAddresses returns the root-server addresses to query.
@@ -50,6 +65,8 @@ func NewValidator(queryTimeout, totalTimeout time.Duration, maxConcurrent int, a
 		totalTimeout:  totalTimeout,
 		maxConcurrent: maxConcurrent,
 		queryType:     dns.TypeA,
+
+		verificationBudget: DefaultVerificationBudget,
 	}
 }
 
@@ -189,6 +206,16 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 	ctx, cancel := context.WithTimeout(ctx, v.totalTimeout)
 	defer cancel()
 
+	// One work budget per top-level validation, shared by every nested alias
+	// hop and by every chain/DS/DNSKEY/leaf/denial check (RA6X-052).
+	if depth == 0 || v.budget == nil {
+		limit := v.verificationBudget
+		if limit <= 0 {
+			limit = DefaultVerificationBudget
+		}
+		v.budget = newVerifyBudget(ctx, limit)
+	}
+
 	// Discover actual zone cuts instead of assuming every label is a zone
 	v.emitEvent("progress", ProgressEvent{
 		Zone:   result.Domain,
@@ -300,6 +327,13 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 		case StatusIndeterminate:
 			if lastStatus == StatusSecure || lastStatus == StatusInsecure {
 				lastStatus = StatusIndeterminate
+			}
+			// A resource limit is surfaced at the top level as well, so an API
+			// caller sees why the verdict is indeterminate (RA6X-052).
+			for _, e := range zoneResult.Errors {
+				if isBudgetExhaustedText(e) {
+					result.Errors = append(result.Errors, fmt.Sprintf("%s: %s", zone, e))
+				}
 			}
 		}
 	}
@@ -614,13 +648,13 @@ func (v *Validator) leafSignatureError(qr *dnspkg.QueryResult, domain, zone stri
 	}
 	switch {
 	case answerHasTypeAt(qr.RawResponse, v.leafType(), domain):
-		_, err := VerifyRRsetFromResponse(qr.RawResponse, v.leafType(), dnskeys, domain, zone, true)
+		_, err := verifyRRsetFromResponseB(v.budget, qr.RawResponse, v.leafType(), dnskeys, domain, zone, true)
 		return err
 	case len(answerCNAMEsOwnedBy(qr.CNAME, domain)) > 0:
 		if dnameAncestorInAnswer(qr, domain) != "" {
 			return nil // authenticated through the DNAME path instead
 		}
-		_, err := VerifyRRsetFromResponse(qr.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
+		_, err := verifyRRsetFromResponseB(v.budget, qr.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
 		return err
 	}
 	return nil
@@ -738,7 +772,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		// Check for denial proofs if this is NXDOMAIN or NODATA
 		if len(nsecCands) > 0 {
 			// Verify NSEC denial proof with full RRSIG verification
-			proof := VerifyNSECDenialWithRRSIG(domain, v.leafType(), nsecCands, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
+			proof := verifyNSECDenialWithRRSIGB(v.budget, domain, v.leafType(), nsecCands, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
 			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
@@ -748,7 +782,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 			return validation
 		} else if len(nsec3Cands) > 0 {
 			// Verify NSEC3 denial proof with full RRSIG verification
-			proof := VerifyNSEC3DenialWithRRSIG(domain, v.leafType(), nsec3Cands, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
+			proof := verifyNSEC3DenialWithRRSIGB(v.budget, domain, v.leafType(), nsec3Cands, dnskeys, zone, queryResult.RawResponse, queryResult.RCode)
 			validation.DenialProof = proof
 			if proof.Verified {
 				validation.RRSIGVerified = true
@@ -781,7 +815,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 	}
 
 	if answerHasTypeAt(queryResult.RawResponse, v.leafType(), domain) {
-		verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, v.leafType(), dnskeys, domain, zone, true)
+		verified, err := verifyRRsetFromResponseB(v.budget, queryResult.RawResponse, v.leafType(), dnskeys, domain, zone, true)
 		if err != nil {
 			validation.Error = fmt.Sprintf("%s record RRSIG verification failed: %v", v.leafTypeName(), err)
 			return validation
@@ -798,7 +832,7 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		}
 		// The answer is an alias: authenticate the CNAME RRset at the owner.
 		validation.RecordType = "CNAME"
-		verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
+		verified, err := verifyRRsetFromResponseB(v.budget, queryResult.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
 		if err != nil {
 			validation.Error = fmt.Sprintf("CNAME RRSIG verification failed: %v", err)
 			return validation
@@ -881,7 +915,7 @@ func (v *Validator) verifyDNAMEAnswer(validation *RecordValidation, domain, zone
 	validation.RecordType = "DNAME"
 	validation.SynthesizedFrom = dnameOwner
 
-	verified, err := VerifyRRsetFromResponse(queryResult.RawResponse, dns.TypeDNAME, dnskeys, dnameOwner, zone, true)
+	verified, err := verifyRRsetFromResponseB(v.budget, queryResult.RawResponse, dns.TypeDNAME, dnskeys, dnameOwner, zone, true)
 	if err != nil {
 		validation.Error = fmt.Sprintf("DNAME RRSIG verification failed for %s: %v", dnameOwner, err)
 		return validation
@@ -992,14 +1026,14 @@ func (v *Validator) verifyWildcard(validation *RecordValidation, qname, zone str
 	var cryptoErr error
 	switch {
 	case len(nsecCands) > 0:
-		verified, _, err := VerifyDenialRRsetsFromResponse(queryResult.RawResponse, dns.TypeNSEC, dnskeys, zone)
+		verified, _, err := verifyDenialRRsetsFromResponseB(v.budget, queryResult.RawResponse, dns.TypeNSEC, dnskeys, zone)
 		if err != nil {
 			cryptoErr = err
 		} else {
 			authNSEC = nsecRecordsFromVerified(verified)
 		}
 	case len(nsec3Cands) > 0:
-		verified, _, err := VerifyDenialRRsetsFromResponse(queryResult.RawResponse, dns.TypeNSEC3, dnskeys, zone)
+		verified, _, err := verifyDenialRRsetsFromResponseB(v.budget, queryResult.RawResponse, dns.TypeNSEC3, dnskeys, zone)
 		if err != nil {
 			cryptoErr = err
 		} else {
@@ -1057,7 +1091,8 @@ func recordValidationVerdict(rv *RecordValidation) (ValidationStatus, string) {
 		if msg == "" {
 			msg = "wildcard answer lacks a verified no-exact-match (NSEC/NSEC3) proof"
 		}
-		if isUnqueryableRecordError(msg) {
+		if isUnqueryableRecordError(msg) || isBudgetExhaustedText(msg) ||
+			(rv.WildcardProof != nil && isBudgetExhaustedText(rv.WildcardProof.Error)) {
 			return StatusIndeterminate, msg
 		}
 		return StatusBogus, msg
@@ -1081,6 +1116,19 @@ func recordValidationVerdict(rv *RecordValidation) (ValidationStatus, string) {
 		msg := rv.Error
 		if msg == "" {
 			msg = "record could not be queried from authoritative servers"
+		}
+		return StatusIndeterminate, msg
+	}
+	// RA6X-052: an exhausted work budget (or a cancelled validation) is a
+	// resource limit, not a signature failure — never bogus, never secure.
+	if isBudgetExhaustedText(rv.Error) || (rv.DenialProof != nil && isBudgetExhaustedText(rv.DenialProof.Error)) ||
+		(rv.WildcardProof != nil && isBudgetExhaustedText(rv.WildcardProof.Error)) {
+		msg := rv.Error
+		if msg == "" && rv.DenialProof != nil {
+			msg = rv.DenialProof.Error
+		}
+		if msg == "" && rv.WildcardProof != nil {
+			msg = rv.WildcardProof.Error
 		}
 		return StatusIndeterminate, msg
 	}
@@ -1308,6 +1356,10 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			return result, nil
 		}
 		trust = func(keys []dnspkg.DNSKEYRecord) (*ChainLink, []dnspkg.DNSKEYRecord, error) {
+			keys = dedupeKeys(keys)
+			if err := v.budget.charge(int64(len(activeAnchors)) * int64(len(keys)) * 2); err != nil {
+				return nil, nil, err
+			}
 			link, err := VerifyRootTrustAnchor(keys, activeAnchors)
 			if err != nil {
 				return nil, nil, fmt.Errorf("root trust anchor verification failed: %v", err)
@@ -1347,6 +1399,11 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		// R-079: a secure delegation requires the DS RRset to be signed by the parent's
 		// authenticated DNSKEY. Without a verified DS RRSIG, a forged DS pointing at an
 		// attacker-generated key would be accepted. Fail closed to bogus.
+		if ds.Validation != nil && isBudgetExhaustedText(ds.Validation.Error) {
+			result.Status = StatusIndeterminate
+			result.AddError(ds.Validation.Error)
+			return result, nil
+		}
 		if ds.Validation == nil || !ds.Validation.RRSIGVerified || len(ds.Authenticated) == 0 {
 			result.Status = StatusBogus
 			msg := "DS RRset is not signed by the parent (no verified DS RRSIG)"
@@ -1379,6 +1436,10 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		}
 
 		trust = func(keys []dnspkg.DNSKEYRecord) (*ChainLink, []dnspkg.DNSKEYRecord, error) {
+			keys = dedupeKeys(keys)
+			if err := v.budget.charge(int64(len(supportedDS)) * int64(len(keys)) * 2); err != nil {
+				return nil, nil, err
+			}
 			// Validate DS matches DNSKEY (digest) and record the chain link, using
 			// ONLY the exact DS RRset the parent's signature authenticated (RA6X-007)
 			// and this validator can act on (RA6X-017).
@@ -1416,9 +1477,17 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		if err == nil {
 			if len(sr.Response.RawResponse) == 0 {
 				err = fmt.Errorf("DNSKEY response could not be retained in wire form; cannot verify the DNSKEY RRset")
-			} else if _, verr := VerifyDNSKEYRRsetFromResponse(sr.Response.RawResponse, zone, authed); verr != nil {
+			} else if _, verr := verifyDNSKEYRRsetFromResponseB(v.budget, sr.Response.RawResponse, zone, authed); verr != nil {
 				err = fmt.Errorf("DNSKEY RRSIG verification failed: %v", verr)
 			}
+		}
+		if IsBudgetExhausted(err) {
+			// A resource limit is not evidence about the zone: stop here with an
+			// explicit indeterminate result (RA6X-052).
+			result.Status = StatusIndeterminate
+			result.AddError(err.Error())
+			applyServerResults()
+			return result, nil
 		}
 		if err != nil {
 			sr.Status = StatusBogus
@@ -1561,7 +1630,7 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 		result, err := v.resolver.QueryDSAuthoritative(ctx, addr, zone)
 		if out != nil {
 			// Extended mode: judge this parent server against the chosen answer.
-			if d := judgeParentDSServer(out, addr, result, err, zone, parentZone, parentDNSKEY); d != nil {
+			if d := judgeParentDSServer(v.budget, out, addr, result, err, zone, parentZone, parentDNSKEY); d != nil {
 				out.Disagreements = append(out.Disagreements, *d)
 			}
 			continue
@@ -1576,7 +1645,7 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 
 			// Verify DS RRSIG if we have parent's DNSKEY and a DS RRset was served.
 			if len(parentDNSKEY) > 0 && len(out.Observed) > 0 {
-				out.Authenticated = verifyDSRRSIGSet(validation, zone, parentZone, parentDNSKEY, result.RawResponse)
+				out.Authenticated = verifyDSRRSIGSetB(v.budget, validation, zone, parentZone, parentDNSKEY, result.RawResponse)
 			}
 			if v.quickMode || idx == len(parentNS)-1 {
 				return out, nil
@@ -1598,7 +1667,7 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 // judgeParentDSServer compares one additional parent server's DS answer with
 // the chosen one (RA6X-018): it must answer, serve the same DS RRset for the
 // child, and (when the parent's keys are known) its signature must verify.
-func judgeParentDSServer(chosen *parentDSResult, addr string, qr *dnspkg.QueryResult, err error, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord) *Disagreement {
+func judgeParentDSServer(b *VerifyBudget, chosen *parentDSResult, addr string, qr *dnspkg.QueryResult, err error, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord) *Disagreement {
 	d := &Disagreement{Server: "parent " + parentZone, IP: addr}
 	switch {
 	case err != nil:
@@ -1621,7 +1690,10 @@ func judgeParentDSServer(chosen *parentDSResult, addr string, qr *dnspkg.QueryRe
 	}
 	if len(parentDNSKEY) > 0 && len(observed) > 0 {
 		v := &DSValidation{ParentZone: parentZone}
-		if got := verifyDSRRSIGSet(v, zone, parentZone, parentDNSKEY, qr.RawResponse); got == nil {
+		if got := verifyDSRRSIGSetB(b, v, zone, parentZone, parentDNSKEY, qr.RawResponse); got == nil {
+			if isBudgetExhaustedText(v.Error) {
+				return nil // out of budget: no verdict on this server
+			}
 			d.Issue, d.Expected, d.Got = "parent server's DS RRSIG does not verify", "valid signature", v.Error
 			return d
 		}
@@ -1672,7 +1744,12 @@ func dsSummary(ds []dnspkg.DSRecord) string {
 // signed by the parent zone (RA6X-007); a DS replayed for another delegation
 // or injected in Authority/Additional never verifies and is never returned.
 func verifyDSRRSIGSet(validation *DSValidation, childZone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) []dnspkg.DSRecord {
-	verified, err := VerifyRRsetFromResponse(rawResponse, dns.TypeDS, parentDNSKEY, childZone, parentZone, true)
+	return verifyDSRRSIGSetB(nil, validation, childZone, parentZone, parentDNSKEY, rawResponse)
+}
+
+// verifyDSRRSIGSetB is verifyDSRRSIGSet charged against a work budget (RA6X-052).
+func verifyDSRRSIGSetB(b *VerifyBudget, validation *DSValidation, childZone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord, rawResponse []byte) []dnspkg.DSRecord {
+	verified, err := verifyRRsetFromResponseB(b, rawResponse, dns.TypeDS, parentDNSKEY, childZone, parentZone, true)
 	if err != nil {
 		validation.Error = fmt.Sprintf("DS RRSIG verification failed: %v", err)
 		return nil
@@ -1707,7 +1784,7 @@ func (v *Validator) verifyDSAbsence(childName, parentZone string, parentDNSKEY [
 		for _, nsec := range nsecCands {
 			proof.Records = append(proof.Records, fmt.Sprintf("%s types: %v", nsec.Owner, nsec.TypeBitmap))
 		}
-		verified, rejected, err := VerifyDenialRRsetsFromResponse(qr.RawResponse, dns.TypeNSEC, parentDNSKEY, parentZone)
+		verified, rejected, err := verifyDenialRRsetsFromResponseB(v.budget, qr.RawResponse, dns.TypeNSEC, parentDNSKEY, parentZone)
 		if err != nil {
 			proof.Error = fmt.Sprintf("NSEC RRSIG verification failed: %v", err)
 			return proof, false
@@ -1751,7 +1828,7 @@ func (v *Validator) verifyDSAbsence(childName, parentZone string, parentDNSKEY [
 		for _, rec := range nsec3Cands {
 			proof.Records = append(proof.Records, fmt.Sprintf("%s → %s types: %v", rec.HashedOwner, rec.NextHashed, rec.TypeBitmap))
 		}
-		verified, rejected, err := VerifyDenialRRsetsFromResponse(qr.RawResponse, dns.TypeNSEC3, parentDNSKEY, parentZone)
+		verified, rejected, err := verifyDenialRRsetsFromResponseB(v.budget, qr.RawResponse, dns.TypeNSEC3, parentDNSKEY, parentZone)
 		if err != nil {
 			proof.Error = fmt.Sprintf("NSEC3 RRSIG verification failed: %v", err)
 			return proof, false
@@ -1853,6 +1930,12 @@ func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone, parentZone 
 		// stripped DS would look identical. Fail to indeterminate rather than downgrade.
 		result.Status = StatusIndeterminate
 		result.AddError("insecure delegation claimed but the parent returned no authenticated proof of DS absence (possible downgrade attack)")
+		return
+	}
+
+	if proof != nil && isBudgetExhaustedText(proof.Error) {
+		result.Status = StatusIndeterminate
+		result.AddError(proof.Error)
 		return
 	}
 
@@ -1997,7 +2080,12 @@ func (v *Validator) judgeDNSKEYServers(result *ZoneResult, serverResults []Addre
 			sr.Error = "DNSKEY response could not be retained in wire form"
 			continue
 		}
-		if _, err := VerifyDNSKEYRRsetFromResponse(sr.Response.RawResponse, zone, authenticatedKeys); err != nil {
+		if _, err := verifyDNSKEYRRsetFromResponseB(v.budget, sr.Response.RawResponse, zone, authenticatedKeys); err != nil {
+			if IsBudgetExhausted(err) {
+				sr.Status = StatusIndeterminate
+				sr.Error = err.Error()
+				continue
+			}
 			sr.Status = StatusBogus
 			sr.Error = fmt.Sprintf("DNSKEY RRSIG verification failed: %v", err)
 			result.Disagreements = append(result.Disagreements, Disagreement{
