@@ -181,3 +181,66 @@ func TestRA6X015_InsecureSourceStillBoundedByTarget(t *testing.T) {
 		t.Fatalf("expected the bogus target to be named: %v", res.Errors)
 	}
 }
+
+// The unauthenticated fallback has its own section/owner filter, and it is the
+// one that matters most: below an insecure ancestor there is no signature to
+// bound what gets followed, so discoverAliasTarget accepts only an
+// Answer-section CNAME owned by the queried name (RA6X-015).
+//
+// TestRA6X015_UnrelatedCNAMEIsNotFollowed covers the same rule on the
+// authenticated path, where the leaf RRset verification already excludes
+// Additional; it is a secure zone, so it never reaches this code.
+func TestRA6X015_InsecureAliasDiscoveryIgnoresOffOwnerAndAdditional(t *testing.T) {
+	cases := []struct {
+		name   string
+		answer []dns.RR
+		extra  []dns.RR
+	}{
+		{
+			name:   "CNAME in Answer at another owner",
+			answer: []dns.RR{&dns.CNAME{Hdr: rrHdr("elsewhere.plain.test.", dns.TypeCNAME), Target: "attacker.invalid."}},
+		},
+		{
+			name:  "same-owner CNAME in Additional",
+			extra: []dns.RR{&dns.CNAME{Hdr: rrHdr("decoy.plain.test.", dns.TypeCNAME), Target: "attacker.invalid."}},
+		},
+		{
+			name:   "off-owner in Answer and same-owner in Additional",
+			answer: []dns.RR{&dns.CNAME{Hdr: rrHdr("elsewhere.plain.test.", dns.TypeCNAME), Target: "attacker.invalid."}},
+			extra:  []dns.RR{&dns.CNAME{Hdr: rrHdr("decoy.plain.test.", dns.TypeCNAME), Target: "other.invalid."}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newChainFixture(t)
+			insecure := f.addInsecureChild(t, "plain.test.")
+			_ = insecure
+			f.m.respond("decoy.plain.test.", dns.TypeA, dns.RcodeSuccess, tc.answer, nil, tc.extra)
+
+			res := f.validate(t, "decoy.plain.test.")
+			if len(res.CNAMEChains) != 0 {
+				t.Fatalf("no alias may be followed from an off-owner or Additional CNAME: %+v", res.CNAMEChains)
+			}
+			if res.Result == StatusSecure {
+				t.Fatalf("an insecure zone's answer must not be secure, got %s", res.Result)
+			}
+		})
+	}
+}
+
+// The control: the same insecure zone with a well-formed Answer-section CNAME
+// owned by the queried name IS followed, so the test above is not passing
+// merely because traversal is broken.
+func TestRA6X015_InsecureAliasDiscoveryFollowsTheAnswerOwner(t *testing.T) {
+	f := newChainFixture(t)
+	insecure := f.addInsecureChild(t, "plain.test.")
+	other := f.addChild(t, "other.test.")
+	_ = insecure
+	serveA(t, f.m, other, "www.other.test.")
+	f.m.answer("real.plain.test.", dns.TypeA, &dns.CNAME{Hdr: rrHdr("real.plain.test.", dns.TypeCNAME), Target: "www.other.test."})
+
+	res := f.validate(t, "real.plain.test.")
+	if len(res.CNAMEChains) != 1 || res.CNAMEChains[0].Target != "www.other.test." {
+		t.Fatalf("a well-formed Answer-section alias must still be followed: %+v", res.CNAMEChains)
+	}
+}
