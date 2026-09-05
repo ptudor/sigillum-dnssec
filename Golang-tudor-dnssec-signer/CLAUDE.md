@@ -277,8 +277,16 @@ coalesce_post_sign = true
 ### Possible status values
 - `healthy` — Everything fine, no action needed
 - `action_required` — Human needs to do something (usually DS update)
-- `warning` — Will need attention soon (approaching rollover)
+- `warning` — Will need attention soon (approaching rollover, or an automatic
+  rollover safety wait in progress)
 - `error` — Something is broken
+
+Each entry in `errors` names the operation that failed — `signing:`,
+`rollover:`, `init:`, `deployment:`, `registrar:` — and a later success of
+that operation clears exactly that entry (RA6X-048). A configured zone that
+has no state entry yet is listed with an `init:` error rather than omitted;
+`/healthz` is 503 until every configured zone has produced a signed,
+confirmed-served generation (RA6X-033).
 
 ## Web UI Requirements
 

@@ -47,12 +47,25 @@ type StatusSummary struct {
 // DTO. This presentation layer sits above both state (persistence) and the
 // validator, so ZoneStatusOutput can carry an optional *ValidationResult
 // without state ever depending on the validator.
-func buildStatusOutput(s *statepkg.State) *StatusOutput {
+func buildStatusOutput(s *statepkg.State, configured ...string) *StatusOutput {
 	output := &StatusOutput{
 		Timestamp: time.Now().UTC(),
 		Zones:     make(map[string]*ZoneStatusOutput),
 	}
-	for domain, zc := range s.SnapshotZones() {
+	zones := s.SnapshotZones()
+	// RA6X-033: a configured zone with no state entry never initialized; it
+	// is reported as an error rather than omitted from every count.
+	for _, domain := range configured {
+		if _, ok := zones[domain]; !ok {
+			output.Zones[domain] = &ZoneStatusOutput{
+				Status: "error",
+				Errors: []string{statepkg.OpInit + ": configured but not initialized (no state entry yet)"},
+			}
+			output.Summary.Total++
+			output.Summary.Errors++
+		}
+	}
+	for domain, zc := range zones {
 		status := zc.Status()
 		output.Zones[domain] = &ZoneStatusOutput{
 			Status:          status,
@@ -82,6 +95,6 @@ func buildStatusOutput(s *statepkg.State) *StatusOutput {
 }
 
 // statusJSON returns the status output as indented JSON.
-func statusJSON(s *statepkg.State) ([]byte, error) {
-	return json.MarshalIndent(buildStatusOutput(s), "", "  ")
+func statusJSON(s *statepkg.State, configured ...string) ([]byte, error) {
+	return json.MarshalIndent(buildStatusOutput(s, configured...), "", "  ")
 }

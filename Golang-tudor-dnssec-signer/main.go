@@ -437,10 +437,28 @@ func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath
 	if err := firePostSignHooks(&cfg.Hooks, cfg.OutputDir, []SignedZoneRef{ref}, nil, nil); err != nil {
 		slog.Error("[CLI] Post-sign hook failed; the zone is not confirmed served and stays pending deployment", "domain", domain, "error", err)
 		fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; the signed zone is written but not confirmed served (the daemon retries the hook)\n", domain)
+		state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, "post-sign hook failed: "+err.Error()) })
+		if perr := persistState(state); perr != nil {
+			slog.Error("[CLI] Failed to persist deployment error", "error", perr)
+		}
 		return false
 	}
 	confirmPublicationCLI(state, []SignedZoneRef{ref})
 	return true
+}
+
+// recordSigningFailure persists a zone's signing error the way the daemon
+// and `sign` do (RA6X-048), leaving unrelated errors and the last good
+// output in place.
+func recordSigningFailure(state *statepkg.State, domain string, err error) {
+	zs := state.GetZone(domain)
+	if zs == nil {
+		return
+	}
+	state.Mutate(func() { zs.SetOperationError(statepkg.OpSigning, err.Error()) })
+	if perr := persistState(state); perr != nil {
+		slog.Error("[CLI] Failed to persist signing error", "domain", domain, "error", perr)
+	}
 }
 
 // confirmPublicationCLI records hook-confirmed publication for the given
@@ -452,7 +470,10 @@ func confirmPublicationCLI(state *statepkg.State, zones []SignedZoneRef) {
 		if zs == nil {
 			continue
 		}
-		state.Mutate(func() { zs.ConfirmPublication(z.SignedAt, now) })
+		state.Mutate(func() {
+			zs.ConfirmPublication(z.SignedAt, now)
+			zs.ClearOperationError(statepkg.OpDeployment)
+		})
 	}
 	if err := persistState(state); err != nil {
 		slog.Error("[CLI] Failed to persist publication confirmation; the daemon will re-run the hook", "error", err)
@@ -730,19 +751,31 @@ func runSign(cmd *cobra.Command, args []string) error {
 	// warning eventually becomes "expired" (R-036). Mirrors the daemon's
 	// per-zone post-sign rollover check; the advanced state is persisted below.
 	rollover := newRolloverManager(cfg, state)
+	var rolloverErr error
 	for domain := range cfg.Zones {
 		zoneState := state.GetZone(domain)
 		if zoneState == nil || zoneState.ZSK == nil {
 			continue
 		}
-		if err := rollover.CheckZSKRollover(domain); err != nil {
-			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
+		failed := false
+		for name, check := range map[string]func(string) error{
+			"ZSK":       rollover.CheckZSKRollover,
+			"KSK":       rollover.CheckKSKRollover,
+			"algorithm": rollover.CheckAlgorithmRollover,
+		} {
+			if err := check(domain); err != nil && !fsutil.IsCommitted(err) {
+				slog.Error("[ROLLOVER] rollover check failed", "domain", domain, "rollover", name, "error", err)
+				// RA6X-048: a rollover failure is persisted on the zone and
+				// reported through the exit status so cron sees it.
+				state.Mutate(func() { zoneState.SetOperationError(statepkg.OpRollover, name+" rollover: "+err.Error()) })
+				failed = true
+				if rolloverErr == nil {
+					rolloverErr = fmt.Errorf("%s: %s rollover: %w", domain, name, err)
+				}
+			}
 		}
-		if err := rollover.CheckKSKRollover(domain); err != nil {
-			slog.Error("[ROLLOVER] KSK rollover check failed", "domain", domain, "error", err)
-		}
-		if err := rollover.CheckAlgorithmRollover(domain); err != nil {
-			slog.Error("[ROLLOVER] algorithm rollover check failed", "domain", domain, "error", err)
+		if !failed {
+			state.Mutate(func() { zoneState.ClearOperationError(statepkg.OpRollover) })
 		}
 	}
 	if err := persistState(state); err != nil {
@@ -780,7 +813,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 	}
 
 	// Output status
-	jsonData, err := statusJSON(state)
+	jsonData, err := statusJSON(state, configuredZones(cfg)...)
 	if err != nil {
 		return fmt.Errorf("generating status: %w", err)
 	}
@@ -788,6 +821,9 @@ func runSign(cmd *cobra.Command, args []string) error {
 
 	if signErr != nil {
 		return fmt.Errorf("signing failed: %w", signErr)
+	}
+	if rolloverErr != nil {
+		return fmt.Errorf("rollover failed: %w", rolloverErr)
 	}
 	if hookErr != nil {
 		return fmt.Errorf("zones signed, but the post-sign hook failed (signed output may not be served yet): %w", hookErr)
@@ -819,8 +855,12 @@ func runResign(cmd *cobra.Command, args []string) error {
 
 	slog.Info("[CLI] Force re-signing zone", "domain", domain)
 
+	// Signing outcome bookkeeping matches the daemon and `sign` (RA6X-048): a
+	// failure is persisted on the zone (the last good output stays), a
+	// success clears exactly the signing error.
 	signer := signerpkg.NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
+		recordSigningFailure(state, domain, err)
 		return fmt.Errorf("signing failed: %w", err)
 	}
 
@@ -1203,6 +1243,7 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 	// Sign with both keys
 	signer := signerpkg.NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
+		recordSigningFailure(state, domain, err)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
@@ -1344,6 +1385,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	// The key set does not change yet; re-sign so state and output stay coherent.
 	signer := signerpkg.NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
+		recordSigningFailure(state, domain, err)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 
@@ -1399,6 +1441,7 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 	// Re-sign with both algorithms
 	signer := signerpkg.NewSigner(cfg, state)
 	if err := signer.SignZone(domain); err != nil {
+		recordSigningFailure(state, domain, err)
 		return fmt.Errorf("signing zone: %w", err)
 	}
 

@@ -811,6 +811,51 @@ func (z *ZoneState) ClearStickyWarnings() {
 	z.Warnings = kept
 }
 
+// Operation-scoped errors (RA6X-048). Every error a zone carries names the
+// operation that produced it ("signing", "rollover", "init", "deployment"),
+// so a successful repair of one operation clears exactly that operation's
+// error and leaves the others — a registrar or deployment problem must not
+// vanish because a later sign succeeded. The JSON shape is unchanged: errors
+// stay strings, prefixed "<operation>: ".
+const (
+	OpSigning    = "signing"
+	OpRollover   = "rollover"
+	OpInit       = "init"
+	OpDeployment = "deployment"
+	OpRegistrar  = "registrar"
+)
+
+// SetOperationError records the current failure of one operation, replacing
+// any earlier error of the same operation.
+func (z *ZoneState) SetOperationError(op, msg string) {
+	z.ClearOperationError(op)
+	z.Errors = append(z.Errors, op+": "+msg)
+}
+
+// ClearOperationError removes the error recorded for one operation, if any.
+func (z *ZoneState) ClearOperationError(op string) {
+	if len(z.Errors) == 0 {
+		return
+	}
+	kept := z.Errors[:0:0]
+	for _, e := range z.Errors {
+		if !strings.HasPrefix(e, op+": ") {
+			kept = append(kept, e)
+		}
+	}
+	z.Errors = kept
+}
+
+// HasOperationError reports whether an error is recorded for the operation.
+func (z *ZoneState) HasOperationError(op string) bool {
+	for _, e := range z.Errors {
+		if strings.HasPrefix(e, op+": ") {
+			return true
+		}
+	}
+	return false
+}
+
 // AddError adds an error to a zone
 func (z *ZoneState) AddError(msg string) {
 	for _, e := range z.Errors {
