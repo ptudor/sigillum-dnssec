@@ -101,14 +101,27 @@ func TestRegistrarFor_UnknownAdapter(t *testing.T) {
 // any future accidental change to the signed-string order.
 func TestDynadotSign_Deterministic(t *testing.T) {
 	c := &DynadotClient{apiKey: "key123", apiSecret: "secret456"}
-	got := c.sign("/restful/v2/domains/example.com/dnssec", "req-id", `{"k":1}`)
+	const path = "/restful/v2/domains/example.com/dnssec"
 
-	// Recompute with the exact same inputs — the point of this test is to
-	// fail loudly if someone changes the field order or separator.
-	want := c.sign("/restful/v2/domains/example.com/dnssec", "req-id", `{"k":1}`)
-	if got != want || got == "" {
-		t.Fatalf("sign() not deterministic or empty: got=%q want=%q", got, want)
+	// Fixed vectors computed independently (Python hmac/hashlib over
+	// key + "\n" + path + "\n" + requestID + "\n" + body), including the
+	// empty request-ID and empty-body shapes GET/DELETE use and a body ending
+	// in a newline — a field-order or separator change fails here (RA6X-050).
+	vectors := []struct {
+		reqID, body, want string
+	}{
+		{"req-id", `{"k":1}`, "YTvt8STXKvQDz0G+Bly4p6lBG+qgz3WCXk6xt95+ilI="},
+		{"", "", "XCc0VFJKrQvT0x9jiWJ2nKYqoa+68Admgy7a4ZiIBk8="},
+		{"", `{"k":1}`, "ufva4fUB2qNpI58DcOFH4w2/SeqbQoR2+P5QgTS7OGw="},
+		{"req-id", "", "68grtSO+iMln2a4tzh7TsYvkPkOo5X9GnuLf4rdtko4="},
+		{"", "{\"k\":1}\n", "LKL2Rc5tM3FkZdExcyAWbXnTGcEWhr9n78TsIBHGW08="},
 	}
+	for _, v := range vectors {
+		if got := c.sign(path, v.reqID, v.body); got != v.want {
+			t.Fatalf("sign(%q, %q) = %q, want independent vector %q", v.reqID, v.body, got, v.want)
+		}
+	}
+	got := c.sign(path, "req-id", `{"k":1}`)
 
 	// Mutating any input must change the signature.
 	if c.sign("/different/path", "req-id", `{"k":1}`) == got {

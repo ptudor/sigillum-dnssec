@@ -151,11 +151,38 @@ digest_type = 4
 // R-015: the shipped testdata config (every key maps to a struct tag) must keep
 // loading under strict decoding.
 func TestLoadConfig_TestdataStillLoads(t *testing.T) {
-	if _, err := os.Stat("testdata/zones/example.com.zone"); err != nil {
-		t.Skip("testdata zone file missing")
+	// The committed fixture lives at the module root; this package runs two
+	// directories below it. Resolve it there and FAIL — never skip — when it is
+	// missing, so a lost fixture cannot turn the regression invisible (RA6X-050).
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := LoadConfig("testdata/config.toml"); err != nil {
+	for _, rel := range []string{"testdata/config.toml", "testdata/zones/example.com.zone"} {
+		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
+			t.Fatalf("committed fixture %s is missing: %v", rel, err)
+		}
+	}
+	// The fixture's zone path is relative to the module root, as it is when the
+	// documented `--config ./testdata/config.toml` is used from there.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	cfg, err := LoadConfig("testdata/config.toml")
+	if err != nil {
 		t.Fatalf("testdata/config.toml must still load under strict decode: %v", err)
+	}
+	zc, ok := cfg.Zones["example.com"]
+	if !ok || zc.Path != "testdata/zones/example.com.zone" {
+		t.Fatalf("fixture zone not loaded as committed: %+v", cfg.Zones)
+	}
+	if _, err := os.Stat(zc.Path); err != nil {
+		t.Fatalf("fixture zone path must resolve from the module root: %v", err)
 	}
 }
 

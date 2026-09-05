@@ -33,6 +33,14 @@ type servedZone struct {
 	state            *statepkg.State
 	ksk, zsk         *dns.DNSKEY
 	kskPriv, zskPriv ed25519.PrivateKey
+	seen             map[uint16]int // authoritative queries received, by type
+}
+
+// queries returns how many authoritative queries of qtype the server received.
+func (z *servedZone) queries(qtype uint16) int {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.seen[qtype]
 }
 
 func newServedZone(t *testing.T) *servedZone {
@@ -64,7 +72,7 @@ func newServedZone(t *testing.T) *servedZone {
 	st := statepkg.NewState(cfg.StatePath())
 	st.SetZone(domain, &statepkg.ZoneState{Path: "/unused", KSK: kskState, ZSK: zskState, Serial: 7, PublishedSerial: 7})
 
-	z := &servedZone{domain: domain, cfg: cfg, state: st, ksk: ksk, zsk: zsk, kskPriv: ed25519.PrivateKey(kskPriv), zskPriv: ed25519.PrivateKey(zskPriv)}
+	z := &servedZone{domain: domain, cfg: cfg, state: st, ksk: ksk, zsk: zsk, kskPriv: expandED25519(t, kskPriv), zskPriv: expandED25519(t, zskPriv)}
 	z.ksk.Hdr.Ttl, z.zsk.Hdr.Ttl = 3600, 3600
 	z.dnskeys = []dns.RR{z.ksk, z.zsk}
 	z.soa = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{Name: dns.Fqdn(domain), Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 3600},
@@ -86,6 +94,10 @@ func newServedZone(t *testing.T) *servedZone {
 		z.mu.Lock()
 		defer z.mu.Unlock()
 		q := r.Question[0]
+		if z.seen == nil {
+			z.seen = map[uint16]int{}
+		}
+		z.seen[q.Qtype]++
 		switch q.Qtype {
 		case dns.TypeDS:
 			m.Answer = append(m.Answer, z.parentDS...)
@@ -143,6 +155,22 @@ func (z *servedZone) resignAll(t *testing.T, inc, exp time.Time) {
 	t.Helper()
 	z.dnskeySigs = []dns.RR{z.sign(t, z.dnskeys, z.ksk, z.kskPriv, inc, exp)}
 	z.soaSigs = []dns.RR{z.sign(t, z.soa, z.zsk, z.zskPriv, inc, exp)}
+}
+
+// expandED25519 turns the raw private material the key loader returns (the
+// 32-byte seed the key files carry since RA6X-047, or a legacy 64-byte
+// expanded key) into the crypto/ed25519 form miekg's RRSIG.Sign needs.
+func expandED25519(t *testing.T, raw []byte) ed25519.PrivateKey {
+	t.Helper()
+	switch len(raw) {
+	case ed25519.SeedSize:
+		return ed25519.NewKeyFromSeed(raw)
+	case ed25519.PrivateKeySize:
+		return ed25519.PrivateKey(raw)
+	default:
+		t.Fatalf("unexpected ED25519 private key length %d", len(raw))
+		return nil
+	}
 }
 
 // edit mutates what the server serves under the handler's lock.
@@ -239,7 +267,7 @@ func TestValidateZone_CryptographicVerdicts(t *testing.T) {
 			z.dnskeys = []dns.RR{z.ksk, newKSK, z.zsk}
 			z.dnskeySigs = []dns.RR{
 				z.sign(t, z.dnskeys, z.ksk, z.kskPriv, now.Add(-time.Hour), now.Add(24*time.Hour)),
-				z.sign(t, z.dnskeys, newKSK, ed25519.PrivateKey(newPriv), now.Add(-time.Hour), now.Add(24*time.Hour)),
+				z.sign(t, z.dnskeys, newKSK, expandED25519(t, newPriv), now.Add(-time.Hour), now.Add(24*time.Hour)),
 			}
 			z.parentDS = []dns.RR{z.ksk.ToDS(dns.SHA256)} // parent still holds the old DS only
 		})

@@ -173,38 +173,39 @@ func TestToWireFormat(t *testing.T) {
 }
 
 func TestComputeNSEC3Hash(t *testing.T) {
-	// Test vectors from RFC 5155 Appendix A
+	// Fixed vectors: RFC 5155 Appendix A (salt aabbccdd, 12 iterations) plus
+	// independently computed values (Python hashlib over the canonical wire
+	// name, RFC 5155 §5) for an empty salt, zero and several iterations, owner
+	// case and a label with a binary octet. A wrong hash, salt or iteration
+	// handling fails here (RA6X-050).
+	saltA := []byte{0xaa, 0xbb, 0xcc, 0xdd}
 	tests := []struct {
 		name       string
 		salt       []byte
 		iterations uint16
 		want       string
 	}{
-		{
-			// Example from RFC 5155 - *.w.example with empty salt, 1 iteration
-			// Note: The exact hash depends on the full computation
-			name:       "example.",
-			salt:       []byte{0xaa, 0xbb, 0xcc, 0xdd},
-			iterations: 12,
-			// This is a computed value for testing purposes
-			want: "", // We'll verify the hash is non-empty and correct format
-		},
+		{"example.", saltA, 12, "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM"},
+		{"a.example.", saltA, 12, "35MTHGPGCU1QG68FAB165KLNSNK3DPVL"},
+		{"ai.example.", saltA, 12, "GJEQE526PLBF1G8MKLP59ENFD789NJGI"},
+		{"ns1.example.", saltA, 12, "2T7B4G4VSA5SMI47K61MV5BV1A22BOJR"},
+		{"*.w.example.", saltA, 12, "R53BQ7CC2UVMUBFU5OCMM6PERS9TK9EN"},
+		{"x.y.w.example.", saltA, 12, "2VPTU5TIMAMQTTGL4LUU9KG21E0AOR3S"},
+		{"xx.example.", saltA, 12, "T644EBQK9BIBCNA874GIVR6JOJ62MLHV"},
+		{"example.", nil, 0, "3MSEV9USMD4BR9S97V51R2TDVMR9IQO1"},
+		{"EXAMPLE.", nil, 0, "3MSEV9USMD4BR9S97V51R2TDVMR9IQO1"}, // owner case is canonicalized
+		{"example", nil, 0, "3MSEV9USMD4BR9S97V51R2TDVMR9IQO1"},  // missing trailing dot
+		{"example.", nil, 5, "POMLVMMH82T6P8PG24NPK8RDR7KUPOOI"},
+		{`x\000y.example.`, nil, 0, "EN9UU3BEVDHKQ7FV3QPAFLPA9N3I25K1"}, // binary octet in a label
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := computeNSEC3Hash(tt.name, tt.salt, tt.iterations)
-
-			// Verify it's valid base32hex (uppercase, no padding)
-			if got == "" {
-				t.Error("computeNSEC3Hash returned empty string")
+			if got != tt.want {
+				t.Fatalf("computeNSEC3Hash(%q, %x, %d) = %q, want %q", tt.name, tt.salt, tt.iterations, got, tt.want)
 			}
-			if strings.ToUpper(got) != got {
-				t.Errorf("hash should be uppercase, got %q", got)
-			}
-			// SHA-1 produces 20 bytes = 32 base32 characters
-			if len(got) != 32 {
-				t.Errorf("hash length = %d, want 32", len(got))
+			if strings.ToUpper(got) != got || len(got) != 32 {
+				t.Errorf("hash must be 32 uppercase base32hex characters, got %q", got)
 			}
 		})
 	}
