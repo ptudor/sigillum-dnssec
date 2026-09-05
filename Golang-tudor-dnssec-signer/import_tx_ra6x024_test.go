@@ -84,9 +84,11 @@ func (f *importFixture) run(t *testing.T) error {
 	return runImport(cmd, []string{f.domain, f.zonePath})
 }
 
-func (f *importFixture) keysDir() string    { return filepath.Join(f.dir, "keys") }
-func (f *importFixture) outputPath() string { return filepath.Join(f.dir, "signed", f.domain+".zone.signed") }
-func (f *importFixture) statePath() string  { return filepath.Join(f.dir, "state.json") }
+func (f *importFixture) keysDir() string { return filepath.Join(f.dir, "keys") }
+func (f *importFixture) outputPath() string {
+	return filepath.Join(f.dir, "signed", f.domain+".zone.signed")
+}
+func (f *importFixture) statePath() string { return filepath.Join(f.dir, "state.json") }
 
 // dirSnapshot maps every regular file under dir to its bytes.
 func dirSnapshot(t *testing.T, dir string) map[string][]byte {
@@ -198,8 +200,8 @@ func TestImport_CorruptSeedRejectedBeforeAnyWrite(t *testing.T) {
 	corrupt := append([]byte(nil), priv...)
 	corrupt[0] ^= 1
 	dnskey := &dns.DNSKEY{
-		Hdr:       dns.RR_Header{Name: dns.Fqdn(f.domain), Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
-		Flags:     257, Protocol: 3, Algorithm: dns.ED25519,
+		Hdr:   dns.RR_Header{Name: dns.Fqdn(f.domain), Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
+		Flags: 257, Protocol: 3, Algorithm: dns.ED25519,
 		PublicKey: base64.StdEncoding.EncodeToString(pub),
 	}
 	base := filepath.Join(t.TempDir(), "K"+f.domain+".+015+corrupt")

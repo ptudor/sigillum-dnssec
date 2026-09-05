@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"os"
@@ -30,6 +31,10 @@ type Signer struct {
 	// records before the self-verification gate, so a generator regression can
 	// be driven through the real publication boundary; nil in production.
 	mutateBeforeVerify func([]dns.RR) []dns.RR
+	// afterSourceRead is a test-only seam invoked after the zone file's bytes
+	// have been read and before the post-read consistency check, so a rewrite
+	// racing the read can be simulated; nil in production.
+	afterSourceRead func(path string)
 }
 
 // NewSigner creates a new signer
@@ -105,7 +110,8 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("zone %s not in state", domain)
 	}
 
-	slog.Info("[SIGN] Signing zone", "domain", domain, "path", zoneState.Path)
+	sourcePath := s.SourcePath(domain, zoneState)
+	slog.Info("[SIGN] Signing zone", "domain", domain, "path", sourcePath)
 
 	// Load keys - handling rollover scenarios
 	keyGen := NewKeyGenerator(s.cfg)
@@ -114,7 +120,7 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("loading keys: %w", err)
 	}
 
-	res, err := s.prepareSignedZone(domain, zoneState, keys)
+	res, err := s.prepareSignedZone(domain, zoneState, keys, sourcePath)
 	if err != nil {
 		return err
 	}
@@ -148,39 +154,56 @@ func (s *Signer) OutputPath(domain string) string {
 	return filepath.Join(s.cfg.OutputDir, fmt.Sprintf("%s.zone.signed", domain))
 }
 
+// SourcePath is the unsigned zone file every signing entry point reads for a
+// domain (RA6X-005): the path the active configuration names, falling back to
+// the path recorded in state only for a zone the configuration does not list.
+// Change detection (NeedsSign) and hook metadata use the same path, and the
+// state's copy is updated only after a successful publication
+// (recordSignedZone), so a path change that fails to parse keeps the prior
+// source reference and the prior signed output.
+func (s *Signer) SourcePath(domain string, zoneState *statepkg.ZoneState) string {
+	if zc, ok := s.cfg.Zones[domain]; ok && zc.Path != "" {
+		return zc.Path
+	}
+	if zoneState != nil {
+		return zoneState.Path
+	}
+	return ""
+}
+
 // signedZone is a fully signed and self-verified zone that has not been
 // written or recorded yet.
 type signedZone struct {
 	records     []dns.RR
 	serial      uint32
 	published   uint32
+	sourcePath  string
 	srcModTime  time.Time
 	srcSize     int64
 	dnskeyTTL   uint32
 	maxRRSIGTTL uint32
 }
 
-// prepareSignedZone parses the unsigned zone, computes the published serial,
-// builds the DNSKEY RRset and denial chain, signs every RRset with keys and
-// self-verifies the result. It touches no file and no state.
-func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState, keys *signingKeys) (*signedZone, error) {
-	// Capture the source file's mtime/size at PARSE time so it becomes the
-	// change-detection reference (R-022). Recording it here — not after signing —
-	// means an edit that lands between this parse and the LastSigned stamp is
-	// still detected on the next NeedsSign. A stat failure is non-fatal (the
-	// parse below will surface a real read error); leave the reference untouched.
-	res := &signedZone{}
-	if fi, statErr := os.Stat(zoneState.Path); statErr == nil {
-		res.srcModTime = fi.ModTime()
-		res.srcSize = fi.Size()
-	}
-
-	// Parse the zone file
-	records, serial, err := s.parseZoneFile(domain, zoneState.Path)
+// prepareSignedZone reads one consistent snapshot of the unsigned zone at
+// sourcePath, computes the published serial, builds the DNSKEY RRset and
+// denial chain, signs every RRset with keys and self-verifies the result. It
+// touches no file and no state.
+func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState, keys *signingKeys, sourcePath string) (*signedZone, error) {
+	// The snapshot's mtime/size become the change-detection reference (R-022):
+	// they describe exactly the bytes that were parsed, so an edit that lands
+	// after the read is still detected on the next NeedsSign.
+	snap, err := s.readSourceSnapshot(domain, sourcePath)
 	if err != nil {
 		return nil, fmt.Errorf("parsing zone file: %w", err)
 	}
-	res.serial = serial
+	res := &signedZone{
+		sourcePath: sourcePath,
+		srcModTime: snap.modTime,
+		srcSize:    snap.size,
+		serial:     snap.serial,
+	}
+	records := snap.records
+	serial := snap.serial
 
 	// R-007: the largest TTL among the zone's authoritative RRsets. A data RRSIG
 	// inherits its RRset's TTL, so an old-ZSK signature can outlive the DNSKEY RRset;
@@ -261,6 +284,11 @@ func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState,
 func (s *Signer) recordSignedZone(domain string, zoneState *statepkg.ZoneState, res *signedZone, durabilityUncertain string) {
 	now := time.Now().UTC()
 	s.state.Mutate(func() {
+		if res.sourcePath != "" {
+			// The old source reference is replaced only now that the new
+			// source has been parsed and published (RA6X-005).
+			zoneState.Path = res.sourcePath
+		}
 		zoneState.Serial = res.serial
 		zoneState.PublishedSerial = res.published
 		zoneState.LastSigned = now
@@ -324,7 +352,7 @@ func (s *Signer) StageZoneWithKeys(domain string, zoneState *statepkg.ZoneState,
 	if err := keys.validateConsistency(); err != nil {
 		return nil, fmt.Errorf("internal key state for %s: %w", domain, err)
 	}
-	res, err := s.prepareSignedZone(domain, zoneState, keys)
+	res, err := s.prepareSignedZone(domain, zoneState, keys, s.SourcePath(domain, zoneState))
 	if err != nil {
 		return nil, err
 	}
@@ -674,6 +702,22 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneStat
 		return true, "rollover in progress"
 	}
 
+	// RA6X-005: the configured source differs from the one the last signing
+	// used. That is a forced sign regardless of the new file's mtime/size —
+	// an older or same-size replacement must not be skipped until refresh.
+	if zoneState.Path != "" && filepath.Clean(zonePath) != filepath.Clean(zoneState.Path) {
+		return true, "source path changed"
+	}
+
+	// RA6X-035: state may look fresh while the published output is gone or
+	// unusable (a partially restored output directory, a changed output_dir).
+	// Presence and file type are checked, never the output's mtime.
+	if !zoneState.LastSigned.IsZero() {
+		if reason := s.outputUnusable(domain); reason != "" {
+			return true, reason
+		}
+	}
+
 	// Check zone file modification time
 	info, err := os.Stat(zonePath)
 	if err != nil {
@@ -725,11 +769,78 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneStat
 }
 
 func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
-	f, err := os.Open(path)
+	snap, err := s.readSourceSnapshot(domain, path)
 	if err != nil {
 		return nil, 0, err
 	}
+	return snap.records, snap.serial, nil
+}
+
+// sourceSnapshot is one consistent read of an unsigned zone file: the parsed
+// records and the metadata that describes exactly those bytes.
+type sourceSnapshot struct {
+	records []dns.RR
+	serial  uint32
+	modTime time.Time
+	size    int64
+}
+
+// outputUnusable reports why the published output for a domain cannot be
+// served: missing, unreadable or not a regular file. Empty when it is usable.
+func (s *Signer) outputUnusable(domain string) string {
+	info, err := os.Stat(s.OutputPath(domain))
+	switch {
+	case os.IsNotExist(err):
+		return "signed output missing"
+	case err != nil:
+		return fmt.Sprintf("signed output unreadable: %v", err)
+	case !info.Mode().IsRegular():
+		return fmt.Sprintf("signed output is not a regular file (%s)", info.Mode().Type())
+	}
+	return ""
+}
+
+// readSourceSnapshot reads the unsigned zone through a single regular-file
+// descriptor and parses exactly the bytes it read (RA6X-042). The file is
+// opened without blocking so a FIFO or device cannot hang the signer holding
+// the state lock; anything but a regular file is rejected. The descriptor is
+// stat'ed before and after the read: a size or mtime change means a writer
+// rewrote the file in place while it was being read, and the read is refused
+// rather than published. A producer that replaces the file atomically (write
+// to a temporary file, then rename) never trips this — the descriptor keeps
+// the complete previous version and the next change check picks up the new
+// one — which is the documented producer contract; metadata cannot prove a
+// paused in-place writer's valid prefix is complete.
+func (s *Signer) readSourceSnapshot(domain, path string) (*sourceSnapshot, error) {
+	f, err := openSourceFile(path)
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
+
+	before, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspecting zone file %s: %w", path, err)
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("zone file %s is not a regular file (%s); pipes, devices and directories are not supported as zone sources", path, before.Mode().Type())
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("reading zone file %s: %w", path, err)
+	}
+	if s.afterSourceRead != nil {
+		s.afterSourceRead(path)
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspecting zone file %s after read: %w", path, err)
+	}
+	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) || int64(len(data)) != before.Size() {
+		return nil, fmt.Errorf("zone file %s changed while it was being read (size %d→%d); a zone producer must replace the file atomically (write a temporary file, then rename it into place) — not signed, retried on the next check",
+			path, before.Size(), after.Size())
+	}
 
 	var records []dns.RR
 	var serial uint32
@@ -740,7 +851,7 @@ func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
 	// ambiguity for a daemon that may run from `/`. A zone using $INCLUDE fails
 	// with miekg's clear "$INCLUDE directive not allowed" error naming the line;
 	// the limitation is documented in CLAUDE.md (R-065). Inline the records.
-	zp := dns.NewZoneParser(f, dns.Fqdn(domain), path)
+	zp := dns.NewZoneParser(bytes.NewReader(data), dns.Fqdn(domain), path)
 	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
 		records = append(records, rr)
 
@@ -751,7 +862,7 @@ func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
 	}
 
 	if err := zp.Err(); err != nil {
-		return nil, 0, fmt.Errorf("parsing zone: %w", err)
+		return nil, fmt.Errorf("parsing zone: %w", err)
 	}
 
 	// Strip any DNSSEC records the signer manages itself before validation and
@@ -761,10 +872,10 @@ func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
 
 	// Validate zone structure
 	if err := s.validateZone(domain, records); err != nil {
-		return nil, 0, fmt.Errorf("zone validation failed: %w", err)
+		return nil, fmt.Errorf("zone validation failed: %w", err)
 	}
 
-	return records, serial, nil
+	return &sourceSnapshot{records: records, serial: serial, modTime: before.ModTime(), size: before.Size()}, nil
 }
 
 // stripInputDNSSEC removes DNSSEC records that the signer generates itself from a

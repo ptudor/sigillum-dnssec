@@ -57,6 +57,13 @@ This tool exists because every DNSSEC solution is either:
 - Process `$INCLUDE` directives in zone files — each zone must be a single
   self-contained file (a zone using `$INCLUDE` fails to parse with a clear
   "`$INCLUDE` directive not allowed" error). Inline the included records.
+- Guarantee a consistent read of a zone file that is rewritten **in place**.
+  The producer contract is atomic replacement (temporary file + `rename`).
+  The signer reads each source through one regular-file descriptor, refuses
+  FIFOs/devices, and refuses a file whose size or mtime changed during the
+  read, but a paused in-place writer's valid SOA/NS prefix is
+  indistinguishable from a complete small zone (RA6X-042). No deployment
+  scripts that produce zone files live in this repository; check yours.
 
 ### What It Optionally Does (Registrar Integration)
 
