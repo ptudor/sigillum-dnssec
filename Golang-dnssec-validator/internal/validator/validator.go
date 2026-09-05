@@ -342,7 +342,14 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			if verdict, msg := recordValidationVerdict(recordValidation); verdict != StatusSecure {
 				lastStatus = verdict
 				if msg != "" {
-					result.Errors = append(result.Errors, fmt.Sprintf("%s: %s", leafZone.Zone, msg))
+					if verdict == StatusInsecure {
+						// An authenticated opt-out conclusion is not a failure; record
+						// it as a warning so the insecure verdict is explained (RA6X-012).
+						result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %s", leafZone.Zone, msg))
+						leafZone.Warnings = append(leafZone.Warnings, msg)
+					} else {
+						result.Errors = append(result.Errors, fmt.Sprintf("%s: %s", leafZone.Zone, msg))
+					}
 				}
 			}
 		}
@@ -841,6 +848,16 @@ func recordValidationVerdict(rv *RecordValidation) (ValidationStatus, string) {
 	}
 
 	if rv.RRSIGVerified {
+		// RA6X-012: an authenticated proof that rests on an opt-out NSEC3 cover
+		// of the next closer name cannot exclude an unsigned delegation there.
+		// The signatures verified, but the conclusion is insecure, not secure
+		// (RFC 5155 §9.2).
+		if rv.DenialProof != nil && rv.DenialProof.Verified && rv.DenialProof.OptOut {
+			return StatusInsecure, fmt.Sprintf("denial rests on an opt-out NSEC3 covering %s: an unsigned delegation may exist, so the answer is insecure rather than secure (RFC 5155 §9.2)", rv.DenialProof.NextCloser)
+		}
+		if rv.Wildcard && rv.WildcardProof != nil && rv.WildcardProof.Verified && rv.WildcardProof.OptOut {
+			return StatusInsecure, fmt.Sprintf("wildcard proof rests on an opt-out NSEC3 covering %s: an unsigned delegation may exist, so the answer is insecure rather than secure (RFC 5155 §9.2)", rv.WildcardProof.NextCloser)
+		}
 		return StatusSecure, ""
 	}
 
@@ -1360,50 +1377,61 @@ func (v *Validator) verifyDSAbsence(childName, parentZone string, parentDNSKEY [
 			proof.Error = fmt.Sprintf("NSEC3 RRSIG verification failed: %v", err)
 			return proof, false
 		}
-		authenticated := nsec3RecordsFromVerified(verified)
-		params := authenticated[0]
-		if params.Algorithm != NSEC3HashSHA1 {
-			proof.Error = fmt.Sprintf("unsupported NSEC3 hash algorithm: %d (only SHA-1 supported)", params.Algorithm)
-			return proof, false
-		}
-		salt, err := hexDecode(params.Salt)
+		// RA6X-013: every proof lives inside one parameter-consistent chain; a
+		// hash computed with one chain's salt is never compared with another
+		// chain's intervals. RA6X-012: records with unknown flags are ignored.
+		chains, ignored, err := nsec3Chains(nsec3RecordsFromVerified(verified))
 		if err != nil {
-			proof.Error = fmt.Sprintf("invalid NSEC3 salt: %v", err)
+			proof.Error = fmt.Sprintf("no usable NSEC3 chain: %v", err)
 			return proof, false
 		}
-		childHash := computeNSEC3Hash(child, salt, params.Iterations)
-		// 1) Direct match: an NSEC3 whose owner hash equals H(child) with the DS bit clear
-		//    and the NS bit set is the delegation-point NSEC3 (non-opt-out zones).
-		for _, rec := range authenticated {
-			if !strings.EqualFold(rec.HashedOwner, childHash) {
+		proof.Ignored = ignored
+		lastErr := ""
+		for _, chain := range chains {
+			childHash := chain.hash(child)
+			// 1) Direct match: an NSEC3 whose owner hash equals H(child) with the DS bit
+			//    clear and the NS bit set is the delegation-point NSEC3 (non-opt-out zones).
+			if rec := chain.match(childHash); rec != nil {
+				if HasTypeInBitmap("DS", rec.TypeBitmap) {
+					proof.Error = "parent NSEC3 at the delegation point has the DS bit set"
+					return proof, false
+				}
+				if !HasTypeInBitmap("NS", rec.TypeBitmap) || HasTypeInBitmap("SOA", rec.TypeBitmap) {
+					lastErr = fmt.Sprintf("NSEC3 matching %s is not a delegation point (NS clear or SOA set); it does not prove an insecure delegation", child)
+					continue
+				}
+				proof.Verified = true
+				proof.ClosestEncloser = child
+				proof.CoveringNSEC = fmt.Sprintf("NSEC3 %s types: %v", rec.HashedOwner, rec.TypeBitmap)
+				proof.Explanation = fmt.Sprintf("Authenticated NSEC3 matches %s with the DS bit clear (insecure delegation)", child)
+				return proof, true
+			}
+			// 2) Opt-out: an unsigned delegation without its own NSEC3 is proven by a
+			//    COMPLETE closest-encloser proof (RFC 5155 §8.3) in which the next
+			//    closer name is covered by an opt-out NSEC3 (RFC 5155 §6, §8.9). A
+			//    cover alone, or a non-opt-out cover, proves nothing about a
+			//    delegation (RA6X-012).
+			ce, nextCloser, _, ncRec, err := chain.closestEncloser(child)
+			if err != nil {
+				lastErr = err.Error()
 				continue
 			}
-			if HasTypeInBitmap("DS", rec.TypeBitmap) {
-				proof.Error = "parent NSEC3 at the delegation point has the DS bit set"
-				return proof, false
-			}
-			if !HasTypeInBitmap("NS", rec.TypeBitmap) {
+			if !isOptOut(ncRec) {
+				lastErr = fmt.Sprintf("next closer name %s of %s is covered by a non-opt-out NSEC3: the name does not exist in the parent, so this is not an unsigned delegation", nextCloser, child)
 				continue
 			}
 			proof.Verified = true
-			proof.CoveringNSEC = fmt.Sprintf("NSEC3 %s types: %v", rec.HashedOwner, rec.TypeBitmap)
-			proof.Explanation = fmt.Sprintf("Authenticated NSEC3 matches %s with the DS bit clear (insecure delegation)", child)
+			proof.OptOut = true
+			proof.ClosestEncloser = ce
+			proof.NextCloser = nextCloser
+			proof.CoveringNSEC = fmt.Sprintf("NSEC3 %s -> %s [opt-out]", ncRec.HashedOwner, ncRec.NextHashed)
+			proof.Explanation = fmt.Sprintf("Authenticated opt-out NSEC3 covers the next closer name %s below closest encloser %s (unsigned delegation permitted by opt-out; insecure)", nextCloser, ce)
 			return proof, true
 		}
-		// 2) Opt-out cover: an opt-out NSEC3 (Flags bit 0 set) whose hash range covers
-		//    H(child) proves an unsigned delegation without its own NSEC3 (RFC 5155 §6).
-		for _, rec := range authenticated {
-			if rec.Flags&0x01 == 0 {
-				continue
-			}
-			if hashBetween(childHash, rec.HashedOwner, rec.NextHashed) {
-				proof.Verified = true
-				proof.CoveringNSEC = fmt.Sprintf("NSEC3 %s -> %s [opt-out]", rec.HashedOwner, rec.NextHashed)
-				proof.Explanation = fmt.Sprintf("Authenticated opt-out NSEC3 covers %s (insecure delegation)", child)
-				return proof, true
-			}
+		if lastErr == "" {
+			lastErr = fmt.Sprintf("no authenticated NSEC3 proves the DS RRset is absent for %s", child)
 		}
-		proof.Error = fmt.Sprintf("no authenticated NSEC3 proves the DS RRset is absent for %s%s", child, rejectedNote(rejected))
+		proof.Error = lastErr + rejectedNote(rejected)
 		return proof, false
 	}
 
