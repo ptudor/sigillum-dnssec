@@ -24,10 +24,14 @@ type ownershipTarget struct {
 
 var ownership ownershipTarget
 
-// Test seams: the effective uid and the chown syscall.
+// Test seams: the effective uid, the chown syscall and the directory fsync.
+// syncDirFn exists so the post-rename durability contract (RA6X-049) can be
+// fault-injected: a directory sync that fails after a visible rename must
+// surface as a *DurabilityError and must never cause a rollback.
 var (
-	geteuid = os.Geteuid
-	chownFn = os.Chown
+	geteuid   = os.Geteuid
+	chownFn   = os.Chown
+	syncDirFn = syncDirectory
 )
 
 // OwnershipStatus is the outcome of InitOwnershipTarget (RA6X-044).
@@ -291,6 +295,11 @@ var unsupportedDirSyncOnce sync.Once
 // a filesystem that does not support directory fsync at all is classified as such
 // (logged once) and treated as success, while any other error is returned.
 func SyncDir(dir string) error {
+	return syncDirFn(dir)
+}
+
+// syncDirectory is the real directory fsync behind the SyncDir seam.
+func syncDirectory(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("opening directory %s for fsync: %w", dir, err)
