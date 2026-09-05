@@ -396,6 +396,17 @@ func (s *State) MarkRemoved(domain string) {
 }
 
 // ClearRemoved drops the deletion marker for a zone that is being managed again.
+// RestoreRemoved re-establishes a removal marker with its original timestamp,
+// undoing a ClearRemoved from a transaction that did not commit.
+func (s *State) RestoreRemoved(domain string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Removed == nil {
+		s.Removed = make(map[string]time.Time)
+	}
+	s.Removed[domain] = at
+}
+
 func (s *State) ClearRemoved(domain string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

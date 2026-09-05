@@ -103,48 +103,6 @@ func (s *Signer) SignZone(domain string) error {
 
 	slog.Info("[SIGN] Signing zone", "domain", domain, "path", zoneState.Path)
 
-	// Capture the source file's mtime/size at PARSE time so it becomes the
-	// change-detection reference (R-022). Recording it here — not after signing —
-	// means an edit that lands between this parse and the LastSigned stamp is
-	// still detected on the next NeedsSign. A stat failure is non-fatal (the
-	// parse below will surface a real read error); leave the reference untouched.
-	var srcModTime time.Time
-	var srcSize int64
-	if fi, statErr := os.Stat(zoneState.Path); statErr == nil {
-		srcModTime = fi.ModTime()
-		srcSize = fi.Size()
-	}
-
-	// Parse the zone file
-	records, serial, err := s.parseZoneFile(domain, zoneState.Path)
-	if err != nil {
-		return fmt.Errorf("parsing zone file: %w", err)
-	}
-
-	// R-007: the largest TTL among the zone's authoritative RRsets. A data RRSIG
-	// inherits its RRset's TTL, so an old-ZSK signature can outlive the DNSKEY RRset;
-	// ZSK retirement gates on this so the old key is not dropped while one of its
-	// cached signatures is still verifiable.
-	var maxRRSIGTTL uint32
-	for _, rr := range records {
-		if t := rr.Header().Ttl; t > maxRRSIGTTL {
-			maxRRSIGTTL = t
-		}
-	}
-
-	// Compute the serial to publish and rewrite the SOA before anything is
-	// signed — the SOA RRset's RRSIG covers the published serial.
-	published, err := s.publishedSerial(domain, serial, zoneState)
-	if err != nil {
-		return err
-	}
-	if published != serial {
-		setSOASerial(records, published)
-	}
-
-	// Extract SOA minimum TTL for NSEC/NSEC3 records (RFC 4035 §2.3)
-	soaMinTTL := s.getSOAMinimumTTL(records)
-
 	// Load keys - handling rollover scenarios
 	keyGen := NewKeyGenerator(s.cfg)
 	keys, err := s.loadKeysForSigning(domain, keyGen, zoneState)
@@ -152,48 +110,15 @@ func (s *Signer) SignZone(domain string) error {
 		return fmt.Errorf("loading keys: %w", err)
 	}
 
-	// Determine DNSKEY TTL: use config value or SOA TTL
-	dnskeyTTL := s.cfg.DNSSEC.DNSKEYTtl
-	if dnskeyTTL == 0 {
-		dnskeyTTL = s.getSOATTL(records) // Use SOA record TTL as convention
-	}
-
-	// Add all DNSKEY records with appropriate TTL (may include rollover keys)
-	for _, k := range keys.dnskeys {
-		k.Hdr.Ttl = dnskeyTTL
-		records = append(records, k)
-	}
-
-	// Generate NSEC/NSEC3 chain
-	if s.cfg.DNSSEC.NSECVersion == "nsec3" {
-		nsec3Records, err := s.generateNSEC3Chain(domain, records, soaMinTTL)
-		if err != nil {
-			return fmt.Errorf("generating NSEC3 chain: %w", err)
-		}
-		records = append(records, nsec3Records...)
-	} else {
-		nsecRecords := s.generateNSECChain(domain, records, soaMinTTL)
-		records = append(records, nsecRecords...)
-	}
-
-	// Sign all RRsets
-	signedRecords, err := s.signRecordsWithKeys(domain, records, keys)
+	res, err := s.prepareSignedZone(domain, zoneState, keys)
 	if err != nil {
-		return fmt.Errorf("signing records: %w", err)
-	}
-
-	// R-001: self-verify the produced records before publishing. If signing produced
-	// something internally inconsistent (an RRSIG that doesn't verify, an unsigned
-	// authoritative RRset, a broken NSEC/NSEC3 chain), fail here so the previous signed
-	// output keeps serving instead of shipping a zone that SERVFAILs at every resolver.
-	if err := s.verifySignedZone(domain, signedRecords, keys); err != nil {
-		return fmt.Errorf("post-sign verification failed (previous signed zone kept): %w", err)
+		return err
 	}
 
 	// Write signed zone
-	outputPath := filepath.Join(s.cfg.OutputDir, fmt.Sprintf("%s.zone.signed", domain))
+	outputPath := s.OutputPath(domain)
 	durabilityUncertain := ""
-	if err := s.writeSignedZone(domain, outputPath, signedRecords); err != nil {
+	if err := s.writeSignedZone(domain, outputPath, res.records); err != nil {
 		if !fsutil.IsCommitted(err) {
 			return fmt.Errorf("writing signed zone: %w", err)
 		}
@@ -204,16 +129,132 @@ func (s *Signer) SignZone(domain string) error {
 		slog.Warn("[SIGN] "+durabilityUncertain, "domain", domain, "path", outputPath)
 	}
 
-	// Update state under the write lock so concurrent readers (web UI,
-	// health checks) never observe a half-updated zone.
+	s.recordSignedZone(domain, zoneState, res, durabilityUncertain)
+
+	// Record successful signing metrics
+	duration := time.Since(startTime).Seconds()
+	metrics.RecordSigningOperation(domain, duration, true)
+
+	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", res.serial, "published_serial", res.published, "output", outputPath, "duration_ms", int64(duration*1000))
+	return nil
+}
+
+// OutputPath is the signed-zone path for a domain.
+func (s *Signer) OutputPath(domain string) string {
+	return filepath.Join(s.cfg.OutputDir, fmt.Sprintf("%s.zone.signed", domain))
+}
+
+// signedZone is a fully signed and self-verified zone that has not been
+// written or recorded yet.
+type signedZone struct {
+	records     []dns.RR
+	serial      uint32
+	published   uint32
+	srcModTime  time.Time
+	srcSize     int64
+	dnskeyTTL   uint32
+	maxRRSIGTTL uint32
+}
+
+// prepareSignedZone parses the unsigned zone, computes the published serial,
+// builds the DNSKEY RRset and denial chain, signs every RRset with keys and
+// self-verifies the result. It touches no file and no state.
+func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState, keys *signingKeys) (*signedZone, error) {
+	// Capture the source file's mtime/size at PARSE time so it becomes the
+	// change-detection reference (R-022). Recording it here — not after signing —
+	// means an edit that lands between this parse and the LastSigned stamp is
+	// still detected on the next NeedsSign. A stat failure is non-fatal (the
+	// parse below will surface a real read error); leave the reference untouched.
+	res := &signedZone{}
+	if fi, statErr := os.Stat(zoneState.Path); statErr == nil {
+		res.srcModTime = fi.ModTime()
+		res.srcSize = fi.Size()
+	}
+
+	// Parse the zone file
+	records, serial, err := s.parseZoneFile(domain, zoneState.Path)
+	if err != nil {
+		return nil, fmt.Errorf("parsing zone file: %w", err)
+	}
+	res.serial = serial
+
+	// R-007: the largest TTL among the zone's authoritative RRsets. A data RRSIG
+	// inherits its RRset's TTL, so an old-ZSK signature can outlive the DNSKEY RRset;
+	// ZSK retirement gates on this so the old key is not dropped while one of its
+	// cached signatures is still verifiable.
+	for _, rr := range records {
+		if t := rr.Header().Ttl; t > res.maxRRSIGTTL {
+			res.maxRRSIGTTL = t
+		}
+	}
+
+	// Compute the serial to publish and rewrite the SOA before anything is
+	// signed — the SOA RRset's RRSIG covers the published serial.
+	published, err := s.publishedSerial(domain, serial, zoneState)
+	if err != nil {
+		return nil, err
+	}
+	res.published = published
+	if published != serial {
+		setSOASerial(records, published)
+	}
+
+	// Extract SOA minimum TTL for NSEC/NSEC3 records (RFC 4035 §2.3)
+	soaMinTTL := s.getSOAMinimumTTL(records)
+
+	// Determine DNSKEY TTL: use config value or SOA TTL
+	res.dnskeyTTL = s.cfg.DNSSEC.DNSKEYTtl
+	if res.dnskeyTTL == 0 {
+		res.dnskeyTTL = s.getSOATTL(records) // Use SOA record TTL as convention
+	}
+
+	// Add all DNSKEY records with appropriate TTL (may include rollover keys)
+	for _, k := range keys.dnskeys {
+		k.Hdr.Ttl = res.dnskeyTTL
+		records = append(records, k)
+	}
+
+	// Generate NSEC/NSEC3 chain
+	if s.cfg.DNSSEC.NSECVersion == "nsec3" {
+		nsec3Records, err := s.generateNSEC3Chain(domain, records, soaMinTTL)
+		if err != nil {
+			return nil, fmt.Errorf("generating NSEC3 chain: %w", err)
+		}
+		records = append(records, nsec3Records...)
+	} else {
+		nsecRecords := s.generateNSECChain(domain, records, soaMinTTL)
+		records = append(records, nsecRecords...)
+	}
+
+	// Sign all RRsets
+	signedRecords, err := s.signRecordsWithKeys(domain, records, keys)
+	if err != nil {
+		return nil, fmt.Errorf("signing records: %w", err)
+	}
+
+	// R-001: self-verify the produced records before publishing. If signing produced
+	// something internally inconsistent (an RRSIG that doesn't verify, an unsigned
+	// authoritative RRset, a broken NSEC/NSEC3 chain), fail here so the previous signed
+	// output keeps serving instead of shipping a zone that SERVFAILs at every resolver.
+	if err := s.verifySignedZone(domain, signedRecords, keys); err != nil {
+		return nil, fmt.Errorf("post-sign verification failed (previous signed zone kept): %w", err)
+	}
+	res.records = signedRecords
+	return res, nil
+}
+
+// recordSignedZone updates the zone state after a signed zone has been
+// published, under the write lock so concurrent readers (web UI, health
+// checks) never observe a half-updated zone.
+func (s *Signer) recordSignedZone(domain string, zoneState *statepkg.ZoneState, res *signedZone, durabilityUncertain string) {
 	now := time.Now().UTC()
 	s.state.Mutate(func() {
-		zoneState.Serial = serial
-		zoneState.PublishedSerial = published
+		zoneState.Serial = res.serial
+		zoneState.PublishedSerial = res.published
 		zoneState.LastSigned = now
-		if !srcModTime.IsZero() {
-			zoneState.SourceModTime = srcModTime
-			zoneState.SourceSize = srcSize
+		if !res.srcModTime.IsZero() {
+			zoneState.SourceModTime = res.srcModTime
+			zoneState.SourceSize = res.srcSize
 		}
 		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
 		zoneState.ForceResign = false
@@ -222,11 +263,11 @@ func (s *Signer) SignZone(domain string) error {
 		// resolvers really cache. Never shorten a previously-established wait while a
 		// rollover is active — only raise it (a mid-phase SOA TTL decrease must not
 		// let the phase advance early).
-		if zoneState.Rollover == nil || dnskeyTTL > zoneState.PublishedDNSKEYTTL {
-			zoneState.PublishedDNSKEYTTL = dnskeyTTL
+		if zoneState.Rollover == nil || res.dnskeyTTL > zoneState.PublishedDNSKEYTTL {
+			zoneState.PublishedDNSKEYTTL = res.dnskeyTTL
 		}
-		if zoneState.Rollover == nil || maxRRSIGTTL > zoneState.PublishedMaxRRSIGTTL {
-			zoneState.PublishedMaxRRSIGTTL = maxRRSIGTTL
+		if zoneState.Rollover == nil || res.maxRRSIGTTL > zoneState.PublishedMaxRRSIGTTL {
+			zoneState.PublishedMaxRRSIGTTL = res.maxRRSIGTTL
 		}
 		zoneState.ClearTransientWarnings()
 		if durabilityUncertain != "" {
@@ -236,13 +277,78 @@ func (s *Signer) SignZone(domain string) error {
 		// Check for upcoming rollovers
 		s.checkRolloverWarnings(domain, zoneState)
 	})
+}
 
-	// Record successful signing metrics
-	duration := time.Since(startTime).Seconds()
-	metrics.RecordSigningOperation(domain, duration, true)
+// StagedZone is a signed zone produced from explicit key pairs and written to
+// a staging path, not yet published as the domain's signed output and not yet
+// recorded in the zone state. Import uses it to prove the complete signed zone
+// before any live artifact changes (RA6X-024).
+type StagedZone struct {
+	s         *Signer
+	domain    string
+	zoneState *statepkg.ZoneState
+	res       *signedZone
+	path      string
+}
 
-	slog.Info("[SIGN] Zone signed successfully", "domain", domain, "serial", serial, "published_serial", published, "output", outputPath, "duration_ms", int64(duration*1000))
+// StageZoneWithKeys signs zoneState's zone file with exactly the given KSK and
+// ZSK pairs — nothing is loaded from the live key slots — and writes the result
+// atomically to stagingPath. The pairs are validated for the domain and role and
+// for private/public correspondence first. zoneState is only read.
+func (s *Signer) StageZoneWithKeys(domain string, zoneState *statepkg.ZoneState, ksk *dns.DNSKEY, kskPriv []byte, zsk *dns.DNSKEY, zskPriv []byte, stagingPath string) (*StagedZone, error) {
+	if err := ValidateKeyForImport(domain, "ksk", ksk, kskPriv); err != nil {
+		return nil, err
+	}
+	if err := ValidateKeyForImport(domain, "zsk", zsk, zskPriv); err != nil {
+		return nil, err
+	}
+	keys := &signingKeys{
+		dnskeys:      []*dns.DNSKEY{ksk, zsk},
+		signingKSKs:  []*dns.DNSKEY{ksk},
+		signingKSKPs: [][]byte{kskPriv},
+		signingZSKs:  []*dns.DNSKEY{zsk},
+		signingZSKPs: [][]byte{zskPriv},
+	}
+	if err := keys.validateConsistency(); err != nil {
+		return nil, fmt.Errorf("internal key state for %s: %w", domain, err)
+	}
+	res, err := s.prepareSignedZone(domain, zoneState, keys)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.writeSignedZone(domain, stagingPath, res.records); err != nil && !fsutil.IsCommitted(err) {
+		return nil, fmt.Errorf("writing staged signed zone: %w", err)
+	}
+	return &StagedZone{s: s, domain: domain, zoneState: zoneState, res: res, path: stagingPath}, nil
+}
+
+// Path is the staging file.
+func (sz *StagedZone) Path() string { return sz.path }
+
+// Publish moves the staged file over the domain's signed output atomically
+// (same directory rename), syncs the directory and records the signing in the
+// zone state. The caller is responsible for preserving any prior output.
+func (sz *StagedZone) Publish() error {
+	outputPath := sz.s.OutputPath(sz.domain)
+	if err := os.Rename(sz.path, outputPath); err != nil {
+		return fmt.Errorf("publishing staged signed zone: %w", err)
+	}
+	durabilityUncertain := ""
+	if err := fsutil.SyncDir(filepath.Dir(outputPath)); err != nil {
+		durabilityUncertain = fmt.Sprintf("signed zone written but its directory sync failed; durability across power loss uncertain: %v", err)
+		slog.Warn("[SIGN] "+durabilityUncertain, "domain", sz.domain, "path", outputPath)
+	}
+	sz.s.recordSignedZone(sz.domain, sz.zoneState, sz.res, durabilityUncertain)
+	metrics.RecordSigningOperation(sz.domain, 0, true)
+	slog.Info("[SIGN] Zone signed successfully", "domain", sz.domain, "serial", sz.res.serial, "published_serial", sz.res.published, "output", outputPath)
 	return nil
+}
+
+// Discard removes the staging file of a transaction that did not commit.
+func (sz *StagedZone) Discard() {
+	if err := os.Remove(sz.path); err != nil && !os.IsNotExist(err) {
+		slog.Warn("[SIGN] could not remove staged signed zone", "path", sz.path, "error", err)
+	}
 }
 
 // serialGt reports whether serial a is greater than b in RFC 1982 serial

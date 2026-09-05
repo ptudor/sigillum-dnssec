@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
-	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 )
 
 // Config represents the main configuration structure
@@ -287,6 +286,34 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		return nil, err
+	}
+
+	warnIfConfigWorldReadable(path, cfg)
+	cfg.LoadedAt = time.Now().UTC()
+
+	return cfg, nil
+}
+
+// ParseConfig decodes and validates configuration bytes exactly as LoadConfig
+// does for a file (defaults applied, strict decoding, Validate). It is also the
+// check every config edit runs on its candidate before replacing the file.
+func ParseConfig(data []byte) (*Config, error) {
+	cfg, err := decodeConfig(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validating config: %w", err)
+	}
+	return cfg, nil
+}
+
+// decodeConfig applies defaults and strictly decodes configuration bytes
+// without running Validate.
+func decodeConfig(data []byte) (*Config, error) {
 	cfg := DefaultConfig()
 	// Strict decoding: reject unknown/misspelled keys instead of silently
 	// ignoring them. For a signing daemon a typo like `signture_validity` or a
@@ -302,14 +329,6 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
-
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("validating config: %w", err)
-	}
-
-	warnIfConfigWorldReadable(path, cfg)
-	cfg.LoadedAt = time.Now().UTC()
-
 	return cfg, nil
 }
 
@@ -612,177 +631,6 @@ func (c *Config) KeysDir() string {
 // StatePath returns the path to the state file
 func (c *Config) StatePath() string {
 	return filepath.Join(c.DataDir, "state.json")
-}
-
-// AddZoneToConfigFile appends a new zone entry to the config file. It reads the
-// existing bytes, appends the new [zones."<domain>"] table, and commits the whole
-// file atomically and durably (temp + fsync + rename + dir fsync) while preserving
-// the config's own owner/mode. The prior O_APPEND write was neither atomic nor
-// durable — a short write or crash could leave a truncated table/header/path in the
-// only config file after state/output were already committed (R-019). Existing
-// tables/comments are preserved verbatim (only appended to).
-func AddZoneToConfigFile(configPath, domain, zonePath string) error {
-	existing, err := os.ReadFile(configPath)
-	if err != nil {
-		return fmt.Errorf("reading config file: %w", err)
-	}
-
-	// Append the new zone section, matching the previous formatting (a leading blank
-	// line before the table). Ensure exactly one separating newline regardless of
-	// whether the file already ends in one.
-	buf := make([]byte, 0, len(existing)+128)
-	buf = append(buf, existing...)
-	if len(buf) > 0 && buf[len(buf)-1] != '\n' {
-		buf = append(buf, '\n')
-	}
-	buf = append(buf, []byte(fmt.Sprintf("\n[zones.%q]\npath = %q\n", domain, zonePath))...)
-
-	if err := fsutil.WriteConfigFileAtomic(configPath, buf); err != nil {
-		return fmt.Errorf("writing config file: %w", err)
-	}
-	return nil
-}
-
-// RemoveZoneFromConfigFile deletes the [zones."<domain>"] table (the header written by
-// AddZoneToConfigFile plus every key line under it) from the config file, preserving all
-// other content and comments. It writes atomically (temp + rename, ownership preserved)
-// and keeps the file's existing mode so a secrets-bearing 0640 config is not loosened.
-// Returns ErrZoneNotInConfig if the table isn't present, so the caller can proceed.
-func RemoveZoneFromConfigFile(configPath, domain string) error {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return fmt.Errorf("reading config file: %w", err)
-	}
-	lines := strings.Split(string(data), "\n")
-
-	start := -1
-	for i, line := range lines {
-		if IsZoneTableHeader(line, domain) {
-			start = i
-			break
-		}
-	}
-	if start == -1 {
-		return ErrZoneNotInConfig
-	}
-
-	// The table runs until the next TOML table header or EOF.
-	end := len(lines)
-	for i := start + 1; i < len(lines); i++ {
-		if isTOMLTableHeader(lines[i]) {
-			end = i
-			break
-		}
-	}
-
-	// Absorb one blank line immediately preceding the table (AddZoneToConfigFile prefixes
-	// one) so repeated add/remove cycles don't accumulate blank runs.
-	removeStart := start
-	if removeStart > 0 && strings.TrimSpace(lines[removeStart-1]) == "" {
-		removeStart--
-	}
-
-	kept := make([]string, 0, len(lines)-(end-removeStart))
-	kept = append(kept, lines[:removeStart]...)
-	kept = append(kept, lines[end:]...)
-
-	// R-002: use the config-specific atomic writer, which preserves the config's
-	// OWN uid/gid/mode. writeFileAtomicOwned would chown the (root-owned, secrets-
-	// bearing) config to the daemon account.
-	if err := fsutil.WriteConfigFileAtomic(configPath, []byte(strings.Join(kept, "\n"))); err != nil {
-		return fmt.Errorf("writing config file: %w", err)
-	}
-	return nil
-}
-
-// ErrZoneNotInConfig is returned by RemoveZoneFromConfigFile when the zone table is absent.
-var ErrZoneNotInConfig = fmt.Errorf("zone table not found in config file")
-
-// IsZoneTableHeader reports whether a config line is the [zones."<domain>"]
-// table header for the given domain. AddZoneToConfigFile writes exactly
-// `[zones."<domain>"]`, but hand-edited configs carry TOML-equivalent variants
-// an exact match would miss: surrounding whitespace, a trailing `# comment`,
-// or a single-quoted (literal-string) key. Missing the header would make
-// `remove` leave the entry behind so the zone is re-adopted on SIGHUP
-// (runRemove escalates that to an error rather than claiming success). This is
-// deliberately anchored to the two quote forms — not a general TOML parser.
-func IsZoneTableHeader(line, domain string) bool {
-	t := strings.TrimSpace(line)
-	for _, header := range []string{
-		fmt.Sprintf("[zones.%q]", domain),   // basic-string key, what AddZoneToConfigFile writes
-		fmt.Sprintf("[zones.'%s']", domain), // literal-string key
-	} {
-		rest, ok := strings.CutPrefix(t, header)
-		if !ok {
-			continue
-		}
-		rest = strings.TrimSpace(rest)
-		if rest == "" || strings.HasPrefix(rest, "#") {
-			return true
-		}
-	}
-	return false
-}
-
-// isTOMLTableHeader reports whether a line is a TOML table header — a normal table
-// "[...]" or an array-of-tables "[[...]]" — allowing surrounding whitespace, quoted/
-// dotted keys (basic "..." or literal '...' strings that may themselves contain '#'
-// or ']'), and a trailing inline comment. The previous HasPrefix("[")+HasSuffix("]")
-// test wrongly rejected a valid header followed by a comment (e.g.
-// `[zones."next"] # x`), which made RemoveZoneFromConfigFile run past that boundary
-// and delete every following table/comment through EOF (R-001).
-func isTOMLTableHeader(line string) bool {
-	t := strings.TrimLeft(line, " \t")
-	if !strings.HasPrefix(t, "[") {
-		return false
-	}
-	array := strings.HasPrefix(t, "[[")
-	i := 1
-	if array {
-		i = 2
-	}
-	inBasic, inLiteral := false, false
-	for i < len(t) {
-		c := t[i]
-		switch {
-		case inBasic:
-			if c == '\\' && i+1 < len(t) {
-				i += 2
-				continue
-			}
-			if c == '"' {
-				inBasic = false
-			}
-		case inLiteral:
-			if c == '\'' {
-				inLiteral = false
-			}
-		default:
-			switch c {
-			case '"':
-				inBasic = true
-			case '\'':
-				inLiteral = true
-			case ']':
-				if array {
-					if i+1 < len(t) && t[i+1] == ']' {
-						return afterHeaderIsCommentOrBlank(t[i+2:])
-					}
-					return false // single ']' cannot close an array-of-tables header
-				}
-				return afterHeaderIsCommentOrBlank(t[i+1:])
-			}
-		}
-		i++
-	}
-	return false
-}
-
-// afterHeaderIsCommentOrBlank reports whether the text following a table header's
-// closing bracket(s) is only whitespace and an optional inline comment.
-func afterHeaderIsCommentOrBlank(rest string) bool {
-	rest = strings.TrimSpace(rest)
-	return rest == "" || strings.HasPrefix(rest, "#")
 }
 
 // CanonicalZoneIdentity returns the case- and trailing-dot-normalized management
