@@ -154,7 +154,7 @@ func TestVerifyNSECDenialWithRRSIG_VerifiesSignature(t *testing.T) {
 	raw, key, nsec, rrsig := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "zzz.example.com.")
 
 	proof := VerifyNSECDenialWithRRSIG("nonexistent.example.com.", miekgdns.TypeA,
-		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, raw, 3)
+		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, "example.com.", raw, 3)
 
 	if !proof.Verified {
 		t.Fatalf("expected a genuine denial proof to verify, got error: %q", proof.Error)
@@ -168,7 +168,7 @@ func TestVerifyNSECDenialWithRRSIG_RejectsForgedSignature(t *testing.T) {
 	raw, key, nsec, rrsig := buildSignedNSECResponse(t, "example.com.", "zzz.example.com.", "yyy.example.com.")
 
 	proof := VerifyNSECDenialWithRRSIG("nonexistent.example.com.", miekgdns.TypeA,
-		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, raw, 3)
+		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, "example.com.", raw, 3)
 
 	if proof.Verified {
 		t.Fatal("forged NSEC signature was incorrectly reported as cryptographically verified")
@@ -183,7 +183,7 @@ func TestVerifyNSECDenialWithRRSIG_RequiresRawResponse(t *testing.T) {
 
 	// No raw response means the signature cannot be checked; the proof must not verify.
 	proof := VerifyNSECDenialWithRRSIG("nonexistent.example.com.", miekgdns.TypeA,
-		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, nil, 3)
+		[]dnspkg.NSECRecord{nsec}, []dnspkg.RRSIGRecord{rrsig}, []dnspkg.DNSKEYRecord{key}, "example.com.", nil, 3)
 
 	if proof.Verified {
 		t.Fatal("denial proof reported verified without a raw response to check the signature")

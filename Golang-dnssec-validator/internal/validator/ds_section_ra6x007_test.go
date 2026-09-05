@@ -206,28 +206,28 @@ func TestRA6X007_DenialEvidenceBoundary(t *testing.T) {
 	keys := parent.keyRecords()
 
 	// Genuine signed NSEC in Authority proves DS absence.
-	if proof, ok := v.verifyDSAbsence(child, keys, build([]dns.RR{genuine, sig}, nil)); !ok {
+	if proof, ok := v.verifyDSAbsence(child, parentZone, keys, build([]dns.RR{genuine, sig}, nil)); !ok {
 		t.Fatalf("genuine authority NSEC must prove DS absence: %+v", proof)
 	}
 	// An unsigned forged NSEC (DS bit set) in Additional is not evidence: the
 	// genuine proof still stands and the forged record is not consulted.
-	if proof, ok := v.verifyDSAbsence(child, keys, build([]dns.RR{genuine, sig}, []dns.RR{forged})); !ok {
+	if proof, ok := v.verifyDSAbsence(child, parentZone, keys, build([]dns.RR{genuine, sig}, []dns.RR{forged})); !ok {
 		t.Fatalf("Additional-section NSEC must not poison the proof: %+v", proof)
 	}
 	// Only an Additional-section NSEC, unsigned: there is no denial evidence
 	// at all — never a verified proof.
-	if proof, ok := v.verifyDSAbsence(child, keys, build(nil, []dns.RR{genuine, sig})); ok || !strings.Contains(proof.Error, "no NSEC/NSEC3") {
+	if proof, ok := v.verifyDSAbsence(child, parentZone, keys, build(nil, []dns.RR{genuine, sig})); ok || !strings.Contains(proof.Error, "no NSEC/NSEC3") {
 		t.Fatalf("Additional-only NSEC must not be denial evidence: ok=%v %+v", ok, proof)
 	}
 	// A forged record in Authority beside the genuine one is excluded (not
 	// verifiable) and the genuine record still proves absence.
-	if proof, ok := v.verifyDSAbsence(child, keys, build([]dns.RR{forged, genuine, sig}, nil)); ok {
+	if proof, ok := v.verifyDSAbsence(child, parentZone, keys, build([]dns.RR{forged, genuine, sig}, nil)); ok {
 		// Both records share the owner and therefore one RRset; the signature
 		// covers only the genuine record, so the served RRset does not verify.
 		t.Fatalf("an RRset altered by an injected record must not verify: %+v", proof)
 	}
 	unrelatedForged := &dns.NSEC{Hdr: rrHdr("other.example.com.", dns.TypeNSEC), NextDomain: "zzz.example.com.", TypeBitMap: []uint16{dns.TypeA}}
-	if proof, ok := v.verifyDSAbsence(child, keys, build([]dns.RR{unrelatedForged, genuine, sig}, nil)); !ok {
+	if proof, ok := v.verifyDSAbsence(child, parentZone, keys, build([]dns.RR{unrelatedForged, genuine, sig}, nil)); !ok {
 		t.Fatalf("an unverifiable unrelated NSEC RRset must be ignored, not fail the genuine proof: %+v", proof)
 	}
 }

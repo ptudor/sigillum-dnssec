@@ -107,14 +107,14 @@ func TestVerifyDNSKEYRRSIGByKeys_RejectsRogueKSK(t *testing.T) {
 
 	// Genuine: RRset signed by the DS-matched KSK-A verifies.
 	rrsigA := signDNSKEYRRset(t, zone, rrsetKeys, signerA, recA.KeyTag)
-	if err := VerifyDNSKEYRRSIGByKeys(dnskeys, []dnspkg.RRSIGRecord{rrsigA}, authed); err != nil {
+	if err := VerifyDNSKEYRRSIGByKeys(zone, dnskeys, []dnspkg.RRSIGRecord{rrsigA}, authed); err != nil {
 		t.Fatalf("genuine DNSKEY RRSIG by DS-matched KSK must verify, got: %v", err)
 	}
 
 	// Attack: RRset signed by the rogue KSK-B, which is present in the RRset but is NOT
 	// authenticated by the parent DS. Must be rejected (the R-080 chain break).
 	rrsigB := signDNSKEYRRset(t, zone, rrsetKeys, signerB, recB.KeyTag)
-	if err := VerifyDNSKEYRRSIGByKeys(dnskeys, []dnspkg.RRSIGRecord{rrsigB}, authed); err == nil {
+	if err := VerifyDNSKEYRRSIGByKeys(zone, dnskeys, []dnspkg.RRSIGRecord{rrsigB}, authed); err == nil {
 		t.Fatal("DNSKEY RRset signed by a rogue (non-DS-matched) KSK was accepted; R-080 not enforced")
 	}
 }
@@ -126,7 +126,7 @@ func TestVerifyDNSKEYRRSIGByKeys_NoAuthenticatedKeys(t *testing.T) {
 
 	// Empty authenticated set: nothing the parent vouches for, so the RRset cannot be
 	// trusted regardless of its self-signature.
-	if err := VerifyDNSKEYRRSIGByKeys([]dnspkg.DNSKEYRecord{recA}, []dnspkg.RRSIGRecord{rrsigA}, nil); err == nil {
+	if err := VerifyDNSKEYRRSIGByKeys(zone, []dnspkg.DNSKEYRecord{recA}, []dnspkg.RRSIGRecord{rrsigA}, nil); err == nil {
 		t.Fatal("expected error when no authenticated keys are available")
 	}
 }
@@ -233,26 +233,26 @@ func TestVerifyDSAbsence(t *testing.T) {
 	// Genuine insecure delegation: NSEC with NS set, DS clear, signed by the parent.
 	qr, parentKey := buildDSAbsenceResponse(t, child, parentZone,
 		[]uint16{miekgdns.TypeNS, miekgdns.TypeRRSIG})
-	if _, ok := v.verifyDSAbsence(child, []dnspkg.DNSKEYRecord{parentKey}, qr); !ok {
+	if _, ok := v.verifyDSAbsence(child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, qr); !ok {
 		t.Fatal("a signed NSEC proving no DS must verify as an insecure delegation")
 	}
 
 	// DS bit present: the NSEC contradicts the empty-DS answer → not a valid absence proof.
 	qrDS, keyDS := buildDSAbsenceResponse(t, child, parentZone,
 		[]uint16{miekgdns.TypeNS, miekgdns.TypeDS, miekgdns.TypeRRSIG})
-	if _, ok := v.verifyDSAbsence(child, []dnspkg.DNSKEYRecord{keyDS}, qrDS); ok {
+	if _, ok := v.verifyDSAbsence(child, parentZone, []dnspkg.DNSKEYRecord{keyDS}, qrDS); ok {
 		t.Fatal("an NSEC with the DS bit set must not prove DS absence")
 	}
 
 	// No NSEC/NSEC3 at all (DS stripped by an attacker) → cannot prove insecure.
 	empty := &dnspkg.QueryResult{RCode: miekgdns.RcodeSuccess}
-	if _, ok := v.verifyDSAbsence(child, []dnspkg.DNSKEYRecord{parentKey}, empty); ok {
+	if _, ok := v.verifyDSAbsence(child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, empty); ok {
 		t.Fatal("an empty response must not prove an insecure delegation")
 	}
 
 	// Wrong parent key: the NSEC RRSIG cannot be verified → fail closed.
 	_, _, otherKey := genTestDNSKEY(t, parentZone, 256)
-	if _, ok := v.verifyDSAbsence(child, []dnspkg.DNSKEYRecord{otherKey}, qr); ok {
+	if _, ok := v.verifyDSAbsence(child, parentZone, []dnspkg.DNSKEYRecord{otherKey}, qr); ok {
 		t.Fatal("DS-absence proof must fail when the NSEC RRSIG does not verify")
 	}
 }
@@ -265,7 +265,7 @@ func TestFinalizeNoDSDelegation(t *testing.T) {
 	// Insecure parent (no authenticated DNSKEY threaded in): unsigned delegation is
 	// genuinely insecure and needs no proof.
 	r1 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r1, child, nil, nil)
+	v.finalizeNoDSDelegation(r1, child, parentZone, nil, nil)
 	if r1.Status != StatusInsecure {
 		t.Fatalf("no parent DNSKEY should yield insecure, got %s", r1.Status)
 	}
@@ -274,14 +274,14 @@ func TestFinalizeNoDSDelegation(t *testing.T) {
 	qr, parentKey := buildDSAbsenceResponse(t, child, parentZone,
 		[]uint16{miekgdns.TypeNS, miekgdns.TypeRRSIG})
 	r2 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r2, child, []dnspkg.DNSKEYRecord{parentKey}, qr)
+	v.finalizeNoDSDelegation(r2, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, qr)
 	if r2.Status != StatusInsecure {
 		t.Fatalf("valid absence proof should yield insecure, got %s", r2.Status)
 	}
 
 	// Secure parent, no denial at all → indeterminate (possible downgrade), not insecure.
 	r3 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r3, child, []dnspkg.DNSKEYRecord{parentKey}, &dnspkg.QueryResult{})
+	v.finalizeNoDSDelegation(r3, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, &dnspkg.QueryResult{})
 	if r3.Status != StatusIndeterminate {
 		t.Fatalf("missing absence proof should yield indeterminate, got %s", r3.Status)
 	}
@@ -290,7 +290,7 @@ func TestFinalizeNoDSDelegation(t *testing.T) {
 	qrDS, keyDS := buildDSAbsenceResponse(t, child, parentZone,
 		[]uint16{miekgdns.TypeNS, miekgdns.TypeDS, miekgdns.TypeRRSIG})
 	r4 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r4, child, []dnspkg.DNSKEYRecord{keyDS}, qrDS)
+	v.finalizeNoDSDelegation(r4, child, parentZone, []dnspkg.DNSKEYRecord{keyDS}, qrDS)
 	if r4.Status != StatusBogus {
 		t.Fatalf("a DS-bit NSEC should yield bogus, got %s", r4.Status)
 	}

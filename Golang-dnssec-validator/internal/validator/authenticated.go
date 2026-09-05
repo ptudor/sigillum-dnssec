@@ -229,11 +229,23 @@ func VerifyDenialRRsetsFromResponse(rawResponse []byte, typeCovered uint16, keys
 		return nil, nil, fmt.Errorf("no %s records found in the Answer or Authority section", dnspkg.TypeName(typeCovered))
 	}
 
+	wantZone := ""
+	if expectedSigner != "" {
+		wantZone = dns.CanonicalName(expectedSigner)
+	}
+
 	for _, owner := range order {
 		rrset := rrsetByOwner[owner]
 		sigs := sigsByOwner[owner]
 		if len(sigs) == 0 {
 			rejected = append(rejected, fmt.Sprintf("%s RRset at %s has no RRSIG", dnspkg.TypeName(typeCovered), owner))
+			continue
+		}
+		// RA6X-016: a zone's denial records are owned inside that zone. A record
+		// owned elsewhere is another zone's evidence even if the same key
+		// material would verify it.
+		if wantZone != "" && !dns.IsSubDomain(wantZone, owner) {
+			rejected = append(rejected, fmt.Sprintf("%s RRset at %s is not within zone %s", dnspkg.TypeName(typeCovered), owner, expectedSigner))
 			continue
 		}
 		records := append(append([]dns.RR{}, rrset...), rrsToRRs(sigs)...)

@@ -94,7 +94,7 @@ func TestVerifyWildcard_EndToEnd_Verified(t *testing.T) {
 	aRRSIG := dnspkg.RRSIGRecord{TypeCovered: miekgdns.TypeA, Labels: 2, SignerName: "example.com.", KeyTag: key.KeyTag}
 
 	var v Validator
-	v.verifyWildcard(validation, "foo.example.com.", aRRSIG, qr, []dnspkg.DNSKEYRecord{key})
+	v.verifyWildcard(validation, "foo.example.com.", "example.com.", aRRSIG, qr, []dnspkg.DNSKEYRecord{key})
 
 	if !validation.Wildcard {
 		t.Fatal("expected wildcard synthesis to be detected")
@@ -120,7 +120,7 @@ func TestVerifyWildcard_EndToEnd_ForgedProofRejected(t *testing.T) {
 	aRRSIG := dnspkg.RRSIGRecord{TypeCovered: miekgdns.TypeA, Labels: 2, SignerName: "example.com.", KeyTag: key.KeyTag}
 
 	var v Validator
-	v.verifyWildcard(validation, "foo.example.com.", aRRSIG, qr, []dnspkg.DNSKEYRecord{key})
+	v.verifyWildcard(validation, "foo.example.com.", "example.com.", aRRSIG, qr, []dnspkg.DNSKEYRecord{key})
 
 	if !validation.Wildcard {
 		t.Fatal("expected wildcard synthesis to be detected")
@@ -140,7 +140,7 @@ func TestVerifyWildcard_NotWildcard(t *testing.T) {
 	aRRSIG := dnspkg.RRSIGRecord{TypeCovered: miekgdns.TypeA, Labels: 3, SignerName: "example.com."}
 
 	var v Validator
-	v.verifyWildcard(validation, "foo.example.com.", aRRSIG, qr, nil)
+	v.verifyWildcard(validation, "foo.example.com.", "example.com.", aRRSIG, qr, nil)
 
 	if validation.Wildcard {
 		t.Fatal("a non-wildcard answer must not be flagged as wildcard")
