@@ -30,10 +30,10 @@ func TestRA6X006_StartupValidationDoesNotWriteState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.ensureDirectories(); err != nil {
+	if err := d.ensureDirectories(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.validateStartup(); err != nil {
+	if err := d.validateStartup(cfg); err != nil {
 		t.Fatalf("validateStartup: %v", err)
 	}
 	after, err := os.ReadFile(cfg.StatePath())

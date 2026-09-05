@@ -15,6 +15,7 @@ import (
 
 	signerpkg "github.com/ptudor/dnssec-tudor/internal/signer"
 
+	"github.com/ptudor/dnssec-tudor/internal/fsutil"
 	"github.com/ptudor/dnssec-tudor/internal/metrics"
 	statepkg "github.com/ptudor/dnssec-tudor/internal/state"
 
@@ -44,6 +45,17 @@ type Daemon struct {
 	// in the most recent signing cycle ("" when healthy). While set, signing
 	// cycles are skipped and readiness reports the failure (RA6X-026).
 	stateFault atomic.Pointer[string]
+	// ready is closed once Run has bound its listeners, started the heartbeat
+	// and registered its workers. Reload waits for it, so a SIGHUP during
+	// startup cannot race the startup reads of cfg/heartbeat (RA6X-040).
+	ready     chan struct{}
+	readyOnce sync.Once
+	starting  atomic.Bool // Run has begun its startup sequence
+}
+
+// markReady publishes the ready lifecycle state (idempotent).
+func (d *Daemon) markReady() {
+	d.readyOnce.Do(func() { close(d.ready) })
 }
 
 // setStateFault records (or clears, with "") the persistent state-load failure.
@@ -71,32 +83,47 @@ func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 		ctx:         ctx,
 		cancel:      cancel,
 		tickerReset: make(chan time.Duration, 1),
+		ready:       make(chan struct{}),
 	}
 }
 
 // Run starts the daemon's main loop
-func (d *Daemon) Run() error {
+func (d *Daemon) Run() (err error) {
 	slog.Info("[DAEMON] starting")
+	d.starting.Store(true)
+
+	// A startup that fails, or that finds shutdown already requested, must
+	// wake any Reload waiting for readiness and never start a worker
+	// afterwards (RA6X-040).
+	defer func() {
+		if err != nil {
+			d.cancel()
+		}
+		d.markReady()
+	}()
+
+	// Every startup reference to state a Reload may swap goes through ONE
+	// guarded snapshot (RA6X-040); Reload itself waits for readiness, so the
+	// snapshot is also what the workers start from.
+	snap := d.takeSnapshot()
 
 	// Ensure directories exist
-	if err := d.ensureDirectories(); err != nil {
+	if err := d.ensureDirectories(snap.cfg); err != nil {
 		return err
 	}
 
 	// Validate startup requirements
-	if err := d.validateStartup(); err != nil {
+	if err := d.validateStartup(snap.cfg); err != nil {
 		return fmt.Errorf("startup validation failed: %w", err)
 	}
 
 	// Bind the listeners before starting anything else. A failed initial bind is
 	// a startup failure, not a warning: return it from Run() so the process
-	// exits non-zero. This also gives implicit single-instance protection — a
-	// second `serve` cannot bind the already-held health port (R-021).
-	d.mu.RLock()
-	healthAddr := d.cfg.Health.Listen
-	webEnabled := d.cfg.Web.Enabled
-	webAddr := d.cfg.Web.Listen
-	d.mu.RUnlock()
+	// exits non-zero. Together with the instance lock taken in runServe this
+	// refuses a second `serve` (R-021, RA6X-006).
+	healthAddr := snap.cfg.Health.Listen
+	webEnabled := snap.cfg.Web.Enabled
+	webAddr := snap.cfg.Web.Listen
 
 	healthLn, err := net.Listen("tcp", healthAddr)
 	if err != nil {
@@ -112,8 +139,22 @@ func (d *Daemon) Run() error {
 		}
 	}
 
-	// Start heartbeat monitoring only once the ports are secured.
-	d.heartbeat.Start()
+	// Shutdown may already have been requested while we were binding: do not
+	// start the heartbeat or any worker on a cancelled daemon (RA6X-040).
+	select {
+	case <-d.ctx.Done():
+		healthLn.Close()
+		if webLn != nil {
+			webLn.Close()
+		}
+		slog.Info("[DAEMON] shutdown requested during startup; nothing started")
+		return nil
+	default:
+	}
+
+	// Start heartbeat monitoring only once the ports are secured, using the
+	// client captured in the snapshot (Reload cannot have swapped it yet).
+	snap.heartbeat.Start()
 
 	// Start web server if enabled
 	if webLn != nil {
@@ -128,6 +169,10 @@ func (d *Daemon) Run() error {
 	// Main signing loop
 	d.wg.Add(1)
 	go d.runSigningLoop()
+
+	// Workers are registered and the heartbeat is running: publish readiness
+	// so a pending Reload may proceed.
+	d.markReady()
 
 	// Wait for shutdown
 	<-d.ctx.Done()
@@ -162,10 +207,14 @@ func (d *Daemon) waitForHooks(timeout time.Duration) {
 func (d *Daemon) Shutdown() {
 	slog.Info("[DAEMON] Initiating graceful shutdown")
 
-	// Stop heartbeat monitoring (sends stopping heartbeat)
-	d.heartbeat.Stop()
-
+	// Cancel first so a Run still in its startup sequence stops before it
+	// starts any worker or heartbeat, then stop the heartbeat client read
+	// under the lock (Reload may have swapped it) (RA6X-040).
 	d.cancel()
+	d.mu.RLock()
+	hb := d.heartbeat
+	d.mu.RUnlock()
+	hb.Stop()
 
 	// R-016: snapshot the server pointer and timeout under the lock, then RELEASE the
 	// lock BEFORE the blocking server.Shutdown. That call waits for in-flight handlers
@@ -187,8 +236,22 @@ func (d *Daemon) Shutdown() {
 	}
 }
 
-// Reload updates the daemon's configuration and state
+// Reload updates the daemon's configuration and state. It waits until Run has
+// published its ready lifecycle state so startup never races a swap, and is a
+// no-op once shutdown has begun (RA6X-040).
 func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
+	// Only a startup that is actually in progress is serialized against; a
+	// daemon whose Run has not begun has no startup reads to race.
+	if d.starting.Load() {
+		select {
+		case <-d.ready:
+		case <-d.ctx.Done():
+		}
+	}
+	if d.ctx.Err() != nil {
+		slog.Info("[DAEMON] Ignoring reload: daemon is shutting down or failed to start")
+		return
+	}
 	d.mu.Lock()
 	oldCfg := d.cfg
 	oldHeartbeat := d.heartbeat
@@ -236,34 +299,34 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 	slog.Info("[DAEMON] Configuration and state reloaded", "zones", len(cfg.Zones))
 }
 
-func (d *Daemon) ensureDirectories() error {
+func (d *Daemon) ensureDirectories(cfg *config.Config) error {
 	// Data and output dirs need standard permissions
-	for _, dir := range []string{d.cfg.DataDir, d.cfg.OutputDir} {
+	for _, dir := range []string{cfg.DataDir, cfg.OutputDir} {
 		if err := signerpkg.EnsureDir(dir); err != nil {
 			return err
 		}
 	}
 	// Keys directory holds private keys — restrict to owner-only
-	if err := signerpkg.EnsureDirSecure(d.cfg.KeysDir()); err != nil {
+	if err := signerpkg.EnsureDirSecure(cfg.KeysDir()); err != nil {
 		return err
 	}
 	return nil
 }
 
 // validateStartup performs startup checks to ensure the daemon can operate correctly
-func (d *Daemon) validateStartup() error {
+func (d *Daemon) validateStartup(cfg *config.Config) error {
 	// Verify output_dir is writable
-	if err := d.checkDirWritable(d.cfg.OutputDir, "output_dir"); err != nil {
+	if err := d.checkDirWritable(cfg.OutputDir, "output_dir"); err != nil {
 		return err
 	}
 
 	// Verify data_dir is writable
-	if err := d.checkDirWritable(d.cfg.DataDir, "data_dir"); err != nil {
+	if err := d.checkDirWritable(cfg.DataDir, "data_dir"); err != nil {
 		return err
 	}
 
 	// Verify keys_dir is writable (with secure permissions)
-	keysDir := d.cfg.KeysDir()
+	keysDir := cfg.KeysDir()
 	if err := d.checkDirWritable(keysDir, "keys_dir"); err != nil {
 		return err
 	}
@@ -275,7 +338,7 @@ func (d *Daemon) validateStartup() error {
 	// that then fails to start would have clobbered live state. Writability
 	// of data_dir was checked above; an existing file must merely be
 	// openable for writing.
-	if err := checkStateFileAccessible(d.cfg.StatePath()); err != nil {
+	if err := checkStateFileAccessible(cfg.StatePath()); err != nil {
 		return fmt.Errorf("cannot access state file: %w", err)
 	}
 
@@ -321,7 +384,9 @@ func (d *Daemon) runSigningLoop() {
 	defer d.wg.Done()
 	defer d.signingLoopDead.Store(true)
 
-	ticker := time.NewTicker(d.cfg.PollInterval.Duration)
+	// The initial interval comes from a guarded snapshot; Reload may swap
+	// d.cfg concurrently (RA6X-040).
+	ticker := time.NewTicker(d.takeSnapshot().cfg.PollInterval.Duration)
 	defer ticker.Stop()
 
 	// Initial sign
@@ -452,7 +517,11 @@ rolloverLoop:
 			continue
 		}
 		if err := snap.rollover.CheckZSKRollover(domain); err != nil {
-			slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
+			if fsutil.IsCommitted(err) {
+				slog.Warn("[ROLLOVER] ZSK rollover state saved but its durability across power loss is uncertain", "domain", domain, "error", err)
+			} else {
+				slog.Error("[ROLLOVER] ZSK rollover check failed", "domain", domain, "error", err)
+			}
 		}
 	}
 
@@ -467,7 +536,12 @@ rolloverLoop:
 		d.setStateFault(msg)
 		slog.Error("[DAEMON] Not saving state this cycle: state on disk is unreadable or invalid", "error", err)
 	} else if err := snap.state.Save(); err != nil {
-		slog.Error("[DAEMON] Failed to save state", "error", err)
+		if fsutil.IsCommitted(err) {
+			// The state file is in place; only its durability is uncertain (RA6X-049).
+			slog.Warn("[DAEMON] State saved but its durability across power loss is uncertain", "error", err)
+		} else {
+			slog.Error("[DAEMON] Failed to save state", "error", err)
+		}
 	}
 
 	// Fire the coalesced post-sign hook after state is saved — this way
