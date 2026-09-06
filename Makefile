@@ -1,8 +1,8 @@
-# daemon/dnssec root Makefile
+# Sigillum DNSSEC root Makefile
 # Builds all services for the specified platform
 
-PROJECTS = Golang-tudor-dnssec-signer \
-           Golang-dnssec-validator
+PROJECTS = signer \
+           validator
 
 .PHONY: all build build-linux build-linux-arm64 build-darwin build-darwin-arm64 build-freebsd \
         test clean deps help
@@ -84,7 +84,7 @@ deps:
 
 # Show help
 help:
-	@echo "daemon/dnssec Build System"
+	@echo "Sigillum DNSSEC Build System"
 	@echo ""
 	@echo "Usage: make [target]"
 	@echo ""
@@ -102,3 +102,12 @@ help:
 	@echo ""
 	@echo "Projects:"
 	@for dir in $(PROJECTS); do echo "  - $$dir"; done
+
+# GitHub uses the same GoReleaser configuration as local snapshot builds.
+GORELEASER ?= goreleaser
+.PHONY: release-check snapshot
+release-check:
+	$(GORELEASER) check
+
+snapshot:
+	$(GORELEASER) release --snapshot --clean

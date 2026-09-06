@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-10
 **Reviewer:** Claude (Fable 5), multi-agent ultracode review
-**Scope:** Full source of both projects — `Golang-tudor-dnssec-signer` (dnssec-tudor) and `Golang-dnssec-validator` — plus build system, docs, deployment artifacts.
+**Scope:** Full source of both projects — `signer` (dnssec-tudor) and `validator` — plus build system, docs, deployment artifacts.
 **Mode:** Analysis only. No source files were modified.
 
 ## Method
@@ -27,7 +27,7 @@ Every finding was re-verified against the current source during the review; line
 
 ---
 
-# Part 1 — `Golang-tudor-dnssec-signer` (dnssec-tudor)
+# Part 1 — `signer` (dnssec-tudor)
 
 ## Critical / High
 
@@ -438,7 +438,7 @@ The following are maintainability, minor-correctness, doc, and test-gap items. E
 
 ---
 
-# Part 2 — `Golang-dnssec-validator`
+# Part 2 — `validator`
 
 The three headline findings (R-079, R-080, R-081) are soundness breaks in the chain-of-trust enforcement: the tool computes the right cryptographic checks but does not *require* them to pass for a `secure` verdict. Because the validator bootstraps all NS records, glue, and zone-cut structure from an untrusted recursive resolver (default in config: `127.0.0.1`; library default `8.8.8.8`) and only the authoritative-side crypto is meant to provide integrity, these enforcement gaps make the tool spoofable by a network attacker.
 
@@ -557,14 +557,14 @@ The three headline findings (R-079, R-080, R-081) are soundness breaks in the ch
 - **R-096 (Low) — CNAME RRSIG verification lacks the signer-name==zone check the A path has.** `internal/validator/validator.go:476-505` verifies a CNAME RRSIG by keytag but, unlike the A path (`validator.go:531`), never checks `rrsig.SignerName == zone`. Cryptographic verification still requires the signature to be by that key, so impact is low, but the defense-in-depth check is missing. *Fix:* add the signer-name check to the CNAME branch. *Verify:* a CNAME RRSIG with a foreign signer is rejected.
 - **R-097 (Low) — NODATA NSEC proof doesn't check the CNAME/DNAME bit (RFC 6840 §4.3).** `internal/validator/nsec.go:148-177` — an NSEC NODATA proof should confirm the CNAME bit is not set (else a CNAME should have been returned). *Fix:* reject NODATA when the matching NSEC has the CNAME (or DNAME above) bit. *Verify:* a NODATA NSEC with the CNAME bit is not accepted.
 - **R-098 (Low) — `/metrics` is unrestricted by default.** `server.go:71-80` — `MetricsAllowedCIDRs` defaults empty, so Prometheus metrics (including request/validation internals) are world-readable unless the operator sets a CIDR. *Fix:* default to loopback-only, or document prominently; the systemd unit should set the allowlist. *Verify:* default config restricts `/metrics` to loopback.
-- **R-099 (Low, maintainability) — heartbeat code is duplicated between the two projects.** `Golang-tudor-dnssec-signer/heartbeat.go` and `Golang-dnssec-validator/internal/heartbeat/heartbeat.go` are near-duplicate AnyStatus clients that have already diverged (async vs sync sends, different lifecycle). *Fix:* extract a shared `libs/` heartbeat package (per the `~/Git` layout conventions) consumed by both. *Verify:* one implementation, both projects import it.
+- **R-099 (Low, maintainability) — heartbeat code is duplicated between the two projects.** `signer/heartbeat.go` and `validator/internal/heartbeat/heartbeat.go` are near-duplicate AnyStatus clients that have already diverged (async vs sync sends, different lifecycle). *Fix:* extract a shared `libs/` heartbeat package (per the `~/Git` layout conventions) consumed by both. *Verify:* one implementation, both projects import it.
 - **R-100 (Low) — the "query every NS, flag inconsistencies" headline feature is only partial for the leaf record.** `verifyActualRecord`/`checkAndFollowCNAME` (`validator.go:424-431`, `:348-355`) query authoritative servers only until the *first* success, so a per-server disagreement on the actual answer (the exact scenario the tool advertises) is not surfaced for the leaf record — only the DNSKEY step (`ValidateMultipleServers`) compares across servers, and even there disagreements are warning-only. *Fix:* query all servers for the leaf record and report per-server disagreement, consistent with the DNSKEY step and the documented feature. *Verify:* a zone where one NS returns a different/expired answer is flagged.
 
 ---
 
 # Summary
 
-**Coverage note:** The signer (`Golang-tudor-dnssec-signer`) was reviewed by a fleet of area reviewers plus a full manual verification pass of every High/Medium finding against source. The validator (`Golang-dnssec-validator`) was reviewed entirely by direct read (the review fleet was cut off by an account spend limit before it reached the validator), covering every `.go` file, the frontend, and config/build artifacts. Both projects' `go build`/`go vet`/`gofmt`/`go test` are clean — every finding here is invisible to that toolchain.
+**Coverage note:** The signer (`signer`) was reviewed by a fleet of area reviewers plus a full manual verification pass of every High/Medium finding against source. The validator (`validator`) was reviewed entirely by direct read (the review fleet was cut off by an account spend limit before it reached the validator), covering every `.go` file, the frontend, and config/build artifacts. Both projects' `go build`/`go vet`/`gofmt`/`go test` are clean — every finding here is invisible to that toolchain.
 
 ## Findings by severity
 
@@ -615,6 +615,6 @@ The three headline findings (R-079, R-080, R-081) are soundness breaks in the ch
 
 ## Cross-cutting notes
 
-- **Build/git hygiene:** `git ls-files` shows the compiled binaries `Golang-tudor-dnssec-signer/dnssec-tudor` and `Golang-dnssec-validator/dnssec-validator` are present on disk but the `.gitignore` (widened in commit `4d80794`/`990f6c5`) excludes them; confirm they are untracked before release. Both projects build/vet/test clean on go1.26.4.
+- **Build/git hygiene:** `git ls-files` shows the compiled binaries `signer/dnssec-tudor` and `validator/dnssec-validator` are present on disk but the `.gitignore` (widened in commit `4d80794`/`990f6c5`) excludes them; confirm they are untracked before release. Both projects build/vet/test clean on go1.26.4.
 - **Doc/reality inversions (both projects):** the root and `daemons/dnssec` `CLAUDE.md` claim the signer uses `BurntSushi/toml` "the only project on BurntSushi rather than go-toml" — both projects actually use `pelletier/go-toml/v2` (R-055). The signer's documented unquoted `[zones.ptudor.net]` config silently registers zero zones (R-054). The validator's CLAUDE.md documents env/`.env` config while the code prefers TOML (R-094). These matter because they misdirect fixes and can produce a non-functional deployment from copy-pasted docs.
 - **What is genuinely solid (not findings, for reviewer confidence):** signer NSEC/NSEC3 chain generation's occlusion/ENT handling; validator DO-bit + TCP-fallback transport; validator denial-proof *RRSIG* cryptographic verification (the 4ec8209 fix); validator XFF rightmost-untrusted client-IP extraction (the 95a3976 fix); validator frontend XSS escaping; both projects' graceful-shutdown skeletons and structured logging. The signer's `hooks` are not command-injectable (operator-config commands, env-var data).

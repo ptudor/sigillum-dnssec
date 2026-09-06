@@ -282,7 +282,7 @@ Verification: `TestLeafFingerprint` — same answer/different TTL fingerprints i
 
 **R-055 — doc drift: BurntSushi → go-toml corrected.**
 Both projects use `github.com/pelletier/go-toml/v2` (go.mod: signer v2.1.1, validator v2.2.4); nothing here is on BurntSushi. `daemons/dnssec/CLAUDE.md:21` now reads `github.com/pelletier/go-toml/v2` with an explicit "no project here is on BurntSushi" note, and the signer `CLAUDE.md:457` dependency bullet reads `pelletier/go-toml/v2` (noting the strict `DisallowUnknownFields` decoding from R-015). `~/Git/CLAUDE.md` never named BurntSushi. This removes the misdirection that R-015 flagged (the two libraries have different strict-mode APIs).
-Files: `CLAUDE.md`, `Golang-tudor-dnssec-signer/CLAUDE.md`.
+Files: `CLAUDE.md`, `signer/CLAUDE.md`.
 Verification: `grep -rn BurntSushi --include='*.md'` across the repo returns only the review/FIXES logs and the "not on BurntSushi" disclaimer — no doc claims BurntSushi is used.
 
 **R-029 — Key-tag collisions are avoided at generation, and backups can't be clobbered by one.**
@@ -348,13 +348,13 @@ Files: `config.go`, `dnssec-validator.toml.example`.
 Verification: `TestDefaultConfig_MetricsLoopbackOnly` (default is exactly the two loopback CIDRs, non-empty); `TestMetricsDefaultLoopbackOnly` (end-to-end: under the default config a `/metrics` request from 203.0.113.7 is 403 and from 127.0.0.1 is 200).
 
 **R-099 — SKIPPED (shared heartbeat library).** The fix spec conflicts with the code's actual, intentionally-diverged behavior and with the repo's module boundaries.
-Reason: the finding asks to extract `Golang-tudor-dnssec-signer/heartbeat.go` and `Golang-dnssec-validator/internal/heartbeat/heartbeat.go` into a shared `libs/` package consumed by both. But (1) the two clients have deliberately diverged — the signer's was reworked in R-044 into an async, bounded, drop-oldest event queue, while the validator's remains a synchronous sender with a different lifecycle; unifying them would either regress R-044 or force one project onto semantics it doesn't want. (2) A cross-repo `libs/` dependency is not an established pattern for these self-contained daemon repos: `daemons/dnssec/` is its own filtered-history repo with two independent Go modules and no `replace =>` into a sibling `libs/` tree, so introducing one would break the standalone `go build ./...` each repo relies on (there is no `daemons/*/libs` convention). Per the task rules, a fix spec that conflicts with the code's actual behavior is logged as SKIPPED rather than guessed. The duplication is ~one small file per project and is noted for a future deliberate refactor if a shared daemon-support module is ever established.
+Reason: the finding asks to extract `signer/heartbeat.go` and `validator/internal/heartbeat/heartbeat.go` into a shared `libs/` package consumed by both. But (1) the two clients have deliberately diverged — the signer's was reworked in R-044 into an async, bounded, drop-oldest event queue, while the validator's remains a synchronous sender with a different lifecycle; unifying them would either regress R-044 or force one project onto semantics it doesn't want. (2) A cross-repo `libs/` dependency is not an established pattern for these self-contained daemon repos: `daemons/dnssec/` is its own filtered-history repo with two independent Go modules and no `replace =>` into a sibling `libs/` tree, so introducing one would break the standalone `go build ./...` each repo relies on (there is no `daemons/*/libs` convention). Per the task rules, a fix spec that conflicts with the code's actual behavior is logged as SKIPPED rather than guessed. The duplication is ~one small file per project and is noted for a future deliberate refactor if a shared daemon-support module is ever established.
 
 ---
 
 ## Reconstructed Phase 6 signer entries (code committed earlier; documentation completed here)
 
-The Phase 6 signer fixes below were implemented and committed in the commits noted per entry, and their tests pass in `go test ./...`, but their FIXES documentation was never written into this file at the time (the entries had been drafted into a stray `Golang-tudor-dnssec-signer/FIXES_FABLE5_ULTRACODE.md` that was later removed). Each entry here was reconstructed strictly from the actual committed diff (`git show <commit>`); the listed files match the diff and every cited test exists and passes. Ordered by finding ID.
+The Phase 6 signer fixes below were implemented and committed in the commits noted per entry, and their tests pass in `go test ./...`, but their FIXES documentation was never written into this file at the time (the entries had been drafted into a stray `signer/FIXES_FABLE5_ULTRACODE.md` that was later removed). Each entry here was reconstructed strictly from the actual committed diff (`git show <commit>`); the listed files match the diff and every cited test exists and passes. Ordered by finding ID.
 
 **R-004 — `ReplaceDS` restore hardened against the post-DELETE zero-DS window; the failure made distinguishable and escalated.** (commit `65c5325`)
 `DynadotClient.ReplaceDS` ran its post-DELETE restore PUT on the caller's shared ~60s context with no retry, so a transient 5xx, reset, or parent cancel after the DELETE succeeded left the parent holding zero DS while `maybeAutoPublishDS` emitted only a generic stderr warning. The fix runs the restore on a caller-detached context (`context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)`) across 3 attempts with linear backoff (1s, 2s), and on permanent failure returns the new `ErrRegistrarDSEmpty` sentinel defined in `registrar.go`. In `runRegistrarPush` and `maybeAutoPublishDS`, an `errors.Is(err, ErrRegistrarDSEmpty)` match now logs at Error with an explicit `registrar push` remediation and persists a zone warning via `recordRegistrarWarning`.
@@ -552,5 +552,5 @@ Verification: `TestDaemonReload_HandlersReflectNewState` fails before the R-006/
 
 All 100 findings (R-001…R-100) are resolved: **implemented and verified**, except the few explicitly logged **SKIPPED** with reasons (R-099 above; any earlier skips are recorded in their phase sections). Both projects build, vet, and test clean:
 
-- `Golang-tudor-dnssec-signer` — `go build ./...`, `go vet ./...`, `go test ./...` green.
-- `Golang-dnssec-validator` — `go build ./...`, `go vet ./...`, `go test -race ./...` green.
+- `signer` — `go build ./...`, `go vet ./...`, `go test ./...` green.
+- `validator` — `go build ./...`, `go vet ./...`, `go test -race ./...` green.

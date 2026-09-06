@@ -1,0 +1,140 @@
+# Build with GoReleaser OSS v2.18.1. No signing keys or paid features required.
+version: 2
+project_name: sigillum-dnssec
+env:
+  - CGO_ENABLED=0
+builds:
+  - id: signer
+    binary: dnssec-tudor
+    dir: signer
+    main: .
+    goos: [linux, freebsd, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    ldflags:
+      - -s -w -X main.Version={{ .Version }} -X main.BuildTime={{ .CommitDate }}
+  - id: validator
+    binary: dnssec-validator
+    dir: validator
+    main: .
+    goos: [linux, freebsd, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    ldflags:
+      - -s -w -X main.Version={{ .Version }} -X main.BuildTime={{ .CommitDate }}
+archives:
+  - formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - README.md
+      - CHANGELOG.md
+      - LICENSE
+      - THIRD_PARTY_NOTICES.md
+      - SECURITY.md
+      - docs/*
+      - packaging/*.toml
+      - signer/dnssec_signer.rc.d
+      - signer/README.md
+      - signer/QUICKSTART.md
+      - validator/freebsd/*
+      - validator/dnssec-validator.toml.example
+      - validator/README.md
+nfpms:
+  - id: signer
+    package_name: dnssec-tudor
+    ids: [signer]
+    file_name_template: '{{ .ConventionalFileName }}'
+    homepage: https://github.com/ptudor/sigillum-dnssec
+    maintainer: Patrick Tudor <ptudor@ptudor.net>
+    description: DNSSEC zone signing and key lifecycle management.
+    license: MIT
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    section: net
+    priority: optional
+    mtime: '{{ .CommitDate }}'
+    overrides:
+      deb:
+        dependencies: [ca-certificates, systemd, passwd]
+      rpm:
+        dependencies: [ca-certificates, systemd, shadow-utils]
+    contents:
+      - src: packaging/dnssec-tudor.toml
+        dst: /etc/dnssec-tudor/config.toml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+      - src: packaging/dnssec-tudor.service
+        dst: /usr/lib/systemd/system/dnssec-tudor.service
+      - src: README.md
+        dst: /usr/share/doc/dnssec-tudor/README.md
+      - src: docs/linux-packages.md
+        dst: /usr/share/doc/dnssec-tudor/linux-packages.md
+      - src: LICENSE
+        dst: /usr/share/doc/dnssec-tudor/copyright
+      - src: THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/dnssec-tudor/THIRD_PARTY_NOTICES.md
+    scripts:
+      preinstall: packaging/dnssec-tudor-preinstall.sh
+      postinstall: packaging/dnssec-tudor-postinstall.sh
+      preremove: packaging/dnssec-tudor-preremove.sh
+      postremove: packaging/postremove.sh
+  - id: validator
+    package_name: dnssec-validator
+    ids: [validator]
+    file_name_template: '{{ .ConventionalFileName }}'
+    homepage: https://github.com/ptudor/sigillum-dnssec
+    maintainer: Patrick Tudor <ptudor@ptudor.net>
+    description: Streaming DNSSEC validation and troubleshooting in the browser.
+    license: MIT
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    section: net
+    priority: optional
+    mtime: '{{ .CommitDate }}'
+    overrides:
+      deb:
+        dependencies: [ca-certificates, systemd, passwd]
+      rpm:
+        dependencies: [ca-certificates, systemd, shadow-utils]
+    contents:
+      - src: packaging/dnssec-validator.toml
+        dst: /etc/dnssec-validator/dnssec-validator.toml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+      - src: packaging/dnssec-validator.service
+        dst: /usr/lib/systemd/system/dnssec-validator.service
+      - src: README.md
+        dst: /usr/share/doc/dnssec-validator/README.md
+      - src: docs/linux-packages.md
+        dst: /usr/share/doc/dnssec-validator/linux-packages.md
+      - src: LICENSE
+        dst: /usr/share/doc/dnssec-validator/copyright
+      - src: THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/dnssec-validator/THIRD_PARTY_NOTICES.md
+    scripts:
+      preinstall: packaging/dnssec-validator-preinstall.sh
+      postinstall: packaging/dnssec-validator-postinstall.sh
+      preremove: packaging/dnssec-validator-preremove.sh
+      postremove: packaging/postremove.sh
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+changelog:
+  sort: asc
+  filters:
+    exclude: ['^chore:', '^ci:', '^docs:']
+release:
+  github:
+    owner: ptudor
+    name: sigillum-dnssec
+  draft: true
+  prerelease: auto
+  header: |
+    Static Go binaries for the platforms named in each archive.
+    Linux RPM and DEB packages are unsigned and install without starting services.
+    See the README and docs/linux-packages.md before enabling a daemon.
+    Check SHA-256 hashes in checksums.txt and verify the GitHub build attestation.

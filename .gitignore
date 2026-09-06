@@ -7,6 +7,10 @@
 *.swp
 *.swo
 *~
-
 # Build artifacts at root level
 build/
+# Release outputs and local configuration
+/dist/
+.env
+.env.local
+/validator.local.toml

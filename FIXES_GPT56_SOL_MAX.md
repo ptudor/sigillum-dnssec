@@ -11,7 +11,7 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 
 ### R-057 — Release toolchain has GO-2026-5856 — FIXED
 - **Change:** Added a `toolchain go1.26.5` directive to both modules' `go.mod`. The `go` language-version directive is unchanged (validator `go 1.21.0`, signer `go 1.23.0`); the new directive pins/enforces the minimum patched release toolchain (Go 1.26.5 fixes GO-2026-5856, an Encrypted Client Hello PSK identity leak). `GOTOOLCHAIN=auto` (the environment default) now selects 1.26.5 automatically for build/test/release.
-- **Files:** `Golang-dnssec-validator/go.mod`, `Golang-tudor-dnssec-signer/go.mod`
+- **Files:** `validator/go.mod`, `signer/go.mod`
 - **Verification:** Rebuilt both binaries; `go version -m` reports `go1.26.5` for each (was `go1.26.4`). Ran `govulncheck -mode=binary` on both rebuilt binaries → "No vulnerabilities found. Your code is affected by 0 vulnerabilities." GO-2026-5856 is absent from both. Both modules still `go build ./...` clean under the pinned toolchain.
 
 ### R-059 — Critical orchestration lacks deterministic tests — SKIPPED
@@ -124,28 +124,28 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 
 ### R-002 — Removal chowns root secrets config to daemon — FIXED
 - **Change:** Added `writeConfigFileAtomic`/`preserveOwner` (`ownership.go`): a config-specific atomic+durable writer (unique temp → chmod → fsync → **preserve destination uid/gid** → rename → dir fsync) that captures the config's own owner via `os.Stat` and restores it before the rename, and never calls `chownToTarget`. `RemoveZoneFromConfigFile` (and `AddZoneToConfigFile`, R-019) now use it instead of `writeFileAtomicOwned`, which chowned the replacement to the recorded data_dir owner — handing the root-owned, secrets-bearing config to the daemon account. Ownership-preservation failure aborts before replacing the original.
-- **Files:** `Golang-tudor-dnssec-signer/ownership.go`, `Golang-tudor-dnssec-signer/config.go`, `config_boundary_r001_r002_test.go` (new)
+- **Files:** `signer/ownership.go`, `signer/config.go`, `config_boundary_r001_r002_test.go` (new)
 - **Verification:** `TestR002_ConfigWritePreservesMode` — a 0640 config keeps mode 0640 after an add (not loosened) and is rewritten atomically. uid/gid preservation is a root-only chown of the destination's recorded owner; it can never infer ownership from data_dir. Full signer race suite green.
 
 ### R-019 — Config append is non-atomic/non-durable — FIXED
 - **Change:** Rewrote `AddZoneToConfigFile` to read the existing bytes, append the new `[zones."<domain>"]` table, and commit the whole file via `writeConfigFileAtomic` (temp + fsync + rename + dir fsync, ownership/mode preserved). The prior `O_APPEND` `WriteString` was neither atomic nor durable and ignored the deferred `Close` error — a short write or crash could leave a truncated header/path in the only config after state/output were already committed.
-- **Files:** `Golang-tudor-dnssec-signer/config.go`
+- **Files:** `signer/config.go`
 - **Verification:** `TestR002_ConfigWritePreservesMode` exercises the new atomic add (mode preserved, table present). Existing add/remove/reload tests pass. Full signer race suite green.
 
 ### R-001 — Commented TOML boundary deletes later tables — FIXED
 - **Change:** Rewrote `isTOMLTableHeader` from `HasPrefix("[") && HasSuffix("]")` to a quote-aware scanner recognizing normal `[...]` and array `[[...]]` headers with surrounding whitespace, quoted/dotted keys (basic and literal strings that may contain `#` or `]`), and a trailing inline comment (`afterHeaderIsCommentOrBlank`). The old suffix test rejected `[zones."next"] # comment`, so `RemoveZoneFromConfigFile` ran past that boundary and deleted every following table/comment (including credentials) through EOF. Removal now also commits via the ownership-preserving `writeConfigFileAtomic`.
-- **Files:** `Golang-tudor-dnssec-signer/config.go`, `config_boundary_r001_r002_test.go` (new)
+- **Files:** `signer/config.go`, `config_boundary_r001_r002_test.go` (new)
 - **Verification:** `TestR001_IsTOMLTableHeader` — headers with inline comments, `[[array]]`, and quoted keys containing `#`/`]` are recognized; non-headers (incl. `key = "[not a header]"`, unterminated `[`) are not. `TestR001_RemovePreservesFollowingCommentedTables` — removing `target.example` leaves the following `[zones."next.example"] # keep me`, its keys, and a `[[registrar.extra]] # also keep` table (with its `api_key` secret) intact. Full signer race suite green.
 
 ### R-020 — Signed-zone rename lacks directory durability — FIXED
 - **Change:** `writeSignedZone` now calls `syncDir(filepath.Dir(path))` after the `os.Rename`, matching the file-and-directory durability contract of `writeFileAtomicOwned` (state/config). Without the directory fsync a power loss could lose the directory entry even after state was saved with a new serial, leaving `NeedsSign` to trust state and decline to recreate the missing output.
-- **Files:** `Golang-tudor-dnssec-signer/sign.go`
+- **Files:** `signer/sign.go`
 - **Verification:** Full signer `go test -race` green (`sign_atomic_test.go`/`sign_partial_test.go` exercise the unchanged unique-temp write+rename). Output path/content and 0644 mode unchanged; the added best-effort dir sync matches the existing state/config contract.
 
 ### R-029 — Equivalent zone names create conflicting identities — FIXED (duplicate rejection; full boundary-canonicalization not applied)
 - **Change:** Added `canonicalZoneIdentity` (lowercase, trailing root dot removed) and `canonicalConflict` (`config.go`) plus `State.ZoneNames()` (`state.go`). `Config.Validate` now rejects a config whose zone entries collapse to the same canonical identity (`example.com` vs `Example.COM` vs `example.com.`) before any signing/registrar action, and `runAdd`/`runImport` reject a new zone that canonically matches an existing config or state entry (not just an exact-string match).
 - **Scope note:** This closes the primary harm (two competing KSK/DS sets for one DNS zone, registrar DS oscillation). It does NOT rewrite every state/key-filename/metrics/registrar path to a canonical key, nor add the migration/diagnostic for a single legacy mixed-case/dotted entry — that pervasive change risks silently renaming/merging existing on-disk key sets, which the fix spec explicitly warns against, and is the larger part of this "foundation" finding. Existing correctly-spelled single entries are unaffected; the duplicate guard is validation-only (no path/state mutation).
-- **Files:** `Golang-tudor-dnssec-signer/config.go`, `Golang-tudor-dnssec-signer/state.go`, `Golang-tudor-dnssec-signer/main.go`, `config_canonical_r029_test.go` (new)
+- **Files:** `signer/config.go`, `signer/state.go`, `signer/main.go`, `config_canonical_r029_test.go` (new)
 - **Verification:** `TestR029_CanonicalZoneIdentity` (case/trailing-dot normalization) and `TestR029_ValidateRejectsDuplicateCanonicalZones` (case-variant and trailing-dot duplicates rejected; single canonical entry validates). Full signer suite green; `go vet` clean.
 
 ## Phase 5 — Signer command/reload transactions (bounded pieces)
@@ -153,27 +153,27 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 ### R-009 — Import accepts mismatched/incomplete key set — FIXED (import rejection; verifier-strengthening not added)
 - **Change:** `runImport` now REJECTS (returns an error before touching any live file) a KSK/ZSK pair with different algorithms, instead of only logging a warning and continuing. This signer signs the DNSKEY RRset with the KSK algorithm and data with the ZSK algorithm only, so a mismatched pair publishes an algorithm-incomplete zone (RFC 6840 §5.11) that standards-conforming validators may reject.
 - **Scope note:** The independent second half of the fix spec (strengthen the post-sign `verifySignedZone` to derive the active algorithms from DNSKEY and require a valid in-time signature from each over every authoritative RRset) is a larger verifier change and is NOT included here; the import-time rejection prevents the mismatched pair from ever being installed, which is the primary defect ("import can publish an incompletely signed zone"). Same-algorithm separate KSK/ZSK keys are unaffected; a genuine algorithm change still goes through `rollover algorithm`.
-- **Files:** `Golang-tudor-dnssec-signer/main.go`
+- **Files:** `signer/main.go`
 - **Verification:** Build clean; full signer suite green (existing import/sign tests unaffected — none imported mismatched algorithms). The guard runs before the config-append preflight and any key installation.
 
 ### R-003 — Path reload signs old source file — FIXED
 - **Change:** `checkAndSignZone` now reconciles `zoneState.Path` to the active `zoneCfg.Path` (under the state lock, via `UpdateZone`) before calling `SignZone`, when they differ. Change detection already used the config path; previously `SignZone` then parsed/signed the stale `state.json` path, so the daemon could notice file B changed but re-publish file A. `SignZone` captures source mtime/size and writes signed output only after a successful parse, so a failed/unparseable new path leaves the prior signed output and change-detection bookkeeping intact (no false migration claim). The persisted `ZoneState.Path` field and signed-zone naming are unchanged.
-- **Files:** `Golang-tudor-dnssec-signer/daemon.go`
+- **Files:** `signer/daemon.go`
 - **Verification:** Build clean; full signer suite green (sign/reload tests unaffected). Confirmed against `SignZone` that mtime/size are captured into locals and only committed after a successful parse/sign, and that parsing precedes any output write — so the reconcile cannot overwrite good output on a bad new path. (End-to-end daemon reconcile driving requires the daemon snapshot harness — R-059 coupling — so verified by the parse-before-write invariant in `SignZone` plus the passing suite.)
 
 ### R-041 — Startup probe destroys fixed-name file — FIXED
 - **Change:** `Daemon.checkDirWritable` now creates a UNIQUE temp file via `os.CreateTemp(dir, ".startup_check-*")` (O_EXCL semantics) and checks both the `Close` and `Remove` errors, instead of `os.Create(".startup_check")` (create-or-truncate) followed by an unchecked remove. It never opens, truncates, or removes a pre-existing fixed-name path. (The sibling health check already used the safe `os.CreateTemp` pattern.)
-- **Files:** `Golang-tudor-dnssec-signer/daemon.go`, `daemon_startup_probe_r041_test.go` (new)
+- **Files:** `signer/daemon.go`, `daemon_startup_probe_r041_test.go` (new)
 - **Verification:** `TestR041_StartupProbePreservesExistingFile` — a pre-existing `.startup_check` file with distinctive content survives the probe byte-intact, the probe succeeds on a writable dir, and no leftover temp files remain. Full signer suite green.
 
 ### R-010 — Removal rollback reconstructs partial config — FIXED
 - **Change:** `runRemove` now snapshots the EXACT original config bytes (`os.ReadFile`) before `RemoveZoneFromConfigFile`, and on a state-save failure restores them verbatim via `writeConfigFileAtomic` (ownership/mode preserved). The prior rollback called `AddZoneToConfigFile(domain, path)`, which reconstructs only a minimal `[zones."<domain>"]` table with `path` — silently dropping the zone's algorithm, lifetimes, serial policy, registrar settings, explicit booleans, ordering, and comments.
-- **Files:** `Golang-tudor-dnssec-signer/main.go`
+- **Files:** `signer/main.go`
 - **Verification:** Build + full signer suite green (`config_remove`/reload tests unaffected). The restore writes back the captured bytes exactly; ownership/mode preserved by `writeConfigFileAtomic` (R-002). (Injected state-save-failure + restart recovery is the R-059 harness's domain; the byte-snapshot restore is verified by construction and the passing suite.)
 
 ### R-011 — Failed re-add deletes prior signed output — FIXED
 - **Change:** `runAdd` now snapshots any pre-existing signed output (`os.ReadFile` of `<domain>.zone.signed`) BEFORE the sign step may overwrite it, and passes it to `unwindAdd(..., origOutput, outputExisted)`. On rollback, `unwindAdd` RESTORES the exact previous bytes when a predecessor existed (a nameserver may still serve them) and only REMOVES the output when this add created it (no predecessor). Previously the rollback unconditionally `os.Remove`d the output, deleting the last known-good signed zone from a prior management period on any add failure.
-- **Files:** `Golang-tudor-dnssec-signer/main.go`, `add_rollback_r011_test.go` (new), updated `verification_fixes1_test.go` caller
+- **Files:** `signer/main.go`, `add_rollback_r011_test.go` (new), updated `verification_fixes1_test.go` caller
 - **Verification:** `TestR011_UnwindRestoresPreExistingOutput` — a predecessor output overwritten by a failing add is restored to its original bytes on rollback. `TestR011_UnwindRemovesNewlyCreatedOutput` — output with no predecessor is removed. Existing `TestUnwindAdd_PreservesPrivateOnlyOrphan` still passes (key-orphan preservation unchanged). Full signer suite green.
 
 ### R-013 — Key-pair replacement is non-atomic — SKIPPED
@@ -201,32 +201,32 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 
 ### R-060 — Invalid DS digest silently defaults to SHA-256 — FIXED
 - **Change:** `Config.Validate` now rejects any registrar `digest_type` other than 0 (unset/default), 2 (SHA-256), or 4 (SHA-384), before any key/state/output/registrar mutation. Previously `RegistrarConfig.DigestType()` silently coerced every unsupported value to 2, so a typo published a different DS representation than intended with no error. The method's defensive default is retained but now unreachable for invalid values (Validate gates first).
-- **Files:** `Golang-tudor-dnssec-signer/config.go`, `phase6_lowfindings_test.go` (new)
+- **Files:** `signer/config.go`, `phase6_lowfindings_test.go` (new)
 - **Verification:** `TestR060_ValidateRejectsInvalidDigestType` — 1/3/5/255/-1 rejected; 0/2/4 accepted. Existing `DigestType()` method test (value 1 → 2) still passes (it does not go through Validate). Full signer suite green.
 
 ### R-022 — Key generation accepts tag collision after retries — FIXED
 - **Change:** After `maxTagAttempts` unresolved key-tag collisions, key generation now returns a hard error (naming domain/role/attempt count and the colliding tag, no secret material) and leaves every live/backup key and state entry unchanged — no files are written at that point. Previously it logged a warning and `break`, then installed the colliding key, corrupting rollover identity (`OldKeyID == NewKeyID`), clobbering the tag-named backup, and making registrar upsert-by-key-tag replace the old DS.
-- **Files:** `Golang-tudor-dnssec-signer/keys.go`
+- **Files:** `signer/keys.go`
 - **Verification:** Build clean; full signer suite green (normal generation, which never exhausts the retries, is unaffected — the loop breaks on the first unique tag). The collision itself is ~1/65536 per attempt so it cannot be forced deterministically without a generator seam (R-059); the change is a warn→fail-closed with no files written before the return.
 
 ### R-021 — Rollover metrics keep stale active types — FIXED
 - **Change:** `UpdateZoneMetrics` now zeros all three supported rollover-type series (`ksk`/`zsk`/`algorithm`) for each domain on every refresh, THEN sets the single current type, instead of only zeroing them in the no-rollover branch. A direct type→type transition (e.g. ksk → algorithm) between scrapes no longer leaves the previous type's gauge stuck at 1.
-- **Files:** `Golang-tudor-dnssec-signer/metrics.go`, `phase6_lowfindings_test.go` (new)
+- **Files:** `signer/metrics.go`, `phase6_lowfindings_test.go` (new)
 - **Verification:** `TestR021_RolloverMetricsNoStaleType` — ksk→algorithm→nil transitions each leave exactly one (then zero) type series at 1; the old type is always zeroed. Full signer suite green.
 
 ### R-017 — Success erases unrelated warnings — FIXED
 - **Change:** Gave warnings a stable stickiness category via the `"URGENT:"` prefix (the marker registrar-critical zero-DS notices already use). Added `ZoneState.ClearTransientWarnings()` (removes only signer-owned expiry/rollover notices, preserving sticky ones) and `ClearStickyWarnings()` (removes sticky notices, invoked only by the resolving operation). Signing (`sign.go`) and all three rollover completions (`rollover.go`) now call `ClearTransientWarnings()` instead of the wholesale `ClearWarnings()`, so a routine sign/rollover no longer erases an urgent "registrar left zone with ZERO DS" warning. `runRegistrarPush` now calls `clearRegistrarStickyWarnings` after it leaves the expected NONEMPTY DS set at the parent (in-sync, add, or replace) — the read-back that confirms the zero-DS condition is resolved. The public `warnings` string array and old-state decoding are unchanged (an unknown legacy string without the prefix is treated as transient — it stays until sign, matching prior behavior for non-sticky notices; only the sticky URGENT class is newly preserved).
-- **Files:** `Golang-tudor-dnssec-signer/state.go`, `sign.go`, `rollover.go`, `registrar_cli.go`, `warnings_r017_test.go` (new)
+- **Files:** `signer/state.go`, `sign.go`, `rollover.go`, `registrar_cli.go`, `warnings_r017_test.go` (new)
 - **Verification:** `TestR017_StickyWarningsSurviveTransientClear` — a transient clear keeps the URGENT warning and drops expiry/rollover notices; a sticky clear then removes the URGENT one. `TestR017_TransientClearWithoutSticky` — a transient clear with no sticky present clears all. Full signer suite green.
 
 ### R-006 — Rollover guard shorter than published DNSKEY TTL — FIXED
 - **Change:** Added `ZoneState.PublishedDNSKEYTTL` (recorded at each sign as the DNSKEY RRset TTL actually published — the config value, or the SOA TTL when `dnskey_ttl = 0`). `dnskeyTTLFloor` now takes the zone state and returns `max(observed published TTL, configured TTL)` with a 24h fallback only for old state lacking the field, instead of a hardcoded 24h when `dnskey_ttl = 0`. So a zone with a >24h SOA-derived DNSKEY TTL is no longer advanced early. The recorded TTL is never decreased while a rollover is active (a mid-phase SOA TTL decrease cannot shorten an established wait). Persisted for restart round-trips; old state falls back conservatively.
-- **Files:** `Golang-tudor-dnssec-signer/state.go`, `sign.go`, `rollover.go`, `rollover_ttl_r006_test.go` (new)
+- **Files:** `signer/state.go`, `sign.go`, `rollover.go`, `rollover_ttl_r006_test.go` (new)
 - **Verification:** `TestR006_DNSKEYTTLFloorUsesPublishedTTL` — with `dnskey_ttl=0` and a recorded 48h published TTL the floor is 48h (not 24h); old state falls back to 24h; a larger configured TTL wins. Full signer race suite green.
 
 ### R-007 — Retiring ZSK signatures outlive key — FIXED (built on R-006)
 - **Change:** Added `ZoneState.PublishedMaxRRSIGTTL` (recorded at each sign as the largest TTL of any authoritative RRset). The ZSK signing→retirement gate now waits `zskRetireFloor = max(DNSKEY-TTL floor, largest signed RRset TTL)` before dropping the old ZSK, instead of the DNSKEY-TTL alone — a data RRSIG by the retiring key stays cached for its RRset's TTL, which can far exceed the DNSKEY RRset's. Persisted for restarts; not decreased during an active rollover (a mid-phase TTL increase is honored, a decrease cannot shorten the wait).
-- **Files:** `Golang-tudor-dnssec-signer/state.go`, `sign.go`, `rollover.go`, `rollover_ttl_r006_test.go`
+- **Files:** `signer/state.go`, `sign.go`, `rollover.go`, `rollover_ttl_r006_test.go`
 - **Verification:** `TestR007_ZSKRetireFloorUsesMaxRRSIGTTL` — a 7-day A RRSIG with a 1h DNSKEY TTL makes the retire floor 7 days; when the DNSKEY TTL is the largest it wins. Full signer race suite green.
 
 ### R-008 — KSK trust path retired before cached DS — SKIPPED
@@ -236,81 +236,81 @@ Baseline before any changes: both modules build, `go vet ./...` clean, `go test 
 
 ### R-053 — Repeated rate-limiter shutdown panics — FIXED
 - **Change:** `RateLimiter` gained a `sync.Once` (`stopOnce`); `Stop` now closes `stopCh` inside `stopOnce.Do(...)`, making it idempotent and concurrency-safe. A repeated or concurrent `Server.Shutdown` no longer panics with "close of closed channel". No-argument API and rate/bucket behavior unchanged; the bucket mutex is not held while stopping.
-- **Files:** `Golang-dnssec-validator/ratelimit.go`, `phase7_lowfindings_test.go` (new)
+- **Files:** `validator/ratelimit.go`, `phase7_lowfindings_test.go` (new)
 - **Verification:** `TestR053_RateLimiterStopIdempotent` — sequential double-Stop and 32 concurrent Stops, no panic. Full validator module `go test -race` green.
 
 ### R-054 — Invalid metrics allowlist fails open — FIXED
 - **Change:** In `Server.registerRoutes`, when `parseCIDRs` fails on a nonempty `metrics_allowed_cidrs`, the `/metrics` route now installs a **deny** handler (503 "invalid access restriction configured") and logs an error, instead of leaving the unwrapped Prometheus handler exposed to all source IPs. Fails closed even if a direct `NewServer` bypassed `Config.Validate`. Valid CIDR behavior, the public `/metrics` path, and the documented empty-list (unrestricted) semantics are unchanged; operator's invalid restriction is never silently replaced with defaults.
-- **Files:** `Golang-dnssec-validator/server.go`
+- **Files:** `validator/server.go`
 - **Verification:** Build clean; full validator module race suite green. The handler is an explicit fail-closed 503 for the invalid-CIDR path (a construction-level guarantee that no metrics are served from any IP when the restriction is unparseable).
 
 ### R-056 — Failed entropy yields duplicate request IDs — FIXED
 - **Change:** `GenerateRequestID`'s `crypto/rand` failure path no longer hex-encodes the zero/partially-filled buffer (which repeats IDs). It now returns `formatFallbackRequestID(n)` — a deterministic, process-local, collision-free ID from a monotonic `atomic.Uint64` counter mixed with a per-process seed (PID) and the clock, in the same 16-hex-char shape, with a `sync.Once`-guarded warning (no client data/secrets). The counter guarantees uniqueness within the process regardless of clock resolution.
-- **Files:** `Golang-dnssec-validator/logging.go`, `phase7_lowfindings_test.go` (new)
+- **Files:** `validator/logging.go`, `phase7_lowfindings_test.go` (new)
 - **Verification:** `TestR056_FallbackRequestIDsUnique` — 1000 fallback IDs are all unique and exactly 16 chars. Full validator module race suite green.
 
 ### R-016 — Shutdown mutex deadlock — FIXED
 - **Change:** `Daemon.Shutdown` now snapshots the server pointer and shutdown timeout under `d.mu`, RELEASES the lock, and only then calls the blocking `server.Shutdown(ctx)`. Previously it held `d.mu` across that call; `http.Server.Shutdown` waits for in-flight handlers, and those handlers still need `d.current()`'s RLock to return, so the write lock held across the wait deadlocked every graceful stop until the context expired. `http.Server.Shutdown` is idempotent, so a repeated/concurrent shutdown is safe. Endpoints, timeout config, and request draining are unchanged.
-- **Files:** `Golang-tudor-dnssec-signer/daemon.go`
+- **Files:** `signer/daemon.go`
 - **Verification:** Build + full signer `go test -race` green. The fix is a lock-scope reduction (release before the blocking wait), removing the lock/wait cycle by construction; a nil server is a no-op.
 
 ### R-023 — Hook stderr buffer is unbounded — FIXED
 - **Change:** Both `executeHook` and `executeBatchHook` now capture stderr into a `cappedBuffer` (cap `maxHookStderr` = 64 KiB) instead of an unbounded `bytes.Buffer`. `cappedBuffer.Write` retains only a bounded prefix, appends a `[stderr truncated]` marker via `String()`, and ALWAYS returns the full write length so the child's stderr pipe keeps draining and cannot deadlock the hook. A broken hook that writes stderr continuously for the 30s timeout can no longer allocate until the daemon OOMs. The 30s timeout, hook env/API, stdout behavior, and async/sync semantics are unchanged.
 - **Scope note:** The additional "cap concurrent hook processes independently of the signing loop" item is NOT implemented — the per-process memory-exhaustion vector (the finding's core) is closed by the bounded buffer; a global hook-concurrency semaphore is a separate availability tuning left out to avoid changing the coalesced/per-zone hook scheduling semantics.
-- **Files:** `Golang-tudor-dnssec-signer/hooks.go`, `hooks_capped_r023_test.go` (new)
+- **Files:** `signer/hooks.go`, `hooks_capped_r023_test.go` (new)
 - **Verification:** `TestR023_CappedBuffer` — a 1 MB write reports its full length (drains), retains only ~cap bytes plus the truncation marker, subsequent overflow writes still drain, and a within-cap write is retained verbatim without a marker. Full signer race suite green.
 
 ### R-047 — Heartbeat can leak credentials or silently disable — FIXED
 - **Change:** `Config.Validate` now, when heartbeat is enabled, requires a nonempty `api_key`, `app`, and `url`, and requires the URL to be HTTPS (the `api_key` is sent in the POST body, so an HTTP endpoint transmits it in cleartext) — failing startup with a clear non-secret error instead of `NewClient` silently returning a disabled client. Added `heartbeatRedirectPolicy` (`CheckRedirect` on the heartbeat `http.Client`) that rejects HTTPS→non-HTTPS scheme downgrades and cross-origin (host:port) redirects, so a 307/308 cannot relocate the credentialed POST to an insecure/foreign destination. Disabled-by-default behavior, form schema, and endpoint defaults are unchanged; the key is never logged.
 - **Scope note:** The optional narrowly-scoped loopback-HTTP testing opt-in is not added — HTTPS is required unconditionally when enabled (the secure default).
-- **Files:** `Golang-dnssec-validator/config.go`, `Golang-dnssec-validator/internal/heartbeat/heartbeat.go`, `heartbeat_config_r047_test.go` (new)
+- **Files:** `validator/config.go`, `validator/internal/heartbeat/heartbeat.go`, `heartbeat_config_r047_test.go` (new)
 - **Verification:** `TestR047_HeartbeatValidation` — a full HTTPS config validates; missing api_key/app/url and an http:// URL each fail; a disabled incomplete config does not fail. Full validator suite green.
 
 ### R-018 — Per-zone validation bypasses work bound/cache — FIXED (single-flight cache; global cap/429 not added)
 - **Change:** Added `zoneValidationCache` (one single-flight slot per domain, keyed map, same `validationCacheTTL`/`validationMaxWait` bounds as the aggregate dashboard cache) and `cachedValidateZone`. `apiValidateZoneHandler` now routes `/api/validate/{domain}` through it instead of calling `v.ValidateZone(domain)` directly, so repeated or concurrent requests for a zone coalesce into ONE live-DNS run and hits within the TTL are served from cache. The map only ever holds managed zones (the handler checks `state.GetZone` first), so it cannot grow unboundedly. Endpoint path and JSON schema unchanged; routine signing is not serialized behind dashboard validation.
 - **Scope note:** A single GLOBAL concurrency cap across all zones with deterministic 429/503 + `Retry-After` at capacity (as the fix spec also describes) is NOT added — distinct zones still validate concurrently (bounded by the number of managed zones). The per-zone single-flight + TTL closes the "repeated requests trigger repeated unbounded live runs" DoS named in the Evidence; a global scheduler/429 is a further capacity-shaping refinement left out.
-- **Files:** `Golang-tudor-dnssec-signer/web.go`, `web_zonecache_r018_test.go` (new)
+- **Files:** `signer/web.go`, `web_zonecache_r018_test.go` (new)
 - **Verification:** `TestR018_PerZoneSingleFlightAndCache` (race) — 20 concurrent same-zone requests coalesce to 1 compute, a within-TTL hit does not recompute, and a distinct zone computes independently. Full signer suite green.
 
 ## Phase 8 — Diagnostics, UI, compatibility (bounded pieces)
 
 ### R-048 — Exact base path breaks relative UI URLs — FIXED
 - **Change:** The exact `basePath` route now issues a permanent method-preserving redirect (308) to `basePath + "/"`, retaining the query string, instead of serving the UI directly at the no-trailing-slash URL. Serving at `/dnssec` left the address bar without a trailing slash, so browser-relative URLs (`style.css`, `app.js`, `validate`, `api/...`) resolved against the parent as root paths — a reverse proxy exposing only `/dnssec/` then served a page with no assets. The UI/APIs continue to be served under the slash form; root aliases and empty-base-path behavior are unchanged. Removed the now-dead `requestWithPath` helper.
-- **Files:** `Golang-dnssec-validator/server.go`, `server_basepath_r048_test.go` (new)
+- **Files:** `validator/server.go`, `server_basepath_r048_test.go` (new)
 - **Verification:** `TestR048_BasePathRedirectsToSlash` — `GET /dnssec?domain=…&mode=…` returns 308 with `Location: /dnssec/?domain=…&mode=…` (query preserved); HEAD is redirected too (method preserved). Full validator suite green.
 
 ### R-050 — `static_dir` configuration is inert — FIXED
 - **Change:** Deprecated the no-op `static_dir` safely: its default is now empty (was `"./static"`) so a fresh config carries no value, and `main` emits a clear startup WARNING (not a failure) when a legacy value is supplied, noting the web UI is always served from embedded assets. The TOML field and `STATIC_DIR` env decoding are retained for backward compatibility (strict TOML decoding still accepts the key); embedded assets remain the only source, and a working-directory path is never trusted.
-- **Files:** `Golang-dnssec-validator/config.go`, `Golang-dnssec-validator/main.go`
+- **Files:** `validator/config.go`, `validator/main.go`
 - **Verification:** Build clean; full validator suite green (strict TOML decode of `static_dir` still accepted — the field/tag are retained). A supplied value now logs a deprecation warning without failing startup; the default empty value is silent.
 
 ### R-051 — RDAP registrable-domain heuristic is incorrect — FIXED
 - **Change:** `GetRegistrableDomain`/`IsRegistrableDomain` now use `golang.org/x/net/publicsuffix` (`EffectiveTLDPlusOne`) instead of a "exactly two labels" heuristic. RDAP cross-checking runs only when the validated zone equals its registrable domain (eTLD+1), so real registrants under multi-label public suffixes (`example.co.uk`, `example.com.au`) are checked and public suffixes (`co.uk`, `com`) are never queried as registrants. RDAP remains advisory — it does not change secure/insecure/bogus status. (`x/net` promoted from indirect to direct dependency via `go mod tidy`.)
 - **Scope note:** Separate IDNA punycode normalization of unicode labels is not added (the PSL lookup is performed on the presented ASCII/punycode form); the fix spec's IDNA step is deferred.
-- **Files:** `Golang-dnssec-validator/internal/validator/chain.go`, `internal/validator/registrable_r051_test.go` (new), `go.mod`/`go.sum`
+- **Files:** `validator/internal/validator/chain.go`, `internal/validator/registrable_r051_test.go` (new), `go.mod`/`go.sum`
 - **Verification:** `TestR051_RegistrableDomainPublicSuffix` — `example.com`, `example.co.uk`, `example.com.au` (and their subdomains) resolve to the correct registrable domain; `IsRegistrableDomain` is true only for the registrable domain itself and false for subdomains, `co.uk`, `com`, and root. Full validator suite green; `go vet` clean.
 
 ### R-046 — Slow SSE clients exhaust validation capacity — FIXED
 - **Change:** `SSEWriter` now holds an `http.ResponseController` and arms a SLIDING per-event write deadline (`defaultSSEEventWriteTimeout` = 10s, reset before each event and keep-alive) via `armDeadline()`, called at the start of every `WriteEvent`/`WriteRawEvent`/`WriteComment`/`WriteRetry`/`WriteID`. A stuck client (full socket buffer) now makes the next write RETURN an error instead of blocking forever; the handler's existing `cancelOnWriteError` cancels the validation context on that error, the validation goroutine stops, the handler returns, and the deferred `releaseValidationSlot` frees the semaphore/gauge. Long-lived streams keep working because it is a per-event (not whole-stream) deadline; writers that don't support deadlines are left unbounded (best effort), matching the fix spec's conservative handling.
 - **Scope note:** Decoupling validation from writing with a bounded queue is not added — the per-event deadline + existing cancel path is what frees exhausted slots (the finding's core). Event order/JSON/path are unchanged.
-- **Files:** `Golang-dnssec-validator/sse.go`, `sse_deadline_r046_test.go` (new)
+- **Files:** `validator/sse.go`, `sse_deadline_r046_test.go` (new)
 - **Verification:** `TestR046_SSEArmsPerEventDeadline` — a `SetWriteDeadline`-capable writer records that `WriteEvent` and `WriteComment` each arm a deadline ~10s in the future (sliding). Existing SSE tests (including `TestHandleValidateSSE_WriteFailureReturnsQuickly`) pass; full validator module race suite green.
 
 ### R-052 — Heartbeat activity lifecycle is unwired — FIXED (running/idle activity wired; joined shutdown not added)
 - **Change:** Added a concurrency-safe active-validation count to `heartbeat.Client` (`atomic.Int64` + `ValidationStarted`/`ValidationFinished`) and a `periodicAction()` that returns `"running"` while the count is nonzero, `"idle"` otherwise — replacing the background ticker's check for a `"validate:"` `lastAction` prefix that NO caller ever set (so it read idle even during long/concurrent validations). Handlers now notify an injected `activityObserver` on `acquireValidationSlot`/`releaseValidationSlot`; `main` wires the heartbeat client via `Server.SetActivityObserver(hbClient)`. Existing action strings/form fields, disabled behavior, request latency, and secret handling are unchanged; a nil observer is a no-op.
 - **Scope note:** The explicit per-request `validate:start`/`validate:complete` action sends and the bounded background-shutdown JOIN (so the final `stopping` send is attempted before process exit) are NOT added — the periodic `running`/`idle` signal (the finding's primary requirement) is what makes the heartbeat reflect live activity; the counter is maintained without blocking or failing validation.
-- **Files:** `Golang-dnssec-validator/internal/heartbeat/heartbeat.go`, `Golang-dnssec-validator/handlers.go`, `Golang-dnssec-validator/server.go`, `Golang-dnssec-validator/main.go`, `internal/heartbeat/heartbeat_r052_test.go` (new)
+- **Files:** `validator/internal/heartbeat/heartbeat.go`, `validator/handlers.go`, `validator/server.go`, `validator/main.go`, `internal/heartbeat/heartbeat_r052_test.go` (new)
 - **Verification:** `TestR052_PeriodicActionTracksActiveValidations` — idle with no validations, running with 1–2 in flight, back to idle when all finish. Full validator module race suite green; `go vet` clean.
 
 ### R-049 — UI cannot select supported record types — FIXED
 - **Change:** Added an accessible record-type `<select>` (`#type-select`, options A/AAAA/MX/TXT/NS/SOA/CNAME/CAA/SRV/PTR/NAPTR/SPF, default A) to the form in `static/index.html`. `static/app.js` now reads the selected type and threads it through the SSE request (`validate?...&type=`), the form-submit and example-button paths, the shareable/history URL (`updateURL` sets `type` only when non-default, so A-only links stay backward compatible), and reload initialization (reads the `type` URL param). An invalid URL `type` value is rejected against the supported set and falls back to A rather than silently selecting a different type. The API's parameter name, accepted values, response schema, and absent-parameter A default are unchanged.
-- **Files:** `Golang-dnssec-validator/static/index.html`, `Golang-dnssec-validator/static/app.js`
+- **Files:** `validator/static/index.html`, `validator/static/app.js`
 - **Verification:** `node --check static/app.js` passes (valid JS); all three `startValidation` call sites pass the type; the backend already accepts `type` via `SupportedQueryType` and defaults to A when absent/invalid. Assets are embedded (build clean); full validator suite green. (Browser-level exercising of each type is manual — no JS test harness ships.)
 
 ### R-058 — Deployment/conformance docs contradict code — FIXED (deployment-example env vars + anchor behavior; RFC matrix rewrite deferred)
 - **Change:** Corrected the concrete deployment-example errors that lead operators to non-working config: `QUICKSTART-FREEBSD.md` now uses `QUERY_TIMEOUT_SECONDS=5`/`TOTAL_TIMEOUT_SECONDS=30` (integers, the names the loader actually reads) instead of `QUERY_TIMEOUT=5s`/`TOTAL_TIMEOUT=30s`; `ANYSTATUS.md` now uses `HEARTBEAT_INTERVAL_MINUTES=5` (all three occurrences) instead of `HEARTBEAT_INTERVAL=5m`. Rewrote the validator `CLAUDE.md` "Integration" section to describe the **actual** anchor behavior (file-first, no age/`GeneratedAt` check, no write-back cache, pinned-set authentication) and explicitly flag the aspirational "prefer-fresh-then-fetch-and-cache" text as not implemented (R-025).
 - **Scope note:** The full RFC-compliance-matrix rewrite (re-deriving every row from executable behavior, linking each claim to a test/RFC section) is NOT done — it depends on underlying findings that remain open/skipped (R-025, R-035, R-038, R-008, R-012/R-013/R-042, etc.), so the matrix cannot be truthfully re-marked "compliant." Per the fix spec's own guidance, those guarantees should stay marked partial/noncompliant until the code findings land; this entry fixes the mechanically-verifiable env-var and anchor-behavior contradictions.
-- **Files:** `Golang-dnssec-validator/QUICKSTART-FREEBSD.md`, `Golang-dnssec-validator/ANYSTATUS.md`, `Golang-dnssec-validator/CLAUDE.md`
+- **Files:** `validator/QUICKSTART-FREEBSD.md`, `validator/ANYSTATUS.md`, `validator/CLAUDE.md`
 - **Verification:** Mechanically cross-checked every `VAR=` assignment in both edited deployment docs against the loader — all 17 are now names `config.go` reads (no unrecognized names remain). The anchor-behavior text now matches `LoadAnchorsWithFallback`/the R-024 pinned-set gate.
 
 ---

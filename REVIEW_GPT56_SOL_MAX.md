@@ -14,7 +14,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/config.go:591-641`, especially `RemoveZoneFromConfigFile`; `Golang-tudor-dnssec-signer/config.go:673-677`, `isTOMLTableHeader`; `Golang-tudor-dnssec-signer/config_remove_test.go:88-145`
+**Location:** `signer/config.go:591-641`, especially `RemoveZoneFromConfigFile`; `signer/config.go:673-677`, `isTOMLTableHeader`; `signer/config_remove_test.go:88-145`
 
 **Problem:** `dnssec-tudor remove` finds the end of a zone table with a line-based predicate that does not recognize a valid TOML table header followed by an inline comment. If the next table is written as `[zones."next.example"] # comment`, removal does not stop there. It deletes that table and every subsequent line until it encounters a header whose final non-space character is `]`, or through EOF. This can silently erase unrelated zones and global/registrar configuration, including credentials, while the command reports success.
 
@@ -28,7 +28,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/main.go:338-380`, `loadConfigAndState` / `loadConfigStateLocked`; `Golang-tudor-dnssec-signer/config.go:596-640`, `RemoveZoneFromConfigFile`; `Golang-tudor-dnssec-signer/ownership.go:25-63`, `InitOwnershipTarget`; `Golang-tudor-dnssec-signer/ownership.go:104-147`, `writeFileAtomicOwned`; documented trust boundary in `Golang-tudor-dnssec-signer/CLAUDE.md:84-85`
+**Location:** `signer/main.go:338-380`, `loadConfigAndState` / `loadConfigStateLocked`; `signer/config.go:596-640`, `RemoveZoneFromConfigFile`; `signer/ownership.go:25-63`, `InitOwnershipTarget`; `signer/ownership.go:104-147`, `writeFileAtomicOwned`; documented trust boundary in `signer/CLAUDE.md:84-85`
 
 **Problem:** When root invokes a mutating CLI command and `data_dir` belongs to the unprivileged daemon user, global ownership state is initialized to that user. Zone removal rewrites `/etc/.../config.toml` through the same helper used for daemon data and chowns the replacement to the daemon account. The documented deployment expects a root-owned, group-readable configuration because it contains registrar API keys and shell-hook commands. After one removal, a compromised daemon can edit those commands/credentials; a later root-run invocation or service restart can turn that write access into command execution or persistent DNS control.
 
@@ -42,7 +42,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/daemon.go:430-477`, `checkAndSignZone`; `Golang-tudor-dnssec-signer/sign.go:90-116`, `SignZone`; `Golang-tudor-dnssec-signer/state.go:174-214`, `ReloadFromDisk`
+**Location:** `signer/daemon.go:430-477`, `checkAndSignZone`; `signer/sign.go:90-116`, `SignZone`; `signer/state.go:174-214`, `ReloadFromDisk`
 
 **Problem:** After an operator edits a managed zone's `path` and reloads the daemon, change detection uses the new path from `Config`, but the actual signing operation uses the stale path stored in `state.json`. The daemon can therefore notice that file B changed, log that it is signing B, then parse file A and publish A again. This is a correctness and stale-data risk for DNS content migration and can keep records that the operator believed were removed.
 
@@ -56,7 +56,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/rollover.go:190-233`, `startZSKRollover`; `Golang-tudor-dnssec-signer/keys.go`, `GenerateZSKWithAlgorithm` / key-file replacement; contrast `Golang-tudor-dnssec-signer/rollover.go:476-551`, algorithm-rollover save rollback; `Golang-tudor-dnssec-signer/daemon.go:390-400`
+**Location:** `signer/rollover.go:190-233`, `startZSKRollover`; `signer/keys.go`, `GenerateZSKWithAlgorithm` / key-file replacement; contrast `signer/rollover.go:476-551`, algorithm-rollover save rollback; `signer/daemon.go:390-400`
 
 **Problem:** Starting an automatic ZSK rollover replaces the live ZSK files and mutates in-memory rollover state, then returns `state.Save()` directly. If that save fails, the live key files remain new while durable state still describes the old ZSK with no rollover. The daemon's later pre-save merge can re-adopt the old on-disk state. A subsequent sign can then publish/sign with an untracked key set and drop the old DNSKEY before cached signatures/keys have expired, causing validating resolvers to return bogus/SERVFAIL.
 
@@ -70,7 +70,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/rollover.go:452-552`, `StartAlgorithmRollover`; `Golang-tudor-dnssec-signer/keys.go`, `GenerateKSKWithAlgorithm`, `GenerateZSKWithAlgorithm`, and `saveKeyFiles`
+**Location:** `signer/rollover.go:452-552`, `StartAlgorithmRollover`; `signer/keys.go`, `GenerateKSKWithAlgorithm`, `GenerateZSKWithAlgorithm`, and `saveKeyFiles`
 
 **Problem:** Algorithm rollover generates and installs the new KSK first, then generates the new ZSK. If the second generation/write fails, the function returns immediately without restoring the already-replaced KSK. Durable state still points to the old keys and has no rollover record, while the live KSK file is from the target algorithm. The next sign can omit the parent-DS-matched old KSK and break the chain of trust. A failure between writing the private and public half of either generated pair can also expose a mixed or partial live pair.
 
@@ -84,7 +84,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/sign.go:139-148`, DNSKEY TTL selection; `Golang-tudor-dnssec-signer/rollover.go:247-280`, `dnskeyTTLFloor` and `handleZSKRolloverState`
+**Location:** `signer/sign.go:139-148`, DNSKEY TTL selection; `signer/rollover.go:247-280`, `dnskeyTTLFloor` and `handleZSKRolloverState`
 
 **Problem:** When `dnskey_ttl = 0`, signing uses the zone's SOA TTL for the DNSKEY RRset, but rollover timing substitutes a hard-coded 24-hour floor. A zone with an SOA TTL greater than 24 hours can advance to the new signing key or retire the old key while resolvers still cache the prior DNSKEY RRset. That violates the rollover's cache-safety invariant and can produce intermittent bogus answers/SERVFAIL for the difference between the actual TTL and 24 hours.
 
@@ -98,7 +98,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/sign.go`, `SignZone` and RRset signing; `Golang-tudor-dnssec-signer/rollover.go:331-376`, `handleZSKRolloverState`
+**Location:** `signer/sign.go`, `SignZone` and RRset signing; `signer/rollover.go:331-376`, `handleZSKRolloverState`
 
 **Problem:** The retirement wait is based only on the DNSKEY TTL. Data RRSIGs inherit the covered RRset's TTL, so an old-ZSK signature can remain cached substantially longer than the DNSKEY RRset containing that key. Removing the old ZSK after only the DNSKEY TTL makes that cached signature unverifiable after a resolver refreshes DNSKEY, producing an avoidable bogus/SERVFAIL interval.
 
@@ -112,7 +112,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/main.go:1098-1152`, rollover-completion handling; `Golang-tudor-dnssec-signer/rollover.go:96-133`, `CompleteKSKRollover`; `Golang-tudor-dnssec-signer/rollover.go:555-587`, algorithm-rollover completion
+**Location:** `signer/main.go:1098-1152`, rollover-completion handling; `signer/rollover.go:96-133`, `CompleteKSKRollover`; `signer/rollover.go:555-587`, algorithm-rollover completion
 
 **Problem:** Seeing the new DS at the parent once is treated as permission to remove the old KSK immediately. Resolvers that cached the preceding, old-DS-only RRset can still have that DS for its full parent TTL. Once the child publishes only the new KSK, those resolvers have no key matching their cached DS and validation fails. The same unsafe transition exists in ordinary KSK and full algorithm rollover.
 
@@ -126,7 +126,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/main.go:1415-1420`, `runImport`; `Golang-tudor-dnssec-signer/sign.go:713-770`, DNSKEY/data signing; `Golang-tudor-dnssec-signer/sign.go:785-868`, `verifySignedZone`
+**Location:** `signer/main.go:1415-1420`, `runImport`; `signer/sign.go:713-770`, DNSKEY/data signing; `signer/sign.go:785-868`, `verifySignedZone`
 
 **Problem:** Import merely warns when the KSK and ZSK use different algorithms. The resulting DNSKEY RRset signals both algorithms, while the DNSKEY RRset is signed only with the KSK algorithm and ordinary RRsets only with the ZSK algorithm. That is an algorithm-incomplete zone and standards-conforming validators may reject it. The post-sign verifier checks only that an RRset has some valid signature, so it certifies this invalid output.
 
@@ -140,7 +140,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/main.go:942-970`, `runRemove`; `Golang-tudor-dnssec-signer/config.go`, `RemoveZoneFromConfigFile` and `AddZoneToConfigFile`
+**Location:** `signer/main.go:942-970`, `runRemove`; `signer/config.go`, `RemoveZoneFromConfigFile` and `AddZoneToConfigFile`
 
 **Problem:** If durable state saving fails after the zone table has been removed, rollback re-adds only the domain and zone path. Per-zone algorithm, lifetimes, serial policy, registrar settings, explicit booleans, ordering, and comments are lost. The command reports failure but has silently changed future signing/rollover behavior, including settings that protect key lifetime and parent DS publication.
 
@@ -154,7 +154,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/main.go:435-462`, `runAdd` rollback closure; `Golang-tudor-dnssec-signer/main.go`, `runAdd`
+**Location:** `signer/main.go:435-462`, `runAdd` rollback closure; `signer/main.go`, `runAdd`
 
 **Problem:** `add` supports reusing an existing key pair after a zone has previously been managed, but its rollback always removes the configured signed-output path. A failure during recovery, signing, state persistence, or config update therefore deletes the last known-good signed zone left by the previous management period. A nameserver or deployment process reading that path can immediately lose the zone even though the add failed.
 
@@ -168,7 +168,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/main.go:1429-1492`, `runImport`; `Golang-tudor-dnssec-signer/keys.go`, `saveKeyFiles`
+**Location:** `signer/main.go:1429-1492`, `runImport`; `signer/keys.go`, `saveKeyFiles`
 
 **Problem:** Import installs the converted KSK, then the converted ZSK, then signs and updates state/config. Any error after the first installation can leave some or all imported keys live while durable metadata and the parent DS still describe the old set. Later cleanup removes output/state but does not restore the prior key files. This can turn a failed administrative command into a chain-of-trust outage.
 
@@ -182,7 +182,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/keys.go:225-260`, `saveKeyFiles`; `Golang-tudor-dnssec-signer/keys.go:347-354`, `moveKeyPair`
+**Location:** `signer/keys.go:225-260`, `saveKeyFiles`; `signer/keys.go:347-354`, `moveKeyPair`
 
 **Problem:** The private and public halves of a live key are separate files committed in sequence. If the public write/rename fails after the private half succeeds, the live slot contains a mixed or incomplete pair. The backup rollback path itself ignores a rename failure. Callers commonly return the original error without restoring the pair, so an ordinary I/O failure can make the daemon unable to load/sign with keys that were valid before the operation.
 
@@ -196,7 +196,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/ownership.go:39-45`, ownership inference; `Golang-tudor-dnssec-signer/main.go:367-369`, `runAdd`; first-time `add`/`import` directory and file creation
+**Location:** `signer/ownership.go:39-45`, ownership inference; `signer/main.go:367-369`, `runAdd`; first-time `add`/`import` directory and file creation
 
 **Problem:** When the configured data directory does not yet exist and an operator runs the documented administrative command as root, ownership inference silently returns no service owner. The command then creates the directory, keys, state, and output as root. The daemon is normally configured to drop to a dedicated user and subsequently cannot update those artifacts, so a successful setup becomes a startup or first-sign failure.
 
@@ -210,7 +210,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/state.go`, `ReloadFromDisk` and `Save`; `Golang-tudor-dnssec-signer/main.go`, `runRemove`; daemon signing/reload loop
+**Location:** `signer/state.go`, `ReloadFromDisk` and `Save`; `signer/main.go`, `runRemove`; daemon signing/reload loop
 
 **Problem:** The merge used before saving durable state adds/updates entries read from disk but never treats absence as deletion. A daemon cycle that began with the old configuration can acquire the lock after `remove`, merge the now-deleted on-disk state into its in-memory map, and save its stale zone entry back. Even after SIGHUP excludes the zone from signing, the resurrected state can make status misleading and block a later add as already managed.
 
@@ -224,7 +224,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/daemon.go:139-156`, `Daemon.Shutdown`; `Golang-tudor-dnssec-signer/daemon.go`, `current` and HTTP handler/watcher access
+**Location:** `signer/daemon.go:139-156`, `Daemon.Shutdown`; `signer/daemon.go`, `current` and HTTP handler/watcher access
 
 **Problem:** `Shutdown` holds the daemon's write mutex across the blocking `http.Server.Shutdown` call. An in-flight handler that has not yet called `current()` needs the corresponding read lock before it can return, while `Shutdown` waits for that handler. The two operations wait until the shutdown context expires; under the wrong handler timing this makes every graceful stop degrade into a forced timeout and can skip orderly completion work.
 
@@ -238,7 +238,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/sign.go:183-200`, `SignZone`; `Golang-tudor-dnssec-signer/rollover.go:120-125`, `369-373`, and `575-580`; `Golang-tudor-dnssec-signer/registrar_cli.go:17-27`, `recordRegistrarWarning`; `Golang-tudor-dnssec-signer/state.go:406-419`
+**Location:** `signer/sign.go:183-200`, `SignZone`; `signer/rollover.go:120-125`, `369-373`, and `575-580`; `signer/registrar_cli.go:17-27`, `recordRegistrarWarning`; `signer/state.go:406-419`
 
 **Problem:** Warnings have no category or ownership, and several unrelated success paths call `ClearWarnings()`. A normal sign or rollover completion can therefore erase an urgent persisted warning that a registrar replacement left the parent with zero DS records. The dashboard/health state becomes healthy-looking while the external outage remains. Conversely, a later successful registrar reconciliation has no targeted way to clear only the resolved registrar warning.
 
@@ -252,7 +252,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/web.go:15-95`, shared validation cache; `Golang-tudor-dnssec-signer/web.go:299-318`, `apiValidateZoneHandler`
+**Location:** `signer/web.go:15-95`, shared validation cache; `signer/web.go:299-318`, `apiValidateZoneHandler`
 
 **Problem:** The aggregate dashboard and `/api/validate` use a single-flight cache, but `/api/validate/{domain}` constructs a fresh validator and performs live DNS queries for every request. There is no request-level concurrency limit, per-zone cache, or cancellation propagation. When the unauthenticated dashboard is exposed through a reverse proxy, repeated requests can consume sockets, resolver capacity, goroutines, and the server's request budget despite the protection on the neighboring endpoint.
 
@@ -266,7 +266,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/config.go:572-589`, `AddZoneToConfigFile`; `Golang-tudor-dnssec-signer/main.go`, successful `runAdd` and `runImport` commit order
+**Location:** `signer/config.go:572-589`, `AddZoneToConfigFile`; `signer/main.go`, successful `runAdd` and `runImport` commit order
 
 **Problem:** Adding/importing a zone writes TOML directly with `O_APPEND` and neither fsyncs nor checks the deferred close. A short I/O failure or crash can leave a partial table/header/path in the only config file. State and signed output are committed first, so the command can leave an un-loadable config plus a managed state entry, or report success before the append is durable. This is the write-side counterpart to the removal transaction problems in R-001/R-010.
 
@@ -280,7 +280,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/sign.go:1370-1425`, `writeSignedZone`; `Golang-tudor-dnssec-signer/ownership.go:104-160`, durable atomic-write helper
+**Location:** `signer/sign.go:1370-1425`, `writeSignedZone`; `signer/ownership.go:104-160`, durable atomic-write helper
 
 **Problem:** The signed file is fsynced and renamed, but its parent directory is not fsynced. A power loss can therefore lose or roll back the directory entry even after state is saved with a new serial, source metadata, and signature expiration. On restart `NeedsSign` can trust that state and decline to recreate the missing/old output until another trigger, leaving the authoritative deployment without the generation state claims is live.
 
@@ -294,7 +294,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-tudor-dnssec-signer/metrics.go:148-193`, `UpdateZoneMetrics`
+**Location:** `signer/metrics.go:148-193`, `UpdateZoneMetrics`
 
 **Problem:** When a zone has a rollover, the collector sets only its current `{domain,type}` series to 1. It resets all types only when there is no rollover. If state changes directly from one rollover type to another between scrapes/restarts/tests, the old type remains 1 indefinitely, producing contradictory alerts and dashboards.
 
@@ -308,7 +308,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-tudor-dnssec-signer/keys.go:72-104`, key-generation collision loop
+**Location:** `signer/keys.go:72-104`, key-generation collision loop
 
 **Problem:** The collision guard documents that equal 16-bit tags can overwrite backup identity and cause registrar upsert to replace the old DS, but after ten collisions it logs a warning and proceeds with exactly that unsafe key. Random occurrence is extraordinarily unlikely, yet a generator failure, deterministic entropy problem, or test/future implementation can turn the guard into silent integrity loss instead of a fail-closed error.
 
@@ -322,7 +322,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-tudor-dnssec-signer/hooks.go:46-109`, `executeHook`; `Golang-tudor-dnssec-signer/hooks.go:111-175`, `executeBatchHook`
+**Location:** `signer/hooks.go:46-109`, `executeHook`; `signer/hooks.go:111-175`, `executeBatchHook`
 
 **Problem:** Asynchronous post-sign hooks capture all stderr in a `bytes.Buffer` for up to 30 seconds. A broken command that writes continuously can allocate until the daemon is killed, taking signing and monitoring down. The timeout bounds wall time but not output rate or memory, and multiple non-coalesced zone hooks can amplify the allocation.
 
@@ -336,7 +336,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Critical
 
-**Location:** `Golang-dnssec-validator/internal/dns/anchors.go:12-145`, anchor loaders; `Golang-dnssec-validator/internal/validator/dnssec.go:630-668`, `VerifyRootTrustAnchor`; `Golang-dnssec-validator/config.go:407-411`
+**Location:** `validator/internal/dns/anchors.go:12-145`, anchor loaders; `validator/internal/validator/dnssec.go:630-668`, `VerifyRootTrustAnchor`; `validator/config.go:407-411`
 
 **Problem:** The validator treats arbitrary local/remote JSON as root trust material. The only swap check is that *one* entry has key tag 20326 or 38696; that entry's digest need not be the real IANA digest, and arbitrary additional anchors are trusted. The HTTP client also follows redirects by default, including HTTPS-to-HTTP and cross-origin redirects, so validating only the configured URL's prefix does not protect the final fetch. An attacker who controls the file/fetch and DNS path can add their own anchor, serve a matching forged root key/chain, and make arbitrary data report `secure`.
 
@@ -350,7 +350,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-dnssec-validator/internal/dns/anchors.go:131-145`, `LoadAnchorsWithFallback`; `Golang-dnssec-validator/anchors_store.go:27-69`; `Golang-dnssec-validator/main.go:86-136`, refresh loop; `Golang-dnssec-validator/health.go:45-64`
+**Location:** `validator/internal/dns/anchors.go:131-145`, `LoadAnchorsWithFallback`; `validator/anchors_store.go:27-69`; `validator/main.go:86-136`, refresh loop; `validator/health.go:45-64`
 
 **Problem:** The 24-hour “refresh” always returns any nonempty local file before consulting the URL. Its content age and `GeneratedAt` are ignored, while `loadedAt` is reset on each reread, so health/metrics can call a years-old file fresh. A file containing only KSK-2017 tag 20326 will therefore never acquire successor tag 38696 and will reject the root when the successor takes over. IANA currently schedules that rollover for 2026-10-11, making this an imminent whole-service failure mode.
 
@@ -364,7 +364,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-dnssec-validator/internal/validator/validator.go:301-329`, leaf-verdict integration; `Golang-dnssec-validator/internal/validator/validator.go:722-797`, `verifyWildcard` and `recordValidationVerdict`
+**Location:** `validator/internal/validator/validator.go:301-329`, leaf-verdict integration; `validator/internal/validator/validator.go:722-797`, `verifyWildcard` and `recordValidationVerdict`
 
 **Problem:** A valid RRSIG whose Labels field indicates wildcard synthesis is insufficient: the validator must also authenticate that no closer/exact name existed. The code detects a missing/invalid NSEC/NSEC3 proof and records an error, but `recordValidationVerdict` returns `secure` immediately whenever the data RRSIG verified. An attacker able to replay a wildcard-signed RRset without its denial proof can therefore obtain a false secure verdict.
 
@@ -378,7 +378,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-dnssec-validator/internal/dns/query.go:95-208`, `parseResponse`; `Golang-dnssec-validator/internal/validator/dnssec.go:393-455`, `VerifyRRsetRRSIGFromResponse`; `Golang-dnssec-validator/internal/validator/validator.go:539-685`, `verifyActualRecord`
+**Location:** `validator/internal/dns/query.go:95-208`, `parseResponse`; `validator/internal/validator/dnssec.go:393-455`, `VerifyRRsetRRSIGFromResponse`; `validator/internal/validator/validator.go:539-685`, `verifyActualRecord`
 
 **Problem:** Parsed records from Answer, Authority, and Additional are merged and most record models lose owner/section. The leaf verifier then accepts the first cryptographically valid RRset of the requested type/key tag anywhere in the message; it never requires that RRset to be the queried name (or the correctly derived wildcard owner). A forged target answer accompanied by a replayed valid A/CNAME RRset and RRSIG for another owner in the same zone can be labeled secure.
 
@@ -392,7 +392,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-dnssec-validator/internal/validator/dnssec.go:393-539`, RRset/denial verification helpers; `Golang-dnssec-validator/internal/validator/nsec.go:35-103` and `215-290`; `Golang-dnssec-validator/internal/validator/validator.go:1104-1275`, DS and DS-absence verification
+**Location:** `validator/internal/validator/dnssec.go:393-539`, RRset/denial verification helpers; `validator/internal/validator/nsec.go:35-103` and `215-290`; `validator/internal/validator/validator.go:1104-1275`, DS and DS-absence verification
 
 **Problem:** `dns.RRSIG.Verify` verifies bytes, not inception/expiration. Both raw-response helpers omit time checks. Several callers pre-check only the first parsed signature, then the helper is free to succeed with another same-type/tag signature; DS-absence calls the denial helper without any time check at all. Expired authenticated denial can downgrade a currently secure delegation to `insecure`, and expired/replayed data or DS signatures can contribute to false secure chain/leaf results.
 
@@ -406,7 +406,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-tudor-dnssec-signer/config.go:336-467`, config validation; `Golang-tudor-dnssec-signer/config.go:679-697`, `ValidateDomainName`; `Golang-tudor-dnssec-signer/main.go`, `runAdd`/`runImport` exact-key checks; state/key/output path construction throughout the signer
+**Location:** `signer/config.go:336-467`, config validation; `signer/config.go:679-697`, `ValidateDomainName`; `signer/main.go`, `runAdd`/`runImport` exact-key checks; state/key/output path construction throughout the signer
 
 **Problem:** DNS names are case-insensitive and an optional trailing root dot does not change identity, but configuration/state maps and filesystem names use the operator's spelling verbatim. `example.com`, `Example.COM`, and `example.com.` can therefore be added as separate managed zones, generating independent KSK/DS sets for one DNS zone. Automatic registrar publication can oscillate the parent between those sets; case-insensitive filesystems can also make the nominally separate key paths collide.
 
@@ -420,7 +420,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-dnssec-validator/internal/dns/resolver.go:172-245`, `CheckZoneCut`/`DiscoverZoneCuts`; `Golang-dnssec-validator/internal/dns/query.go:65-75`, authoritative flag capture; `Golang-dnssec-validator/internal/validator/validator.go:178-189` and `539-603`; `Golang-dnssec-validator/internal/validator/nsec.go:172-208`, NSEC NODATA logic
+**Location:** `validator/internal/dns/resolver.go:172-245`, `CheckZoneCut`/`DiscoverZoneCuts`; `validator/internal/dns/query.go:65-75`, authoritative flag capture; `validator/internal/validator/validator.go:178-189` and `539-603`; `validator/internal/validator/nsec.go:172-208`, NSEC NODATA logic
 
 **Problem:** The security-critical zone hierarchy is inferred from an unvalidated recursive resolver. If it omits a child cut, leaf validation asks the signed parent for data at the delegation. A parent referral is not an authoritative leaf answer, but the validator ignores the captured AA flag and merges the authority NSEC. For a query at the delegation name, the signed parent-side NSEC (NS set, SOA clear, queried type absent) is accepted as NODATA, yielding `secure` even though the child may publish different data.
 
@@ -434,7 +434,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/dns/types.go:174-195`, `TypeName`; `Golang-dnssec-validator/internal/dns/query.go:163-193`, NSEC/NSEC3 parsing; `Golang-dnssec-validator/internal/validator/validator.go:75-93`, `SupportedQueryType`; `Golang-dnssec-validator/internal/validator/nsec.go`, NODATA checks
+**Location:** `validator/internal/dns/types.go:174-195`, `TypeName`; `validator/internal/dns/query.go:163-193`, NSEC/NSEC3 parsing; `validator/internal/validator/validator.go:75-93`, `SupportedQueryType`; `validator/internal/validator/nsec.go`, NODATA checks
 
 **Problem:** PTR, SRV, NAPTR, and SPF are accepted query types but absent from the local type-name map. They—and every other unlisted bitmap type—become the same string `UNKNOWN`. A legitimate NODATA proof for SRV can be rejected merely because the owner has an unrelated SSHFP/other unlisted type, and diagnostics cannot identify which type was present. This creates false bogus results for a public API feature.
 
@@ -448,7 +448,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/dnssec.go:182-245`, `ValidateChainLink`; corresponding multi-algorithm tests/comments
+**Location:** `validator/internal/validator/dnssec.go:182-245`, `ValidateChainLink`; corresponding multi-algorithm tests/comments
 
 **Problem:** A delegation with one valid algorithm path and one stale, unsupported, or temporarily incomplete rollover path is declared bogus. Validators are supposed to accept any single valid supported path; requiring every DS algorithm makes legitimate algorithm rollovers and heterogeneous validator capabilities fail.
 
@@ -462,7 +462,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/validator.go:191-299`, parent-state threading; `nextParentDNSKEY`; `Golang-dnssec-validator/internal/validator/validator.go:909-1012`, non-root validation
+**Location:** `validator/internal/validator/validator.go:191-299`, parent-state threading; `nextParentDNSKEY`; `validator/internal/validator/validator.go:909-1012`, non-root validation
 
 **Problem:** Once an ancestor is proven insecure, descendants cannot regain a chain to the configured root (absent a separate local trust anchor). The code represents that state only by clearing `parentDNSKEY`. If a lower parent response contains a DS, the child path then demands a verified DS RRSIG with the now-nil keys and returns bogus. That DS is unauthenticated under the root and must not change the overall insecure state by itself.
 
@@ -476,7 +476,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/validator.go:120-132`, validation recursion; `Golang-dnssec-validator/internal/validator/validator.go:333-356`, depth gate; `checkAndFollowCNAME`
+**Location:** `validator/internal/validator/validator.go:120-132`, validation recursion; `validator/internal/validator/validator.go:333-356`, depth gate; `checkAndFollowCNAME`
 
 **Problem:** CNAME traversal has only a depth counter. At depth 10 it simply stops looking and returns the security status accumulated so far, normally `secure`; there is no visited-name set or error. A two-name loop repeats until the cutoff and is then reported secure, and a valid chain longer than the policy limit is presented as fully validated although its terminal target was never checked.
 
@@ -490,7 +490,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/validator.go:473-537`, leaf querying; `Golang-dnssec-validator/internal/validator/validator.go:859-904`, DNSKEY selection; `Golang-dnssec-validator/internal/validator/validator.go:1057-1101`, parent DS query; `Golang-dnssec-validator/internal/validator/validator.go:1316-1410`, `ValidateMultipleServers`/`compareDNSKEYSets`
+**Location:** `validator/internal/validator/validator.go:473-537`, leaf querying; `validator/internal/validator/validator.go:859-904`, DNSKEY selection; `validator/internal/validator/validator.go:1057-1101`, parent DS query; `validator/internal/validator/validator.go:1316-1410`, `ValidateMultipleServers`/`compareDNSKEYSets`
 
 **Problem:** Extended mode gathers several DNSKEY responses but marks every transport-level NOERROR response `secure`, selects the first by input address order before cryptographic validation, and treats disagreements as warnings. Empty responses are excluded from comparison, and equal key-tag sets are called equal even if flags, algorithms, or public keys differ. DS queries stop at the first NOERROR/NXDOMAIN server, while leaf queries are sequential and likewise verify the first usable answer. A broken first server can make a valid zone bogus/indeterminate despite later valid servers, and per-server JSON can show green for unverified data.
 
@@ -504,7 +504,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:481-515`, `canonicallyBetween` and `hashBetween`; all NSEC/NSEC3 denial and wildcard callers
+**Location:** `validator/internal/validator/nsec.go:481-515`, `canonicallyBetween` and `hashBetween`; all NSEC/NSEC3 denial and wildcard callers
 
 **Problem:** In a denial chain containing one owner, the record's next owner equals itself and the interval wraps across the entire namespace except that owner. Both interval helpers treat `start == end` as an empty normal interval, so legitimate minimal signed zones cannot prove NXDOMAIN, wildcard nonexistence, opt-out coverage, or similar denials.
 
@@ -518,7 +518,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium — Needs investigation
 
-**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:293-413`, `VerifyNSEC3Denial` and helpers; `Golang-dnssec-validator/internal/validator/nsec.go:625-660`, wildcard proof; `Golang-dnssec-validator/internal/validator/validator.go:1209-1271`, DS absence
+**Location:** `validator/internal/validator/nsec.go:293-413`, `VerifyNSEC3Denial` and helpers; `validator/internal/validator/nsec.go:625-660`, wildcard proof; `validator/internal/validator/validator.go:1209-1271`, DS absence
 
 **Problem:** Hashes are computed using the first record's algorithm/iterations/salt, but matching/coverage searches consider every NSEC3 record in the response. During an NSEC3 salt/parameter transition—or with replayed signed records—records from distinct chains can be combined into a logical proof that no single chain establishes. RFC 5155 permits treating mixed-parameter responses as bogus; it does not permit comparing a hash from one parameter space with ranges from another.
 
@@ -532,7 +532,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:172-208`, `verifyNSECNODATA`; `Golang-dnssec-validator/internal/validator/nsec.go:380-413`, `verifyNSEC3NODATA`; leaf denial dispatch in `verifyActualRecord`
+**Location:** `validator/internal/validator/nsec.go:172-208`, `verifyNSECNODATA`; `validator/internal/validator/nsec.go:380-413`, `verifyNSEC3NODATA`; leaf denial dispatch in `verifyActualRecord`
 
 **Problem:** When a wildcard exists but lacks the requested type, the authenticated NODATA proof is about the wildcard owner plus the closest-encloser/no-closer-match proof. The implementation only accepts an NSEC/NSEC3 whose owner/hash exactly matches QNAME, so standards-compliant wildcard NODATA responses fail and make a valid zone look bogus.
 
@@ -546,7 +546,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/dns/anchors.go:148-175`, `GetActiveAnchors`; `Golang-dnssec-validator/internal/validator/validator.go:162-172` and `944-955`; `Golang-dnssec-validator/handlers.go:203-213`, `322-329`; `Golang-dnssec-validator/health.go:45-64`
+**Location:** `validator/internal/dns/anchors.go:148-175`, `GetActiveAnchors`; `validator/internal/validator/validator.go:162-172` and `944-955`; `validator/handlers.go:203-213`, `322-329`; `validator/health.go:45-64`
 
 **Problem:** Availability checks look only at the unfiltered anchor slice. If every entry is future-dated, expired, or has an invalid validity timestamp, requests proceed with zero active anchors and label the real root DNSKEY `bogus`. This is local trust configuration/update failure, not evidence that the root zone is bogus, and readiness incorrectly remains healthy.
 
@@ -560,7 +560,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/validator.go:713-720`, `leafSignerMatchesZone`; A/CNAME leaf verification callers
+**Location:** `validator/internal/validator/validator.go:713-720`, `leafSignerMatchesZone`; A/CNAME leaf verification callers
 
 **Problem:** DNS names are case-insensitive, but a legitimate RRSIG whose Signer Name uses different letter case from the discovered zone is rejected. This creates a false bogus leaf verdict even though cryptographic canonicalization accepts the signature.
 
@@ -574,7 +574,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/daemon.go:249-258`, `Daemon.checkDirWritable`; startup validation for data/output/keys directories
+**Location:** `signer/daemon.go:249-258`, `Daemon.checkDirWritable`; startup validation for data/output/keys directories
 
 **Problem:** The daemon tests writability by creating the fixed path `.startup_check` with truncation semantics and then deleting it. If an operator, deployment tool, or another process already owns a file at that name, every daemon startup destroys it. Close/remove errors are also ignored, so the probe can report success while leaving an artifact or after an unsuccessful flush.
 
@@ -588,7 +588,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-tudor-dnssec-signer/hooks.go:208-237`, `copyFile`; `Golang-tudor-dnssec-signer/rollover.go:382-440`, `backupKey`/`restoreKeyFromBackup`; `Golang-tudor-dnssec-signer/keys.go`, backup-copy callers
+**Location:** `signer/hooks.go:208-237`, `copyFile`; `signer/rollover.go:382-440`, `backupKey`/`restoreKeyFromBackup`; `signer/keys.go`, backup-copy callers
 
 **Problem:** Key backup/restore opens the destination with `O_TRUNC`, streams bytes directly, and does not fsync the file or directory. An I/O error or crash can leave a truncated backup or live key half. A rollover can then durably record the new generation even though the only recovery copy of the old private key was never durable; restore can also produce a mixed live pair by replacing private and public files separately.
 
@@ -602,7 +602,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** High
 
-**Location:** `Golang-dnssec-validator/internal/dns/query.go:113-135`, DNSKEY parsing; `Golang-dnssec-validator/internal/validator/dnssec.go:102-129`, key lookup; `CollectDSMatchedKeys`, `CollectAnchorMatchedKeys`, and all signature-verification key selection
+**Location:** `validator/internal/dns/query.go:113-135`, DNSKEY parsing; `validator/internal/validator/dnssec.go:102-129`, key lookup; `CollectDSMatchedKeys`, `CollectAnchorMatchedKeys`, and all signature-verification key selection
 
 **Problem:** The validator records the Zone Key flag and Protocol field but never enforces them before using a DNSKEY. A DS can match a key with Zone Key clear or Protocol other than 3, and that key can then verify DNSKEY/data/denial signatures and produce `secure`. RFC 4034 explicitly forbids using a non-zone key to verify RRSIGs and requires a non-3 Protocol key to be treated invalid.
 
@@ -616,7 +616,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/internal/validator/dnssec.go:102-129`, `Find*ByKeyTag`; `ValidateChainLink`; `verifyDNSKEYRRSIGOne`; `VerifyDenialRRSIGFromResponse`; leaf and DS RRSIG verification callers
+**Location:** `validator/internal/validator/dnssec.go:102-129`, `Find*ByKeyTag`; `ValidateChainLink`; `verifyDNSKEYRRSIGOne`; `VerifyDenialRRSIGFromResponse`; leaf and DS RRSIG verification callers
 
 **Problem:** A DNSSEC key tag is only a 16-bit hint, but most paths return the first key with a tag and never try another colliding key. If that first key has the wrong algorithm/material/role, a later key that really verifies the DS or signature is ignored, producing a false bogus result. This contradicts the code's own correct digest treatment and RFC 6840 collision guidance.
 
@@ -630,7 +630,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium — Needs investigation
 
-**Location:** `Golang-dnssec-validator/internal/validator/nsec.go:472-500`, `canonicalizeName`/`canonicallyBetween`; `splitLabels`/`compareCanonical`; all NSEC range proofs
+**Location:** `validator/internal/validator/nsec.go:472-500`, `canonicalizeName`/`canonicallyBetween`; `splitLabels`/`compareCanonical`; all NSEC range proofs
 
 **Problem:** RFC 4034 canonical order compares unescaped, lowercased label octets from right to left. The validator lowercases presentation strings and splits on literal dots, so escaped octets (including escaped dots) sort and split incorrectly. A signed NSEC interval can consequently be rejected or, more seriously, accepted for a QNAME that is not canonically inside it, creating a false authenticated denial.
 
@@ -644,7 +644,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/server.go:30`, `82-85`, and `248-258`; `Golang-dnssec-validator/sse.go:45-98`; `Golang-dnssec-validator/handlers.go:148-195` and event callback
+**Location:** `validator/server.go:30`, `82-85`, and `248-258`; `validator/sse.go:45-98`; `validator/handlers.go:148-195` and event callback
 
 **Problem:** SSE is excluded from every write deadline because streams are long-lived. Event writes and flushes run synchronously inside validation callbacks while the global validation semaphore is held. If a client stops reading and the socket buffer fills, the handler blocks in write/flush; the validation context's timer cannot interrupt a blocked `ResponseWriter`, so enough slow clients permanently exhaust all validation slots.
 
@@ -658,7 +658,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Medium
 
-**Location:** `Golang-dnssec-validator/config.go:319-413`, `Config.Validate`; `Golang-dnssec-validator/internal/heartbeat/heartbeat.go:42-67` and `69-116`
+**Location:** `validator/config.go:319-413`, `Config.Validate`; `validator/internal/heartbeat/heartbeat.go:42-67` and `69-116`
 
 **Problem:** When heartbeat is enabled, configuration validates only the interval. An HTTP URL sends the API key in cleartext form data (and a default redirect policy can downgrade a configured HTTPS POST via 307/308). Missing API key or app does not fail startup; `NewClient` silently returns a disabled client, so an operator can believe monitoring is active while no heartbeat is sent.
 
@@ -672,7 +672,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/server.go:57-136`, `Server.registerRoutes`; `Golang-dnssec-validator/static/index.html:10`, `108-109`, and `117`; `Golang-dnssec-validator/static/app.js:74-111`
+**Location:** `validator/server.go:57-136`, `Server.registerRoutes`; `validator/static/index.html:10`, `108-109`, and `117`; `validator/static/app.js:74-111`
 
 **Problem:** When `base_path` is `/dnssec`, the server renders the UI directly at the exact URL `/dnssec` without redirecting to `/dnssec/`. Browser-relative URLs then resolve against the parent: `style.css`, `app.js`, `validate`, and `api/...` become root paths instead of `/dnssec/...`. The backend's duplicate root routes mask this during direct access, but a reverse proxy that exposes only the configured prefix serves a page with no assets and nonworking validation.
 
@@ -686,7 +686,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/static/index.html:23-35`; `Golang-dnssec-validator/static/app.js:25-111`; `Golang-dnssec-validator/handlers.go:114-120` and `303-309`, query-type parsing
+**Location:** `validator/static/index.html:23-35`; `validator/static/app.js:25-111`; `validator/handlers.go:114-120` and `303-309`, query-type parsing
 
 **Problem:** The JSON and SSE APIs support twelve record types, but the only shipped user interface always omits `type`, so it can validate only the default A record. Operators cannot inspect AAAA, MX, TXT, NS, SOA, SRV, CAA, PTR, NAPTR, CNAME, or SPF through the UI, and copied result links cannot reproduce a non-A API validation.
 
@@ -700,7 +700,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/config.go:64-65`, `149`, and `260-261`; `Golang-dnssec-validator/server.go:15-16` and `91-107`; `Golang-dnssec-validator/.env.example:41`; `Golang-dnssec-validator/CLAUDE.md:589`
+**Location:** `validator/config.go:64-65`, `149`, and `260-261`; `validator/server.go:15-16` and `91-107`; `validator/.env.example:41`; `validator/CLAUDE.md:589`
 
 **Problem:** Configuration and deployment documentation promise a selectable web-UI directory, but the server always serves the embedded filesystem and never reads `Config.StaticDir`. An operator can point `STATIC_DIR` or `static_dir` at updated/emergency assets, receive no error or warning, and continue serving the compiled copy.
 
@@ -714,7 +714,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/internal/validator/chain.go:140-170`, `IsRegistrableDomain`/`GetRegistrableDomain`; `Golang-dnssec-validator/internal/validator/validator.go:1004-1010`, RDAP invocation
+**Location:** `validator/internal/validator/chain.go:140-170`, `IsRegistrableDomain`/`GetRegistrableDomain`; `validator/internal/validator/validator.go:1004-1010`, RDAP invocation
 
 **Problem:** RDAP cross-checking assumes every registrable domain has exactly two labels. It therefore skips real registrants such as `example.co.uk` and can query public suffixes such as `co.uk` as though they were registrants. The DNSSEC verdict is not derived from RDAP, but diagnostic absence or mismatch warnings become inconsistent by TLD and can mislead an operator investigating DS publication.
 
@@ -728,7 +728,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/main.go:52-74` and `140-158`; `Golang-dnssec-validator/internal/heartbeat/heartbeat.go:141-178`, `Client.StartBackground`; `Golang-dnssec-validator/handlers.go`, all validation handlers; `Golang-dnssec-validator/ANYSTATUS.md:57-73`
+**Location:** `validator/main.go:52-74` and `140-158`; `validator/internal/heartbeat/heartbeat.go:141-178`, `Client.StartBackground`; `validator/handlers.go`, all validation handlers; `validator/ANYSTATUS.md:57-73`
 
 **Problem:** Documentation claims `running`, `validate:start`, and `validate:complete` actions describe live request activity, but request handlers have no heartbeat client and never send any of them. The background loop changes `lastAction` only through its own `starting`/`idle` sends, so it remains idle even during long or concurrent validations. Cancellation also provides no completion signal, allowing process exit before the synchronous `stopping` request finishes.
 
@@ -742,7 +742,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/ratelimit.go:24`, `114-139`, `RateLimiter.Stop`; `Golang-dnssec-validator/server.go:264-278`, `Server.Shutdown`
+**Location:** `validator/ratelimit.go:24`, `114-139`, `RateLimiter.Stop`; `validator/server.go:264-278`, `Server.Shutdown`
 
 **Problem:** `Stop` closes an unguarded channel. A repeated or concurrent `Server.Shutdown`—a normal idempotency expectation for lifecycle APIs—panics with `close of closed channel` instead of safely returning the underlying server result.
 
@@ -756,7 +756,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low — Needs investigation
 
-**Location:** `Golang-dnssec-validator/config.go:391-400`, `Config.Validate`; `Golang-dnssec-validator/server.go:70-81`, metrics route construction; direct `NewServer` callers
+**Location:** `validator/config.go:391-400`, `Config.Validate`; `validator/server.go:70-81`, metrics route construction; direct `NewServer` callers
 
 **Problem:** The normal loader rejects a malformed metrics CIDR, but `NewServer` independently reparses the list and deliberately exposes `/metrics` without any restriction if parsing fails. Any future construction/reload path that misses `Config.Validate`, or a partial-validation regression, turns a defensive error into a fail-open disclosure of service internals.
 
@@ -770,7 +770,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/anchors_store.go:10-67`, `AnchorsStore.Load`/`Age`; `Golang-dnssec-validator/main.go:38-50` and `86-136`; `Golang-dnssec-validator/metrics.go:66-71` and `146-149`
+**Location:** `validator/anchors_store.go:10-67`, `AnchorsStore.Load`/`Age`; `validator/main.go:38-50` and `86-136`; `validator/metrics.go:66-71` and `146-149`
 
 **Problem:** `dnssec_validator_root_anchors_age_seconds` is described as the current age of loaded anchors, but it is updated only after retry success and on the 24-hour refresh tick. A successful startup leaves the default zero; a successful refresh resets `loadedAt` and immediately records approximately zero; then the gauge remains frozen for another day. Alerts therefore cannot distinguish fresh, aging, or never-loaded state.
 
@@ -784,7 +784,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/logging.go:12-20`, `GenerateRequestID`; request logging and validation handlers that use the ID
+**Location:** `validator/logging.go:12-20`, `GenerateRequestID`; request logging and validation handlers that use the ID
 
 **Problem:** If `crypto/rand.Read` fails, the stated timestamp fallback is not implemented; the function hex-encodes the same zero-filled or partially filled buffer. Repeated failures can assign identical IDs to unrelated requests, defeating log correlation precisely when the host has an entropy/runtime fault.
 
@@ -798,7 +798,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low — Needs investigation
 
-**Location:** `Golang-dnssec-validator/go.mod:3`; `Golang-tudor-dnssec-signer/go.mod:3`; both Makefiles/release build environments; reviewed binaries `/tmp/dnssec-validator-review` and `/tmp/dnssec-tudor-review`
+**Location:** `validator/go.mod:3`; `signer/go.mod:3`; both Makefiles/release build environments; reviewed binaries `/tmp/dnssec-validator-review` and `/tmp/dnssec-tudor-review`
 
 **Problem:** Both review builds use Go 1.26.4. Binary-mode `govulncheck` reports reachable `crypto/tls` symbols affected by GO-2026-5856, an Encrypted Client Hello PSK identity privacy leak fixed in Go 1.26.5. The applications do not visibly configure ECH, so practical exposure is not confirmed; future transport configuration or deployment wrappers could activate it.
 
@@ -812,7 +812,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/QUICKSTART-FREEBSD.md:29-45`; `Golang-dnssec-validator/ANYSTATUS.md:20-73`; `Golang-dnssec-validator/docs/RFC_COMPLIANCE.md:13-149`; `Golang-dnssec-validator/CLAUDE.md:863-881`; `Golang-dnssec-validator/config.go:230-285` and `425-447`
+**Location:** `validator/QUICKSTART-FREEBSD.md:29-45`; `validator/ANYSTATUS.md:20-73`; `validator/docs/RFC_COMPLIANCE.md:13-149`; `validator/CLAUDE.md:863-881`; `validator/config.go:230-285` and `425-447`
 
 **Problem:** Operator instructions use unrecognized environment names, monitoring docs promise unwired events, and the RFC matrix asserts behaviors contradicted by current validation paths. Following these sources can silently retain timeout/heartbeat defaults and can lead engineers or auditors to rely on nonexistent trust-anchor freshness and DNSSEC guarantees.
 
@@ -826,7 +826,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-dnssec-validator/internal/validator/validator.go`, `Validator.Validate`/`validateWithCache`/`validateZone`/multi-server/CNAME paths; `Golang-dnssec-validator/internal/dns/query.go` and `resolver.go`; `Golang-dnssec-validator/internal/heartbeat/heartbeat.go`; signer filesystem/state/config transaction paths; both test suites
+**Location:** `validator/internal/validator/validator.go`, `Validator.Validate`/`validateWithCache`/`validateZone`/multi-server/CNAME paths; `validator/internal/dns/query.go` and `resolver.go`; `validator/internal/heartbeat/heartbeat.go`; signer filesystem/state/config transaction paths; both test suites
 
 **Problem:** Unit tests exercise many helpers, but the network, clock, filesystem, and orchestration layers are tightly coupled to concrete implementations. The actual path that combines DNS responses into a security verdict—and the crash/error interleavings that protect signer keys and state—cannot be tested deterministically. This allowed multiple high-severity cross-layer defects in this review to coexist with green tests.
 
@@ -840,7 +840,7 @@ The review traces the signer and validator from configuration and process startu
 
 **Severity:** Low
 
-**Location:** `Golang-tudor-dnssec-signer/config.go:38-51`, `RegistrarConfig.DigestType`; `Golang-tudor-dnssec-signer/config.go:337-468`, `Config.Validate`; `Golang-tudor-dnssec-signer/registrar.go:63-72`; `Golang-tudor-dnssec-signer/registrar_test.go:54-73`
+**Location:** `signer/config.go:38-51`, `RegistrarConfig.DigestType`; `signer/config.go:337-468`, `Config.Validate`; `signer/registrar.go:63-72`; `signer/registrar_test.go:54-73`
 
 **Problem:** Any registrar `digest_type` other than 4 silently becomes 2, including typos and unsupported values. An operator can request the wrong digest, pass startup validation, and have a different DS representation automatically published to the parent. SHA-256 is valid, so this is not inherently insecure, but silent mutation of trust-publication configuration makes intent and change control unverifiable.
 
