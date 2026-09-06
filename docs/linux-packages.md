@@ -5,6 +5,10 @@ on amd64 and arm64. CI exercises Debian 13 and Fedora 43 on amd64; other
 distribution versions need their own acceptance run. Both executables are built
 with `CGO_ENABLED=0`.
 
+The project MIT license and dependency notices are combined in each package's
+`/usr/share/doc/<package>/copyright`, which Debian slim retains when filtering
+other documentation.
+
 ## What gets installed
 
 | Component | Signer | Validator |

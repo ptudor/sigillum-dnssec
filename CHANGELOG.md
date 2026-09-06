@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep project and dependency license notices in the package copyright file so
+  minimal Debian images preserve them.
+
 - Adopt the MIT license and include dependency license/attribution notices in all
   release archives and Linux packages.
 
