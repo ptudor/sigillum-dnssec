@@ -26,42 +26,16 @@ A release stays a draft if attestation fails. Investigate the failed run before
 publishing it manually. Never overwrite a public version tag to repair a release;
 use a new version for corrected public artifacts.
 
-## First GitHub setup
+## Public releases
 
-The public repository is `https://github.com/ptudor/sigillum-dnssec`.
-The maintainer uses a separate `github` remote for GitHub publication alongside
-an existing private `origin`. Contributors can use an ordinary GitHub clone;
-its `origin` remote points to GitHub.
+[Sigillum v1.0.0](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.0.0)
+is the first public release. Releases include static binaries, unsigned RPM and
+DEB packages, SHA-256 checksums, and GitHub build attestations. See the
+[release notes](release-notes/v1.0.0.md) for features and platform coverage.
 
-For maintainers setting up or transferring this repository:
-
-1. Review the [MIT license](../LICENSE) and [third-party notices](../THIRD_PARTY_NOTICES.md).
-   Both snapshot and release archives/packages include these texts. The package
-   metadata identifies the project as MIT. CI checks the notices against the
-   actual built dependencies; refresh them when changing dependencies or Go.
-2. Review the complete Git history for credentials, private keys, internal
-   hostnames, deployment records, and material you do not intend to publish.
-   This repository retains historical review and deployment notes. A clean
-   working tree or a clean secret scan does not decide whether that history is
-   suitable for public release. Decide whether to publish that history or an
-   intentionally prepared public baseline. Do not copy a live `.env` or config.
-3. Create the repository with `main` as the default branch, enable Actions and
-   private vulnerability reporting, and enable Dependabot alerts. A useful About
-   description is shown below. If the repository owner/name changes, update
-   `.goreleaser.yaml`, README badges/links, and service documentation URLs.
-4. Push `main` and verify the first CI run. Review the downloadable snapshot
-   packages, including a native install on each deployment platform you intend
-   to support. GitHub’s public-repository artifact attestations use the supplied
-   `GITHUB_TOKEN` and OIDC permissions; no long-lived signing key is needed.
-5. Protect the default branch and release tags with rules appropriate to your
-   maintenance workflow. Require the CI test jobs and package job for changes.
-   Keep write access to version tags limited to release maintainers.
-
-Suggested About description:
-
-> DNSSEC zone signing and streaming browser diagnostics for operators of their own nameservers.
-
-Suggested topics: `dnssec`, `dns`, `golang`, `nsd`, `bind`, `freebsd`, `linux`, `systemd`.
+The project uses the [MIT license](../LICENSE). Archives and packages also carry
+[third-party notices](../THIRD_PARTY_NOTICES.md) for their compiled dependencies.
+CI checks those notices against every release binary.
 
 ## Local rehearsal
 
@@ -91,19 +65,39 @@ This exercises conffile retention on reinstall; native version-to-version upgrad
 and runtime service behavior remain release acceptance tasks. The containers
 receive no clock-control privileges or reference-clock devices.
 
+## Update dependencies
+
+Apply dependency updates and run the module’s tests and `go mod tidy`. Rebuild
+all release targets, refresh the compiled dependency notices, and rebuild the
+packages so they carry the updated notices:
+
+```sh
+make snapshot
+python3 scripts/update-notices.py
+make snapshot
+python3 scripts/update-notices.py --check
+```
+
+Use the Go version in `.go-version` for both builds and notice generation. If your
+Go distribution installs its `LICENSE` outside `GOROOT`, pass its location using
+`--go-license /path/to/go/LICENSE`. Review upstream license changes and commit the
+module files and refreshed notices together.
+
 ## Publish a version
 
-After the intended commit has passed CI and the first-release setup is complete:
+Update `CHANGELOG.md` and add `docs/release-notes/vMAJOR.MINOR.PATCH.md` for the
+version being released. After the intended commit has passed CI, create and push
+an annotated version tag. For example, the next patch release would use:
 
 ```sh
 # In this repository, with a github remote configured:
-git tag -a v0.1.0 -m 'First public release'
-git push github v0.1.0
+git tag -a v1.0.1 -m 'Release 1.0.1'
+git push github v1.0.1
 ```
 
 That tag is a publication action: the workflow will publish when its checks and
-attestation succeed. Use `v0.1.0-rc.1` for a prerelease; GoReleaser marks it as such.
-The name above is an example, not a tag created by this preparation work.
+attestation succeed. Use `v1.1.0-rc.1` for a prerelease; GoReleaser marks it as such.
+The workflow uses the version’s checked-in release notes for its GitHub Release.
 
 Artifacts include one archive per OS/architecture, unsigned Linux packages, and
 `checksums.txt`. These are downloadable package files. There is no signed APT/YUM

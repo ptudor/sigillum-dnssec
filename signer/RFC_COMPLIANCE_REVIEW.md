@@ -168,7 +168,6 @@ Before going live:
 
 4. **Test with real resolvers**:
    - Google (8.8.8.8) with +dnssec
-   - Cloudflare (1.1.1.1) with +dnssec
    - Verify AD (Authenticated Data) flag is set
 
 5. **Test wildcard expansion**:

@@ -4,7 +4,7 @@ Get DNSSEC signing working in 10 minutes.
 
 ## Prerequisites
 
-- Go 1.21+ (for building)
+- Go 1.27.1 (the release toolchain in `../.go-version`)
 - An authoritative DNS server (NSD, BIND, Knot)
 - Access to your domain's registrar (for DS records)
 
@@ -134,7 +134,6 @@ sudo systemctl reload nsd
 Go to your registrar's DNS settings and add the DS record. The exact process varies:
 
 **Common registrars:**
-- **Cloudflare**: DNS → DNSSEC → Enable → Enter DS record
 - **Namecheap**: Advanced DNS → DNSSEC → Add DS record
 - **GoDaddy**: DNS Management → DNSSEC → Add
 - **Gandi**: DNSSEC tab → Add DS record

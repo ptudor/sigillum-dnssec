@@ -1,7 +1,7 @@
-![Sigillum — Sign your zones. See the chain of trust.](docs/banner.svg)
+# Sigillum
 
 [![CI](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml/badge.svg)](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ptudor/sigillum-dnssec?include_prereleases)](https://github.com/ptudor/sigillum-dnssec/releases)
+[![Release](https://img.shields.io/github/v/release/ptudor/sigillum-dnssec?include_prereleases)](https://github.com/ptudor/sigillum-dnssec/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)](.go-version)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -57,8 +57,8 @@ names are retained so deployment commands and integrations remain familiar.
 
 ## Install
 
-Download a matching asset from [GitHub Releases](https://github.com/ptudor/sigillum-dnssec/releases)
-once the first release is published. See [verification instructions](docs/releases.md#verify-a-download)
+Download a matching asset from [GitHub Releases](https://github.com/ptudor/sigillum-dnssec/releases/latest)
+for **v1.0.0**. See [verification instructions](docs/releases.md#verify-a-download)
 before installation. Development builds are available as artifacts of successful
 [CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
 

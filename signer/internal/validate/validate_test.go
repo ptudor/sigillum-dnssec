@@ -83,7 +83,7 @@ func TestResolverAddr(t *testing.T) {
 	t.Run("empty resolver uses system or fallback", func(t *testing.T) {
 		v := &Validator{resolver: "", timeout: 5 * time.Second}
 		got := v.resolverAddr()
-		// Should return either a system resolver or 1.1.1.1:53
+		// Should return either a system resolver or 9.9.9.9:53
 		if got == "" {
 			t.Error("resolverAddr() returned empty string")
 		}
