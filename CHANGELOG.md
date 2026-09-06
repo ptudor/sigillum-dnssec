@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.0.0 — 2026-09-06
+## Unreleased
 
-- First public release of Sigillum: automatic DNSSEC zone signing, key lifecycle
+- Prepare the public distribution of Sigillum: automatic DNSSEC zone signing, key lifecycle
   management, and a streaming browser validator for the chain of trust.
 - Publish static Linux, FreeBSD, and macOS binaries for amd64 and arm64, unsigned
   Linux RPMs and DEBs, SHA-256 manifests, and GitHub build attestations.

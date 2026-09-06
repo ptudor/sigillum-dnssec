@@ -1,7 +1,6 @@
 # Sigillum
 
 [![CI](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml/badge.svg)](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ptudor/sigillum-dnssec?include_prereleases)](https://github.com/ptudor/sigillum-dnssec/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)](.go-version)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -57,10 +56,11 @@ names are retained so deployment commands and integrations remain familiar.
 
 ## Install
 
-Download a matching asset from [GitHub Releases](https://github.com/ptudor/sigillum-dnssec/releases/latest)
-for **v1.0.0**. See [verification instructions](docs/releases.md#verify-a-download)
-before installation. Development builds are available as artifacts of successful
-[CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
+Download development binaries and packages from the artifacts of a successful
+[CI run](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
+Choose the `sigillum-dnssec-snapshot` artifact and the file matching your platform.
+See [build and verification instructions](docs/releases.md) for source builds,
+checksums, and the distinction between development artifacts and tagged releases.
 
 | Platform | Architectures | Distribution |
 | --- | --- | --- |
