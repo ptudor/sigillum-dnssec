@@ -56,7 +56,7 @@ func defaultUserAgent() string {
 	if v == "" {
 		v = "dev"
 	}
-	return "dnssec-tudor/" + v + " (+https://github.com/ptudor/sigillum-dnssec/signer)"
+	return "sigillum-signer/" + v + " (+https://github.com/ptudor/sigillum-dnssec/signer)"
 }
 
 // NewDynadotClient validates credentials and constructs a client. The adapter
@@ -624,7 +624,7 @@ func (c *DynadotClient) ReplaceDS(ctx context.Context, domain string, records []
 			missing, extra := CompareDSSets(records, have)
 			if len(missing) == 0 {
 				if len(extra) > 0 {
-					return fmt.Errorf("registrar holds the desired DS set but %d extra DS record(s) remain because the clear did not apply (%v); re-run `dnssec-tudor registrar push %s`",
+					return fmt.Errorf("registrar holds the desired DS set but %d extra DS record(s) remain because the clear did not apply (%v); re-run `sigillum-signer registrar push %s`",
 						len(extra), delErr, domain)
 				}
 				slog.Info("[REGISTRAR] dynadot DS set verified", "domain", domain, "records", len(records))

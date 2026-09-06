@@ -19,7 +19,7 @@ import (
 )
 
 // recordRegistrarWarning attaches a warning to the zone's status (deduped) and
-// persists state, so `dnssec-tudor status` and the dashboard reflect a
+// persists state, so `sigillum-signer status` and the dashboard reflect a
 // registrar auto-publish failure that the operator would otherwise only see on
 // stderr — honoring the documented "added to the zone's warnings array"
 // contract (R-032). Mutation and Save each take the state write lock
@@ -204,10 +204,10 @@ func RunRegistrarPush(cmd *cobra.Command, args []string) error {
 				// non-zero exit, so status/dashboard surface the outage (R-004).
 				slog.Error("[REGISTRAR] DS restore failed — parent left with ZERO DS; zone will go bogus until republished",
 					"domain", domain, "registrar", reg.Name(),
-					"remediation", fmt.Sprintf("re-run `dnssec-tudor registrar push %s`", domain),
+					"remediation", fmt.Sprintf("re-run `sigillum-signer registrar push %s`", domain),
 					"error", err)
 				recordRegistrarWarning(state, domain,
-					fmt.Sprintf("URGENT: registrar left zone with ZERO DS at parent; re-run `dnssec-tudor registrar push %s`: %v", domain, err))
+					fmt.Sprintf("URGENT: registrar left zone with ZERO DS at parent; re-run `sigillum-signer registrar push %s`: %v", domain, err))
 			}
 			return fmt.Errorf("registrar replace_ds: %w", err)
 		}
@@ -334,7 +334,7 @@ func MaybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string
 		return
 	}
 	if !registrarAutoPublish(cfg, reg.Name()) {
-		fmt.Printf("Registrar %s is configured but auto_publish is off; run `dnssec-tudor registrar push %s` to publish DS.\n", reg.Name(), domain)
+		fmt.Printf("Registrar %s is configured but auto_publish is off; run `sigillum-signer registrar push %s` to publish DS.\n", reg.Name(), domain)
 		return
 	}
 
@@ -355,7 +355,7 @@ func MaybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string
 		// destructive ReplaceDS clears valid DS at the registrar before the
 		// PUT lands — leaving a zone with no DS at all, which validators
 		// read as an unsigned delegation (silent DNSSEC outage). Operators
-		// can clear residual DS explicitly via `dnssec-tudor registrar push`
+		// can clear residual DS explicitly via `sigillum-signer registrar push`
 		// or `... registrar clear` after verifying with `... registrar verify`.
 		// For `rollover_start`, additive is required so the old KSK's DS
 		// stays published throughout the rollover window.
@@ -378,10 +378,10 @@ func MaybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string
 			if errors.Is(err, registrar.ErrRegistrarDSEmpty) {
 				slog.Error("[REGISTRAR] DS restore failed — parent left with ZERO DS; zone will go bogus until republished",
 					"domain", domain, "registrar", reg.Name(),
-					"remediation", fmt.Sprintf("run `dnssec-tudor registrar push %s` to republish the DS set immediately", domain),
+					"remediation", fmt.Sprintf("run `sigillum-signer registrar push %s` to republish the DS set immediately", domain),
 					"error", err)
 				recordRegistrarWarning(state, domain,
-					fmt.Sprintf("URGENT: registrar left zone with ZERO DS at parent; run `dnssec-tudor registrar push %s` immediately: %v", domain, err))
+					fmt.Sprintf("URGENT: registrar left zone with ZERO DS at parent; run `sigillum-signer registrar push %s` immediately: %v", domain, err))
 			} else {
 				msg := fmt.Sprintf("registrar auto-publish failed: %v", err)
 				fmt.Fprintf(os.Stderr, "warning: %s\n", msg)

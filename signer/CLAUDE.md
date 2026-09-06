@@ -1,4 +1,4 @@
-# CLAUDE.md — dnssec-tudor
+# CLAUDE.md — sigillum-signer
 
 A minimal, opinionated DNSSEC signing daemon for sysadmins who just want zones signed.
 
@@ -14,13 +14,13 @@ This tool exists because every DNSSEC solution is either:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    dnssec-tudor                         │
+│                    sigillum-signer                         │
 ├─────────────────────────────────────────────────────────┤
-│  Config: /etc/dnssec-tudor/config.toml                  │
-│  Zones:  /etc/dnssec-tudor/zones/net/ptudor/zone.db     │
-│  Keys:   /var/lib/dnssec-tudor/keys/                    │
-│  Output: /var/lib/dnssec-tudor/signed/                  │
-│  State:  /var/lib/dnssec-tudor/state.json               │
+│  Config: /etc/sigillum-signer/config.toml                  │
+│  Zones:  /etc/sigillum-signer/zones/net/ptudor/zone.db     │
+│  Keys:   /var/lib/sigillum-signer/keys/                    │
+│  Output: /var/lib/sigillum-signer/signed/                  │
+│  State:  /var/lib/sigillum-signer/state.json               │
 └─────────────────────────────────────────────────────────┘
            │                              │
            ▼                              ▼
@@ -96,53 +96,53 @@ Design constraints:
 
 ```bash
 # Run the daemon (foreground, logs to stderr, reloads on SIGHUP)
-dnssec-tudor serve
+sigillum-signer serve
 
 # Run with web UI enabled (loopback only — the dashboard is unauthenticated;
 # a non-loopback --web address is refused unless web.allow_remote = true)
-dnssec-tudor serve --web 127.0.0.1:8053
+sigillum-signer serve --web 127.0.0.1:8053
 
 # One-shot: sign all zones, print status JSON to stdout, exit
-dnssec-tudor sign
+sigillum-signer sign
 
 # Print status JSON to stdout
-dnssec-tudor status
-dnssec-tudor status --domain example.com
+sigillum-signer status
+sigillum-signer status --domain example.com
 
 # Add a new domain (registers zone path, generates keys, signs)
 # Zone file must already exist at the path
-dnssec-tudor add example.com /etc/dnssec-tudor/zones/com/example/zone.db
+sigillum-signer add example.com /etc/sigillum-signer/zones/com/example/zone.db
 
 # Remove a domain: deletes it from state.json AND the config file (does NOT delete
 # keys). A running daemon still holds the old config in memory until you SIGHUP it.
-dnssec-tudor remove example.com
+sigillum-signer remove example.com
 
 # Key rollover commands
-dnssec-tudor rollover start example.com    # Begin KSK or ZSK rollover
-dnssec-tudor rollover status example.com   # Show rollover state
-dnssec-tudor rollover complete example.com # Finalize after DS updated
+sigillum-signer rollover start example.com    # Begin KSK or ZSK rollover
+sigillum-signer rollover status example.com   # Show rollover state
+sigillum-signer rollover complete example.com # Finalize after DS updated
 
 # Export for registrar
-dnssec-tudor ds example.com                # Print DS records
-dnssec-tudor dnskey example.com            # Print DNSKEY records
+sigillum-signer ds example.com                # Print DS records
+sigillum-signer dnskey example.com            # Print DNSKEY records
 
 # Registrar API (opt-in; requires [registrar.*] config + zone "registrar" field)
-dnssec-tudor registrar get example.com     # Show DS records currently at registrar
-dnssec-tudor registrar push example.com    # Push expected DS records to registrar
-dnssec-tudor registrar verify example.com  # Compare expected vs actual DS records
-dnssec-tudor registrar clear example.com   # Remove all DS records at registrar
+sigillum-signer registrar get example.com     # Show DS records currently at registrar
+sigillum-signer registrar push example.com    # Push expected DS records to registrar
+sigillum-signer registrar verify example.com  # Compare expected vs actual DS records
+sigillum-signer registrar clear example.com   # Remove all DS records at registrar
 ```
 
 ## Configuration
 
 ```toml
-# /etc/dnssec-tudor/config.toml
+# /etc/sigillum-signer/config.toml
 
 # Where to write signed zone files (flat: ptudor.net.zone.signed)
-output_dir = "/var/lib/dnssec-tudor/signed"
+output_dir = "/var/lib/sigillum-signer/signed"
 
 # Where to store keys and state
-data_dir = "/var/lib/dnssec-tudor"
+data_dir = "/var/lib/sigillum-signer"
 
 # How often to check zones for changes (when running as daemon)
 poll_interval = "5m"
@@ -199,11 +199,11 @@ auto_publish = true             # Push DS automatically on add/rollover events
 # and silently registers zero zones.
 # Supports hierarchical organization: zones/net/ptudor/zone.db
 [zones."ptudor.net"]
-path = "/etc/dnssec-tudor/zones/net/ptudor/zone.db"
+path = "/etc/sigillum-signer/zones/net/ptudor/zone.db"
 registrar = "dynadot"           # Opt-in: push DS via the registrar above
 
 [zones."ptudor.com"]
-path = "/etc/dnssec-tudor/zones/com/ptudor/zone.db"
+path = "/etc/sigillum-signer/zones/com/ptudor/zone.db"
 ksk_lifetime = "5y"  # Override: I'm extra lazy about this one
 
 [zones."example.org"]
@@ -224,7 +224,7 @@ coalesce_post_sign = true
 
 ## JSON Output Schema
 
-### Status Output (`dnssec-tudor status`)
+### Status Output (`sigillum-signer status`)
 
 ```json
 {
@@ -261,7 +261,7 @@ coalesce_post_sign = true
         "old_key_id": 11111,
         "new_key_id": 22222,
         "started": "2024-01-10T00:00:00Z",
-        "action": "Publish new DS record at registrar, then run: dnssec-tudor rollover complete example.org"
+        "action": "Publish new DS record at registrar, then run: sigillum-signer rollover complete example.org"
       }
     }
   },
@@ -357,7 +357,7 @@ KSK rolls require a DS update at the registrar, then a cache-safe wait:
 
 ```bash
 # 1. Start rollover (generates new KSK with the zone's algorithm, adds it to the zone)
-$ dnssec-tudor rollover start example.com
+$ sigillum-signer rollover start example.com
 New KSK generated. Both keys now in zone.
 Update DS record at registrar. New DS:
   example.com. IN DS 22222 13 2 ABC123...
@@ -368,7 +368,7 @@ Update DS record at registrar. New DS:
 #    daemon — or the next `sign` — then retires the old KSK, and the rollover
 #    ends once that zone is confirmed served. The old DS may be removed at the
 #    registrar as soon as step 2 succeeds.
-$ dnssec-tudor rollover complete example.com
+$ sigillum-signer rollover complete example.com
 ```
 
 Phases: `ds_add_wait` (operator) → `ds_propagation_wait` (automatic) →
@@ -422,7 +422,7 @@ attempt fails (e.g., upstream API outage), an `AddDS` leaves whatever the
 registrar previously held intact; a `ReplaceDS` would have already DELETE'd
 before discovering the PUT failure, leaving a zone with zero DS at the
 parent — a silent DNSSEC outage. Operators who need clean-state on add can
-follow up with `dnssec-tudor registrar push` (which uses `ReplaceDS`
+follow up with `sigillum-signer registrar push` (which uses `ReplaceDS`
 internally, but is now operator-explicit).
 
 `import` is intentionally read-only because the registrar already has the
@@ -484,7 +484,7 @@ on a transient API error.
 ## Directory Structure
 
 ```
-/etc/dnssec-tudor/
+/etc/sigillum-signer/
 ├── config.toml
 └── zones/                        # Hierarchical by TLD/domain
     ├── com/
@@ -497,7 +497,7 @@ on a transient API error.
         └── example/
             └── zone.db
 
-/var/lib/dnssec-tudor/
+/var/lib/sigillum-signer/
 ├── state.json                    # Daemon state, zone→path mappings, key metadata
 ├── keys/
 │   ├── ptudor.com.ksk.private
@@ -514,7 +514,7 @@ on a transient API error.
     └── example.org.zone.signed
 ```
 
-Zone files can live anywhere — the path is explicit in config or provided via `dnssec-tudor add`. The hierarchical layout is a convention, not a requirement.
+Zone files can live anywhere — the path is explicit in config or provided via `sigillum-signer add`. The hierarchical layout is a convention, not a requirement.
 
 **Key files are a two-slot transaction.** Every generation is written to its
 tag-named slot (`<domain>.<role>.<tag>.{key,private}`) first, verified by
@@ -536,11 +536,11 @@ No key file is ever deleted; unverifiable material is preserved as `*.bak.N`.
 # /etc/nsd/nsd.conf
 zone:
     name: "ptudor.com"
-    zonefile: "/var/lib/dnssec-tudor/signed/ptudor.com.zone.signed"
+    zonefile: "/var/lib/sigillum-signer/signed/ptudor.com.zone.signed"
 
 zone:
     name: "ptudor.net"
-    zonefile: "/var/lib/dnssec-tudor/signed/ptudor.net.zone.signed"
+    zonefile: "/var/lib/sigillum-signer/signed/ptudor.net.zone.signed"
 ```
 
 After signing, the daemon runs the `post_sign` hook (e.g., `nsd-control reload`).
@@ -592,7 +592,7 @@ white-box tests in the owning package, black-box/integration tests at root.
 **Naming note:** because the persistent-state package is named `state` and the
 signing package `signer`, the root package imports them aliased (`statepkg`,
 `signerpkg`) to avoid shadowing the pervasive local `state`/`signer` variables —
-the same convention the sibling `dnssec-validator` uses for its `dns` package.
+the same convention the sibling `sigillum-validator` uses for its `dns` package.
 
 ### Error Handling Philosophy
 - Never delete a key file automatically
@@ -610,7 +610,7 @@ the same convention the sibling `dnssec-validator` uses for its `dns` package.
 1. **Unit tests** for zone parsing, signing, rollover state machine
 2. **Integration test** with real zone files and temporary directories
 3. **Manual testing checklist:**
-   - [ ] Add a new zone via `dnssec-tudor add`, verify signed output
+   - [ ] Add a new zone via `sigillum-signer add`, verify signed output
    - [ ] Modify zone file, verify re-sign and serial bump detection
    - [ ] Wait for signature refresh
    - [ ] ZSK auto-rollover
@@ -624,16 +624,16 @@ the same convention the sibling `dnssec-validator` uses for its `dns` package.
 
 ```bash
 # Build
-go build -o dnssec-tudor .   # main.go is at the repo root, not under cmd/
+go build -o sigillum-signer .   # main.go is at the repo root, not under cmd/
 
 # Run tests
 go test ./...
 
 # Run with test config
-./dnssec-tudor serve --config ./testdata/config.toml
+./sigillum-signer serve --config ./testdata/config.toml
 
 # Quick iteration: sign and show status
-./dnssec-tudor sign --config ./testdata/config.toml && ./dnssec-tudor status
+./sigillum-signer sign --config ./testdata/config.toml && ./sigillum-signer status
 ```
 
 ## Out of Scope

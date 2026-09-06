@@ -1,12 +1,12 @@
 # DNSSEC Validator Configuration
-# Copy to /usr/local/etc/tudordns/dnssec-validator.toml and customize
+# Copy to /usr/local/etc/sigillum-validator/config.toml and customize
 
 # HTTP server settings
 listen_addr = "127.0.0.1:8791"
 shutdown_timeout_seconds = 30
 
 # Root trust anchors
-root_anchors_path = "/etc/dnssec-validator/root-anchors.json"
+root_anchors_path = "/etc/sigillum-validator/root-anchors.json"
 root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
 
 # DNS query settings
@@ -53,7 +53,7 @@ file = ""                       # Log file path (empty = stdout)
 enabled = false                 # Set to true after registering with AnyStatus
 url = "https://www.any53.com/any53/anystatus/heartbeat/"
 api_key = ""                    # Your API key from AnyStatus registration
-app = "dnssec-validator"        # Must match app_key in AnyStatus
+app = "sigillum-validator"        # Must match app_key in AnyStatus
 status_url = ""                 # URL to dashboard (shown on AnyStatus)
 instance_id = ""                # Optional, defaults to hostname
 interval_minutes = 5            # Background heartbeat interval

@@ -49,7 +49,7 @@ make clean              # Remove build artifacts
 
 Minimal external dependencies following project conventions:
 
-- `github.com/miekg/dns` - DNS library (same as dnssec-signer)
+- `github.com/miekg/dns` - DNS library (same as sigillum-signer)
 - `github.com/prometheus/client_golang` - Prometheus metrics
 - Standard library for everything else
 
@@ -80,7 +80,7 @@ This service performs iterative DNSSEC validation from the root zone down, query
                                     │ EventSource (SSE)
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        dnssec-validator daemon                              │
+│                        sigillum-validator daemon                              │
 │  ┌──────────────┐  ┌──────────────────────────────────────────────────┐    │
 │  │ HTTP Server  │  │              Validation Engine                   │    │
 │  │  /validate   │──│  1. Parse domain → zone hierarchy                │    │
@@ -584,12 +584,12 @@ type RRSIGRecord struct {
 
 Configuration is **TOML-first, with environment variables as a fallback** — this is exactly what `Load()` does: it reads a TOML file if one is found, and only falls back to environment variables when none is.
 
-1. **TOML file (preferred).** Pass an explicit path with `-config /path/to/dnssec-validator.toml`, or drop the file at one of the default paths, checked in order:
-   - `/usr/local/etc/tudordns/dnssec-validator.toml`
-   - `/etc/tudordns/dnssec-validator.toml`
-   - `./dnssec-validator.toml`
+1. **TOML file (preferred).** Pass an explicit path with `-config /path/to/config.toml`, or drop the file at one of the default paths, checked in order:
+   - `/usr/local/etc/sigillum-validator/config.toml`
+   - `/etc/sigillum-validator/config.toml`
+   - `./config.toml`
 
-   Copy `dnssec-validator.toml.example` as your starting point. Unknown/misspelled keys are rejected at load time (strict decoding), so a typo is a startup error rather than a silently ignored setting.
+   Copy `config.toml.example` as your starting point. Unknown/misspelled keys are rejected at load time (strict decoding), so a typo is a startup error rather than a silently ignored setting.
 
    **Outbound DNS egress (RA6X-054).** Authoritative-server addresses come from
    DNS data the requesting client controls, so the service dials only public
@@ -609,7 +609,7 @@ Configuration is **TOML-first, with environment variables as a fallback** — th
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LISTEN_ADDR` | `:8791` | HTTP listen address |
-| `ROOT_ANCHORS_PATH` | `/etc/dnssec-validator/root-anchors.json` | Path to trust anchors |
+| `ROOT_ANCHORS_PATH` | `/etc/sigillum-validator/root-anchors.json` | Path to trust anchors |
 | `ROOT_ANCHORS_URL` | `https://internet.any53.com/dns/anchors/root-anchors.json` | Fallback URL for anchors |
 | `QUERY_TIMEOUT_SECONDS` | `5` | Per-server query timeout (seconds) |
 | `TOTAL_TIMEOUT_SECONDS` | `30` | Total validation timeout (seconds) |
@@ -632,7 +632,7 @@ and logged as malformed, then the default is used — use plain integers.
 | Project Type | Config Method | Example |
 |--------------|---------------|---------|
 | FastCGI web services | Environment variables | rdap-proxy, dns-query |
-| Standalone HTTP / local daemons | TOML file (env-var fallback) | this project, dnssec-signer |
+| Standalone HTTP / local daemons | TOML file (env-var fallback) | this project, sigillum-signer |
 | CLI tools | Command-line flags | All projects for one-shot commands |
 
 ## Deployment
@@ -646,7 +646,7 @@ Unlike other TudorDNS services, this runs as a standalone HTTP server (not FastC
 
 ```
 ┌──────────────┐     ┌─────────────────────┐     ┌───────────────────┐
-│    Client    │────▶│  Apache (optional)  │────▶│ dnssec-validator  │
+│    Client    │────▶│  Apache (optional)  │────▶│ sigillum-validator  │
 │   Browser    │     │  HTTPS termination  │     │    :8080          │
 └──────────────┘     └─────────────────────┘     └───────────────────┘
 ```
@@ -684,10 +684,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=dnssec-validator
-Group=dnssec-validator
-ExecStart=/opt/dnssec-validator/dnssec-validator
-EnvironmentFile=/etc/dnssec-validator/env
+User=sigillum-validator
+Group=sigillum-validator
+ExecStart=/opt/sigillum-validator/sigillum-validator
+EnvironmentFile=/etc/sigillum-validator/env
 Restart=always
 RestartSec=5
 
@@ -696,7 +696,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadOnlyPaths=/etc/dnssec-validator
+ReadOnlyPaths=/etc/sigillum-validator
 
 [Install]
 WantedBy=multi-user.target
@@ -706,7 +706,7 @@ WantedBy=multi-user.target
 
 ```go
 require (
-    github.com/miekg/dns v1.1.58              // DNS library (same as dnssec-signer)
+    github.com/miekg/dns v1.1.73              // DNS library (same as sigillum-signer)
     github.com/prometheus/client_golang v1.19.0  // Prometheus metrics
 )
 ```
@@ -767,7 +767,7 @@ The `/api/*` JSON endpoints use **RFC 7807 (Problem Details for HTTP APIs)** for
 Content-Type: application/problem+json
 
 {
-  "type": "https://dnssec-validator.example.com/errors/invalid-domain",
+  "type": "https://sigillum-validator.example.com/errors/invalid-domain",
   "title": "Invalid Domain",
   "status": 400,
   "detail": "The domain 'not..valid' contains invalid characters.",
@@ -811,9 +811,9 @@ go test ./...
 go test -tags=integration ./...
 
 # Test specific domains
-./dnssec-validator -test-domain=ietf.org
-./dnssec-validator -test-domain=dnssec-failed.org  # Known bogus
-./dnssec-validator -test-domain=unsigned.example   # Known insecure
+./sigillum-validator -test-domain=ietf.org
+./sigillum-validator -test-domain=dnssec-failed.org  # Known bogus
+./sigillum-validator -test-domain=unsigned.example   # Known insecure
 ```
 
 ### Test Domains
@@ -845,7 +845,7 @@ carries its own config/params rather than importing a shared root Config).
 ```
 validator/
 ├── CLAUDE.md                 # This file — project spec and standards
-├── dnssec-validator.toml.example
+├── config.toml.example
 ├── Makefile
 ├── go.mod / go.sum
 │
@@ -894,7 +894,7 @@ This enables single-binary deployment without external file dependencies.
 |---------|--------------|
 | **internet-files-mirror** | Provides `root-anchors.json`; reference `Docs/Website/style.css` for light/dark mode and accessibility patterns |
 | **dns-query-server** | DoH proxy; reference `Docs/Website/doh.css` for dark theme and DNSSEC badge patterns |
-| **tudor-dnssec-signer** | Zone signing (uses same `miekg/dns` library, similar DNSSEC logic) |
+| **sigillum-signer** | Zone signing (uses same `miekg/dns` library, similar DNSSEC logic) |
 
 ### Integration with internet-files-mirror
 
@@ -902,7 +902,7 @@ The root trust anchors should be fetched from your internet-files-mirror instanc
 
 ```bash
 # Configure validator to use mirrored trust anchors
-ROOT_ANCHORS_PATH=/var/cache/dnssec-validator/root-anchors.json
+ROOT_ANCHORS_PATH=/var/cache/sigillum-validator/root-anchors.json
 ROOT_ANCHORS_URL=https://internet.any53.com/dns/anchors/root-anchors.json
 ```
 

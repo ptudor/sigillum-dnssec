@@ -1,6 +1,6 @@
-# AnyStatus Integration for dnssec-tudor
+# AnyStatus Integration for sigillum-signer
 
-This service integrates with [AnyStatus](https://www.any53.com/any53/anystatus/) for "green light" monitoring. The dashboard shows whether dnssec-tudor is running, idle, or actively signing zones.
+This service integrates with [AnyStatus](https://www.any53.com/any53/anystatus/) for "green light" monitoring. The dashboard shows whether sigillum-signer is running, idle, or actively signing zones.
 
 ## Quick Setup
 
@@ -11,14 +11,14 @@ https://www.any53.com/any53/admin/anystatus/serviceheartbeat/add/
 
 | Field | Value |
 |-------|-------|
-| `app_key` | `dnssec-tudor` |
+| `app_key` | `sigillum-signer` |
 | `app_name` | `DNSSEC Signer` |
 | `stale_threshold_minutes` | `15` |
 | `dead_threshold_minutes` | `60` |
 
 Copy the generated `api_key` for the next step.
 
-### 2. Configure dnssec-tudor
+### 2. Configure sigillum-signer
 
 Add to your `config.toml`:
 
@@ -26,7 +26,7 @@ Add to your `config.toml`:
 [heartbeat]
 enabled = true
 api_key = "paste-your-api-key-here"
-app = "dnssec-tudor"
+app = "sigillum-signer"
 status_url = "/dnssec/admin/"
 interval_minutes = 5
 ```
@@ -34,7 +34,7 @@ interval_minutes = 5
 ### 3. Restart the Service
 
 ```sh
-service dnssec_tudor restart
+service sigillum-signer restart
 ```
 
 Check the dashboard: https://www.any53.com/any53/anystatus/
@@ -55,7 +55,7 @@ url = "https://www.any53.com/any53/anystatus/heartbeat/"
 api_key = "your-api-key-here"
 
 # Application identifier (must match registered app_key)
-app = "dnssec-tudor"
+app = "sigillum-signer"
 
 # URL to admin page (shown as link on dashboard)
 status_url = "/dnssec/admin/"
@@ -72,7 +72,7 @@ interval_minutes = 5
 
 ## Status Actions
 
-dnssec-tudor sends these actions to indicate what it's doing:
+sigillum-signer sends these actions to indicate what it's doing:
 
 | Action | Description |
 |--------|-------------|
@@ -133,11 +133,11 @@ Set your AnyStatus thresholds based on your `poll_interval`:
 
 - Check that `enabled = true` in config
 - Verify `api_key` and `app` match AnyStatus registration
-- Check logs for heartbeat errors: `grep -i heartbeat /var/log/dnssec_tudor.log`
+- Check logs for heartbeat errors: `grep -i heartbeat /var/log/sigillum_signer.log`
 
 ### Service shows "Dead" (red)
 
-- Is the service running? `service dnssec_tudor status`
+- Is the service running? `service sigillum-signer status`
 - Can it reach the internet? `curl -s https://www.any53.com/any53/anystatus/`
 - Check for network/firewall issues
 
@@ -150,7 +150,7 @@ This is normal for quick operations. For zones with thousands of records, signin
 ```sh
 curl -X POST "https://www.any53.com/any53/anystatus/heartbeat/" \
   -d "api_key=YOUR_KEY" \
-  -d "app=dnssec-tudor" \
+  -d "app=sigillum-signer" \
   -d "action=test"
 ```
 
@@ -169,4 +169,4 @@ curl -X POST "https://www.any53.com/any53/anystatus/heartbeat/" \
 ## See Also
 
 - [AnyStatus Documentation](/Users/ptudor/Git/Python-Go/any53-django/ANYSTATUS.md)
-- [dnssec-tudor Web Dashboard](/dnssec/admin/)
+- [sigillum-signer Web Dashboard](/dnssec/admin/)

@@ -1,4 +1,4 @@
-# QUICKSTART: dnssec-tudor
+# QUICKSTART: sigillum-signer
 
 Get DNSSEC signing working in 10 minutes.
 
@@ -13,24 +13,24 @@ Get DNSSEC signing working in 10 minutes.
 ```bash
 cd signer
 make build
-sudo cp dnssec-tudor /usr/local/bin/
+sudo cp sigillum-signer /usr/local/bin/
 ```
 
 ## Step 2: Create Directories
 
-The service runs unprivileged as the `dnssec-tudor` account (the systemd
-unit in step 8 sets `User=dnssec-tudor`, so the account is required, not
+The service runs unprivileged as the `sigillum-signer` account (the systemd
+unit in step 8 sets `User=sigillum-signer`, so the account is required, not
 optional). It must be able to read the unsigned zones, write keys, state and
 signed output, and NSD must be able to read the signed output:
 
 ```bash
-sudo useradd -r -s /usr/sbin/nologin -d /var/lib/dnssec-tudor dnssec-tudor
-sudo mkdir -p /etc/dnssec-tudor
-sudo install -d -o dnssec-tudor -g dnssec-tudor -m 750 /var/lib/dnssec-tudor
-sudo install -d -o dnssec-tudor -g dnssec-tudor -m 700 /var/lib/dnssec-tudor/keys
-sudo install -d -o dnssec-tudor -g nsd -m 750 /var/lib/dnssec-tudor/signed   # NSD reads here
+sudo useradd -r -s /usr/sbin/nologin -d /var/lib/sigillum-signer sigillum-signer
+sudo mkdir -p /etc/sigillum-signer
+sudo install -d -o sigillum-signer -g sigillum-signer -m 750 /var/lib/sigillum-signer
+sudo install -d -o sigillum-signer -g sigillum-signer -m 700 /var/lib/sigillum-signer/keys
+sudo install -d -o sigillum-signer -g nsd -m 750 /var/lib/sigillum-signer/signed   # NSD reads here
 # Unsigned zones: readable by the service account (adjust to where they live)
-sudo chgrp -R dnssec-tudor /etc/nsd/zones && sudo chmod -R g+rX /etc/nsd/zones
+sudo chgrp -R sigillum-signer /etc/nsd/zones && sudo chmod -R g+rX /etc/nsd/zones
 ```
 
 The signer must also be able to tell NSD to reload without a password. Do not
@@ -38,11 +38,11 @@ give the account a general `sudo` or `systemctl` grant; allow exactly the one
 reload command it runs from the hook:
 
 ```bash
-sudo tee /etc/sudoers.d/dnssec-tudor << 'EOF'
-dnssec-tudor ALL=(root) NOPASSWD: /usr/sbin/nsd-control reload
+sudo tee /etc/sudoers.d/sigillum-signer << 'EOF'
+sigillum-signer ALL=(root) NOPASSWD: /usr/sbin/nsd-control reload
 EOF
-sudo chmod 440 /etc/sudoers.d/dnssec-tudor
-sudo -u dnssec-tudor sudo -n /usr/sbin/nsd-control reload   # must succeed non-interactively
+sudo chmod 440 /etc/sudoers.d/sigillum-signer
+sudo -u sigillum-signer sudo -n /usr/sbin/nsd-control reload   # must succeed non-interactively
 ```
 
 (An alternative with no sudo at all: make the account a member of the group
@@ -53,9 +53,9 @@ pass before the daemon is started.)
 ## Step 3: Create Configuration
 
 ```bash
-sudo tee /etc/dnssec-tudor/config.toml << 'EOF'
-output_dir = "/var/lib/dnssec-tudor/signed"
-data_dir = "/var/lib/dnssec-tudor"
+sudo tee /etc/sigillum-signer/config.toml << 'EOF'
+output_dir = "/var/lib/sigillum-signer/signed"
+data_dir = "/var/lib/sigillum-signer"
 poll_interval = "5m"
 
 [dnssec]
@@ -73,7 +73,7 @@ enabled = false
 # Add your zones here after step 4
 
 [hooks]
-# Exactly the command allowed in /etc/sudoers.d/dnssec-tudor (step 2). The
+# Exactly the command allowed in /etc/sudoers.d/sigillum-signer (step 2). The
 # hook must succeed: a signed zone counts as published only after it does.
 post_sign_cmd = ["/usr/bin/sudo", "-n", "/usr/sbin/nsd-control", "reload"]
 EOF
@@ -88,11 +88,11 @@ Make sure your unsigned zone file exists and is valid:
 nsd-checkzone example.com /etc/nsd/zones/example.com.zone
 ```
 
-Add the zone to dnssec-tudor:
+Add the zone to sigillum-signer:
 
 ```bash
-sudo dnssec-tudor add example.com /etc/nsd/zones/example.com.zone \
-  --config /etc/dnssec-tudor/config.toml
+sudo sigillum-signer add example.com /etc/nsd/zones/example.com.zone \
+  --config /etc/sigillum-signer/config.toml
 ```
 
 Output:
@@ -121,7 +121,7 @@ Point NSD to the signed zone:
 # /etc/nsd/nsd.conf
 zone:
     name: "example.com"
-    zonefile: "/var/lib/dnssec-tudor/signed/example.com.zone.signed"
+    zonefile: "/var/lib/sigillum-signer/signed/example.com.zone.signed"
 ```
 
 Reload NSD:
@@ -165,15 +165,15 @@ dig +dnssec example.com
 ### Option A: Systemd Service
 
 ```bash
-sudo tee /etc/systemd/system/dnssec-tudor.service << 'EOF'
+sudo tee /etc/systemd/system/sigillum-signer.service << 'EOF'
 [Unit]
 Description=DNSSEC Tudor Signing Daemon
 After=network.target
 
 [Service]
 Type=simple
-User=dnssec-tudor
-ExecStart=/usr/local/bin/dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
+User=sigillum-signer
+ExecStart=/usr/local/bin/sigillum-signer serve --config /etc/sigillum-signer/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
@@ -183,24 +183,24 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable dnssec-tudor
-sudo systemctl start dnssec-tudor
+sudo systemctl enable sigillum-signer
+sudo systemctl start sigillum-signer
 ```
 
 ### Option B: Run in Screen/Tmux
 
 ```bash
-sudo -u dnssec-tudor dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
+sudo -u sigillum-signer sigillum-signer serve --config /etc/sigillum-signer/config.toml
 ```
 
 ## Step 9: Verify Everything Works
 
 ```bash
 # Check daemon status
-sudo systemctl status dnssec-tudor
+sudo systemctl status sigillum-signer
 
 # Check zone status
-dnssec-tudor status --config /etc/dnssec-tudor/config.toml
+sigillum-signer status --config /etc/sigillum-signer/config.toml
 
 # Verify signatures
 dig +dnssec example.com @localhost
@@ -216,12 +216,12 @@ path = "/etc/nsd/zones/another.com.zone"
 
 2. Reload daemon:
 ```bash
-sudo systemctl reload dnssec-tudor  # or kill -HUP <pid>
+sudo systemctl reload sigillum-signer  # or kill -HUP <pid>
 ```
 
 3. Get DS record and add to registrar:
 ```bash
-dnssec-tudor ds another.com --config /etc/dnssec-tudor/config.toml
+sigillum-signer ds another.com --config /etc/sigillum-signer/config.toml
 ```
 
 ## Troubleshooting
@@ -237,9 +237,9 @@ the supported rollover, which publishes both algorithms until the new DS is
 live and the caches have drained:
 
 ```bash
-dnssec-tudor rollover algorithm example.com ECDSAP256SHA256 --config /etc/dnssec-tudor/config.toml
+sigillum-signer rollover algorithm example.com ECDSAP256SHA256 --config /etc/sigillum-signer/config.toml
 # publish the printed DS at the registrar, wait for it to propagate, then:
-dnssec-tudor rollover complete example.com --config /etc/dnssec-tudor/config.toml
+sigillum-signer rollover complete example.com --config /etc/sigillum-signer/config.toml
 # later, when status asks for it, remove the old DS; retirement is automatic
 ```
 
@@ -249,12 +249,12 @@ later start on the algorithm your registrar accepts.
 ### Signatures expiring
 The daemon should re-sign automatically. Check logs:
 ```bash
-journalctl -u dnssec-tudor -f
+journalctl -u sigillum-signer -f
 ```
 
 ### DNSSEC validation failing
 1. Verify DS record is published: `dig DS example.com +short`
-2. Check DS matches your KSK: `dnssec-tudor ds example.com`
+2. Check DS matches your KSK: `sigillum-signer ds example.com`
 3. Use online debugger: https://dnsviz.net/
 
 ## Next Steps
@@ -267,9 +267,9 @@ journalctl -u dnssec-tudor -f
 
 | Command | Description |
 |---------|-------------|
-| `dnssec-tudor serve` | Run daemon |
-| `dnssec-tudor sign` | One-shot sign all zones |
-| `dnssec-tudor status` | Show status JSON |
-| `dnssec-tudor ds <domain>` | Get DS record for registrar |
-| `dnssec-tudor add <domain> <path>` | Add new domain |
-| `dnssec-tudor rollover start <domain>` | Start KSK rollover |
+| `sigillum-signer serve` | Run daemon |
+| `sigillum-signer sign` | One-shot sign all zones |
+| `sigillum-signer status` | Show status JSON |
+| `sigillum-signer ds <domain>` | Get DS record for registrar |
+| `sigillum-signer add <domain> <path>` | Add new domain |
+| `sigillum-signer rollover start <domain>` | Start KSK rollover |

@@ -1,6 +1,6 @@
-# dnssec-tudor Makefile
+# sigillum-signer Makefile
 
-BINARY := dnssec-tudor
+BINARY := sigillum-signer
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME)"

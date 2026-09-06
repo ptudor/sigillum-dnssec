@@ -16,8 +16,8 @@ func TestRA6X044_BootstrapMessage(t *testing.T) {
 	if err := checkOwnershipBootstrap(t.TempDir()); err != nil {
 		t.Fatalf("existing data_dir must pass: %v", err)
 	}
-	msg := strings.ToLower(fsutil.BootstrapInstructions("/var/lib/dnssec-tudor"))
-	for _, want := range []string{"install -d", "root-only", "daemon account", "/var/lib/dnssec-tudor"} {
+	msg := strings.ToLower(fsutil.BootstrapInstructions("/var/lib/sigillum-signer"))
+	for _, want := range []string{"install -d", "root-only", "daemon account", "/var/lib/sigillum-signer"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("bootstrap message must mention %q: %s", want, msg)
 		}

@@ -25,96 +25,96 @@ var (
 var (
 	// Zone metrics
 	zonesTotal = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "zones_total",
 		Help:      "Total number of zones being managed",
 	})
 
 	zonesHealthy = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "zones_healthy",
 		Help:      "Number of zones in healthy state",
 	})
 
 	zonesActionRequired = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "zones_action_required",
 		Help:      "Number of zones requiring action (e.g., DS update)",
 	})
 
 	zonesWarning = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "zones_warning",
 		Help:      "Number of zones in warning state (attention needed soon)",
 	})
 
 	zonesWithErrors = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "zones_errors",
 		Help:      "Number of zones with errors",
 	})
 
 	// Signing metrics
 	signingOperationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "signing_operations_total",
 		Help:      "Total number of signing operations",
 	}, []string{"domain", "status"})
 
 	signingDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "signing_duration_seconds",
 		Help:      "Duration of zone signing operations in seconds",
 		Buckets:   prometheus.ExponentialBuckets(0.01, 2, 10), // 10ms to ~10s
 	}, []string{"domain"})
 
 	lastSigningTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "last_signing_timestamp_seconds",
 		Help:      "Unix timestamp of the last successful signing operation",
 	}, []string{"domain"})
 
 	signatureExpiryTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "signature_expiry_timestamp_seconds",
 		Help:      "Unix timestamp when signatures expire for a zone",
 	}, []string{"domain"})
 
 	// Key metrics
 	kskExpiryTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "ksk_expiry_timestamp_seconds",
 		Help:      "Unix timestamp when KSK expires for a zone",
 	}, []string{"domain"})
 
 	zskExpiryTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "zsk_expiry_timestamp_seconds",
 		Help:      "Unix timestamp when ZSK expires for a zone",
 	}, []string{"domain"})
 
 	// Rollover metrics
 	rolloversInProgress = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "rollover_in_progress",
 		Help:      "Whether a rollover is in progress (1) or not (0)",
 	}, []string{"domain", "type"})
 
 	rolloverOperationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "rollover_operations_total",
 		Help:      "Total number of rollover operations",
 	}, []string{"domain", "type", "action"})
 
 	// Hook metrics
 	hookExecutionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "hook_executions_total",
 		Help:      "Total number of hook executions",
 	}, []string{"hook", "status"})
 
 	hookDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "dnssec_tudor",
+		Namespace: "sigillum_signer",
 		Name:      "hook_duration_seconds",
 		Help:      "Duration of hook executions in seconds",
 		Buckets:   prometheus.ExponentialBuckets(0.01, 2, 12), // 10ms to ~40s

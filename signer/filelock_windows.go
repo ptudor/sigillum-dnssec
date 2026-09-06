@@ -38,7 +38,7 @@ func acquireInstanceLock(_ string) (*stateLock, error) {
 		slog.Warn("[STATE] cross-process state locking is not implemented on Windows; concurrent daemon+CLI writes are not serialized")
 	})
 	if !winLockMu.TryLock() {
-		return nil, fmt.Errorf("another dnssec-tudor instance holds the process-local lock; refusing to start a second instance")
+		return nil, fmt.Errorf("another sigillum-signer instance holds the process-local lock; refusing to start a second instance")
 	}
 	return &stateLock{}, nil
 }

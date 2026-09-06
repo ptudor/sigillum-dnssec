@@ -453,7 +453,7 @@ func (kg *KeyGenerator) keyFileMtime(path string) time.Time {
 // over an unreadable existing one breaks the DS chain at the registrar and
 // causes SERVFAIL until the operator notices. Regeneration is reserved for
 // the "no key files present" case only. An operator who truly wants new
-// keys should `dnssec-tudor remove <domain>` + re-add.
+// keys should `sigillum-signer remove <domain>` + re-add.
 func RecoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *statepkg.KeyState, zsk *statepkg.KeyState, err error) {
 	ksk, err = keyGen.RecoverKeyState(domain, true)
 	if err != nil {

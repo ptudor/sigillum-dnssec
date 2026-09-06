@@ -8,10 +8,10 @@ Split out of TudorDNS-Golang on 2026-07-09 with filtered history. The full pre-s
 
 ## Projects
 
-### signer (dnssec-tudor)
+### signer (sigillum-signer)
 Minimal, opinionated DNSSEC signing daemon for sysadmins managing zones on NSD or BIND.
 
-**Architecture**: Zone Files → dnssec-tudor (watches/signs) → Signed Zone Files → NSD/BIND
+**Architecture**: Zone Files → sigillum-signer (watches/signs) → Signed Zone Files → NSD/BIND
 
 - Automatic signing on zone file changes or before signature expiry
 - Automatic ZSK rollover (pre-publish method); semi-automatic KSK rollover with DS record guidance
@@ -35,7 +35,7 @@ Web-based DNSSEC troubleshooting and validation tool with a polished UI — thin
 | **Configuration** | TOML config file (preferred) or environment variables |
 | **Health Checks** | `/health` and `/healthz` endpoints |
 
-Default TOML paths are `/usr/local/etc/tudordns/{project}.toml` and `/etc/tudordns/{project}.toml`.
+Canonical component names are `sigillum-signer` and `sigillum-validator` for executables, packages, service accounts, and services. Linux configurations live at `/etc/{component}/config.toml`; FreeBSD configurations live at `/usr/local/etc/{component}/config.toml`. See `docs/linux-packages.md` and the component guides for state paths and activation.
 
 ## Build commands
 

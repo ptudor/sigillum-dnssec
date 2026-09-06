@@ -48,7 +48,7 @@ func acquireStateLock(dataDir string, timeout time.Duration) (*stateLock, error)
 		}
 		if !time.Now().Before(deadline) {
 			f.Close()
-			return nil, fmt.Errorf("timed out after %s waiting for the state lock %s (another dnssec-tudor process holds it)", timeout, lockPath)
+			return nil, fmt.Errorf("timed out after %s waiting for the state lock %s (another sigillum-signer process holds it)", timeout, lockPath)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -72,7 +72,7 @@ func acquireInstanceLock(dataDir string) (*stateLock, error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		if err == syscall.EWOULDBLOCK {
-			return nil, fmt.Errorf("another dnssec-tudor serve already holds %s; refusing to start a second instance against the same data_dir", lockPath)
+			return nil, fmt.Errorf("another sigillum-signer serve already holds %s; refusing to start a second instance against the same data_dir", lockPath)
 		}
 		return nil, fmt.Errorf("locking %s: %w", lockPath, err)
 	}

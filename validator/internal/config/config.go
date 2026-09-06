@@ -16,9 +16,9 @@ import (
 
 // Default config file paths (checked in order)
 var DefaultConfigPaths = []string{
-	"/usr/local/etc/tudordns/dnssec-validator.toml",
-	"/etc/tudordns/dnssec-validator.toml",
-	"dnssec-validator.toml",
+	"/usr/local/etc/sigillum-validator/config.toml",
+	"/etc/sigillum-validator/config.toml",
+	"config.toml",
 }
 
 // Config holds all configuration for the application
@@ -134,7 +134,7 @@ func DefaultConfig() *Config {
 		ListenAddr:               ":8791",
 		ShutdownTimeoutSec:       30,
 		ShutdownTimeout:          30 * time.Second,
-		RootAnchorsPath:          "/etc/dnssec-validator/root-anchors.json",
+		RootAnchorsPath:          "/etc/sigillum-validator/root-anchors.json",
 		RootAnchorsURL:           "https://internet.any53.com/dns/anchors/root-anchors.json",
 		QueryTimeoutSec:          5,
 		TotalTimeoutSec:          30,
@@ -180,12 +180,12 @@ func DefaultConfig() *Config {
 		Heartbeat: HeartbeatConfig{
 			Enabled:         false,
 			URL:             "https://www.any53.com/any53/anystatus/heartbeat/",
-			App:             "dnssec-validator",
+			App:             "sigillum-validator",
 			IntervalMinutes: 5,
 		},
 		HeartbeatEnabled:  false,
 		HeartbeatURL:      "https://www.any53.com/any53/anystatus/heartbeat/",
-		HeartbeatApp:      "dnssec-validator",
+		HeartbeatApp:      "sigillum-validator",
 		HeartbeatInterval: 5 * time.Minute,
 	}
 }

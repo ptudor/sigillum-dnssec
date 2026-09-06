@@ -1,13 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 — 2026-09-06
 
-- Prepare the public distribution of Sigillum: automatic DNSSEC zone signing, key lifecycle
+- First public release of Sigillum: automatic DNSSEC zone signing, key lifecycle
   management, and a streaming browser validator for the chain of trust.
 - Publish static Linux, FreeBSD, and macOS binaries for amd64 and arm64, unsigned
   Linux RPMs and DEBs, SHA-256 manifests, and GitHub build attestations.
 - Use canonical Go module paths beneath `github.com/ptudor/sigillum-dnssec`.
-  Executables remain `dnssec-tudor` and `dnssec-validator`.
+  Align executable, package, service, account, configuration, and state names as
+  `sigillum-signer` and `sigillum-validator`; rename their metric namespaces too.
 - Ship Linux service accounts, loopback configuration, systemd units, and package
   scripts that preserve configuration and require explicit service activation.
 - Use `9.9.9.9` when no explicit or system DNS resolver is available.

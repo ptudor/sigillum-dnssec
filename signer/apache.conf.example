@@ -1,9 +1,9 @@
 # =============================================================================
-# DNSSEC Signer Dashboard - tudor-dnssec-signer
+# DNSSEC Signer Dashboard - sigillum-signer
 # HTTP on 127.0.0.1:8053 (optional, internal only)
 #
 # Installation:
-#   1. Copy to /usr/local/etc/apache24/Includes/dnssec-signer.conf
+#   1. Copy to /usr/local/etc/apache24/Includes/sigillum-signer.conf
 #   2. Ensure mod_proxy, mod_proxy_http, mod_proxy_balancer are loaded
 #   3. Restart Apache: service apache24 restart
 #

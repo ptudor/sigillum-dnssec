@@ -1,7 +1,7 @@
-# Installed as /etc/dnssec-tudor/config.toml. No zones are enrolled by default.
+# Installed as /etc/sigillum-signer/config.toml. No zones are enrolled by default.
 # Read docs/linux-packages.md before connecting this signer to NSD or BIND.
-output_dir = "/var/lib/dnssec-tudor/signed"
-data_dir = "/var/lib/dnssec-tudor"
+output_dir = "/var/lib/sigillum-signer/signed"
+data_dir = "/var/lib/sigillum-signer"
 poll_interval = "5m"
 
 [dnssec]
@@ -25,5 +25,5 @@ listen = "127.0.0.1:8053"
 enabled = false
 
 [zones]
-# [zones."example.com"]
-# path = "/etc/nsd/zones/example.com.zone"
+# [zones."example.invalid"]
+# path = "/etc/sigillum-signer/zones/example.invalid.zone"

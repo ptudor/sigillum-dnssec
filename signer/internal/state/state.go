@@ -610,7 +610,7 @@ func (s *State) Save() error {
 	// Write via a UNIQUE temp file, fsync, then rename for atomicity and durability. A
 	// fixed "state.json.tmp" is shared by the daemon and any concurrent mutating CLI
 	// command; concurrent Saves to the same temp corrupt or lose state (R-002). The atomic
-	// helper preserves the target directory's uid/gid so `dnssec-tudor add` run as root
+	// helper preserves the target directory's uid/gid so `sigillum-signer add` run as root
 	// leaves a state.json the daemon user can still read, and fsyncs so a crash/power loss
 	// can't leave a truncated file (R-040).
 	if err := fsutil.WriteFileAtomicOwned(s.path, data, 0600); err != nil {

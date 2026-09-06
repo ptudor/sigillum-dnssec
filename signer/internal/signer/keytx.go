@@ -463,7 +463,7 @@ func ValidateKeyForImport(domain, keyType string, dnskey *dns.DNSKEY, privateKey
 	}
 	probe := []dns.RR{&dns.TXT{
 		Hdr: dns.RR_Header{Name: dns.Fqdn(domain), Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 60},
-		Txt: []string{"dnssec-tudor import signing probe"},
+		Txt: []string{"sigillum-signer import signing probe"},
 	}}
 	s := &Signer{}
 	now := time.Now().UTC()

@@ -1,5 +1,6 @@
 # Build artifacts
-dnssec-tudor
+/sigillum-signer
+/dnssec-tudor
 build/
 
 # Test artifacts
