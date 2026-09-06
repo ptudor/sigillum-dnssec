@@ -57,7 +57,7 @@ func TestConfigValidate_HeartbeatIntervalWhenEnabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Heartbeat.Enabled = true
 	cfg.Heartbeat.APIKey = "test-key"
-	cfg.Heartbeat.App = "dnssec-validator"
+	cfg.Heartbeat.App = "sigillum-validator"
 	cfg.Heartbeat.IntervalMinutes = 0
 
 	err := cfg.Validate()

@@ -1,40 +1,40 @@
 #!/bin/sh
 #
-# PROVIDE: dnssec_validator
+# PROVIDE: sigillum_validator
 # REQUIRE: LOGIN
 # KEYWORD: shutdown
 #
-# Add the following lines to /etc/rc.conf to enable dnssec_validator:
+# Add the following lines to /etc/rc.conf to enable sigillum_validator:
 #
-# dnssec_validator_enable="YES"
+# sigillum_validator_enable="YES"
 #
 # Optional overrides (defaults shown):
-# dnssec_validator_svcuser="dnssec-validator"
-# dnssec_validator_command="/usr/local/sbin/dnssec-validator"
-# dnssec_validator_logdir="/var/log/tudordns"
+# sigillum_validator_svcuser="sigillum-validator"
+# sigillum_validator_command="/usr/local/sbin/sigillum-validator"
+# sigillum_validator_logdir="/var/log/sigillum-validator"
 #
 # Create the service user and log dir before starting:
-#   pw useradd -n dnssec-validator -d /nonexistent -s /usr/sbin/nologin -c "DNSSEC Validator Service"
-#   install -d -o dnssec-validator /var/log/tudordns
+#   pw useradd -n sigillum-validator -d /nonexistent -s /usr/sbin/nologin -c "DNSSEC Validator Service"
+#   install -d -o sigillum-validator /var/log/sigillum-validator
 #
 # Configuration is a TOML file the binary auto-discovers at
-# /usr/local/etc/tudordns/dnssec-validator.toml -- no wrapper, no env file;
+# /usr/local/etc/sigillum-validator/config.toml -- no wrapper, no env file;
 # see QUICKSTART-FREEBSD.md.
 
 . /etc/rc.subr
 
-name="dnssec_validator"
+name="sigillum_validator"
 rcvar="${name}_enable"
 
 load_rc_config $name
 
-: ${dnssec_validator_enable:="NO"}
-: ${dnssec_validator_svcuser:="dnssec-validator"}
-: ${dnssec_validator_command:="/usr/local/sbin/dnssec-validator"}
-: ${dnssec_validator_logdir:="/var/log/tudordns"}
-: ${dnssec_validator_pidfile:="/var/run/${name}.pid"}
+: ${sigillum_validator_enable:="NO"}
+: ${sigillum_validator_svcuser:="sigillum-validator"}
+: ${sigillum_validator_command:="/usr/local/sbin/sigillum-validator"}
+: ${sigillum_validator_logdir:="/var/log/sigillum-validator"}
+: ${sigillum_validator_pidfile:="/var/run/sigillum-validator.pid"}
 
-pidfile="${dnssec_validator_pidfile}"
+pidfile="${sigillum_validator_pidfile}"
 
 # Privilege drop is done by `daemon -u` (below), NOT an su(1) wrapper, so the
 # child pid daemon(8) records in ${pidfile} is the binary itself --
@@ -50,7 +50,7 @@ stop_cmd="${name}_stop"
 status_cmd="${name}_status"
 restart_cmd="${name}_restart"
 
-dnssec_validator_start()
+sigillum_validator_start()
 {
     if [ -f "${pidfile}" ] && kill -0 $(cat ${pidfile}) 2>/dev/null; then
         echo "${name} is already running as pid $(cat ${pidfile})"
@@ -58,17 +58,17 @@ dnssec_validator_start()
     fi
 
     # App writes its structured log under here (logging.file in the TOML).
-    install -d -o ${dnssec_validator_svcuser} ${dnssec_validator_logdir}
+    install -d -o ${sigillum_validator_svcuser} ${sigillum_validator_logdir}
 
     echo "Starting ${name}."
-    # -f detaches daemon(8)'s own inherited stdio. Without it `service dnssec_validator start`
+    # -f detaches daemon(8)'s own inherited stdio. Without it `service sigillum-validator start`
     # over ssh never returns — the supervisor holds the pipe until the process exits.
     # It does not replace -o/-S below: those route the child's output, -f the parent's.
-    /usr/sbin/daemon -f -p ${pidfile} -u ${dnssec_validator_svcuser} \
-        -S -T ${name} ${dnssec_validator_command}
+    /usr/sbin/daemon -f -p ${pidfile} -u ${sigillum_validator_svcuser} \
+        -S -T ${name} ${sigillum_validator_command}
 }
 
-dnssec_validator_stop()
+sigillum_validator_stop()
 {
     if [ -f "${pidfile}" ] && kill -0 $(cat ${pidfile}) 2>/dev/null; then
         echo "Stopping ${name}."
@@ -80,7 +80,7 @@ dnssec_validator_stop()
     rm -f ${pidfile}
 }
 
-dnssec_validator_status()
+sigillum_validator_status()
 {
     if [ -f "${pidfile}" ] && kill -0 $(cat ${pidfile}) 2>/dev/null; then
         echo "${name} is running as pid $(cat ${pidfile})"
@@ -90,11 +90,11 @@ dnssec_validator_status()
     fi
 }
 
-dnssec_validator_restart()
+sigillum_validator_restart()
 {
-    dnssec_validator_stop
+    sigillum_validator_stop
     sleep 1
-    dnssec_validator_start
+    sigillum_validator_start
 }
 
 run_rc_command "$1"

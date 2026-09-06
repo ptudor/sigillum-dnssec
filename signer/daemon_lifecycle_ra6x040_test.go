@@ -190,7 +190,7 @@ func TestRA6X040_StartedHeartbeatIsTheOneShutdownStops(t *testing.T) {
 		Enabled:         true,
 		URL:             srv.URL,
 		APIKey:          "synthetic-not-a-real-key",
-		App:             "dnssec-tudor-test",
+		App:             "sigillum-signer-test",
 		InstanceID:      "ra6x040",
 		IntervalMinutes: 60,
 		AllowInsecure:   true,

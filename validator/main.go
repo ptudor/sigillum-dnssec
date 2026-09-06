@@ -37,11 +37,11 @@ func main() {
 	check := flag.Bool("check", false, "validate configuration and exit without starting the server or fetching anchors")
 	flag.Parse()
 	if *version {
-		fmt.Printf("dnssec-validator %s (built %s)\n", Version, BuildTime)
+		fmt.Printf("sigillum-validator %s (built %s)\n", Version, BuildTime)
 		return
 	}
 	if flag.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "dnssec-validator: unexpected positional arguments")
+		fmt.Fprintln(os.Stderr, "sigillum-validator: unexpected positional arguments")
 		os.Exit(2)
 	}
 
@@ -52,7 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 	if *check {
-		fmt.Println("dnssec-validator: configuration OK (trust-anchor availability and network access are not checked)")
+		fmt.Println("sigillum-validator: configuration OK (trust-anchor availability and network access are not checked)")
 		return
 	}
 

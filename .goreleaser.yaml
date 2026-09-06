@@ -5,7 +5,7 @@ env:
   - CGO_ENABLED=0
 builds:
   - id: signer
-    binary: dnssec-tudor
+    binary: sigillum-signer
     dir: signer
     main: .
     goos: [linux, freebsd, darwin]
@@ -15,7 +15,7 @@ builds:
     ldflags:
       - -s -w -X main.Version={{ .Version }} -X main.BuildTime={{ .CommitDate }}
   - id: validator
-    binary: dnssec-validator
+    binary: sigillum-validator
     dir: validator
     main: .
     goos: [linux, freebsd, darwin]
@@ -35,15 +35,15 @@ archives:
       - SECURITY.md
       - docs/*
       - packaging/*.toml
-      - signer/dnssec_signer.rc.d
+      - signer/sigillum-signer.rc.d
       - signer/README.md
       - signer/QUICKSTART.md
       - validator/freebsd/*
-      - validator/dnssec-validator.toml.example
+      - validator/config.toml.example
       - validator/README.md
 nfpms:
   - id: signer
-    package_name: dnssec-tudor
+    package_name: sigillum-signer
     ids: [signer]
     file_name_template: '{{ .ConventionalFileName }}'
     homepage: https://github.com/ptudor/sigillum-dnssec
@@ -61,27 +61,27 @@ nfpms:
       rpm:
         dependencies: [ca-certificates, systemd, shadow-utils]
     contents:
-      - src: packaging/dnssec-tudor.toml
-        dst: /etc/dnssec-tudor/config.toml
+      - src: packaging/sigillum-signer.toml
+        dst: /etc/sigillum-signer/config.toml
         type: config|noreplace
         file_info:
           mode: 0640
-      - src: packaging/dnssec-tudor.service
-        dst: /usr/lib/systemd/system/dnssec-tudor.service
+      - src: packaging/sigillum-signer.service
+        dst: /usr/lib/systemd/system/sigillum-signer.service
       - src: README.md
-        dst: /usr/share/doc/dnssec-tudor/README.md
+        dst: /usr/share/doc/sigillum-signer/README.md
       - src: docs/linux-packages.md
-        dst: /usr/share/doc/dnssec-tudor/linux-packages.md
+        dst: /usr/share/doc/sigillum-signer/linux-packages.md
       # Debian slim retains copyright while excluding other documentation.
       - src: THIRD_PARTY_NOTICES.md
-        dst: /usr/share/doc/dnssec-tudor/copyright
+        dst: /usr/share/doc/sigillum-signer/copyright
     scripts:
-      preinstall: packaging/dnssec-tudor-preinstall.sh
-      postinstall: packaging/dnssec-tudor-postinstall.sh
-      preremove: packaging/dnssec-tudor-preremove.sh
+      preinstall: packaging/sigillum-signer-preinstall.sh
+      postinstall: packaging/sigillum-signer-postinstall.sh
+      preremove: packaging/sigillum-signer-preremove.sh
       postremove: packaging/postremove.sh
   - id: validator
-    package_name: dnssec-validator
+    package_name: sigillum-validator
     ids: [validator]
     file_name_template: '{{ .ConventionalFileName }}'
     homepage: https://github.com/ptudor/sigillum-dnssec
@@ -99,24 +99,24 @@ nfpms:
       rpm:
         dependencies: [ca-certificates, systemd, shadow-utils]
     contents:
-      - src: packaging/dnssec-validator.toml
-        dst: /etc/dnssec-validator/dnssec-validator.toml
+      - src: packaging/sigillum-validator.toml
+        dst: /etc/sigillum-validator/config.toml
         type: config|noreplace
         file_info:
           mode: 0640
-      - src: packaging/dnssec-validator.service
-        dst: /usr/lib/systemd/system/dnssec-validator.service
+      - src: packaging/sigillum-validator.service
+        dst: /usr/lib/systemd/system/sigillum-validator.service
       - src: README.md
-        dst: /usr/share/doc/dnssec-validator/README.md
+        dst: /usr/share/doc/sigillum-validator/README.md
       - src: docs/linux-packages.md
-        dst: /usr/share/doc/dnssec-validator/linux-packages.md
+        dst: /usr/share/doc/sigillum-validator/linux-packages.md
       # Debian slim retains copyright while excluding other documentation.
       - src: THIRD_PARTY_NOTICES.md
-        dst: /usr/share/doc/dnssec-validator/copyright
+        dst: /usr/share/doc/sigillum-validator/copyright
     scripts:
-      preinstall: packaging/dnssec-validator-preinstall.sh
-      postinstall: packaging/dnssec-validator-postinstall.sh
-      preremove: packaging/dnssec-validator-preremove.sh
+      preinstall: packaging/sigillum-validator-preinstall.sh
+      postinstall: packaging/sigillum-validator-postinstall.sh
+      preremove: packaging/sigillum-validator-preremove.sh
       postremove: packaging/postremove.sh
 checksum:
   name_template: checksums.txt

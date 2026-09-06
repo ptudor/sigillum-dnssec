@@ -1601,7 +1601,7 @@ func TestRecoverOrGenerateKeys_UnreadablePrivateKey(t *testing.T) {
 	}
 
 	// Take the KSK's private key unreadable — simulates the real-world bug
-	// where `dnssec-tudor add` ran as root produces a 0600 root-owned file
+	// where `sigillum-signer add` ran as root produces a 0600 root-owned file
 	// that the non-root daemon can't read.
 	privPath := filepath.Join(cfg.KeysDir(), "locked.example..ksk.private")
 	if err := os.Chmod(privPath, 0); err != nil {

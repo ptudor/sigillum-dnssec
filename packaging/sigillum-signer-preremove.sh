@@ -4,8 +4,8 @@ set -eu
 case "${1:-}" in
     remove|0)
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-            systemctl stop dnssec-tudor.service
-            systemctl disable dnssec-tudor.service
+            systemctl stop sigillum-signer.service
+            systemctl disable sigillum-signer.service
         fi
         ;;
 esac

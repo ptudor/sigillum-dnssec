@@ -40,7 +40,7 @@ func signatureExpirySeriesExists(t *testing.T, domain string) bool {
 		t.Fatalf("gather: %v", err)
 	}
 	for _, mf := range families {
-		if mf.GetName() != "dnssec_tudor_signature_expiry_timestamp_seconds" {
+		if mf.GetName() != "sigillum_signer_signature_expiry_timestamp_seconds" {
 			continue
 		}
 		for _, m := range mf.GetMetric() {
@@ -64,12 +64,12 @@ func TestUpdateZoneMetrics_WarningCounted(t *testing.T) {
 
 	UpdateZoneMetrics(state)
 
-	if got := gaugeValue(t, "dnssec_tudor_zones_warning"); got != 1 {
+	if got := gaugeValue(t, "sigillum_signer_zones_warning"); got != 1 {
 		t.Errorf("zones_warning = %v, want 1", got)
 	}
-	total := gaugeValue(t, "dnssec_tudor_zones_total")
-	sum := gaugeValue(t, "dnssec_tudor_zones_healthy") + gaugeValue(t, "dnssec_tudor_zones_action_required") +
-		gaugeValue(t, "dnssec_tudor_zones_warning") + gaugeValue(t, "dnssec_tudor_zones_errors")
+	total := gaugeValue(t, "sigillum_signer_zones_total")
+	sum := gaugeValue(t, "sigillum_signer_zones_healthy") + gaugeValue(t, "sigillum_signer_zones_action_required") +
+		gaugeValue(t, "sigillum_signer_zones_warning") + gaugeValue(t, "sigillum_signer_zones_errors")
 	if total != sum {
 		t.Errorf("summary gauges do not balance: total=%v, healthy+action+warning+errors=%v", total, sum)
 	}

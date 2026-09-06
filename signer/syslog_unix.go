@@ -22,7 +22,7 @@ type syslogHandler struct {
 // underlying syslog connection; setupLogging tracks it so a SIGHUP re-run can
 // close the previous connection instead of leaking one fd per reload.
 func newSyslogHandler(level slog.Level) (slog.Handler, io.Closer, error) {
-	writer, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "dnssec-tudor")
+	writer, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "sigillum-signer")
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to syslog: %w", err)
 	}

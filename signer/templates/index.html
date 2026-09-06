@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="60">
-    <title>dnssec-tudor Dashboard</title>
+    <title>Sigillum Signer</title>
     <style>
         :root {
             --bg: #1a1a2e;
@@ -123,7 +123,7 @@
     </style>
 </head>
 <body>
-    <h1>dnssec-tudor</h1>
+    <h1>Sigillum Signer</h1>
     <p class="subtitle">DNSSEC Signing Dashboard
         {{if .Validation}}<a href="?" style="margin-left:1rem;color:var(--text-dim);font-size:0.875rem;">Hide Validation</a>
         {{else}}<a href="?validate=true" style="margin-left:1rem;color:var(--accent);font-size:0.875rem;">Validate Now</a>
@@ -248,7 +248,7 @@
                 <div class="code-block"><pre style="margin:0;white-space:pre-wrap;">{{.}}</pre><button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard(this.previousElementSibling.textContent, this)">Copy</button></div>
                 {{else}}
                 <p style="color: var(--text-dim); font-size: 0.875rem;">
-                    Run <code>dnssec-tudor ds {{$domain}}</code> to get DS records.
+                    Run <code>sigillum-signer ds {{$domain}}</code> to get DS records.
                 </p>
                 {{end}}
 
@@ -295,7 +295,7 @@
     </div>
 
     <footer>
-        dnssec-tudor &mdash; Generated at {{.Status.Timestamp.Format "2006-01-02 15:04:05 UTC"}}
+        sigillum-signer &mdash; Generated at {{.Status.Timestamp.Format "2006-01-02 15:04:05 UTC"}}
     </footer>
 
     <script>

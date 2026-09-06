@@ -44,7 +44,7 @@ func TestR001_IsTOMLTableHeader(t *testing.T) {
 // an inline comment (the destructive boundary case).
 func TestR001_RemovePreservesFollowingCommentedTables(t *testing.T) {
 	cfg := strings.Join([]string{
-		`output_dir = "/var/lib/dnssec-tudor/signed"`,
+		`output_dir = "/var/lib/sigillum-signer/signed"`,
 		``,
 		`[zones."target.example"]`,
 		`path = "/etc/zones/target.db"`,

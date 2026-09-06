@@ -118,7 +118,7 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 			OldKeyID: oldKSK.ID,
 			NewKeyID: newKSK.ID,
 			Started:  time.Now().UTC(),
-			Action:   fmt.Sprintf("Publish new DS record at registrar, then run: dnssec-tudor rollover complete %s", domain),
+			Action:   fmt.Sprintf("Publish new DS record at registrar, then run: sigillum-signer rollover complete %s", domain),
 		}
 
 		// Update KSK in state (zone will now be signed with both during rollover)
@@ -154,7 +154,7 @@ func (rm *RolloverManager) StartKSKRollover(domain string) error {
 // sign rather than to retry the rollover.
 func (rm *RolloverManager) activateRecorded(domain string, keyGen *KeyGenerator, keyType string, tag uint16) error {
 	if err := keyGen.ActivateKeyPair(domain, keyType, tag); err != nil {
-		return fmt.Errorf("activating new %s %d (the rollover is recorded; run `dnssec-tudor sign` to retry activation from %s): %w",
+		return fmt.Errorf("activating new %s %d (the rollover is recorded; run `sigillum-signer sign` to retry activation from %s): %w",
 			strings.ToUpper(keyType), tag, keyGen.taggedBase(domain, keyType, tag), err)
 	}
 	return nil
@@ -548,7 +548,7 @@ func (rm *RolloverManager) BackupKey(domain, keyType string, keyID uint16) error
 		return err
 	}
 	if live.KeyTag() != keyID {
-		return fmt.Errorf("live %s key for %s has key tag %d but the recorded state names key %d; refusing to roll over an unrecorded key (run `dnssec-tudor sign` to reconcile first)",
+		return fmt.Errorf("live %s key for %s has key tag %d but the recorded state names key %d; refusing to roll over an unrecorded key (run `sigillum-signer sign` to reconcile first)",
 			keyType, domain, live.KeyTag(), keyID)
 	}
 	return nil
@@ -586,7 +586,7 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 	// KSK-rollover path does, so an algorithm rollover on such a zone returns a
 	// descriptive error instead of panicking (R-025).
 	if zoneState.KSK == nil || zoneState.ZSK == nil {
-		return fmt.Errorf("zone %s has no usable keys (key initialization previously failed); fix the underlying issue and re-run `dnssec-tudor sign` before attempting an algorithm rollover", domain)
+		return fmt.Errorf("zone %s has no usable keys (key initialization previously failed); fix the underlying issue and re-run `sigillum-signer sign` before attempting an algorithm rollover", domain)
 	}
 
 	oldAlgorithm := zoneState.KSK.Algorithm
@@ -636,7 +636,7 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 			OldAlgorithm: oldAlgorithm,
 			NewAlgorithm: targetAlgorithm,
 			Started:      time.Now().UTC(),
-			Action:       fmt.Sprintf("Publish new DS record (algorithm %s) at registrar, then run: dnssec-tudor rollover complete %s", targetAlgorithm, domain),
+			Action:       fmt.Sprintf("Publish new DS record (algorithm %s) at registrar, then run: sigillum-signer rollover complete %s", targetAlgorithm, domain),
 		}
 
 		// Update keys to new algorithm (old keys are backed up and will be used during rollover)

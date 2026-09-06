@@ -4,8 +4,8 @@ set -eu
 case "${1:-}" in
     remove|0)
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-            systemctl stop dnssec-validator.service
-            systemctl disable dnssec-validator.service
+            systemctl stop sigillum-validator.service
+            systemctl disable sigillum-validator.service
         fi
         ;;
 esac

@@ -16,15 +16,15 @@ type ProblemDetails struct {
 
 // Error type URIs for RFC 7807 responses
 const (
-	ErrTypeBadRequest          = "https://dnssec-validator.any53.com/errors/bad-request"
-	ErrTypeForbidden           = "https://dnssec-validator.any53.com/errors/forbidden"
-	ErrTypeNotFound            = "https://dnssec-validator.any53.com/errors/not-found"
-	ErrTypeMethodNotAllowed    = "https://dnssec-validator.any53.com/errors/method-not-allowed"
-	ErrTypeTooManyRequests     = "https://dnssec-validator.any53.com/errors/too-many-requests"
-	ErrTypeInternalServerError = "https://dnssec-validator.any53.com/errors/internal-server-error"
-	ErrTypeServiceUnavailable  = "https://dnssec-validator.any53.com/errors/service-unavailable"
-	ErrTypeInvalidDomain       = "https://dnssec-validator.any53.com/errors/invalid-domain"
-	ErrTypeValidationFailed    = "https://dnssec-validator.any53.com/errors/validation-failed"
+	ErrTypeBadRequest          = "https://sigillum-validator.any53.com/errors/bad-request"
+	ErrTypeForbidden           = "https://sigillum-validator.any53.com/errors/forbidden"
+	ErrTypeNotFound            = "https://sigillum-validator.any53.com/errors/not-found"
+	ErrTypeMethodNotAllowed    = "https://sigillum-validator.any53.com/errors/method-not-allowed"
+	ErrTypeTooManyRequests     = "https://sigillum-validator.any53.com/errors/too-many-requests"
+	ErrTypeInternalServerError = "https://sigillum-validator.any53.com/errors/internal-server-error"
+	ErrTypeServiceUnavailable  = "https://sigillum-validator.any53.com/errors/service-unavailable"
+	ErrTypeInvalidDomain       = "https://sigillum-validator.any53.com/errors/invalid-domain"
+	ErrTypeValidationFailed    = "https://sigillum-validator.any53.com/errors/validation-failed"
 )
 
 // writeProblemDetails writes an RFC 7807 Problem Details error response

@@ -1,6 +1,7 @@
 # Sigillum
 
 [![CI](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml/badge.svg)](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ptudor/sigillum-dnssec)](https://github.com/ptudor/sigillum-dnssec/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)](.go-version)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -12,14 +13,14 @@ The signer fits beside NSD or BIND and works with ordinary zone files. The valid
 streams its findings as it walks DNS delegations and checks signatures. Both are
 Go programs with embedded web interfaces and no database to administer.
 
-[Install](#install) · [Try the signer](#try-the-signer) · [Try the validator](#try-the-validator) · [Operations](docs/linux-packages.md) · [Releases](docs/releases.md)
+[Install](#install) · [Configure](#configure-the-signer) · [Try the signer](#try-the-signer) · [Try the validator](#try-the-validator) · [Operations](docs/linux-packages.md) · [Releases](docs/releases.md)
 
 ## Two tools, one operational loop
 
 | Tool | What it does | Executable |
 | --- | --- | --- |
-| **Signer** | Watches zones, signs changes, refreshes signatures, manages key rollovers, and exposes status and DS records. | `dnssec-tudor` |
-| **Validator** | Inspects DNSSEC chains, authoritative-server agreement, authenticated denial, and optional registrar DS information. | `dnssec-validator` |
+| **Signer** | Watches zones, signs changes, refreshes signatures, manages key rollovers, and exposes status and DS records. | `sigillum-signer` |
+| **Validator** | Inspects DNSSEC chains, authoritative-server agreement, authenticated denial, and optional registrar DS information. | `sigillum-validator` |
 
 ```mermaid
 flowchart LR
@@ -33,8 +34,8 @@ flowchart LR
 ```
 
 The programs run independently. Use the signer without the validator, or point the
-validator at zones signed by any other DNSSEC implementation. The existing binary
-names are retained so deployment commands and integrations remain familiar.
+validator at zones signed by any other DNSSEC implementation. Each component uses
+the same name for its executable, Linux package, service, and service account.
 
 ## What makes it useful
 
@@ -56,11 +57,12 @@ names are retained so deployment commands and integrations remain familiar.
 
 ## Install
 
-Download development binaries and packages from the artifacts of a successful
-[CI run](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
-Choose the `sigillum-dnssec-snapshot` artifact and the file matching your platform.
-See [build and verification instructions](docs/releases.md) for source builds,
-checksums, and the distinction between development artifacts and tagged releases.
+Download binaries and packages from the
+[1.0.0 release](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.0.0).
+Choose the file matching your OS and architecture, then follow the
+[verification instructions](docs/releases.md#verify-a-download).
+Development snapshots are also available from successful
+[CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
 
 | Platform | Architectures | Distribution |
 | --- | --- | --- |
@@ -73,10 +75,10 @@ the signer or validator you need. In a directory containing the downloaded files
 
 ```sh
 # Debian / Ubuntu
-sudo apt install ./dnssec-tudor_*_amd64.deb ./dnssec-validator_*_amd64.deb
+sudo apt install ./sigillum-signer_*_amd64.deb ./sigillum-validator_*_amd64.deb
 
 # Fedora / RHEL family (local packages are unsigned)
-sudo dnf --setopt=localpkg_gpgcheck=0 install ./dnssec-tudor-*.x86_64.rpm ./dnssec-validator-*.x86_64.rpm
+sudo dnf --setopt=localpkg_gpgcheck=0 install ./sigillum-signer-*.x86_64.rpm ./sigillum-validator-*.x86_64.rpm
 ```
 
 Use the `arm64` DEBs or `aarch64` RPMs on ARM. Packages install binaries under
@@ -84,6 +86,35 @@ Use the `arm64` DEBs or `aarch64` RPMs on ARM. Packages install binaries under
 start, or restart services.** Follow [Linux setup](docs/linux-packages.md) to configure
 nameserver access, publication hooks, and the validator’s recursive resolver.
 Package signatures and a hosted APT/YUM repository are not currently provided.
+
+## Configure the signer
+
+Save this as `/etc/sigillum-signer/config.toml`. The `example.invalid` zone is a
+placeholder for your own domain and unsigned zone file:
+
+```toml
+data_dir = "/var/lib/sigillum-signer"
+output_dir = "/var/lib/sigillum-signer/signed"
+poll_interval = "5m"
+
+[dnssec]
+algorithm = "ED25519"
+nsec_version = "nsec3"
+nsec3_iterations = 0
+serial_policy = "keep"
+
+[web]
+enabled = true
+listen = "127.0.0.1:8053"
+
+[zones."example.invalid"]
+path = "/etc/sigillum-signer/zones/example.invalid.zone"
+```
+
+The `sigillum-signer` account needs read access to the unsigned zone and write
+access to its state and signed-output directories. Connect the signed output to
+your nameserver and configure publication confirmation before using this with a
+real delegation; the [Linux guide](docs/linux-packages.md) walks through those steps.
 
 ## Try the signer
 
@@ -94,7 +125,7 @@ with the Go toolchain in [.go-version](.go-version):
 
 ```sh
 make build
-signer="$PWD/signer/dnssec-tudor"
+signer="$PWD/signer/sigillum-signer"
 demo_dir=$(mktemp -d)
 cp signer/testdata/zones/example.com.zone "$demo_dir/example.com.zone"
 cat > "$demo_dir/config.toml" <<EOF
@@ -124,10 +155,10 @@ After `make build`, copy the packaged configuration to a local file. Set
 `127.0.0.1`, assumes a locally installed resolver.
 
 ```sh
-cp packaging/dnssec-validator.toml ./validator.local.toml
+cp packaging/sigillum-validator.toml ./validator.local.toml
 # Edit recursive_resolver in validator.local.toml first.
-./validator/dnssec-validator -check -config ./validator.local.toml
-./validator/dnssec-validator -config ./validator.local.toml
+./validator/sigillum-validator -check -config ./validator.local.toml
+./validator/sigillum-validator -config ./validator.local.toml
 ```
 
 Open **http://127.0.0.1:8791** and enter a domain. From another terminal:

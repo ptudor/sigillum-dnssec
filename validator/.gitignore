@@ -1,4 +1,5 @@
 root-anchors.json
-dnssec-validator
+/sigillum-validator
+/dnssec-validator
 build/
 .env

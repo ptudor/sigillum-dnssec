@@ -69,7 +69,7 @@ type RegistrarDynadotConfig struct {
 	BaseURL     string   `toml:"base_url"`     // override the API endpoint (a local proxy or a test double); takes precedence over sandbox
 	Timeout     Duration `toml:"timeout"`      // default 30s
 	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
-	UserAgent   string   `toml:"user_agent"`   // override the default dnssec-tudor/<version> UA
+	UserAgent   string   `toml:"user_agent"`   // override the default sigillum-signer/<version> UA
 	// SendRequestID defaults to false because Dynadot's "X-Signature
 	// invalid" errors appear to correlate with header-case mismatches:
 	// Go HTTP/2 sends `x-request-id` (lowercase) while their docs
@@ -278,8 +278,8 @@ func (d Duration) String() string {
 // DefaultConfig returns a config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		OutputDir:    "/var/lib/dnssec-tudor/signed",
-		DataDir:      "/var/lib/dnssec-tudor",
+		OutputDir:    "/var/lib/sigillum-signer/signed",
+		DataDir:      "/var/lib/sigillum-signer",
 		PollInterval: Duration{5 * time.Minute},
 		DNSSEC: DNSSECConfig{
 			Algorithm:          "ED25519",
@@ -307,7 +307,7 @@ func DefaultConfig() *Config {
 		Heartbeat: HeartbeatConfig{
 			Enabled:         false,
 			URL:             "https://www.any53.com/any53/anystatus/heartbeat/",
-			App:             "dnssec-tudor",
+			App:             "sigillum-signer",
 			IntervalMinutes: 5,
 		},
 		Validation: ValidateConfig{

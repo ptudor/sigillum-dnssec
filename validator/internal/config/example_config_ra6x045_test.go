@@ -9,7 +9,7 @@ import (
 // The shipped example configuration and the keys the FreeBSD walkthrough tells
 // operators to set must load under the strict decoder (RA6X-045 verification).
 func TestShippedExampleAndWalkthroughKeysLoad(t *testing.T) {
-	example, err := filepath.Abs(filepath.Join("..", "..", "dnssec-validator.toml.example"))
+	example, err := filepath.Abs(filepath.Join("..", "..", "config.toml.example"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,14 +21,14 @@ func TestShippedExampleAndWalkthroughKeysLoad(t *testing.T) {
 	}
 
 	walkthrough := `listen_addr = "127.0.0.1:8791"
-root_anchors_path = "/var/www/internet.any53.com/dns/anchors/root-anchors.json"
+root_anchors_path = "/usr/local/etc/sigillum-validator/root-anchors.json"
 root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
 recursive_resolver = "127.0.0.1"
 
 [logging]
 format = "json"
 level = "info"
-file = "/var/log/tudordns/dnssec-validator.log"
+file = "/var/log/sigillum-validator/sigillum-validator.log"
 `
 	path := filepath.Join(t.TempDir(), "walkthrough.toml")
 	if err := os.WriteFile(path, []byte(walkthrough), 0644); err != nil {

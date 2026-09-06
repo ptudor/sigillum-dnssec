@@ -24,7 +24,7 @@ func TestRecordAPIRequest_BoundedMethodLabel(t *testing.T) {
 	methods := map[string]bool{}
 	var other float64
 	for _, f := range families {
-		if f.GetName() != "dnssec_validator_api_requests_total" {
+		if f.GetName() != "sigillum_validator_api_requests_total" {
 			continue
 		}
 		for _, m := range f.GetMetric() {

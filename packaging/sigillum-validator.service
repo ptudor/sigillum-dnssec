@@ -1,20 +1,18 @@
 [Unit]
-Description=Sigillum DNSSEC zone signer
+Description=Sigillum DNSSEC validation service
 Documentation=https://github.com/ptudor/sigillum-dnssec
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=dnssec-tudor
-Group=dnssec-tudor
-ExecStart=/usr/bin/dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
-ExecReload=/bin/kill -HUP $MAINPID
+User=sigillum-validator
+Group=sigillum-validator
+ExecStartPre=/usr/bin/sigillum-validator -check -config /etc/sigillum-validator/config.toml
+ExecStart=/usr/bin/sigillum-validator -config /etc/sigillum-validator/config.toml
 Restart=on-failure
 RestartSec=5s
 UMask=0027
-StateDirectory=dnssec-tudor
-StateDirectoryMode=0750
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

@@ -56,9 +56,9 @@ func main() {
 
 	// Root command
 	rootCmd := &cobra.Command{
-		Use:   "dnssec-tudor",
+		Use:   "sigillum-signer",
 		Short: "A minimal DNSSEC signing daemon",
-		Long: `dnssec-tudor is a minimal, opinionated DNSSEC signing daemon for sysadmins
+		Long: `sigillum-signer is a minimal, opinionated DNSSEC signing daemon for sysadmins
 who just want zones signed without the complexity of full-featured solutions.
 
 It watches unsigned zone files, generates keys, signs zones automatically,
@@ -74,7 +74,7 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 	}
 
 	// Persistent flags
-	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "/etc/dnssec-tudor/config.toml", "Path to config file")
+	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "/etc/sigillum-signer/config.toml", "Path to config file")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", getEnvOrDefault("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", getEnvOrDefault("LOG_FORMAT", "text"), "Log format (text, json)")
 	rootCmd.PersistentFlags().StringVar(&logOutput, "log-output", getEnvOrDefault("LOG_OUTPUT", "stderr"), "Log output (stderr, syslog, or file path)")
@@ -84,7 +84,7 @@ and outputs signed zones for authoritative nameservers like NSD.`,
 		Use:   "version",
 		Short: "Print version information",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("dnssec-tudor %s (built %s)\n", Version, BuildTime)
+			fmt.Printf("sigillum-signer %s (built %s)\n", Version, BuildTime)
 		},
 	}
 
@@ -253,7 +253,7 @@ For example, if your keys are:
 Use: --ksk Kexample.com.+015+12345
 
 The command will read both .key and .private files, convert them to
-dnssec-tudor's format, and set up the zone for management.`,
+sigillum-signer's format, and set up the zone for management.`,
 		Args: cobra.ExactArgs(2),
 		RunE: runImport,
 	}
@@ -642,7 +642,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	slog.Info("[DAEMON] Starting dnssec-tudor",
+	slog.Info("[DAEMON] Starting sigillum-signer",
 		"version", Version,
 		"config", configPath,
 		"poll_interval", cfg.PollInterval.String(),
@@ -1115,7 +1115,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		slog.Warn("[CLI] zone added, but the KSK could not be loaded to print its DS record",
 			"domain", domain, "error", err)
-		fmt.Printf("Could not print the DS record automatically; run `dnssec-tudor ds %s` to retrieve it.\n", domain)
+		fmt.Printf("Could not print the DS record automatically; run `sigillum-signer ds %s` to retrieve it.\n", domain)
 	} else {
 		if kskGenerated {
 			fmt.Println("Add the following DS record to your registrar:")
@@ -1135,7 +1135,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	if hookOK {
 		MaybeAutoPublishDS(cfg, state, domain, "add")
 	} else {
-		fmt.Printf("DS auto-publish skipped: the post-sign hook failed. Once the zone is served, run `dnssec-tudor registrar push %s`.\n", domain)
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed. Once the zone is served, run `sigillum-signer registrar push %s`.\n", domain)
 	}
 
 	return nil
@@ -1184,7 +1184,7 @@ func runRemove(cmd *cobra.Command, args []string) error {
 				// form the line matcher doesn't recognize). Printing success
 				// would leave the entry in the file and a SIGHUPed daemon
 				// would re-adopt the zone — surface it instead.
-				return fmt.Errorf("zone %q is in the config but its [zones.%q] table header could not be located in %s; remove the entry by hand, then re-run `dnssec-tudor remove %s`",
+				return fmt.Errorf("zone %q is in the config but its [zones.%q] table header could not be located in %s; remove the entry by hand, then re-run `sigillum-signer remove %s`",
 					domain, domain, configPath, domain)
 			}
 			return fmt.Errorf("removing zone from config file: %w", err)
@@ -1262,12 +1262,12 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading new KSK for DS: %w", err)
 	}
 	fmt.Println(signerpkg.FormatDSRecordsFromKey(domain, kskKey))
-	fmt.Printf("\nOnce the new DS is published, run: dnssec-tudor rollover complete %s\n", domain)
+	fmt.Printf("\nOnce the new DS is published, run: sigillum-signer rollover complete %s\n", domain)
 
 	if hookOK {
 		MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
 	} else {
-		fmt.Printf("DS auto-publish skipped: the post-sign hook failed, so the new KSK is not confirmed served yet. Once it is, run `dnssec-tudor registrar push %s`.\n", domain)
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed, so the new KSK is not confirmed served yet. Once it is, run `sigillum-signer registrar push %s`.\n", domain)
 	}
 
 	return nil
@@ -1322,7 +1322,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot complete rollover type %q manually", rollover.Type)
 	}
 	if !rollover.NeedsOperator() || rollover.State == statepkg.AlgoRolloverStateOldDSRemoval {
-		return fmt.Errorf("rollover for %s is in phase %s: retirement continues automatically (the daemon or `dnssec-tudor sign` advances it); current action: %s", domain, rollover.State, rollover.Action)
+		return fmt.Errorf("rollover for %s is in phase %s: retirement continues automatically (the daemon or `sigillum-signer sign` advances it); current action: %s", domain, rollover.State, rollover.Action)
 	}
 
 	// Before the old KSK can ever be retired, the new KSK's DS must be live at
@@ -1369,7 +1369,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("completing KSK rollover: %w", err)
 		}
 		fmt.Printf("KSK rollover for %s is entering its retirement wait.\n", domain)
-		fmt.Printf("Both KSKs stay published until %s (parent DS TTL); the old KSK is then retired automatically by the daemon or the next `dnssec-tudor sign`.\n",
+		fmt.Printf("Both KSKs stay published until %s (parent DS TTL); the old KSK is then retired automatically by the daemon or the next `sigillum-signer sign`.\n",
 			now.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339))
 		fmt.Println("You may remove the OLD DS record from your registrar now.")
 	case "algorithm":
@@ -1401,7 +1401,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	if hookOK {
 		MaybeAutoPublishDS(cfg, state, domain, "rollover_complete")
 	} else {
-		fmt.Printf("DS auto-publish skipped: the post-sign hook failed. Run `dnssec-tudor registrar push %s` once the zone is served.\n", domain)
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed. Run `sigillum-signer registrar push %s` once the zone is served.\n", domain)
 	}
 
 	return nil
@@ -1467,12 +1467,12 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println(ds.String())
 	fmt.Println()
-	fmt.Printf("After the new DS propagates, run: dnssec-tudor rollover complete %s\n", domain)
+	fmt.Printf("After the new DS propagates, run: sigillum-signer rollover complete %s\n", domain)
 
 	if hookOK {
 		MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
 	} else {
-		fmt.Printf("DS auto-publish skipped: the post-sign hook failed, so the new KSK is not confirmed served yet. Once it is, run `dnssec-tudor registrar push %s`.\n", domain)
+		fmt.Printf("DS auto-publish skipped: the post-sign hook failed, so the new KSK is not confirmed served yet. Once it is, run `sigillum-signer registrar push %s`.\n", domain)
 	}
 
 	return nil
@@ -1950,7 +1950,7 @@ func (tx *importTx) rollback() []string {
 	}
 	if tx.stateSaved {
 		if err := persistState(tx.state); err != nil {
-			note("could not remove the zone from state.json (%v); run `dnssec-tudor remove %s` before retrying", err, tx.domain)
+			note("could not remove the zone from state.json (%v); run `sigillum-signer remove %s` before retrying", err, tx.domain)
 		}
 	}
 

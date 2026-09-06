@@ -11,7 +11,7 @@ import (
 var (
 	promValidationsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "dnssec_validator_validations_total",
+			Name: "sigillum_validator_validations_total",
 			Help: "Total number of DNSSEC validations",
 		},
 		[]string{"status"}, // secure, insecure, bogus, indeterminate
@@ -19,7 +19,7 @@ var (
 
 	promValidationDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "dnssec_validator_validation_duration_seconds",
+			Name:    "sigillum_validator_validation_duration_seconds",
 			Help:    "DNSSEC validation duration in seconds",
 			Buckets: []float64{.1, .25, .5, 1, 2.5, 5, 10, 15, 30},
 		},
@@ -28,7 +28,7 @@ var (
 
 	promAPIRequests = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "dnssec_validator_api_requests_total",
+			Name: "sigillum_validator_api_requests_total",
 			Help: "Total number of API requests",
 		},
 		[]string{"endpoint", "method", "status"},
@@ -36,7 +36,7 @@ var (
 
 	promAPIRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "dnssec_validator_api_request_duration_seconds",
+			Name:    "sigillum_validator_api_request_duration_seconds",
 			Help:    "API request duration in seconds",
 			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30},
 		},
@@ -45,21 +45,21 @@ var (
 
 	promRateLimitHits = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "dnssec_validator_rate_limit_hits_total",
+			Name: "sigillum_validator_rate_limit_hits_total",
 			Help: "Total number of requests rejected by rate limiting",
 		},
 	)
 
 	promActiveValidations = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "dnssec_validator_active_validations",
+			Name: "sigillum_validator_active_validations",
 			Help: "Number of currently active validations",
 		},
 	)
 
 	promActiveSSEConnections = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "dnssec_validator_active_sse_connections",
+			Name: "sigillum_validator_active_sse_connections",
 			Help: "Number of currently active SSE connections",
 		},
 	)
@@ -67,12 +67,12 @@ var (
 
 // expvar metrics for simple debugging
 var (
-	expvarValidationsTotal     = expvar.NewInt("dnssec_validator_validations_total")
-	expvarValidationsSecure    = expvar.NewInt("dnssec_validator_validations_secure")
-	expvarValidationsInsecure  = expvar.NewInt("dnssec_validator_validations_insecure")
-	expvarValidationsBogus     = expvar.NewInt("dnssec_validator_validations_bogus")
-	expvarRateLimitHits        = expvar.NewInt("dnssec_validator_rate_limit_hits")
-	expvarActiveSSEConnections = expvar.NewInt("dnssec_validator_active_sse_connections")
+	expvarValidationsTotal     = expvar.NewInt("sigillum_validator_validations_total")
+	expvarValidationsSecure    = expvar.NewInt("sigillum_validator_validations_secure")
+	expvarValidationsInsecure  = expvar.NewInt("sigillum_validator_validations_insecure")
+	expvarValidationsBogus     = expvar.NewInt("sigillum_validator_validations_bogus")
+	expvarRateLimitHits        = expvar.NewInt("sigillum_validator_rate_limit_hits")
+	expvarActiveSSEConnections = expvar.NewInt("sigillum_validator_active_sse_connections")
 )
 
 func init() {
@@ -96,12 +96,12 @@ func init() {
 func RegisterRootAnchorMetrics(ageFn func() float64, activeFn func() float64) {
 	prometheus.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
-			Name: "dnssec_validator_root_anchors_age_seconds",
+			Name: "sigillum_validator_root_anchors_age_seconds",
 			Help: "Age in seconds of the last successfully loaded root anchor set (NaN if never loaded)",
 		}, ageFn))
 	prometheus.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
-			Name: "dnssec_validator_root_anchors_active",
+			Name: "sigillum_validator_root_anchors_active",
 			Help: "Number of currently-active (validity window open), pinned root trust anchors able to establish root trust",
 		}, activeFn))
 }

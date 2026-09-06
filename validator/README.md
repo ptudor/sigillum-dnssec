@@ -1,6 +1,6 @@
 # Sigillum DNSSEC validator
 
-`dnssec-validator` walks DNS delegations, checks DNSSEC material against its chain
+`sigillum-validator` walks DNS delegations, checks DNSSEC material against its chain
 of trust, and streams progress to an embedded browser interface. It is a diagnostic
 HTTP service, not a recursive resolver to put in `/etc/resolv.conf`.
 
@@ -14,9 +14,9 @@ From this directory:
 
 ```sh
 make build
-./dnssec-validator -version
-./dnssec-validator -check -config ../packaging/dnssec-validator.toml
-./dnssec-validator -config ../packaging/dnssec-validator.toml
+./sigillum-validator -version
+./sigillum-validator -check -config ../packaging/sigillum-validator.toml
+./sigillum-validator -config ../packaging/sigillum-validator.toml
 ```
 
 The packaged configuration binds to **127.0.0.1:8791**. Set `recursive_resolver`
@@ -28,9 +28,10 @@ to authoritative servers and HTTPS to any configured remote metadata services.
 or contacting DNS. A successful check does not prove that root anchors or upstream
 services are available. `-version` works without a configuration file.
 
-Without `-config`, the application searches its existing TudorDNS configuration
-paths and then uses environment-based configuration. For a new deployment, pass
-an explicit TOML path so the selected configuration is unambiguous. Unknown TOML
+Without `-config`, the application searches `/usr/local/etc/sigillum-validator/config.toml`,
+`/etc/sigillum-validator/config.toml`, and then `./config.toml`. If none exists, it
+uses environment-based configuration. For a new deployment, pass an explicit TOML
+path so the selected configuration is unambiguous. Unknown TOML
 keys are errors. The web UI is embedded; `static_dir` is deprecated and ignored.
 
 ## HTTP interface

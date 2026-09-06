@@ -1,6 +1,6 @@
-# AnyStatus Integration for dnssec-validator
+# AnyStatus Integration for sigillum-validator
 
-This service integrates with [AnyStatus](https://www.any53.com/any53/anystatus/) for "green light" monitoring. The dashboard shows whether dnssec-validator is running and healthy.
+This service integrates with [AnyStatus](https://www.any53.com/any53/anystatus/) for "green light" monitoring. The dashboard shows whether sigillum-validator is running and healthy.
 
 ## Quick Setup
 
@@ -11,21 +11,21 @@ https://www.any53.com/any53/admin/anystatus/serviceheartbeat/add/
 
 | Field | Value |
 |-------|-------|
-| `app_key` | `dnssec-validator` |
+| `app_key` | `sigillum-validator` |
 | `app_name` | `DNSSEC Validator` |
 | `stale_threshold_minutes` | `15` |
 | `dead_threshold_minutes` | `60` |
 
 Copy the generated `api_key` for the next step.
 
-### 2. Configure dnssec-validator
+### 2. Configure sigillum-validator
 
 Add to your environment file or `.env`:
 
 ```bash
 HEARTBEAT_ENABLED=true
 HEARTBEAT_API_KEY=paste-your-api-key-here
-HEARTBEAT_APP=dnssec-validator
+HEARTBEAT_APP=sigillum-validator
 HEARTBEAT_STATUS_URL=/
 HEARTBEAT_INTERVAL_MINUTES=5
 ```
@@ -33,7 +33,7 @@ HEARTBEAT_INTERVAL_MINUTES=5
 ### 3. Restart the Service
 
 ```sh
-service dnssec_validator restart
+service sigillum-validator restart
 ```
 
 Check the dashboard: https://www.any53.com/any53/anystatus/
@@ -47,7 +47,7 @@ Check the dashboard: https://www.any53.com/any53/anystatus/
 | `HEARTBEAT_ENABLED` | `false` | Enable heartbeat monitoring |
 | `HEARTBEAT_URL` | `https://www.any53.com/any53/anystatus/heartbeat/` | Heartbeat endpoint (rarely needs changing) |
 | `HEARTBEAT_API_KEY` | (none) | API key from AnyStatus registration (REQUIRED) |
-| `HEARTBEAT_APP` | `dnssec-validator` | Application identifier (must match registered app_key) |
+| `HEARTBEAT_APP` | `sigillum-validator` | Application identifier (must match registered app_key) |
 | `HEARTBEAT_STATUS_URL` | (none) | URL to status page (shown as link on dashboard) |
 | `HEARTBEAT_INSTANCE_ID` | (hostname) | Instance identifier for multiple instances |
 | `HEARTBEAT_INTERVAL_MINUTES` | `5` | Background heartbeat interval (integer minutes) |
@@ -56,7 +56,7 @@ Check the dashboard: https://www.any53.com/any53/anystatus/
 
 ## Status Actions
 
-dnssec-validator sends these actions to indicate what it's doing:
+sigillum-validator sends these actions to indicate what it's doing:
 
 | Action | Description |
 |--------|-------------|
@@ -105,11 +105,11 @@ Set your AnyStatus thresholds based on expected activity:
 
 - Check that `HEARTBEAT_ENABLED=true` in config
 - Verify `HEARTBEAT_API_KEY` and `HEARTBEAT_APP` match AnyStatus registration
-- Check logs for heartbeat errors: `grep -i heartbeat /var/log/tudordns/dnssec-validator.log`
+- Check logs for heartbeat errors: `grep -i heartbeat /var/log/sigillum-validator/sigillum-validator.log`
 
 ### Service shows "Dead" (red)
 
-- Is the service running? `service dnssec_validator status`
+- Is the service running? `service sigillum-validator status`
 - Can it reach the internet? `curl -s https://www.any53.com/any53/anystatus/`
 - Check for network/firewall issues
 
@@ -118,7 +118,7 @@ Set your AnyStatus thresholds based on expected activity:
 ```sh
 curl -X POST "https://www.any53.com/any53/anystatus/heartbeat/" \
   -d "api_key=YOUR_KEY" \
-  -d "app=dnssec-validator" \
+  -d "app=sigillum-validator" \
   -d "action=test"
 ```
 

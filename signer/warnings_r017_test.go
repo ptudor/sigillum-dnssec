@@ -14,7 +14,7 @@ func TestR017_StickyWarningsSurviveTransientClear(t *testing.T) {
 	z := &statepkg.ZoneState{}
 	z.AddWarning("URGENT: registrar left zone with ZERO DS at parent; re-run push")
 	z.AddWarning("ZSK expires in 3 days (will auto-rollover)")
-	z.AddWarning("KSK rollover due - run 'dnssec-tudor rollover start example.com'")
+	z.AddWarning("KSK rollover due - run 'sigillum-signer rollover start example.com'")
 
 	// A successful sign refreshes transient notices but must keep the URGENT one.
 	z.ClearTransientWarnings()

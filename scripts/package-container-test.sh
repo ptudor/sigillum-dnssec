@@ -16,7 +16,7 @@ else
     format=rpm
 fi
 
-services='dnssec-tudor dnssec-validator'
+services='sigillum-signer sigillum-validator'
 for service in $services; do
     getent passwd "$service"
     test -x "/usr/bin/$service"
@@ -27,17 +27,13 @@ for service in $services; do
     grep -q '^## github.com/' "/usr/share/doc/$service/copyright"
     # The package must not create an enablement symlink or start a process.
     test ! -e "/etc/systemd/system/multi-user.target.wants/$service.service"
-    # Linux comm names stop at 15 bytes (dnssec-validator is longer).
+    # Linux comm names stop at 15 bytes (sigillum-validator is longer).
     if pgrep -x "$(printf '%.15s' "$service")"; then
         echo "Package unexpectedly started $service" >&2
         exit 1
     fi
     systemd-analyze verify "/usr/lib/systemd/system/$service.service"
-    if [ "$service" = dnssec-tudor ]; then
-        config="/etc/$service/config.toml"
-    else
-        config="/etc/$service/$service.toml"
-    fi
+    config="/etc/$service/config.toml"
     test "$(stat -c %a "$config")" = 640
     test "$(stat -c %U "$config")" = root
     test "$(stat -c %G "$config")" = "$service"
@@ -46,11 +42,11 @@ for service in $services; do
     printf 'preserve state\n' > "/var/lib/$service/package-test-sentinel"
 done
 
-dnssec-tudor version
-dnssec-validator -version
-runuser -u dnssec-validator -- dnssec-validator -check -config /etc/dnssec-validator/dnssec-validator.toml
+sigillum-signer version | grep '^sigillum-signer '
+sigillum-validator -version | grep '^sigillum-validator '
+runuser -u sigillum-validator -- sigillum-validator -check -config /etc/sigillum-validator/config.toml
 # Empty zone set: verify account permissions without modifying a live zone.
-runuser -u dnssec-tudor -- dnssec-tudor sign --config /etc/dnssec-tudor/config.toml
+runuser -u sigillum-signer -- sigillum-signer sign --config /etc/sigillum-signer/config.toml
 
 # Reinstall through the package manager with a locally edited configuration.
 # conffile retention uses the same package-manager mechanism on version upgrades.
@@ -60,11 +56,7 @@ else
     dnf reinstall -y --setopt=localpkg_gpgcheck=0 "$@"
 fi
 for service in $services; do
-    if [ "$service" = dnssec-tudor ]; then
-        config="/etc/$service/config.toml"
-    else
-        config="/etc/$service/$service.toml"
-    fi
+    config="/etc/$service/config.toml"
     grep -q '^# package-upgrade-sentinel$' "$config"
     test -f "/var/lib/$service/package-test-sentinel"
     test ! -e "/etc/systemd/system/multi-user.target.wants/$service.service"

@@ -1,4 +1,4 @@
-# dnssec-tudor
+# sigillum-signer
 
 A minimal, opinionated DNSSEC signing daemon for sysadmins who just want zones signed.
 
@@ -9,7 +9,7 @@ cover the packaged service account and permissions.
 
 ## Why This Exists
 
-**dnssec-tudor** is for a sysadmin managing a small set of domains on a single
+**sigillum-signer** is for a sysadmin managing a small set of domains on a single
 server, using NSD or a similar authoritative server, who wants a focused tool for
 signing BIND-style zone files and managing their keys.
 
@@ -33,10 +33,10 @@ See [QUICKSTART.md](QUICKSTART.md) for a complete walkthrough.
 make build
 
 # Add a domain (generates keys, signs zone)
-./dnssec-tudor add example.com /etc/nsd/zones/example.com.zone --config /etc/dnssec-tudor/config.toml
+./sigillum-signer add example.com /etc/nsd/zones/example.com.zone --config /etc/sigillum-signer/config.toml
 
 # Copy the DS record to your registrar, then run as daemon
-./dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
+./sigillum-signer serve --config /etc/sigillum-signer/config.toml
 ```
 
 ## Installation
@@ -59,25 +59,25 @@ make build-darwin-arm64 # macOS Apple Silicon
 
 ```bash
 # Create directories
-sudo mkdir -p /etc/dnssec-tudor
-sudo mkdir -p /var/lib/dnssec-tudor/{keys,signed}
+sudo mkdir -p /etc/sigillum-signer
+sudo mkdir -p /var/lib/sigillum-signer/{keys,signed}
 
 # Set permissions (run daemon as dedicated user)
-sudo useradd -r -s /bin/false dnssec-tudor
-sudo chown -R dnssec-tudor:dnssec-tudor /var/lib/dnssec-tudor
-sudo chmod 700 /var/lib/dnssec-tudor/keys
+sudo useradd -r -s /bin/false sigillum-signer
+sudo chown -R sigillum-signer:sigillum-signer /var/lib/sigillum-signer
+sudo chmod 700 /var/lib/sigillum-signer/keys
 ```
 
 ## Configuration
 
-Create `/etc/dnssec-tudor/config.toml`:
+Create `/etc/sigillum-signer/config.toml`:
 
 ```toml
 # Where to write signed zone files
-output_dir = "/var/lib/dnssec-tudor/signed"
+output_dir = "/var/lib/sigillum-signer/signed"
 
 # Where to store keys and state
-data_dir = "/var/lib/dnssec-tudor"
+data_dir = "/var/lib/sigillum-signer"
 
 # How often to check for zone changes
 poll_interval = "5m"
@@ -171,32 +171,32 @@ detection), `published_serial` is what the world sees.
 
 ```bash
 # Run in foreground
-dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
+sigillum-signer serve --config /etc/sigillum-signer/config.toml
 
 # With web UI on custom port (loopback only — the dashboard is unauthenticated;
 # a non-loopback --web address is refused unless web.allow_remote = true)
-dnssec-tudor serve --config /etc/dnssec-tudor/config.toml --web 127.0.0.1:8080
+sigillum-signer serve --config /etc/sigillum-signer/config.toml --web 127.0.0.1:8080
 ```
 
 ### One-Shot Signing
 
 ```bash
 # Sign all zones and exit
-dnssec-tudor sign --config /etc/dnssec-tudor/config.toml
+sigillum-signer sign --config /etc/sigillum-signer/config.toml
 ```
 
 ### Domain Management
 
 ```bash
 # Add a new domain (generates fresh keys)
-dnssec-tudor add example.com /path/to/zone.db --config config.toml
+sigillum-signer add example.com /path/to/zone.db --config config.toml
 
 # Force re-sign a domain (bypasses change detection)
-dnssec-tudor resign example.com --config config.toml
+sigillum-signer resign example.com --config config.toml
 
 # Remove a domain from state AND the config file (keys are NOT deleted).
 # A running daemon still holds the old config in memory — send it SIGHUP to reload.
-dnssec-tudor remove example.com --config config.toml
+sigillum-signer remove example.com --config config.toml
 ```
 
 ### Updating Zone Files
@@ -215,8 +215,8 @@ directories are rejected as zone sources.
 
 ```bash
 # Safe: atomic replacement
-generate-zone > /etc/dnssec-tudor/zones/example.com.db.tmp && \
-  mv /etc/dnssec-tudor/zones/example.com.db.tmp /etc/dnssec-tudor/zones/example.com.db
+generate-zone > /etc/sigillum-signer/zones/example.com.db.tmp && \
+  mv /etc/sigillum-signer/zones/example.com.db.tmp /etc/sigillum-signer/zones/example.com.db
 ```
 
 Changing a zone's `path` in the config (then `SIGHUP`, `sign` or `resign`)
@@ -229,19 +229,19 @@ cycle, and a changed `output_dir` is populated on the next cycle after reload.
 
 If you have existing BIND-style DNSSEC keys (from `dnssec-keygen` or similar), you can import them without changing your DS records at the registrar:
 
-The key files dnssec-tudor writes are in the same BIND private-key format
+The key files sigillum-signer writes are in the same BIND private-key format
 (`Private-key-format: v1.3`), with ED25519 keys stored as the 32-byte seed
 that BIND, ldns and RFC 8080 use, so they can be read back by those tools for
 recovery or migration; the DNSKEY and DS never change. Files written by older
 versions stored Go's 64-byte expanded ED25519 key and remain readable by
-dnssec-tudor; they are not rewritten in place. A key passes through the seed
+sigillum-signer; they are not rewritten in place. A key passes through the seed
 serialization when it is imported or when a rollover stages its successor, so
 to hand a legacy file to another tool, convert its `PrivateKey:` value to the
 first 32 bytes (the seed) — the DNSKEY and DS stay the same.
 
 ```bash
 # Import existing keys
-dnssec-tudor import example.com /path/to/zone.db \
+sigillum-signer import example.com /path/to/zone.db \
   --ksk /path/to/Kexample.com.+015+12345 \
   --zsk /path/to/Kexample.com.+015+67890 \
   --config config.toml
@@ -256,7 +256,7 @@ Use: `--ksk Kexample.com.+015+12345`
 The import command will:
 1. Read and validate the BIND-style key files
 2. Verify KSK (flag 257) and ZSK (flag 256)
-3. Convert to dnssec-tudor's format
+3. Convert to sigillum-signer's format
 4. Add the zone to config.toml
 5. Sign the zone
 6. Display the DS record for verification against your registrar
@@ -265,14 +265,14 @@ The import command will:
 
 ```bash
 # Get DS record for registrar
-dnssec-tudor ds example.com --config config.toml
+sigillum-signer ds example.com --config config.toml
 
 # Get DNSKEY records
-dnssec-tudor dnskey example.com --config config.toml
+sigillum-signer dnskey example.com --config config.toml
 
 # Check status
-dnssec-tudor status --config config.toml
-dnssec-tudor status --domain example.com --config config.toml
+sigillum-signer status --config config.toml
+sigillum-signer status --domain example.com --config config.toml
 ```
 
 ### Key Rollover
@@ -281,13 +281,13 @@ ZSK rollover is fully automatic. KSK rollover requires DS updates at your regist
 
 ```bash
 # Start KSK rollover (generates new key, shows new DS)
-dnssec-tudor rollover start example.com --config config.toml
+sigillum-signer rollover start example.com --config config.toml
 
 # After publishing the new DS at the registrar, record that it has propagated
-dnssec-tudor rollover complete example.com --config config.toml
+sigillum-signer rollover complete example.com --config config.toml
 
 # Check rollover status
-dnssec-tudor rollover status example.com --config config.toml
+sigillum-signer rollover status example.com --config config.toml
 ```
 
 `rollover complete` checks that the new DS is present at **every** parent
@@ -312,10 +312,10 @@ To change algorithms (e.g., ECDSA to ED25519), use the algorithm rollover comman
 
 ```bash
 # Start algorithm rollover (generates new keys with target algorithm)
-dnssec-tudor rollover algorithm example.com ED25519 --config config.toml
+sigillum-signer rollover algorithm example.com ED25519 --config config.toml
 
 # After publishing new DS at registrar, complete rollover
-dnssec-tudor rollover complete example.com --config config.toml
+sigillum-signer rollover complete example.com --config config.toml
 ```
 
 During algorithm rollover, the zone is signed with both the old and new
@@ -332,7 +332,7 @@ Configure NSD to use the signed zone files:
 # /etc/nsd/nsd.conf
 zone:
     name: "example.com"
-    zonefile: "/var/lib/dnssec-tudor/signed/example.com.zone.signed"
+    zonefile: "/var/lib/sigillum-signer/signed/example.com.zone.signed"
 ```
 
 The `post_sign` hook reloads NSD after signing. Environment variables are available for per-zone operations:
@@ -363,8 +363,8 @@ The following environment variables are available in hooks:
 |----------|-------------|---------|
 | `DNSSEC_DOMAIN` | Domain that was signed | `example.com` |
 | `DNSSEC_ZONE_PATH` | Path to unsigned zone file | `/etc/nsd/zones/example.com.zone` |
-| `DNSSEC_SIGNED_PATH` | Path to signed zone file | `/var/lib/dnssec-tudor/signed/example.com.zone.signed` |
-| `DNSSEC_OUTPUT_DIR` | Output directory | `/var/lib/dnssec-tudor/signed` |
+| `DNSSEC_SIGNED_PATH` | Path to signed zone file | `/var/lib/sigillum-signer/signed/example.com.zone.signed` |
+| `DNSSEC_OUTPUT_DIR` | Output directory | `/var/lib/sigillum-signer/signed` |
 
 With `coalesce_post_sign = true` the hook fires once per signing cycle instead
 of once per zone, receiving `DNSSEC_DOMAINS` (space-separated list) and
@@ -397,7 +397,7 @@ secondaries), have it trigger an asynchronous process instead.
 // named.conf
 zone "example.com" {
     type master;
-    file "/var/lib/dnssec-tudor/signed/example.com.zone.signed";
+    file "/var/lib/sigillum-signer/signed/example.com.zone.signed";
 };
 ```
 
@@ -470,10 +470,10 @@ ED25519 (algorithm 15) has excellent resolver support but some registrars may no
 ## File Locations
 
 ```
-/etc/dnssec-tudor/
+/etc/sigillum-signer/
 ├── config.toml              # Configuration
 
-/var/lib/dnssec-tudor/
+/var/lib/sigillum-signer/
 ├── state.json               # Daemon state
 ├── keys/
 │   ├── example.com.ksk.key      # Public KSK
@@ -500,20 +500,20 @@ curl http://127.0.0.1:8054/metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `dnssec_tudor_zones_total` | Gauge | Total zones managed |
-| `dnssec_tudor_zones_healthy` | Gauge | Zones in healthy state |
-| `dnssec_tudor_zones_action_required` | Gauge | Zones needing action |
-| `dnssec_tudor_zones_errors` | Gauge | Zones with errors |
-| `dnssec_tudor_signing_operations_total` | Counter | Signing operations by domain/status |
-| `dnssec_tudor_signing_duration_seconds` | Histogram | Signing duration by domain |
-| `dnssec_tudor_last_signing_timestamp_seconds` | Gauge | Last successful sign time |
-| `dnssec_tudor_signature_expiry_timestamp_seconds` | Gauge | When signatures expire |
-| `dnssec_tudor_ksk_expiry_timestamp_seconds` | Gauge | KSK expiry time |
-| `dnssec_tudor_zsk_expiry_timestamp_seconds` | Gauge | ZSK expiry time |
-| `dnssec_tudor_rollover_in_progress` | Gauge | Rollover active (1/0) |
-| `dnssec_tudor_rollover_operations_total` | Counter | Rollover operations |
-| `dnssec_tudor_hook_executions_total` | Counter | Hook executions by status |
-| `dnssec_tudor_hook_duration_seconds` | Histogram | Hook execution duration |
+| `sigillum_signer_zones_total` | Gauge | Total zones managed |
+| `sigillum_signer_zones_healthy` | Gauge | Zones in healthy state |
+| `sigillum_signer_zones_action_required` | Gauge | Zones needing action |
+| `sigillum_signer_zones_errors` | Gauge | Zones with errors |
+| `sigillum_signer_signing_operations_total` | Counter | Signing operations by domain/status |
+| `sigillum_signer_signing_duration_seconds` | Histogram | Signing duration by domain |
+| `sigillum_signer_last_signing_timestamp_seconds` | Gauge | Last successful sign time |
+| `sigillum_signer_signature_expiry_timestamp_seconds` | Gauge | When signatures expire |
+| `sigillum_signer_ksk_expiry_timestamp_seconds` | Gauge | KSK expiry time |
+| `sigillum_signer_zsk_expiry_timestamp_seconds` | Gauge | ZSK expiry time |
+| `sigillum_signer_rollover_in_progress` | Gauge | Rollover active (1/0) |
+| `sigillum_signer_rollover_operations_total` | Counter | Rollover operations |
+| `sigillum_signer_hook_executions_total` | Counter | Hook executions by status |
+| `sigillum_signer_hook_duration_seconds` | Histogram | Hook execution duration |
 
 Configure the health server address in `config.toml`:
 
@@ -528,7 +528,7 @@ listen = "127.0.0.1:8054"
 
 ```bash
 # Using ldns-utils
-ldns-verify-zone /var/lib/dnssec-tudor/signed/example.com.zone.signed
+ldns-verify-zone /var/lib/sigillum-signer/signed/example.com.zone.signed
 
 # Using dig
 dig +dnssec example.com @localhost
@@ -538,7 +538,7 @@ dig +dnssec example.com @localhost
 
 ```bash
 # Get DS from signed zone
-dnssec-tudor ds example.com --config config.toml
+sigillum-signer ds example.com --config config.toml
 
 # Compare with published DS
 dig DS example.com +short
@@ -547,7 +547,7 @@ dig DS example.com +short
 ### Debug Logging
 
 ```bash
-dnssec-tudor serve --config config.toml --log-level debug
+sigillum-signer serve --config config.toml --log-level debug
 ```
 
 ### Log Output Options
@@ -556,13 +556,13 @@ By default, logs go to stderr. For production on FreeBSD/Linux, use syslog:
 
 ```bash
 # Log to syslog (daemon facility)
-dnssec-tudor serve --config config.toml --log-output syslog
+sigillum-signer serve --config config.toml --log-output syslog
 
 # Log to a file
-dnssec-tudor serve --config config.toml --log-output /var/log/dnssec-tudor.log
+sigillum-signer serve --config config.toml --log-output /var/log/sigillum-signer.log
 
 # Combine with JSON format for log aggregation
-dnssec-tudor serve --config config.toml --log-output syslog --log-format json
+sigillum-signer serve --config config.toml --log-output syslog --log-format json
 ```
 
 Environment variables are also supported: `LOG_OUTPUT`, `LOG_LEVEL`, `LOG_FORMAT`.

@@ -26,12 +26,12 @@ A release stays a draft if attestation fails. Investigate the failed run before
 publishing it manually. Never overwrite a public version tag to repair a release;
 use a new version for corrected public artifacts.
 
-## Available builds
+## Public releases
 
-Development binaries and packages are available from successful
-[CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
-The repository has no published version tag or GitHub Release. The
-[1.0.0 notes](release-notes/v1.0.0.md) are an unpublished draft.
+[Sigillum v1.0.0](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.0.0)
+is the first public release. See the [release notes](release-notes/v1.0.0.md)
+for features, downloads, and platform coverage. Development snapshots are also
+available from successful [CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
 
 The project uses the [MIT license](../LICENSE). Archives and packages also carry
 [third-party notices](../THIRD_PARTY_NOTICES.md) for their compiled dependencies.
@@ -91,8 +91,8 @@ an annotated version tag only when publication is authorized. For example:
 
 ```sh
 # In this repository, with a github remote configured:
-git tag -a v1.0.0 -m 'Release 1.0.0'
-git push github v1.0.0
+git tag -a v1.0.1 -m 'Release 1.0.1'
+git push github v1.0.1
 ```
 
 That tag is a publication action: the workflow will publish when its checks and
