@@ -219,3 +219,9 @@ are permitted with the copyright and license notice preserved. Dependencies
 retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
 
 *Sigillum is Latin for a seal: a small mark that carries a claim of authenticity.*
+
+## Keep exploring
+
+**[Carillon →](https://github.com/ptudor/carillon-time#readme)** is a Go time daemon
+for Linux and FreeBSD, with NTP, GPS/PPS support, and detailed clock diagnostics.
+From the same maintainer, for people who operate their own infrastructure.
