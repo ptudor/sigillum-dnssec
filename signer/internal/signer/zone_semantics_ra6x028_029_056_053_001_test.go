@@ -524,6 +524,7 @@ func TestVerifySignedZone_DenialChainExpectations(t *testing.T) {
 			return resign(t, s, "example.com", out, keys)
 		}, "not an authoritative owner"},
 		{"nsec: out-of-zone owner", "nsec", func(t *testing.T, s *Signer, signed []dns.RR, keys *signingKeys) []dns.RR {
+			model := newZoneModel("example.com", signed)
 			var out []dns.RR
 			for _, rr := range signed {
 				out = append(out, rr)
@@ -533,8 +534,20 @@ func TestVerifySignedZone_DenialChainExpectations(t *testing.T) {
 					out = append(out, extra)
 				}
 			}
+			// Newer miekg/dns rejects the out-of-zone RRSIG before the full
+			// verifier reaches chain semantics. Exercise that check directly
+			// as well, so the earlier rejection does not hide its coverage.
+			var nsecs []*dns.NSEC
+			for _, rr := range out {
+				if n, ok := rr.(*dns.NSEC); ok {
+					nsecs = append(nsecs, n)
+				}
+			}
+			if err := verifyNSECExpectations(model, nsecs); err == nil || !strings.Contains(err.Error(), "not an authoritative owner") {
+				t.Fatalf("denial-chain check must reject the out-of-zone owner, got %v", err)
+			}
 			return resign(t, s, "example.com", out, keys)
-		}, "not an authoritative owner"},
+		}, "does not verify against the published DNSKEY: dns: bad rrset"},
 		{"nsec3: owner omitted, ring reclosed", "nsec3", func(t *testing.T, s *Signer, signed []dns.RR, keys *signingKeys) []dns.RR {
 			target := strings.ToUpper(dns.HashName("www.example.com.", dns.SHA1, 0, ""))
 			var out []dns.RR

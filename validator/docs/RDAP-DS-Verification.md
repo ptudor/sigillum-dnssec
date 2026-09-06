@@ -67,7 +67,7 @@ The `rdap_secure_dns` field appears in zone results for registrable domains (e.g
 
 ```json
 {
-  "zone": "cloudflare.com.",
+  "zone": "example.com.",
   "status": "secure",
   "ds": [
     {

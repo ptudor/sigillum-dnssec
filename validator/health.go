@@ -130,7 +130,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
 	w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
-	// Note: HSTS should be configured at the reverse proxy level (Apache/nginx)
+	// Note: HSTS should be configured at the reverse proxy level
 	// to avoid issues with subdomains that may not support HTTPS
 }
 

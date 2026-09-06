@@ -816,7 +816,7 @@ func (v *Validator) resolveNS(zone string) (string, error) {
 }
 
 // resolverAddr returns the recursive resolver address to use.
-// Priority: explicit config > system default > 1.1.1.1:53
+// Priority: explicit config > system default > 9.9.9.9:53
 func (v *Validator) resolverAddr() string {
 	if v.resolver != "" {
 		// Ensure it has a port
@@ -832,7 +832,7 @@ func (v *Validator) resolverAddr() string {
 		return net.JoinHostPort(conf.Servers[0], conf.Port)
 	}
 
-	return "1.1.1.1:53"
+	return "9.9.9.9:53"
 }
 
 // resolverReachable does a lightweight sanity query (root NS, RD=1) against the

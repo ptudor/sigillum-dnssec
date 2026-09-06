@@ -29,7 +29,7 @@ Use FastCGI for: traditional request/response APIs, services that benefit from A
 
 Use standalone HTTP for: SSE/WebSocket services, simple diagnostic tools, services with streaming responses
 
-**Note**: This project uses Apache as its reverse proxy. Do not reference nginx in code or documentation.
+**Note**: This project uses Apache as its reverse proxy. Use generic reverse-proxy wording in code and documentation.
 
 ### Build Commands
 
@@ -642,7 +642,7 @@ and logged as malformed, then the default is used — use plain integers.
 Unlike other TudorDNS services, this runs as a standalone HTTP server (not FastCGI) because:
 1. SSE requires long-lived connections
 2. Simpler deployment for a public diagnostic tool
-3. Can still run behind Apache/nginx as reverse proxy
+3. Can still run behind Apache as a reverse proxy
 
 ```
 ┌──────────────┐     ┌─────────────────────┐     ┌───────────────────┐
@@ -811,7 +811,7 @@ go test ./...
 go test -tags=integration ./...
 
 # Test specific domains
-./dnssec-validator -test-domain=cloudflare.com
+./dnssec-validator -test-domain=ietf.org
 ./dnssec-validator -test-domain=dnssec-failed.org  # Known bogus
 ./dnssec-validator -test-domain=unsigned.example   # Known insecure
 ```
@@ -820,7 +820,7 @@ go test -tags=integration ./...
 
 | Domain | Expected Result |
 |--------|-----------------|
-| `cloudflare.com` | Secure |
+| `ietf.org` | Secure |
 | `google.com` | Secure |
 | `dnssec-failed.org` | Bogus (intentionally broken) |
 | `unsigned-zone.example` | Insecure |
