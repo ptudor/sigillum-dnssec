@@ -22,7 +22,9 @@ for service in $services; do
     test -x "/usr/bin/$service"
     test -f "/usr/lib/systemd/system/$service.service"
     grep -qx 'MIT License' "/usr/share/doc/$service/copyright"
-    test -s "/usr/share/doc/$service/THIRD_PARTY_NOTICES.md"
+    # Debian slim deliberately excludes other /usr/share/doc files.
+    grep -q '^## Go runtime and standard library' "/usr/share/doc/$service/copyright"
+    grep -q '^## github.com/' "/usr/share/doc/$service/copyright"
     # The package must not create an enablement symlink or start a process.
     test ! -e "/etc/systemd/system/multi-user.target.wants/$service.service"
     # Linux comm names stop at 15 bytes (dnssec-validator is longer).

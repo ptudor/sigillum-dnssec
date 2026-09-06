@@ -72,10 +72,9 @@ nfpms:
         dst: /usr/share/doc/dnssec-tudor/README.md
       - src: docs/linux-packages.md
         dst: /usr/share/doc/dnssec-tudor/linux-packages.md
-      - src: LICENSE
-        dst: /usr/share/doc/dnssec-tudor/copyright
+      # Debian slim retains copyright while excluding other documentation.
       - src: THIRD_PARTY_NOTICES.md
-        dst: /usr/share/doc/dnssec-tudor/THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/dnssec-tudor/copyright
     scripts:
       preinstall: packaging/dnssec-tudor-preinstall.sh
       postinstall: packaging/dnssec-tudor-postinstall.sh
@@ -111,10 +110,9 @@ nfpms:
         dst: /usr/share/doc/dnssec-validator/README.md
       - src: docs/linux-packages.md
         dst: /usr/share/doc/dnssec-validator/linux-packages.md
-      - src: LICENSE
-        dst: /usr/share/doc/dnssec-validator/copyright
+      # Debian slim retains copyright while excluding other documentation.
       - src: THIRD_PARTY_NOTICES.md
-        dst: /usr/share/doc/dnssec-validator/THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/dnssec-validator/copyright
     scripts:
       preinstall: packaging/dnssec-validator-preinstall.sh
       postinstall: packaging/dnssec-validator-postinstall.sh
