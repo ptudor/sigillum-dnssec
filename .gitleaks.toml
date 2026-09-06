@@ -1,0 +1,13 @@
+title = "Sigillum secret scanning"
+
+[extend]
+useDefault = true
+
+# Exact non-credential sentinels used by the credential-redaction regression.
+# Include the former path because the scan intentionally covers Git history.
+[allowlist]
+description = "Synthetic registrar test credentials"
+condition = "AND"
+paths = ['^(signer|Golang-tudor-dnssec-signer)/internal/registrar/probe_script_ra6x039_055_test\.go$']
+regexTarget = "secret"
+regexes = ['^SYNTHETIC-KEY-a1b2c3$', '^SYNTHETIC-SECRET-d4e5f6$']

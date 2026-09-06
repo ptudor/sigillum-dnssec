@@ -1,0 +1,587 @@
+# dnssec-tudor
+
+A minimal, opinionated DNSSEC signing daemon for sysadmins who just want zones signed.
+
+Part of [Sigillum](../README.md). Start there for release downloads, Linux RPM/DEB
+packages, and an isolated local signing demonstration. This document is the
+detailed signer reference; [Linux package operations](../docs/linux-packages.md)
+cover the packaged service account and permissions.
+
+## Why This Exists
+
+**dnssec-tudor** is for a sysadmin managing a small set of domains on a single
+server, using NSD or a similar authoritative server, who wants a focused tool for
+signing BIND-style zone files and managing their keys.
+
+## Features
+
+- **Automatic signing** — watches zone files, re-signs on changes or before expiry
+- **Automatic ZSK rollover** — pre-publish method, no human intervention
+- **Semi-automatic KSK rollover** — generates keys, tells you what DS to publish
+- **ED25519 by default** — smaller signatures, faster validation (ECDSA P-256/P-384 also supported)
+- **NSEC or NSEC3** — configurable denial of existence
+- **Web dashboard** — see status, copy DS records for registrars
+- **JSON status output** — for scripting and monitoring
+- **Post-sign hooks** — reload NSD/BIND after signing
+
+## Quick Start
+
+See [QUICKSTART.md](QUICKSTART.md) for a complete walkthrough.
+
+```bash
+# Build
+make build
+
+# Add a domain (generates keys, signs zone)
+./dnssec-tudor add example.com /etc/nsd/zones/example.com.zone --config /etc/dnssec-tudor/config.toml
+
+# Copy the DS record to your registrar, then run as daemon
+./dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
+```
+
+## Installation
+
+### From Source
+
+```bash
+git clone https://github.com/ptudor/sigillum-dnssec.git
+cd sigillum-dnssec/signer
+make build
+
+# Or for a specific platform
+make build-linux        # Linux x86_64
+make build-linux-arm64  # Linux ARM64
+make build-freebsd      # FreeBSD
+make build-darwin-arm64 # macOS Apple Silicon
+```
+
+### Directory Setup
+
+```bash
+# Create directories
+sudo mkdir -p /etc/dnssec-tudor
+sudo mkdir -p /var/lib/dnssec-tudor/{keys,signed}
+
+# Set permissions (run daemon as dedicated user)
+sudo useradd -r -s /bin/false dnssec-tudor
+sudo chown -R dnssec-tudor:dnssec-tudor /var/lib/dnssec-tudor
+sudo chmod 700 /var/lib/dnssec-tudor/keys
+```
+
+## Configuration
+
+Create `/etc/dnssec-tudor/config.toml`:
+
+```toml
+# Where to write signed zone files
+output_dir = "/var/lib/dnssec-tudor/signed"
+
+# Where to store keys and state
+data_dir = "/var/lib/dnssec-tudor"
+
+# How often to check for zone changes
+poll_interval = "5m"
+
+[dnssec]
+algorithm = "ED25519"           # or ECDSAP256SHA256, ECDSAP384SHA384
+ksk_lifetime = "5y"             # How long before KSK rollover reminder
+zsk_lifetime = "90d"            # ZSK rolls automatically
+signature_validity = "14d"      # How long signatures are valid
+signature_refresh = "3d"        # Re-sign when this much validity remains
+nsec_version = "nsec3"          # "nsec" or "nsec3"
+nsec3_iterations = 0            # RFC 9276 recommends 0
+nsec3_salt = ""                 # Empty salt recommended
+dnskey_ttl = 0                  # 0 = use SOA TTL (recommended)
+rollover_prepublish = "14d"     # Days before expiry to prepublish new key
+rollover_switch = "7d"          # Days to wait before switching to new key
+serial_policy = "keep"          # "keep" or "epoch" — see Serial Management
+# publication = "hook"          # what confirms a zone is served: "hook", "immediate" or "probe" (see Key Rollover)
+# parent_ds_ttl = "24h"         # parent DS TTL assumed by `rollover complete --force`
+
+[web]
+enabled = true
+listen = "127.0.0.1:8053"
+
+# Optional registrar API integration (opt-in). `digest_type` is registrar-agnostic
+# and belongs under [registrar] itself — NOT under [registrar.dynadot]. Each
+# registrar adapter is its own sub-table; a zone binds to one via `registrar = "…"`.
+[registrar]
+# digest_type = 2               # DS digest: 2 (SHA-256, default) or 4 (SHA-384)
+
+[registrar.dynadot]
+enabled = false
+api_key = ""                    # required; keep the config file mode 0640 or stricter
+api_secret = ""                 # required; HMAC-SHA256 key for X-Signature
+sandbox = false                 # true → api-sandbox.dynadot.com
+timeout = "30s"
+auto_publish = true             # push DS automatically on add/rollover events
+
+# Zone definitions
+[zones]
+[zones."example.com"]
+path = "/etc/nsd/zones/example.com.zone"
+
+[zones."example.org"]
+path = "/etc/nsd/zones/example.org.zone"
+ksk_lifetime = "5y"             # Per-zone override
+algorithm = "ECDSAP256SHA256"   # Algorithm for keys generated in the future; existing keys are NOT migrated — use `rollover algorithm`
+serial_policy = "epoch"         # Per-zone override — zone MUST use epoch serials
+
+[hooks]
+post_sign = "systemctl reload nsd"
+```
+
+## Serial Management
+
+By default (`serial_policy = "keep"`) the signed zone carries the unsigned
+zone's SOA serial unchanged. That is fine when NSD reads the signed files
+directly on one host, but it has a gap: **signature refreshes don't change
+the serial**, so AXFR/IXFR secondaries never transfer the refreshed RRSIGs
+and will eventually serve expired signatures.
+
+`serial_policy = "epoch"` (global in `[dnssec]`, or per-zone) fixes this.
+On every signing event the published serial becomes:
+
+```
+max( current unix time, unsigned serial + 1, last published serial + 1 )
+```
+
+so each signature refresh, rollover phase, and zone change is visible to
+secondaries as a strictly increasing serial.
+
+**Zones under the epoch policy MUST use unix epoch serials in the unsigned
+file** (e.g. `date +%s` → `1781042000`). The published serial is derived
+from the clock, so the unsigned serial must never be ahead of it:
+
+- Date-format serials (`2026060901`) are **rejected** — they are larger
+  than the current epoch, and publishing time-based serials beneath them
+  would move the zone backwards.
+- Sequential serials (`1`, `2`, …) are **rejected** — bump them once to
+  the current epoch and continue from there.
+
+A zone that fails the epoch check does not get re-signed (the error appears
+in `status` output and the `/health` endpoint); the previously signed output
+keeps serving until you fix the serial. The `status` command and dashboard
+show both values: `serial` is the unsigned file's serial (used for change
+detection), `published_serial` is what the world sees.
+
+## Commands
+
+### Daemon Mode
+
+```bash
+# Run in foreground
+dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
+
+# With web UI on custom port (loopback only — the dashboard is unauthenticated;
+# a non-loopback --web address is refused unless web.allow_remote = true)
+dnssec-tudor serve --config /etc/dnssec-tudor/config.toml --web 127.0.0.1:8080
+```
+
+### One-Shot Signing
+
+```bash
+# Sign all zones and exit
+dnssec-tudor sign --config /etc/dnssec-tudor/config.toml
+```
+
+### Domain Management
+
+```bash
+# Add a new domain (generates fresh keys)
+dnssec-tudor add example.com /path/to/zone.db --config config.toml
+
+# Force re-sign a domain (bypasses change detection)
+dnssec-tudor resign example.com --config config.toml
+
+# Remove a domain from state AND the config file (keys are NOT deleted).
+# A running daemon still holds the old config in memory — send it SIGHUP to reload.
+dnssec-tudor remove example.com --config config.toml
+```
+
+### Updating Zone Files
+
+The daemon signs a zone again when its unsigned file changes. Whatever
+produces that file — an editor, a generator, a deployment script — must
+replace it **atomically**: write the new content to a temporary file in the
+same directory, `fsync` it, then `rename` it over the zone path. The signer
+reads each zone through a single file descriptor and refuses a file that
+changes while it is being read, but no metadata check can tell a complete
+small zone from a paused in-place rewrite that has so far written only a
+valid SOA/NS prefix. In-place writes (`>` redirection, editors that save in
+place) risk publishing such a prefix, with authenticated denial of existence
+for every record that had not been written yet. Pipes, devices and
+directories are rejected as zone sources.
+
+```bash
+# Safe: atomic replacement
+generate-zone > /etc/dnssec-tudor/zones/example.com.db.tmp && \
+  mv /etc/dnssec-tudor/zones/example.com.db.tmp /etc/dnssec-tudor/zones/example.com.db
+```
+
+Changing a zone's `path` in the config (then `SIGHUP`, `sign` or `resign`)
+signs the new file on the next pass regardless of its timestamp or size; the
+previous signed output is kept until the new source parses and publishes. A
+signed output that goes missing from `output_dir` is regenerated on the next
+cycle, and a changed `output_dir` is populated on the next cycle after reload.
+
+### Migrating from BIND
+
+If you have existing BIND-style DNSSEC keys (from `dnssec-keygen` or similar), you can import them without changing your DS records at the registrar:
+
+The key files dnssec-tudor writes are in the same BIND private-key format
+(`Private-key-format: v1.3`), with ED25519 keys stored as the 32-byte seed
+that BIND, ldns and RFC 8080 use, so they can be read back by those tools for
+recovery or migration; the DNSKEY and DS never change. Files written by older
+versions stored Go's 64-byte expanded ED25519 key and remain readable by
+dnssec-tudor; they are not rewritten in place. A key passes through the seed
+serialization when it is imported or when a rollover stages its successor, so
+to hand a legacy file to another tool, convert its `PrivateKey:` value to the
+first 32 bytes (the seed) — the DNSKEY and DS stay the same.
+
+```bash
+# Import existing keys
+dnssec-tudor import example.com /path/to/zone.db \
+  --ksk /path/to/Kexample.com.+015+12345 \
+  --zsk /path/to/Kexample.com.+015+67890 \
+  --config config.toml
+```
+
+The key paths are the base names without `.key`/`.private` extensions. For example, if your keys are:
+- `Kexample.com.+015+12345.key`
+- `Kexample.com.+015+12345.private`
+
+Use: `--ksk Kexample.com.+015+12345`
+
+The import command will:
+1. Read and validate the BIND-style key files
+2. Verify KSK (flag 257) and ZSK (flag 256)
+3. Convert to dnssec-tudor's format
+4. Add the zone to config.toml
+5. Sign the zone
+6. Display the DS record for verification against your registrar
+
+### Key Information
+
+```bash
+# Get DS record for registrar
+dnssec-tudor ds example.com --config config.toml
+
+# Get DNSKEY records
+dnssec-tudor dnskey example.com --config config.toml
+
+# Check status
+dnssec-tudor status --config config.toml
+dnssec-tudor status --domain example.com --config config.toml
+```
+
+### Key Rollover
+
+ZSK rollover is fully automatic. KSK rollover requires DS updates at your registrar:
+
+```bash
+# Start KSK rollover (generates new key, shows new DS)
+dnssec-tudor rollover start example.com --config config.toml
+
+# After publishing the new DS at the registrar, record that it has propagated
+dnssec-tudor rollover complete example.com --config config.toml
+
+# Check rollover status
+dnssec-tudor rollover status example.com --config config.toml
+```
+
+`rollover complete` checks that the new DS is present at **every** parent
+nameserver, then keeps both KSKs signing until the parent's DS TTL has
+elapsed — a resolver that fetched the old-only DS set just before your change
+holds it that long and would fail if the old key vanished earlier. The daemon
+(or the next `sign`) retires the old KSK automatically after that wait and
+ends the rollover once the retired zone is confirmed served. Pass `--force`
+to skip the probe and start the wait now using `parent_ds_ttl`.
+
+Rollover timers count from *confirmed* publication, not from the file write:
+with a post-sign hook the hook must succeed for that generation (the daemon
+re-runs a failed hook every cycle and after restarts); without one the write
+counts (`publication = "immediate"`); `publication = "probe"` asks every
+authoritative server for the published serial. Cache lifetimes of earlier,
+longer-TTL generations are remembered, so lowering a TTL just before a
+rollover never shortens the wait.
+
+### Algorithm Rollover
+
+To change algorithms (e.g., ECDSA to ED25519), use the algorithm rollover command:
+
+```bash
+# Start algorithm rollover (generates new keys with target algorithm)
+dnssec-tudor rollover algorithm example.com ED25519 --config config.toml
+
+# After publishing new DS at registrar, complete rollover
+dnssec-tudor rollover complete example.com --config config.toml
+```
+
+During algorithm rollover, the zone is signed with both the old and new
+algorithm keys. `rollover complete` records that the new DS is at every parent
+server; after the parent's DS TTL the status asks you to remove the OLD DS,
+and one more DS TTL after it is gone from every parent server the
+old-algorithm keys and signatures are retired automatically (RFC 6781 §4.1.4).
+
+## NSD Integration
+
+Configure NSD to use the signed zone files:
+
+```
+# /etc/nsd/nsd.conf
+zone:
+    name: "example.com"
+    zonefile: "/var/lib/dnssec-tudor/signed/example.com.zone.signed"
+```
+
+The `post_sign` hook reloads NSD after signing. Environment variables are available for per-zone operations:
+
+```toml
+[hooks]
+# Reload all zones (simple, recommended)
+post_sign = "nsd-control reload"
+
+# For systemd-based systems
+post_sign = "systemctl reload nsd"
+
+# Reload only the signed zone. NOTE: $VARIABLE expansion requires a shell —
+# by default post_sign is split on whitespace and exec'd directly, so
+# "$DNSSEC_DOMAIN" would be passed literally. Opt in with shell = true:
+shell = true
+post_sign = "nsd-control reload $DNSSEC_DOMAIN"
+
+# Or use exec-style argv (no shell involved; preferred for scripts):
+post_sign_cmd = ["/usr/local/sbin/reload-zone.sh"]
+```
+
+### Hook Environment Variables
+
+The following environment variables are available in hooks:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `DNSSEC_DOMAIN` | Domain that was signed | `example.com` |
+| `DNSSEC_ZONE_PATH` | Path to unsigned zone file | `/etc/nsd/zones/example.com.zone` |
+| `DNSSEC_SIGNED_PATH` | Path to signed zone file | `/var/lib/dnssec-tudor/signed/example.com.zone.signed` |
+| `DNSSEC_OUTPUT_DIR` | Output directory | `/var/lib/dnssec-tudor/signed` |
+
+With `coalesce_post_sign = true` the hook fires once per signing cycle instead
+of once per zone, receiving `DNSSEC_DOMAINS` (space-separated list) and
+`DNSSEC_BATCH_SIZE` instead of the per-zone variables.
+
+The hook also runs after CLI commands that write a signed zone (`sign`,
+`resign`, `add`, `import`, `rollover start/complete/algorithm`), synchronously,
+so the nameserver picks up the new output before the command exits. The CLI
+follows the same contract as the daemon: with `coalesce_post_sign = true` one
+invocation receives `DNSSEC_DOMAINS`/`DNSSEC_BATCH_SIZE` for every zone the
+command signed (a single-zone command still gets the batch variables);
+otherwise each signed zone gets its own invocation with the per-zone
+variables. Zones that failed to sign are never handed to the hook, a command
+that signed nothing runs no hook, and any `DNSSEC_*` variable inherited from
+the parent environment is stripped so a script cannot read a stale value.
+`sign` exits non-zero when the hook fails (the zones are signed, but may not
+be served yet).
+
+**Note:** Hooks have a 30-second timeout. When it expires the hook's whole
+process group is sent SIGTERM, then SIGKILL two seconds later, and the wait
+for its output pipes is bounded — a background child that inherited the pipes
+cannot hold the signer past the timeout. A descendant that starts its own
+session (`setsid`, a daemonizing service) is outside that group and must
+manage its own lifetime. If your hook needs longer (e.g., zone transfers to
+secondaries), have it trigger an asynchronous process instead.
+
+## BIND Integration
+
+```
+// named.conf
+zone "example.com" {
+    type master;
+    file "/var/lib/dnssec-tudor/signed/example.com.zone.signed";
+};
+```
+
+```toml
+[hooks]
+# Reload only the signed zone ($VARIABLE expansion requires shell = true)
+shell = true
+post_sign = "rndc reload $DNSSEC_DOMAIN"
+```
+
+## Status Output
+
+```json
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "zones": {
+    "example.com": {
+      "status": "healthy",
+      "serial": 2024011501,
+      "last_signed": "2024-01-15T10:00:00Z",
+      "signatures_expire": "2024-01-29T10:00:00Z",
+      "ksk": {
+        "id": 12345,
+        "algorithm": "ED25519",
+        "created": "2023-01-15T00:00:00Z",
+        "expires": "2026-01-15T00:00:00Z"
+      },
+      "zsk": {
+        "id": 67890,
+        "algorithm": "ED25519",
+        "created": "2024-01-01T00:00:00Z",
+        "expires": "2024-04-01T00:00:00Z"
+      }
+    }
+  },
+  "summary": {
+    "total": 1,
+    "healthy": 1,
+    "action_required": 0,
+    "errors": 0
+  }
+}
+```
+
+## Signals
+
+- `SIGINT` / `SIGTERM` — Graceful shutdown
+- `SIGHUP` — Reload configuration (add/remove zones without restart)
+
+## Web Dashboard
+
+When enabled, the web UI shows:
+- All zones with status badges
+- Key IDs and expiry dates
+- DS records in registrar-friendly formats
+- Rollover status and required actions
+
+Access at `http://127.0.0.1:8053` (or your configured address). For public access, put it behind a reverse proxy with authentication.
+
+## Algorithm Support
+
+| Algorithm | Config Value | Notes |
+|-----------|--------------|-------|
+| ED25519 | `ED25519` | Recommended, smallest signatures |
+| ECDSA P-256 | `ECDSAP256SHA256` | Wide registrar support |
+| ECDSA P-384 | `ECDSAP384SHA384` | Higher security margin |
+
+ED25519 (algorithm 15) has excellent resolver support but some registrars may not accept it. Check your registrar before choosing.
+
+## File Locations
+
+```
+/etc/dnssec-tudor/
+├── config.toml              # Configuration
+
+/var/lib/dnssec-tudor/
+├── state.json               # Daemon state
+├── keys/
+│   ├── example.com.ksk.key      # Public KSK
+│   ├── example.com.ksk.private  # Private KSK (mode 0600)
+│   ├── example.com.zsk.key      # Public ZSK
+│   └── example.com.zsk.private  # Private ZSK (mode 0600)
+└── signed/
+    └── example.com.zone.signed  # Signed zone file
+```
+
+## Monitoring
+
+Health and metrics endpoints (on internal health server, default `127.0.0.1:8054`):
+- `GET /health` — JSON health status
+- `GET /healthz` — Simple OK/UNHEALTHY for probes
+- `GET /metrics` — Prometheus metrics
+
+```bash
+curl http://127.0.0.1:8054/healthz
+curl http://127.0.0.1:8054/metrics
+```
+
+### Prometheus Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dnssec_tudor_zones_total` | Gauge | Total zones managed |
+| `dnssec_tudor_zones_healthy` | Gauge | Zones in healthy state |
+| `dnssec_tudor_zones_action_required` | Gauge | Zones needing action |
+| `dnssec_tudor_zones_errors` | Gauge | Zones with errors |
+| `dnssec_tudor_signing_operations_total` | Counter | Signing operations by domain/status |
+| `dnssec_tudor_signing_duration_seconds` | Histogram | Signing duration by domain |
+| `dnssec_tudor_last_signing_timestamp_seconds` | Gauge | Last successful sign time |
+| `dnssec_tudor_signature_expiry_timestamp_seconds` | Gauge | When signatures expire |
+| `dnssec_tudor_ksk_expiry_timestamp_seconds` | Gauge | KSK expiry time |
+| `dnssec_tudor_zsk_expiry_timestamp_seconds` | Gauge | ZSK expiry time |
+| `dnssec_tudor_rollover_in_progress` | Gauge | Rollover active (1/0) |
+| `dnssec_tudor_rollover_operations_total` | Counter | Rollover operations |
+| `dnssec_tudor_hook_executions_total` | Counter | Hook executions by status |
+| `dnssec_tudor_hook_duration_seconds` | Histogram | Hook execution duration |
+
+Configure the health server address in `config.toml`:
+
+```toml
+[health]
+listen = "127.0.0.1:8054"
+```
+
+## Troubleshooting
+
+### Verify Signed Zone
+
+```bash
+# Using ldns-utils
+ldns-verify-zone /var/lib/dnssec-tudor/signed/example.com.zone.signed
+
+# Using dig
+dig +dnssec example.com @localhost
+```
+
+### Check DS Record Matches
+
+```bash
+# Get DS from signed zone
+dnssec-tudor ds example.com --config config.toml
+
+# Compare with published DS
+dig DS example.com +short
+```
+
+### Debug Logging
+
+```bash
+dnssec-tudor serve --config config.toml --log-level debug
+```
+
+### Log Output Options
+
+By default, logs go to stderr. For production on FreeBSD/Linux, use syslog:
+
+```bash
+# Log to syslog (daemon facility)
+dnssec-tudor serve --config config.toml --log-output syslog
+
+# Log to a file
+dnssec-tudor serve --config config.toml --log-output /var/log/dnssec-tudor.log
+
+# Combine with JSON format for log aggregation
+dnssec-tudor serve --config config.toml --log-output syslog --log-format json
+```
+
+Environment variables are also supported: `LOG_OUTPUT`, `LOG_LEVEL`, `LOG_FORMAT`.
+
+## Security Considerations
+
+- Private keys are stored with mode 0600
+- Run the daemon as a dedicated unprivileged user
+- The web UI has no authentication — bind to localhost and proxy if needed
+- Keys are never deleted automatically; manual cleanup required after rollover
+
+## License
+
+[MIT](../LICENSE).
+
+## See Also
+
+- [QUICKSTART.md](QUICKSTART.md) — Step-by-step setup guide
+- [RFC 4033-4035](https://datatracker.ietf.org/doc/html/rfc4033) — DNSSEC specifications
+- [RFC 6781](https://datatracker.ietf.org/doc/html/rfc6781) — DNSSEC operational practices
+- [RFC 7583](https://datatracker.ietf.org/doc/html/rfc7583) — DNSSEC key rollover timing
+- [RFC 9276](https://datatracker.ietf.org/doc/html/rfc9276) — NSEC3 guidance

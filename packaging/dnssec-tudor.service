@@ -1,0 +1,31 @@
+[Unit]
+Description=Sigillum DNSSEC zone signer
+Documentation=https://github.com/ptudor/sigillum-dnssec
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dnssec-tudor
+Group=dnssec-tudor
+ExecStart=/usr/bin/dnssec-tudor serve --config /etc/dnssec-tudor/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+UMask=0027
+StateDirectory=dnssec-tudor
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -7,8 +7,8 @@
 
 ## Ground truth (verified at start of this pass)
 
-- `Golang-tudor-dnssec-signer`: `go build ./...`, `go vet ./...`, `gofmt -l .`, `go test -race -count=1 ./...` — all clean (15.6s).
-- `Golang-dnssec-validator`: same, all clean (all four packages).
+- `signer`: `go build ./...`, `go vet ./...`, `gofmt -l .`, `go test -race -count=1 ./...` — all clean (15.6s).
+- `validator`: same, all clean (all four packages).
 - Compiled binaries on disk (`dnssec-tudor`, `dnssec-validator`) are `.gitignore`d and untracked (the review's release-hygiene note is satisfied).
 - Working tree clean; every fix commit named in FIXES exists and matches its entry.
 
@@ -81,7 +81,7 @@ Lesser residuals (documented, acceptable as-is): `Shutdown()` holding `d.mu` acr
 
 ---
 
-## Per-finding verdicts — Part 1: `Golang-tudor-dnssec-signer`
+## Per-finding verdicts — Part 1: `signer`
 
 **R-001 — PARTIAL.** The post-sign gate is real, correctly ordered between `signRecordsWithKeys` and `writeSignedZone` (`sign.go:173-175`, `790-949`), reuses `findDelegationPoints`/`isOccluded` (no differential parsing), cryptographically verifies every RRSIG (miekg `Verify` does no clock check, so no expiry false-positives), and its three adversarial tests bite. Two gaps vs the spec: the chain check validates only that the emitted NSEC/NSEC3 records form one closed cycle *among themselves* — it never cross-checks that set against the expected owner set, so a chain builder that consistently omits an owner still passes; and no test drives a broken zone through `SignZone` itself (deleting the gate call would go unnoticed). New fail-closed edge: worklist item 12.
 **R-002 — PASS.** Unique `os.CreateTemp` temp + chmod + remove-on-error in `writeSignedZone` (`sign.go:1341-1357`); `State.Save` via `writeFileAtomicOwned` (unique temp, fsync, rename, dir-fsync, ownership — `ownership.go:110-148`). `TestWriteSignedZone_ConcurrentUniqueTemp` (100 iterations, `-race`) is revert-sensitive. Final paths, 0644, and formats unchanged.
@@ -162,7 +162,7 @@ Lesser residuals (documented, acceptable as-is): `Shutdown()` holding `d.mu` acr
 **R-077 — PARTIAL.** State round-trip is genuinely covered (new-fields round-trip + old-schema tolerance, both revert-sensitive). PARTIAL because transition coverage falls short of the review's "every transition and gate": only pre_publish→signing is driven; the signing→complete transition and its three gates, the individual gate (a)/(c) negative cases, and the PhaseStarted-zero fallback for an in-progress old-schema rollover are all untested.
 **R-078 — PASS.** `TestDaemonReload_HandlersReflectNewState` is exactly the demanded reload test and genuinely fails against the pre-fix frozen-closure design (pre-reload 503 assertion pins the failure mode). Covers `/api/status` + health; not the dashboard or `/api/zone/` — acceptable for the spec.
 
-## Per-finding verdicts — Part 2: `Golang-dnssec-validator`
+## Per-finding verdicts — Part 2: `validator`
 
 **R-079 — PASS.** DS-RRSIG enforcement gate in the non-root branch (`validator.go:940-951`): missing/unverified DS RRSIG → `StatusBogus` before `ValidateChainLink`; verification is against the parent's authenticated DNSKEY, so the induction from the root anchors is sound; DS-with-no-RRSIG → bogus; digest match retained; reordered as specified. Caveats: the cited test exercises only the pre-existing crypto helper — reverting the gate itself would not fail any test; two fail-closed misclassification edges (indeterminate-parent → child bogus; first-RRSIG-only, worklist item 5).
 **R-080 — PASS.** `VerifyDNSKEYRRSIGByKeys` verifies the DNSKEY RRSIG using the DS/anchor-matched key's *own material* (not the RRset key named by the RRSIG), with `CollectDSMatchedKeys`/`CollectAnchorMatchedKeys` wired at root and non-root; the old tag-trusting function is fully removed. The rogue-KSK test is genuinely attack-shaped and revert-sensitive for the function (call-site revert uncaught). New issue: worklist item 5 (first-RRSIG-only).

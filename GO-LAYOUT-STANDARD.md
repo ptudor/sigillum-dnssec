@@ -1,7 +1,7 @@
 # Go daemon layout standard
 
 How to decompose a flat `package main` Go daemon into `internal/` packages, to
-the standard set by **`Golang-tudor-dnssec-signer`** (2026-07: it went from a
+the standard set by **`signer`** (2026-07: it went from a
 flat 63-file `package main` to 13 root files + 8 `internal/` packages — see that
 project's `CLAUDE.md` "Code Organization" section for the target shape).
 
@@ -13,7 +13,7 @@ signer is the worked example; this file is the reusable recipe.
 Paste this at a fresh session on the daemon you want to reorganize:
 
 > Decompose this daemon's flat `package main` into `internal/` packages,
-> following the standard in `daemons/dnssec/Golang-tudor-dnssec-signer` (its
+> following the standard in `daemons/dnssec/signer` (its
 > CLAUDE.md "Code Organization" section is the reference). Rules:
 >
 > 1. **Green baseline first.** `go build ./... && go vet ./... && go test ./...`

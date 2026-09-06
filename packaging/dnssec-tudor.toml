@@ -1,0 +1,29 @@
+# Installed as /etc/dnssec-tudor/config.toml. No zones are enrolled by default.
+# Read docs/linux-packages.md before connecting this signer to NSD or BIND.
+output_dir = "/var/lib/dnssec-tudor/signed"
+data_dir = "/var/lib/dnssec-tudor"
+poll_interval = "5m"
+
+[dnssec]
+algorithm = "ED25519"
+ksk_lifetime = "5y"
+zsk_lifetime = "90d"
+signature_validity = "14d"
+signature_refresh = "3d"
+nsec_version = "nsec3"
+nsec3_iterations = 0
+nsec3_salt = ""
+serial_policy = "keep"
+# Choose publication and serial policies for your nameserver topology.
+# Add a post_sign hook only after arranging its exact permissions.
+
+[web]
+enabled = true
+listen = "127.0.0.1:8053"
+
+[heartbeat]
+enabled = false
+
+[zones]
+# [zones."example.com"]
+# path = "/etc/nsd/zones/example.com.zone"

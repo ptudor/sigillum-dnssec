@@ -1,0 +1,26 @@
+# Installed as /etc/dnssec-validator/dnssec-validator.toml.
+listen_addr = "127.0.0.1:8791"
+root_anchors_path = "/etc/dnssec-validator/root-anchors.json"
+# Maintainer-operated JSON mirror; accepted roots must also match binary pins.
+root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
+# Configure a recursive resolver reachable from this host (UDP and TCP 53).
+recursive_resolver = "127.0.0.1"
+# Optional registration comparison uses this maintainer-operated RDAP proxy.
+rdap_base_url = "https://www.any53.com/rdap"
+query_timeout_seconds = 5
+total_timeout_seconds = 30
+max_concurrent = 10
+trusted_proxy_cidrs = ["127.0.0.0/8", "::1/128"]
+metrics_allowed_cidrs = ["127.0.0.0/8", "::1/128"]
+
+[rate_limit]
+per_sec = 10
+burst = 30
+cleanup_seconds = 300
+
+[logging]
+format = "json"
+level = "info"
+
+[heartbeat]
+enabled = false

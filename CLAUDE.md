@@ -4,11 +4,11 @@ DNSSEC tooling: a zone-signing daemon and a browser-based validation/troubleshoo
 
 Split out of TudorDNS-Golang on 2026-07-09 with filtered history. The full pre-split history remains frozen at `git@ptudor.net:/git/TudorDNS-Golang`.
 
-**Package layout standard:** `GO-LAYOUT-STANDARD.md` (this dir) is the reusable recipe + prompt for decomposing a flat `package main` Go daemon into `internal/` packages. `Golang-tudor-dnssec-signer` is the worked exemplar; apply the same to other daemons (mail, dns, …).
+**Package layout standard:** `GO-LAYOUT-STANDARD.md` (this dir) is the reusable recipe + prompt for decomposing a flat `package main` Go daemon into `internal/` packages. `signer` is the worked exemplar; apply the same to other daemons (mail, dns, …).
 
 ## Projects
 
-### Golang-tudor-dnssec-signer (dnssec-tudor)
+### signer (dnssec-tudor)
 Minimal, opinionated DNSSEC signing daemon for sysadmins managing zones on NSD or BIND.
 
 **Architecture**: Zone Files → dnssec-tudor (watches/signs) → Signed Zone Files → NSD/BIND
@@ -22,7 +22,7 @@ Minimal, opinionated DNSSEC signing daemon for sysadmins managing zones on NSD o
 
 Uses `github.com/miekg/dns` and `github.com/pelletier/go-toml/v2` (same TOML library as the other daemons; despite older notes, no project here is on BurntSushi).
 
-### Golang-dnssec-validator
+### validator
 Web-based DNSSEC troubleshooting and validation tool with a polished UI — think DNSViz or `drill`, but in the browser, with real-time streaming results and comprehensive diagnostics.
 
 ## Common patterns
