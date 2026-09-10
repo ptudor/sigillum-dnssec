@@ -890,9 +890,9 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneStat
 	//     (a touched or re-copied file is not re-signed needlessly; the
 	//     metadata reference is refreshed instead);
 	//   - different digest: the zone is signed;
-	//   - no recorded digest (a state written before digests existed) with
-	//     unchanged metadata: today's bytes become the baseline of the
-	//     current output without re-signing;
+	//   - no recorded digest (a state written before digests existed): request
+	//     one signing pass, because only successful publication can establish
+	//     that the digest names the bytes in the served output;
 	//   - a read that cannot be completed consistently updates nothing and
 	//     is retried on the next check.
 	digest, err := s.sourceDigest(zonePath)
@@ -910,11 +910,8 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneStat
 		return false, ""
 	}
 	switch {
-	case zoneState.SourceDigest == "" && !metadataChanged:
-		s.state.Mutate(func() { zoneState.SourceDigest = digest })
-		return false, ""
 	case zoneState.SourceDigest == "":
-		return true, "zone file modified"
+		return true, "source content identity not recorded; publishing once to establish it"
 	case digest == zoneState.SourceDigest:
 		if metadataChanged {
 			s.state.Mutate(func() {
