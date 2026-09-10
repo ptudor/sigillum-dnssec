@@ -54,8 +54,14 @@ prefix. Trust forwarded client addresses only from your actual proxy CIDRs.
 ## Root trust and external services
 
 The validator reads the JSON format represented by `internal/dns.RootAnchors`.
-It first tries `root_anchors_path`, then the configured HTTPS `root_anchors_url`.
-The default URL is the maintainer-operated Any53 mirror. IANA’s XML file is not a
+It first tries `root_anchors_path`, then the last-known-good cache at
+`root_anchors_cache_path`, then the configured HTTPS `root_anchors_url`. Every
+usable download is written to the cache atomically (private temporary file,
+fsync, rename), so a restart while the mirror or the network is unavailable
+still validates from the set that was last authenticated; a fetch, parse, pin
+or write failure never replaces the previous cache. The packaged service keeps
+the cache under `/var/lib/sigillum-validator`, its only writable path. The
+default URL is the maintainer-operated Any53 mirror. IANA’s XML file is not a
 drop-in replacement for this JSON format.
 
 Loaded anchors are filtered for validity and checked against the root DS values
@@ -64,7 +70,8 @@ of trust. New root keys outside that pinned set require a reviewed software upda
 the service does not implement a general RFC 5011 trust-anchor manager.
 
 Failed initial loads retry with backoff; successful operation refreshes the store
-periodically. Check `/health` before treating the service as ready, and monitor
+periodically from the operator file or the URL (never from the cache, which
+only serves starts), keeping the current set when a refresh fails. Check `/health` before treating the service as ready, and monitor
 anchor availability. To use your own mirror or locally managed file, preserve the
 JSON schema and validity metadata and verify health after changing it.
 

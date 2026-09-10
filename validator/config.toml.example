@@ -8,6 +8,11 @@ shutdown_timeout_seconds = 30
 # Root trust anchors
 root_anchors_path = "/etc/sigillum-validator/root-anchors.json"
 root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
+# Last-known-good cache (absolute path in a directory the service can write,
+# distinct from root_anchors_path; empty disables it). Every usable, pinned
+# download is persisted here atomically and read before the network on later
+# starts, so a restart while the mirror or network is down still validates.
+root_anchors_cache_path = "/var/lib/sigillum-validator/root-anchors.json"
 
 # DNS query settings
 query_timeout_seconds = 5       # Per-server query timeout

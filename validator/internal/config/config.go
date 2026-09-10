@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,9 +31,15 @@ type Config struct {
 	ShutdownTimeoutSec int           `toml:"shutdown_timeout_seconds"`
 	ShutdownTimeout    time.Duration `toml:"-"`
 
-	// Root trust anchors
-	RootAnchorsPath string `toml:"root_anchors_path"`
-	RootAnchorsURL  string `toml:"root_anchors_url"`
+	// Root trust anchors. RootAnchorsCachePath is the last-known-good cache
+	// (RDAYBLUEX-011): every usable, pinned document fetched from the URL is
+	// persisted there atomically and read before the network on later
+	// starts, so a restart during a mirror or network outage still validates.
+	// It must be an absolute path in a directory writable by the service and
+	// distinct from root_anchors_path; empty disables caching.
+	RootAnchorsPath      string `toml:"root_anchors_path"`
+	RootAnchorsCachePath string `toml:"root_anchors_cache_path"`
+	RootAnchorsURL       string `toml:"root_anchors_url"`
 
 	// DNS query settings
 	QueryTimeoutSec          int    `toml:"query_timeout_seconds"`
@@ -140,6 +148,7 @@ func DefaultConfig() *Config {
 		ShutdownTimeoutSec:       30,
 		ShutdownTimeout:          30 * time.Second,
 		RootAnchorsPath:          "/etc/sigillum-validator/root-anchors.json",
+		RootAnchorsCachePath:     "/var/lib/sigillum-validator/root-anchors.json",
 		RootAnchorsURL:           "https://internet.any53.com/dns/anchors/root-anchors.json",
 		QueryTimeoutSec:          5,
 		TotalTimeoutSec:          30,
@@ -217,7 +226,9 @@ func LoadFromFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
-	cfg.applyNestedToFlat()
+	if err := cfg.applyNestedToFlat(); err != nil {
+		return nil, fmt.Errorf("validating config: %w", err)
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validating config: %w", err)
@@ -255,6 +266,7 @@ func LoadFromEnv() (*Config, error) {
 
 	// Root trust anchors
 	cfg.RootAnchorsPath = getEnv("ROOT_ANCHORS_PATH", cfg.RootAnchorsPath)
+	cfg.RootAnchorsCachePath = getEnv("ROOT_ANCHORS_CACHE_PATH", cfg.RootAnchorsCachePath)
 	cfg.RootAnchorsURL = getEnv("ROOT_ANCHORS_URL", cfg.RootAnchorsURL)
 
 	// DNS query settings
@@ -294,7 +306,9 @@ func LoadFromEnv() (*Config, error) {
 	cfg.Heartbeat.InstanceID = getEnv("HEARTBEAT_INSTANCE_ID", cfg.Heartbeat.InstanceID)
 	cfg.Heartbeat.IntervalMinutes = getEnvInt("HEARTBEAT_INTERVAL_MINUTES", cfg.Heartbeat.IntervalMinutes)
 
-	cfg.applyNestedToFlat()
+	if err := cfg.applyNestedToFlat(); err != nil {
+		return nil, err
+	}
 
 	// Validate
 	if err := cfg.Validate(); err != nil {
@@ -309,17 +323,81 @@ func LoadConfig() (*Config, error) {
 	return Load("")
 }
 
-// applyNestedToFlat copies nested struct values to flat fields for backwards compatibility.
-func (c *Config) applyNestedToFlat() {
-	// Convert seconds to durations
-	c.ShutdownTimeout = time.Duration(c.ShutdownTimeoutSec) * time.Second
-	c.QueryTimeout = time.Duration(c.QueryTimeoutSec) * time.Second
-	c.TotalTimeout = time.Duration(c.TotalTimeoutSec) * time.Second
+// Operational maxima for the integer duration settings (RDAYBLUEX-023). A
+// technically representable multi-century timeout is never intended; each
+// setting has a documented ceiling well below the point where the
+// int→time.Duration multiplication could overflow.
+const (
+	MaxQueryTimeoutSec        = 300     // 5 minutes per server
+	MaxTotalTimeoutSec        = 3600    // 1 hour per validation
+	MaxShutdownTimeoutSec     = 600     // 10 minutes
+	MaxRateLimitCleanupSec    = 86400   // 1 day
+	MaxHeartbeatIntervalMinut = 24 * 60 // 1 day
+)
+
+// ValidateRootAnchorsCachePath checks the last-known-good anchor cache path
+// (RDAYBLUEX-011): empty disables the cache; otherwise it must be absolute
+// and must not name the operator's anchor file, which the service never
+// writes.
+func ValidateRootAnchorsCachePath(cachePath, anchorsPath string) error {
+	cachePath = strings.TrimSpace(cachePath)
+	if cachePath == "" {
+		return nil
+	}
+	if !filepath.IsAbs(cachePath) {
+		return fmt.Errorf("root_anchors_cache_path must be an absolute path (got %q)", cachePath)
+	}
+	if anchorsPath != "" && filepath.Clean(cachePath) == filepath.Clean(anchorsPath) {
+		return fmt.Errorf("root_anchors_cache_path must differ from root_anchors_path (%q): the operator's anchor file is never written by the service", anchorsPath)
+	}
+	return nil
+}
+
+// checkedDuration converts an integer count of unit into a time.Duration,
+// rejecting values that would overflow int64 nanoseconds, non-positive
+// results, and values above the setting's operational maximum
+// (RDAYBLUEX-023). The error names the field.
+func checkedDuration(field string, n int, unit time.Duration, max int) (time.Duration, error) {
+	if n <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %d", field, n)
+	}
+	if int64(n) > math.MaxInt64/int64(unit) {
+		return 0, fmt.Errorf("%s = %d overflows the representable duration range", field, n)
+	}
+	if n > max {
+		return 0, fmt.Errorf("%s = %d exceeds the maximum of %d", field, n, max)
+	}
+	d := time.Duration(n) * unit
+	if d <= 0 {
+		return 0, fmt.Errorf("%s = %d does not convert to a positive duration", field, n)
+	}
+	return d, nil
+}
+
+// applyNestedToFlat copies nested struct values to flat fields for backwards
+// compatibility. Every integer-to-duration conversion is checked
+// (RDAYBLUEX-023): an overflowing, non-positive or out-of-range value is a
+// configuration error returned before any server, goroutine or ticker is
+// built, never a wrapped duration that silently disables a bound or panics a
+// ticker.
+func (c *Config) applyNestedToFlat() error {
+	var err error
+	if c.ShutdownTimeout, err = checkedDuration("shutdown_timeout_seconds", c.ShutdownTimeoutSec, time.Second, MaxShutdownTimeoutSec); err != nil {
+		return err
+	}
+	if c.QueryTimeout, err = checkedDuration("query_timeout_seconds", c.QueryTimeoutSec, time.Second, MaxQueryTimeoutSec); err != nil {
+		return err
+	}
+	if c.TotalTimeout, err = checkedDuration("total_timeout_seconds", c.TotalTimeoutSec, time.Second, MaxTotalTimeoutSec); err != nil {
+		return err
+	}
 
 	// Rate limiting
 	c.RateLimitPerSec = c.RateLimit.PerSec
 	c.RateLimitBurst = c.RateLimit.Burst
-	c.RateLimitCleanup = time.Duration(c.RateLimit.CleanupSec) * time.Second
+	if c.RateLimitCleanup, err = checkedDuration("rate_limit.cleanup_seconds", c.RateLimit.CleanupSec, time.Second, MaxRateLimitCleanupSec); err != nil {
+		return err
+	}
 
 	// Logging
 	c.LogFormat = c.Logging.Format
@@ -333,7 +411,20 @@ func (c *Config) applyNestedToFlat() {
 	c.HeartbeatApp = c.Heartbeat.App
 	c.HeartbeatStatusURL = c.Heartbeat.StatusURL
 	c.HeartbeatInstanceID = c.Heartbeat.InstanceID
-	c.HeartbeatInterval = time.Duration(c.Heartbeat.IntervalMinutes) * time.Minute
+	// The heartbeat interval only matters when the heartbeat is enabled; a
+	// disabled heartbeat keeps a zero interval (Validate has always allowed
+	// that) and never starts a ticker.
+	if c.Heartbeat.Enabled {
+		if c.HeartbeatInterval, err = checkedDuration("heartbeat.interval_minutes", c.Heartbeat.IntervalMinutes, time.Minute, MaxHeartbeatIntervalMinut); err != nil {
+			return err
+		}
+	} else {
+		c.HeartbeatInterval = 0
+		if c.Heartbeat.IntervalMinutes > 0 && int64(c.Heartbeat.IntervalMinutes) <= math.MaxInt64/int64(time.Minute) {
+			c.HeartbeatInterval = time.Duration(c.Heartbeat.IntervalMinutes) * time.Minute
+		}
+	}
+	return nil
 }
 
 // Validate checks the configuration for errors
@@ -361,19 +452,31 @@ func (c *Config) Validate() error {
 	if c.RateLimit.Burst <= 0 {
 		return fmt.Errorf("rate_limit.burst must be positive")
 	}
-	if c.RateLimit.CleanupSec <= 0 {
-		return fmt.Errorf("rate_limit.cleanup_seconds must be positive")
-	}
 
-	// Validate timeouts
-	if c.QueryTimeoutSec <= 0 {
-		return fmt.Errorf("query_timeout_seconds must be positive")
+	// Every integer that becomes a duration is checked the same way the
+	// loaders convert it (RDAYBLUEX-023): positive, within the representable
+	// range and within its operational maximum. A derived duration that was
+	// populated by some other path must agree with its integer.
+	durations := []struct {
+		field   string
+		n       int
+		unit    time.Duration
+		max     int
+		derived time.Duration
+	}{
+		{"rate_limit.cleanup_seconds", c.RateLimit.CleanupSec, time.Second, MaxRateLimitCleanupSec, c.RateLimitCleanup},
+		{"query_timeout_seconds", c.QueryTimeoutSec, time.Second, MaxQueryTimeoutSec, c.QueryTimeout},
+		{"total_timeout_seconds", c.TotalTimeoutSec, time.Second, MaxTotalTimeoutSec, c.TotalTimeout},
+		{"shutdown_timeout_seconds", c.ShutdownTimeoutSec, time.Second, MaxShutdownTimeoutSec, c.ShutdownTimeout},
 	}
-	if c.TotalTimeoutSec <= 0 {
-		return fmt.Errorf("total_timeout_seconds must be positive")
-	}
-	if c.ShutdownTimeoutSec <= 0 {
-		return fmt.Errorf("shutdown_timeout_seconds must be positive")
+	for _, d := range durations {
+		want, err := checkedDuration(d.field, d.n, d.unit, d.max)
+		if err != nil {
+			return err
+		}
+		if d.derived != 0 && d.derived != want {
+			return fmt.Errorf("%s = %d does not match its derived duration %s", d.field, d.n, d.derived)
+		}
 	}
 
 	// Validate max concurrent
@@ -430,9 +533,22 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Validate heartbeat interval when enabled (time.NewTicker requires > 0)
-	if c.Heartbeat.Enabled && c.Heartbeat.IntervalMinutes <= 0 {
-		return fmt.Errorf("heartbeat.interval_minutes must be positive when heartbeat.enabled is true")
+	// Validate heartbeat interval when enabled (time.NewTicker requires > 0):
+	// the same checked conversion as the loaders (RDAYBLUEX-023).
+	if c.Heartbeat.Enabled {
+		want, err := checkedDuration("heartbeat.interval_minutes", c.Heartbeat.IntervalMinutes, time.Minute, MaxHeartbeatIntervalMinut)
+		if err != nil {
+			return fmt.Errorf("%w (heartbeat.enabled is true)", err)
+		}
+		if c.HeartbeatInterval != 0 && c.HeartbeatInterval != want {
+			return fmt.Errorf("heartbeat.interval_minutes = %d does not match its derived duration %s", c.Heartbeat.IntervalMinutes, c.HeartbeatInterval)
+		}
+	}
+
+	// The last-known-good anchor cache (RDAYBLUEX-011) is written by the
+	// service: absolute, and never the operator's own anchor file.
+	if err := ValidateRootAnchorsCachePath(c.RootAnchorsCachePath, c.RootAnchorsPath); err != nil {
+		return err
 	}
 
 	// The trust-anchor URL, when set, must be HTTPS — anchors fetched over

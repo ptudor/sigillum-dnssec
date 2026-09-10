@@ -73,8 +73,11 @@ func main() {
 		LogWarn("main", "static_dir is deprecated and ignored; the web UI is served from embedded assets", "static_dir", cfg.StaticDir)
 	}
 
-	// Create anchors store and load trust anchors
+	// Create anchors store and load trust anchors. The last-known-good cache
+	// (RDAYBLUEX-011) is read before the network and written after every
+	// usable fetch, so a restart during an outage still validates.
 	anchorsStore := NewAnchorsStore(cfg.RootAnchorsPath, cfg.RootAnchorsURL)
+	anchorsStore.SetCachePath(cfg.RootAnchorsCachePath)
 
 	// Root anchor freshness/availability are computed at scrape time so the gauges
 	// never freeze between refreshes or read zero before the first load (R-055).
@@ -105,6 +108,7 @@ func main() {
 			"loaded_from", anchors.LoadedFrom,
 			"data_source", anchors.Source,
 		)
+		logAnchorCacheOutcome(anchorsStore)
 	}
 
 	// Create and start server
@@ -175,6 +179,7 @@ func main() {
 				anchors := anchorsStore.Get()
 				LogInfo("main", "loaded root trust anchors after retry",
 					"count", len(anchors.Anchors), "loaded_from", anchors.LoadedFrom)
+				logAnchorCacheOutcome(anchorsStore)
 				break
 			}
 		}
@@ -185,10 +190,11 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				if err := anchorsStore.Load(); err != nil {
-					LogWarn("main", "failed to refresh root anchors", "error", err.Error())
+				if err := anchorsStore.Refresh(); err != nil {
+					LogWarn("main", "failed to refresh root anchors; keeping the current set", "error", err.Error())
 				} else {
-					LogInfo("main", "refreshed root trust anchors")
+					LogInfo("main", "refreshed root trust anchors", "loaded_from", anchorsStore.Get().LoadedFrom)
+					logAnchorCacheOutcome(anchorsStore)
 				}
 			case <-anchorDone:
 				return
@@ -226,4 +232,14 @@ func main() {
 	}
 
 	LogInfo("main", "server stopped")
+}
+
+// logAnchorCacheOutcome reports a failed last-known-good cache write
+// (RDAYBLUEX-011). The anchors in memory are unaffected; the next restart
+// during an outage would have nothing to fall back on, which is worth an
+// operator's attention.
+func logAnchorCacheOutcome(store *AnchorsStore) {
+	if err := store.CacheError(); err != nil {
+		LogWarn("main", "root anchors were loaded but could not be cached for offline restarts", "error", err.Error())
+	}
 }

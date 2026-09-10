@@ -78,6 +78,27 @@ type Daemon struct {
 	// and the state mutations they guard.
 	generation atomic.Uint64
 	pubMu      sync.Mutex
+	// healthProbes caches the health endpoints' directory write probes and
+	// healthLimit bounds remote health requests (RDAYBLUEX-035).
+	healthProbes *dirProbeCache
+	healthLimit  healthLimiter
+}
+
+// allowHealthRequest admits a health request: unlimited on the loopback
+// default, rate limited when the listener is deliberately exposed.
+func (d *Daemon) allowHealthRequest(cfg *config.Config) bool {
+	if cfg == nil || !cfg.Health.AllowRemote {
+		return true
+	}
+	return d.healthLimit.allow()
+}
+
+// invalidateHealthProbes discards cached directory probe results so the next
+// health request re-probes: called on reload and after a real write failure.
+func (d *Daemon) invalidateHealthProbes() {
+	if d.healthProbes != nil {
+		d.healthProbes.invalidate()
+	}
 }
 
 // Generation returns the identity of the active config/state pair.
@@ -116,6 +137,7 @@ func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 		ready:       make(chan struct{}),
 	}
 	d.hooks = newHookDispatcher(&d.hookWG)
+	d.healthProbes = newDirProbeCache()
 	d.generation.Store(1)
 	return d
 }
@@ -358,6 +380,8 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) error {
 	// generation's first cycle re-derives what to deploy, and a completion
 	// from the old one is discarded (RDAYBLUEX-005, RDAYBLUEX-018).
 	d.hooks.purgeQueued()
+	// Directories may have changed: re-probe on the next health request.
+	d.invalidateHealthProbes()
 
 	// Stop the old client and start the new one outside the lock. Both Stop()
 	// and Start() send a synchronous heartbeat with up to a 10s HTTP timeout;
@@ -714,6 +738,7 @@ rolloverLoop:
 			slog.Warn("[DAEMON] State saved but its durability across power loss is uncertain", "error", err)
 		} else {
 			d.lastSaveFailed.Store(true)
+			d.invalidateHealthProbes() // a real write failed: re-probe at once
 			slog.Error("[DAEMON] Failed to save state", "error", err)
 		}
 	} else {
@@ -843,6 +868,7 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// Sign the zone
 	signStart := time.Now()
 	if err := snap.signer.SignZone(domain); err != nil {
+		d.invalidateHealthProbes() // a signing (write) failure: re-probe at once
 		snap.state.Mutate(func() { zoneState.SetOperationError(statepkg.OpSigning, err.Error()) })
 		metrics.RecordSigningOperation(domain, time.Since(signStart).Seconds(), false)
 		snap.heartbeat.SigningError(domain)

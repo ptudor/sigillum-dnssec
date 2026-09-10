@@ -21,7 +21,11 @@ other documentation.
 
 Configuration is root-owned, mode `0640`, and readable by the corresponding daemon
 group. Account and state directories are created on installation. Signer keys
-are in a `0700` directory. Units live in `/usr/lib/systemd/system`.
+are in a `0700` directory. Units live in `/usr/lib/systemd/system`. The
+validator's state directory holds its last-known-good root-anchor cache
+(`root_anchors_cache_path`), written after every usable download and read
+before the network on later starts; the unit declares it as
+`StateDirectory=sigillum-validator`, the service's only writable path.
 
 **Installation and upgrades do not enable, start, or restart either daemon.** RPM
 configuration uses `%config(noreplace)`; DEBs register conffiles. Package removal

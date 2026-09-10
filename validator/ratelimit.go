@@ -32,8 +32,14 @@ type tokenBucket struct {
 	lastCheck time.Time
 }
 
-// NewRateLimiter creates a new rate limiter
+// NewRateLimiter creates a new rate limiter. A non-positive cleanup interval
+// (which time.NewTicker would panic on) is replaced by a five-minute default
+// (RDAYBLUEX-023); configuration validation rejects such values before the
+// server is built, so this is defence in depth, never the primary gate.
 func NewRateLimiter(rate, burst int, cleanup time.Duration) *RateLimiter {
+	if cleanup <= 0 {
+		cleanup = 5 * time.Minute
+	}
 	rl := &RateLimiter{
 		limiters:   make(map[string]*tokenBucket),
 		rate:       rate,
