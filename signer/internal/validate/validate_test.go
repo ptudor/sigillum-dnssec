@@ -132,6 +132,7 @@ func TestDSCheck(t *testing.T) {
 	parentAddr, parentCleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 		if r.Question[0].Qtype == dns.TypeDS {
 			m.Answer = append(m.Answer, &dns.DS{
 				Hdr: dns.RR_Header{
@@ -232,6 +233,7 @@ func TestRRSIGCheck(t *testing.T) {
 	authAddr, authCleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 		switch r.Question[0].Qtype {
 		case dns.TypeSOA:
 			m.Answer = append(m.Answer, &dns.SOA{
@@ -326,6 +328,7 @@ func TestSOACheck(t *testing.T) {
 	authAddr, authCleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 		if r.Question[0].Qtype == dns.TypeSOA {
 			m.Answer = append(m.Answer, &dns.SOA{
 				Hdr: dns.RR_Header{
@@ -368,6 +371,7 @@ func TestQueryDirectDOBit(t *testing.T) {
 	addr, cleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 
 		// Check that DO bit is set
 		opt := r.IsEdns0()
@@ -434,12 +438,14 @@ func TestQueryDirect_RetriesTCPOnTruncation(t *testing.T) {
 	udpSrv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 		m.Truncated = true
 		w.WriteMsg(m)
 	})}
 	tcpSrv := &dns.Server{Listener: ln, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 		m.Answer = append(m.Answer, &dns.DNSKEY{
 			Hdr:       dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
 			Flags:     257,
@@ -474,6 +480,7 @@ func TestResolveNS_CaseInsensitiveGlue(t *testing.T) {
 	addr, cleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 		if r.Question[0].Qtype == dns.TypeNS {
 			m.Answer = append(m.Answer, &dns.NS{
 				Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 3600},
@@ -506,6 +513,7 @@ func TestResolverReachable(t *testing.T) {
 	addr, cleanup := startMockDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		m.Authoritative = true
 		w.WriteMsg(m)
 	})
 	defer cleanup()

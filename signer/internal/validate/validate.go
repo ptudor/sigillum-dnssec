@@ -849,34 +849,28 @@ func (v *Validator) resolverReachable() bool {
 	return err == nil
 }
 
-// queryDirect sends a DNS query directly to a specific server with the DO (DNSSEC OK) bit set.
+// queryDirect sends a DNS query directly to a specific authoritative server
+// with the DO (DNSSEC OK) bit set. The answer must echo the question asked,
+// be NOERROR and be authoritative (RDAYBLUEX-003): a referral, a lame or
+// recursive answer, or a response to another question is an error, never
+// data. A truncated answer is retried over TCP (R-050).
 func queryDirect(server, qname string, qtype uint16, timeout time.Duration) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(qname), qtype)
 	m.SetEdns0(4096, true) // DO bit for DNSSEC records
 	m.RecursionDesired = false
 
-	c := new(dns.Client)
-	c.Timeout = timeout
-
-	r, _, err := c.Exchange(m, server)
+	c := &dns.Client{Timeout: timeout}
+	r, err := exchangeTC(c, m, server)
 	if err != nil {
 		return nil, err
 	}
 
-	// A large DNSKEY/RRSIG answer can exceed the UDP buffer; on TC=1 the server
-	// signals "retry over TCP". Without this we'd silently lose records and the
-	// downstream checks would misreport (R-050).
-	if r.Truncated {
-		c.Net = "tcp"
-		r, _, err = c.Exchange(m, server)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	if r.Rcode != dns.RcodeSuccess {
 		return r, fmt.Errorf("DNS response code: %s", dns.RcodeToString[r.Rcode])
+	}
+	if !r.Authoritative {
+		return r, fmt.Errorf("non-authoritative answer from %s for %s/%s", server, dns.Fqdn(qname), dns.TypeToString[qtype])
 	}
 
 	return r, nil

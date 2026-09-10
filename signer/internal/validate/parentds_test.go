@@ -82,13 +82,17 @@ func newParentLab(t *testing.T) *parentLab {
 		m := new(dns.Msg)
 		m.SetReply(r)
 		q := r.Question[0]
-		if q.Qtype == dns.TypeNS {
+		switch {
+		case q.Qtype == dns.TypeNS:
+			// The NS names are out of bailiwick for every zone asked about,
+			// so their addresses are resolved separately (RDAYBLUEX-003).
 			m.Answer = append(m.Answer,
 				&dns.NS{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 60}, Ns: "ns4.lab."},
 				&dns.NS{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 60}, Ns: "ns6.lab."})
-			m.Extra = append(m.Extra,
-				&dns.A{Hdr: dns.RR_Header{Name: "ns4.lab.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("127.0.0.1")},
-				&dns.AAAA{Hdr: dns.RR_Header{Name: "ns6.lab.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60}, AAAA: net.ParseIP("::1")})
+		case q.Qtype == dns.TypeA && q.Name == "ns4.lab.":
+			m.Answer = append(m.Answer, &dns.A{Hdr: dns.RR_Header{Name: "ns4.lab.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("127.0.0.1")})
+		case q.Qtype == dns.TypeAAAA && q.Name == "ns6.lab.":
+			m.Answer = append(m.Answer, &dns.AAAA{Hdr: dns.RR_Header{Name: "ns6.lab.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60}, AAAA: net.ParseIP("::1")})
 		}
 		w.WriteMsg(m)
 	})}

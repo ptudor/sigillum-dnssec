@@ -434,16 +434,21 @@ func preflightConfigAppend(path string) error {
 //     probe is run synchronously and is the sole confirmation authority. When
 //     it does not confirm, the zone stays pending for the daemon (or the next
 //     `sign`) to probe again.
-func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath string) bool {
+//
+// The second result is the deployment hook's failure, if a configured hook
+// failed (RDAYBLUEX-031): commands whose committed result is otherwise
+// complete (`resign`, `import`) report it through their exit status.
+func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath string) (served bool, deployErr error) {
 	zs := state.GetZone(domain)
 	if zs == nil {
-		return false
+		return false, nil
 	}
 	mode := cfg.PublicationMode()
 	if hookConfigured(&cfg.Hooks) {
 		slog.Info("[CLI] Executing post-sign hook", "domain", domain)
 		ref := signedRef(cfg, domain, zonePath, zs.LastSigned)
 		if err := firePostSignHooks(&cfg.Hooks, cfg.OutputDir, []SignedZoneRef{ref}, nil, nil); err != nil {
+			deployErr = err
 			state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, "post-sign hook failed: "+err.Error()) })
 			if perr := persistState(state); perr != nil {
 				slog.Error("[CLI] Failed to persist deployment error", "error", perr)
@@ -452,20 +457,20 @@ func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath
 			case config.PublicationImmediate:
 				slog.Error("[CLI] Post-sign hook failed; the generation is published (immediate mode) but the deployment step did not complete", "domain", domain, "error", err)
 				fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; the signed zone is published (publication = \"immediate\") but the hook did not complete\n", domain)
-				return true
+				return true, deployErr
 			case config.PublicationProbe:
 				slog.Error("[CLI] Post-sign hook failed; publication is decided by the authoritative-server probe", "domain", domain, "error", err)
 				fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; checking whether every authoritative server serves the published serial anyway\n", domain)
 			default:
 				slog.Error("[CLI] Post-sign hook failed; the zone is not confirmed served and stays pending deployment", "domain", domain, "error", err)
 				fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; the signed zone is written but not confirmed served (the daemon retries the hook)\n", domain)
-				return false
+				return false, deployErr
 			}
 		} else {
 			switch mode {
 			case config.PublicationHook:
 				confirmPublicationCLI(state, []SignedZoneRef{ref})
-				return true
+				return true, nil
 			default:
 				// The hook is not the publication authority in this mode; it
 				// only clears its own deployment error.
@@ -478,7 +483,7 @@ func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath
 	}
 	switch mode {
 	case config.PublicationImmediate:
-		return true
+		return true, deployErr
 	case config.PublicationProbe:
 		confirmed := probePendingPublications(cfg, state, []string{domain})
 		if err := persistState(state); err != nil {
@@ -486,13 +491,37 @@ func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath
 		}
 		if len(confirmed) == 0 {
 			fmt.Fprintf(os.Stderr, "notice: %s is signed but not yet confirmed served by every authoritative server (publication = \"probe\"); the daemon or the next `sigillum-signer sign` re-checks\n", domain)
-			return false
+			return false, deployErr
 		}
-		return true
+		return true, deployErr
 	}
 	// Hook mode without a configured hook cannot happen (config validation
 	// requires one); nothing confirmed.
-	return false
+	return false, deployErr
+}
+
+// ErrDeploymentNotConfirmed is the distinct error a CLI command returns when
+// its signing or import committed completely but the deployment hook failed
+// (RDAYBLUEX-031): every key, config, state and output file and the
+// pending-publication marker are in place, nothing is rolled back, and the
+// daemon (or re-running the command) retries the deployment. Automation
+// keying on the exit status must not take the zone as served.
+var ErrDeploymentNotConfirmed = errors.New("committed, but the post-sign hook failed; the zone is not confirmed served")
+
+// reportDeployment prints the deployment outcome line for a committed single
+// zone command and returns the error its exit status must carry.
+func reportDeployment(domain string, served bool, deployErr error) error {
+	switch {
+	case deployErr != nil:
+		fmt.Printf("Deployment: NOT confirmed served — the post-sign hook failed (%v).\n", deployErr)
+		fmt.Printf("The signed generation is committed and stays pending; the daemon retries the hook, or run `sigillum-signer resign %s` once the hook is fixed.\n", domain)
+		return fmt.Errorf("%w: %s: %v", ErrDeploymentNotConfirmed, domain, deployErr)
+	case !served:
+		fmt.Println("Deployment: signed, not yet confirmed served (publication pending).")
+	default:
+		fmt.Println("Deployment: confirmed served.")
+	}
+	return nil
 }
 
 // recordSigningFailure persists a zone's signing error the way the daemon
@@ -977,12 +1006,14 @@ func runResign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	_ = runPostSignHook(cfg, state, domain, zoneCfg.Path)
+	served, deployErr := runPostSignHook(cfg, state, domain, zoneCfg.Path)
 
-	fmt.Printf("Zone %s re-signed successfully.\n", domain)
+	fmt.Printf("Zone %s re-signed.\n", domain)
 	fmt.Printf("Signed zone written to: %s\n", filepath.Join(cfg.OutputDir, domain+".zone.signed"))
 
-	return nil
+	// A failed deployment is reported through the exit status (RDAYBLUEX-031);
+	// the committed signing is never rolled back.
+	return reportDeployment(domain, served, deployErr)
 }
 
 // runStatus prints the current status
@@ -1234,7 +1265,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("Note: a running daemon picks up the new zone after SIGHUP (config reload).")
 
-	hookOK := runPostSignHook(cfg, state, domain, zonePath)
+	hookOK, _ := runPostSignHook(cfg, state, domain, zonePath)
 
 	// If a registrar is configured for this zone and auto-publish is on,
 	// push the DS record automatically. Failures are non-fatal. A DS is only
@@ -1359,7 +1390,7 @@ func runRolloverStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	hookOK := runPostSignHook(cfg, state, domain, zoneState.Path)
+	hookOK, _ := runPostSignHook(cfg, state, domain, zoneState.Path)
 
 	// Print new DS
 	fmt.Printf("KSK rollover started for %s.\n\n", domain)
@@ -1466,7 +1497,9 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Verified the new KSK's DS is present at all %d parent server(s) (DS TTL %ds).\n", len(obs.Servers), obs.TTL)
 	}
 	if parentDSTTL == 0 {
-		parentDSTTL = uint32(cfg.ParentDSTTLFallback() / time.Second)
+		// The single checked conversion (RDAYBLUEX-024): never a truncating
+		// or wrapping cast of the raw duration.
+		parentDSTTL = cfg.ParentDSTTLFallbackSeconds()
 	}
 
 	rolloverMgr := newRolloverManager(cfg, state)
@@ -1501,7 +1534,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	hookOK := runPostSignHook(cfg, state, domain, zoneState.Path)
+	hookOK, _ := runPostSignHook(cfg, state, domain, zoneState.Path)
 
 	// Removing the old DS at the parent is safe from here: every resolver
 	// validates through a DS that matches a served KSK. Only the old KEY's
@@ -1557,7 +1590,7 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	hookOK := runPostSignHook(cfg, state, domain, zoneState.Path)
+	hookOK, _ := runPostSignHook(cfg, state, domain, zoneState.Path)
 
 	// Get new DS record
 	keyGen := signerpkg.NewKeyGenerator(cfg)
@@ -1908,7 +1941,13 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return tx.fail(fmt.Errorf("adding zone to config file: %w", err))
 	}
 
-	fmt.Printf("\nDomain %s imported successfully.\n", domain)
+	// The import is fully committed from here (keys, output, state, config);
+	// deployment runs before the summary so the summary can report it
+	// truthfully, and a failed hook is reported through the exit status
+	// (RDAYBLUEX-031) without rolling anything back.
+	served, deployErr := runPostSignHook(cfg, state, domain, zonePath)
+
+	fmt.Printf("\nDomain %s imported.\n", domain)
 	fmt.Printf("  KSK: %d (%s)\n", ksk.KeyTag(), signerpkg.AlgorithmName(ksk.Algorithm))
 	fmt.Printf("  ZSK: %d (%s)\n", zsk.KeyTag(), signerpkg.AlgorithmName(zsk.Algorithm))
 	fmt.Printf("  Config updated: %s\n", configPath)
@@ -1918,9 +1957,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	fmt.Println(dsOutput)
 	fmt.Println("Note: a running daemon picks up the new zone after SIGHUP (config reload).")
 
-	_ = runPostSignHook(cfg, state, domain, zonePath)
-
-	return nil
+	return reportDeployment(domain, served, deployErr)
 }
 
 // importFailpoint is a test-only fault-injection seam consulted at each
