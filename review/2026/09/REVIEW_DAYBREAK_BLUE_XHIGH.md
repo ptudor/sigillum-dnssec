@@ -2,7 +2,7 @@
 
 Review date: 2026-09-09  
 Scope: the complete repository at commit `3a43241`, including both Go modules, packaging, service definitions, workflows, scripts, browser assets, documentation, and tests.  
-Method: static data-flow and lifecycle tracing, cross-module consistency checks, `go vet ./...` in both modules, and `go test -race ./...` in both modules. The race suites and vet checks passed. Vulnerability scanning could not produce a result because the installed scanner was built with an older Go source-processing stack than the Go 1.27 toolchain used by this repository; that tooling failure is not evidence that the dependency graph is vulnerability-free.
+Method: static data-flow and lifecycle tracing, cross-module consistency checks, `go vet ./...` in both modules, and `go test -race ./...` in both modules. The race suites and vet checks passed. `govulncheck` call-graph and module scans also completed for both modules by running the installed scanner with its compatible Go 1.26 source loader; all four scans reported no known vulnerability. That result is limited to the vulnerability database and dependency/code reachability understood by that scanner on the review date.
 
 The review is analysis only. No source files were changed.
 
@@ -175,3 +175,115 @@ The review is analysis only. No source files were changed.
 **Fix specification:** Make typed environment parsing return an error that names the variable and expected syntax whenever a nonempty value cannot be parsed; accumulate multiple errors if practical so operators can repair a deployment in one pass. Continue applying defaults only when variables are absent or intentionally empty according to the existing contract. Preserve currently accepted boolean aliases, environment variable names, file-first configuration precedence, default values, and the `Config` public fields. Never log secret-valued environment variables while reporting parse errors.
 
 **Verification:** Add table-driven `LoadFromEnv` tests for malformed, overflow, whitespace, and valid integer values plus every accepted and rejected boolean spelling. Assert malformed `MAX_CONCURRENT`, rate-limit, timeout, shutdown, heartbeat interval, and heartbeat enabled values fail startup rather than use defaults; absent values must still receive existing defaults. Run `go test -race ./...` in `validator`.
+
+### RDAYBLUEX-013 — A configured hook defeats explicit publication modes
+
+**Severity:** High
+
+**Location:** `signer/daemon.go:739-744`, method `Daemon.checkAndSignZone`; `signer/daemon.go:548-568`, method `Daemon.signAllZones`; `signer/daemon.go:851-899`, method `Daemon.confirmPublication`; `signer/main.go:419-447`, function `runPostSignHook`; `signer/internal/config/config.go:126-163`, publication-mode contract
+
+**Problem:** Whenever a post-sign hook is configured, daemon and single-zone CLI paths treat its success as publication confirmation even when the operator explicitly selected `publication = "probe"` or `publication = "immediate"`. In probe mode this bypasses the required every-authoritative-server SOA check and lets rollover cache timers start from a local command's completion. A stale or ineffective deployment hook can therefore authorize key retirement before the new generation is actually served everywhere. In immediate mode a later hook confirmation moves `PublishedAt` and cache horizons a second time, while a hook failure is reported as a deployment failure even though the selected policy says the file write itself is publication.
+
+**Evidence:** `PublicationMode` documents three mutually distinct confirmation authorities. `SignZone` correctly confirms only immediate mode and marks hook/probe modes pending at `signer/internal/signer/sign.go:333-340`. However, `checkAndSignZone` launches every configured hook with `d.confirmPublication` as the completion callback without checking the effective mode. The later mode switch also runs the probe, but an earlier or later hook completion can independently clear the same pending flag. The CLI helper similarly calls `confirmPublicationCLI` after any successful hook and is used by `resign`, rollover, add, and import commands regardless of mode.
+
+**Fix specification:** Decouple “run a post-sign command” from “this command is the publication authority.” Continue running configured hooks as the deployment mechanism where that is the established hook contract, but attach the confirmation callback only in effective hook mode. In probe mode, leave the generation pending until the existing every-authoritative-server serial probe succeeds; CLI commands may run that probe synchronously or leave a clearly reported pending state for the daemon, but must not substitute hook success. In immediate mode, the atomic file replacement remains the sole confirmation event; later hook success/failure must not move publication timestamps/cache horizons or block DS automation on the false premise that publication failed. Preserve hook environment, coalescing, config syntax/default auto-selection, state schema, and the rule that an unspecified mode plus a configured hook resolves to hook mode.
+
+**Verification:** Add a mode-by-hook matrix covering daemon and CLI signing. With explicit probe mode and a successful hook but a failing/partial serial probe, assert publication remains pending and rollover gates do not advance. With immediate mode, assert `PublishedAt` is set exactly by signing, hook completion does not move it, and a hook failure does not convert the published generation back to pending. With hook mode, retain current success/failure and retry behavior. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-014 — Registrar credentials can be sent over cleartext or across redirects
+
+**Severity:** High
+
+**Location:** `signer/internal/config/config.go:64-82`, type `RegistrarDynadotConfig`; `signer/internal/config/config.go:409-458`, method `Config.Validate`; `signer/internal/registrar/registrar_dynadot.go:75-113`, function `NewDynadot`; `signer/internal/registrar/registrar_dynadot.go:220-264`, method `DynadotClient.do`
+
+**Problem:** The registrar endpoint override accepts an arbitrary URL and the HTTP client uses Go's default redirect behavior. Every request carries the API key in `Authorization` and an HMAC in `X-Signature`. A mistaken cleartext override exposes credentials on the network. A same-origin HTTPS-to-HTTP redirect can also replay sensitive headers over cleartext; 307/308 redirects can replay the request body without recomputing the path-bound signature. This is a credential-compromise risk in the component authorized to replace or delete parent DS records.
+
+**Evidence:** `Config.Validate` validates the digest type and other registrar settings but never parses or constrains `RegistrarDynadotConfig.BaseURL`. `NewDynadot` copies a nonempty override verbatim after trimming `/` and creates `http.Client{Timeout: timeout}` without `CheckRedirect`. `do` concatenates the endpoint and signed path, then sets `Authorization: Bearer <apiKey>` and `X-Signature` before calling that client. The standard client follows redirects; the adapter neither enforces HTTPS on the redirect target nor re-signs a redirected path.
+
+**Fix specification:** Parse the override as an absolute URL at configuration validation time and require HTTPS for production use. If existing local test/proxy workflows require HTTP, permit it only for a loopback literal/localhost behind an explicit insecure-development setting that is disabled by default; do not infer safety from an arbitrary hostname resolving locally. Install a bounded `CheckRedirect` policy that rejects scheme downgrade, userinfo, host/port changes, and unexpected paths. If any redirects remain supported, build and sign a fresh request for the approved target rather than allowing automatic replay. Apply the same rule to every method, including destructive DS replacement/recovery. Preserve default and sandbox endpoint selection, registrar interfaces, timeout/user-agent settings, config compatibility for valid HTTPS overrides, and test-double support through an explicit safe test mechanism.
+
+**Verification:** Add client/config tests for an HTTP override, malformed/relative URL, HTTPS-to-HTTP redirect, cross-origin redirect, same-origin changed-path 307/308, redirect loops, and an approved no-redirect HTTPS request. A capture server must prove the API key, signature, and body never reach a rejected target. Retain local integration tests using the explicit test path. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-015 — Oversized signature lifetimes wrap DNSSEC time and pass self-verification
+
+**Severity:** Medium
+
+**Location:** `signer/internal/config/config.go:491-509`, method `Config.Validate`; `signer/internal/signer/sign.go:1084-1090`, method `Signer.signRecordsWithModel`; `signer/internal/signer/sign.go:1197-1236`, method `Signer.verifySignedZoneWithModel`; `signer/internal/signer/sign.go:1431-1458`, method `Signer.createRRSIG`; `signer/internal/signer/sign.go:307-326`, method `Signer.recordSignedZone`
+
+**Problem:** Configuration requires only a positive signature validity and a smaller refresh interval. Go durations can represent centuries, but RRSIG inception/expiration are 32-bit serial times and their unambiguous interval is limited by serial arithmetic. An accepted large validity can wrap the expiration into the past or an unintended future epoch. The post-sign verifier checks only the cryptographic signature, not its validity period, so it can publish the unusable zone. Even for normal values, state records `now + configured validity` after signing work completes rather than the actual expiration encoded into the signatures, overstating their usable lifetime.
+
+**Evidence:** `signRecordsWithModel` computes expiration from the unrestricted duration. `createRRSIG` truncates `expiration.Unix()` and inception to `uint32`. `verifySignedZoneWithModel` calls only `sig.Verify`; it never calls the library's validity-period check or compares the serial-time window with the intended policy. `recordSignedZone` independently stamps `SignaturesExp` from a later `now`, so the state deadline does not derive from the records that were written.
+
+**Fix specification:** Reject signature-validity values that are not safely representable under DNSSEC serial arithmetic (strictly less than half the 32-bit serial space), and impose a documented operational maximum well below that boundary. Validate the complete inception/expiration window, including the fixed one-hour backdate. During post-sign verification, require every RRSIG to be currently valid within the intended skew policy and to have the expected bounded window in addition to verifying cryptographically. Carry the minimum actual RRSIG expiration from the constructed signed zone into `recordSignedZone`; state must never claim validity later than the earliest published signature. Preserve normal default behavior, config keys, state JSON field names/backward readability, and public CLI output.
+
+**Verification:** Add config tests for the exact representability boundary, very large values such as 100 years, refresh values near the limit, and ordinary defaults. Mutate a valid signed zone to contain expired, not-yet-valid, wrapped, and unexpectedly long RRSIG windows and assert post-sign verification rejects each before output replacement. Assert persisted `signatures_expire` equals the minimum actual RRSIG expiration, not a later recomputation. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-016 — Same-size source replacements can remain unsigned for days
+
+**Severity:** Medium
+
+**Location:** `signer/internal/state/state.go:51-59`, type `ZoneState`; `signer/internal/signer/sign.go:755-802`, method `Signer.NeedsSign`; `signer/internal/signer/sign.go:813-912`, source-snapshot path
+
+**Problem:** Steady-state change detection persists and compares only source mtime and byte size. Replacing a zone with different same-length content while preserving or restoring its timestamp is deliberately treated as unchanged until periodic signature refresh. With the default validity/refresh relationship, a restored backup, reproducible build, synchronization tool, or adversarial local writer can leave materially changed DNS data unpublished for many days. This is a correctness and data-freshness failure, not merely an optimization tradeoff.
+
+**Evidence:** `ZoneState` stores `SourceModTime` and `SourceSize` but no content identity. `NeedsSign` triggers only when the current mtime is later or the size differs. Lines 796-801 explicitly acknowledge that `cp -p` of different content with the same size is skipped until signature refresh. The read path already holds a consistent regular-file descriptor and buffers the exact bytes, so a digest could be attached to the same snapshot without a second-file TOCTOU.
+
+**Fix specification:** Persist a cryptographic digest of the exact source bytes successfully parsed and published, and use it when metadata alone cannot establish identity. A straightforward safe policy is to digest on every poll; if that is too costly, use a documented metadata fast path plus a reliable mechanism for replacement detection, but equal/older mtime and equal size must not imply equality indefinitely. Compute the digest from the same descriptor snapshot used for parsing, store it only after successful output publication, and make the new state field optional so old files load safely and establish a baseline without losing current output. Retain quiescence checks, atomic-producer guidance, source path semantics, state schema backward compatibility, and avoidance of needless re-signs for genuinely unchanged bytes.
+
+**Verification:** Sign a zone, replace it atomically with different equal-length content while preserving the exact mtime, and assert the next check requests signing. Repeat with an older mtime, an unchanged byte-for-byte replacement, an in-place write observed during digest/read, and an old state file lacking the digest. Assert only changed complete snapshots are signed and failed/incomplete reads do not update the stored identity. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-017 — Zone-file input has no memory or record-count bound
+
+**Severity:** Medium
+
+**Location:** `signer/internal/signer/sign.go:837-912`, method `Signer.readSourceSnapshot`; `signer/internal/signer/sign.go:1048-1074`, function `ValidateZoneFile`; signing and import CLI paths that call them
+
+**Problem:** The daemon reads each source file completely into memory and then accumulates an unbounded record slice. The standalone validation path also accumulates every parsed record without a byte or record cap. A mistakenly huge generated zone, sparse-file read, or writer with access to a configured source can exhaust process memory and terminate signing for all zones. The per-zone panic recovery does not protect against operating-system OOM termination.
+
+**Evidence:** `readSourceSnapshot` verifies only that the descriptor is regular, then calls `io.ReadAll(f)` and appends every parser result to `records`. It does not reject a large `before.Size()` or use a limited reader. `ValidateZoneFile` streams the parser input but likewise appends all records to a slice before semantic validation. No config or package constant bounds either dimension.
+
+**Fix specification:** Define and enforce explicit maximum source bytes and record counts before allocation and throughout parsing. Reject a known oversized descriptor before reading; also use a reader limited to `max+1` to handle growth and special filesystem behavior, and stop record accumulation at `max+1`. Limits should be configurable only if operational requirements demand it, with safe nonzero hard ceilings. A rejected zone must retain its last-known-good signed output/state, record a per-zone signing error, and not prevent other zones from being processed. Apply equivalent protection to `validate`, `add`, and `import` paths. Preserve accepted zone-file syntax, include prohibition, public command APIs, and behavior below the limits.
+
+**Verification:** Add boundary tests at `max-1`, `max`, and `max+1` bytes and records, including a single extremely long record, a sparse oversized regular file, and a file that grows during reading. In a multi-zone daemon test, assert the oversized zone fails visibly while a normal zone still signs and the previous oversized-zone output is unchanged. Measure that allocation stays bounded. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-018 — Pending hooks can overlap without a process-wide bound
+
+**Severity:** Medium
+
+**Location:** `signer/hooks.go:245-313`, function `firePostSignHooks`; `signer/daemon.go:541-566`, pending-publication retry loop; `signer/daemon.go:739-744`, post-sign dispatch
+
+**Problem:** Non-coalesced dispatch starts one goroutine and child process per signed zone with no concurrency bound. Pending publication is retried every signing cycle without tracking whether the same generation already has a hook in flight. If the poll interval is shorter than hook duration or timeout, repeated identical deployments overlap; a large zone set can multiply that into a process/goroutine storm. Coalescing limits a cycle to one child but still permits the same batch to overlap across cycles.
+
+**Evidence:** `firePostSignHooks` constructs an invocation per zone and immediately starts a goroutine for every invocation when a wait group is supplied. It has no worker semaphore or in-flight registry. The daemon retry loop dispatches every pending zone on every cycle solely from persisted state; publication remains pending until callback completion, so a still-running hook qualifies again. No key combines daemon generation, domain, and `SignedAt` to single-flight an invocation.
+
+**Fix specification:** Route asynchronous hooks through a bounded dispatcher with a configurable or defensible fixed process-wide concurrency limit. Maintain single-flight identity for each exact publication generation (and batch identity when coalesced): a cycle must not enqueue or start a duplicate while that identity is queued/running. On completion, clear the identity and let failures become eligible for a later retry with bounded backoff; newer generations should supersede queued obsolete work without allowing stale completion to confirm them. Shutdown must remain bounded and terminate tracked process groups as today. Preserve synchronous CLI execution, hook environment and order contract, coalescing behavior, timeout, and at-least-once retry for current failed generations.
+
+**Verification:** Use blocking hooks across multiple short poll cycles. Assert a single generation has at most one queued/running invocation, total simultaneous child processes never exceeds the configured bound, a failed invocation retries only after completion/backoff, and a newer generation is eventually deployed without stale confirmation. Cover coalesced/non-coalesced operation and shutdown while work is queued. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-019 — State merge can erase same-generation CLI diagnostics
+
+**Severity:** Medium
+
+**Location:** `signer/internal/state/state.go:507-598`, methods `State.ReloadFromDisk` and `rolloverEqual`; `signer/daemon.go:499-504` and `signer/daemon.go:604-626`, failed-save recovery and pre-save merge; `signer/registrar_cli.go:21-31`, function `recordRegistrarWarning`
+
+**Problem:** Cross-process state merge adopts a disk zone only when its `LastSigned` is newer or a small subset of rollover fields differs. Same-generation mutations to warnings, operation errors, publication metadata, rollover timestamps/actions, or other fields are otherwise ignored. After a daemon pre-commit save failure, a CLI can persist an urgent registrar warning while the daemon retains newer unsaved work in memory. The next daemon reload keeps its memory object because signing and core rollover identity are equal, then saves it over disk, silently deleting the CLI warning. This can hide the repository's urgent “parent has zero DS” recovery signal.
+
+**Evidence:** `ReloadFromDisk` replaces a present zone only in two cases at lines 576-583. `rolloverEqual` compares only type, phase string, and four key IDs; it omits algorithms, phase timestamps/horizons, parent-observation fields, action, warnings/errors, publication fields, and force-resign state. `recordRegistrarWarning` intentionally mutates and saves warnings without changing `LastSigned`. The daemon's `lastSaveFailed` path reuses the in-memory snapshot and relies on `ReloadFromDisk` to merge intervening CLI writes, but this mutation class is not merged.
+
+**Fix specification:** Introduce an explicit monotonic revision or per-field transactional merge protocol rather than inferring causality from signing time. Every persisted mutation must carry enough version information to merge CLI and daemon changes without dropping either; warning/error removal requires a revision or tombstone so a union does not resurrect cleared diagnostics. Preserve fresher signing/key/publication state while adopting later independent diagnostics and deletion markers. Older state documents must load with a safe baseline revision and remain backward compatible. All read-merge-save operations stay under the existing cross-process lock, but the implementation must not assume that locking alone identifies which snapshot is newer.
+
+**Verification:** Inject a daemon pre-commit save failure, then under the lock persist an urgent CLI registrar warning at the same `LastSigned`; allow the next cycle to merge/save and assert both the daemon's unsaved signing changes and the CLI warning survive on disk. Repeat for setting/clearing operation errors, publication confirmation, rollover timestamp/action changes, zone removal/re-addition, and upgrades from an old revisionless state file. Run concurrent sequences repeatedly under `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-020 — RDAP endpoint and redirects create a blind HTTP egress path
+
+**Severity:** Medium
+
+**Location:** `validator/internal/config/config.go:243-299` and `validator/internal/config/config.go:334-459`, environment loading and validation; `validator/internal/rdap/client.go:25-83`, functions `NewClient` and `Client.QueryDomain`; `validator/handlers.go:53-59`, RDAP client construction
+
+**Problem:** The optional RDAP base URL is accepted without URL or scheme validation, and its client follows redirects by default. Every public validation can therefore trigger a server-side GET to an arbitrary configured origin or to a redirect target selected by the configured service. A compromised public endpoint can redirect the validator into loopback, link-local, private, or metadata services reachable from its network. The response is parsed only as RDAP and no secrets are attached, so this is principally blind request forgery and internal service interaction rather than direct response exfiltration.
+
+**Evidence:** `LoadFromEnv` copies `RDAP_BASE_URL` directly and `Config.Validate` constrains trust-anchor and heartbeat URLs but not RDAP. `NewClient` only removes a trailing slash and constructs a default `http.Client`. `QueryDomain` formats `<base>/domain/<validated-domain>` and calls `Do`; no redirect or dial destination policy is installed. The DNS egress policy is scoped to DNS queries and is not reused by this HTTP client.
+
+**Fix specification:** Validate RDAP configuration as an absolute HTTPS URL and reject userinfo, fragments, and ambiguous path forms. Keep local HTTP test support only through an explicit loopback-only development option or injected test transport. Reject redirects by default, or allow only a bounded same-origin HTTPS policy whose final resolved destinations also pass a public-egress check at dial time. If hostname endpoints are permitted, defend at the actual dial boundary against DNS rebinding and every resolved non-public address, while retaining an explicit operator allowlist for intentional internal deployments. Preserve RDAP optionality, current default URL/path contract, response-size/time limits, and public validation result schema.
+
+**Verification:** Add config/client tests for cleartext, relative, userinfo, cross-origin and scheme-downgrade redirects; direct and hostname-resolved loopback/private/link-local destinations; a DNS-rebinding-style resolver; redirect loops; and an allowed normal HTTPS endpoint. Assert rejected targets receive no request and validation continues with a visible RDAP diagnostic rather than failing DNSSEC validation itself. Run `go test -race ./...` in `validator`.
