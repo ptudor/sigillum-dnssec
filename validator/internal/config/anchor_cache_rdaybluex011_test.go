@@ -61,3 +61,28 @@ func TestRDAYBLUEX011_CachePathConfiguration(t *testing.T) {
 		t.Fatalf("the environment loader validates the path: %v", err)
 	}
 }
+
+func TestRDAYBLUEX011_CachePathRejectsOperatorFileAliases(t *testing.T) {
+	realDir := t.TempDir()
+	aliasRoot := t.TempDir()
+	aliasDir := filepath.Join(aliasRoot, "anchors")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatal(err)
+	}
+	operatorPath := filepath.Join(realDir, "root-anchors.json")
+	cacheAlias := filepath.Join(aliasDir, "root-anchors.json")
+	if err := ValidateRootAnchorsCachePath(cacheAlias, operatorPath); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("a cache path through a directory symlink must not alias the operator file: %v", err)
+	}
+
+	if err := os.WriteFile(operatorPath, []byte("operator-owned"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	hardlink := filepath.Join(realDir, "cache-hardlink.json")
+	if err := os.Link(operatorPath, hardlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateRootAnchorsCachePath(hardlink, operatorPath); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("a cache hard link to the operator file must be rejected: %v", err)
+	}
+}

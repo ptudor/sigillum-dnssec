@@ -66,12 +66,11 @@ func TestRDAYBLUEX022_NonPublicCategories(t *testing.T) {
 		}
 	}
 	global := map[string]string{
-		"Cloudflare v4":         "1.1.1.1",
-		"Quad9":                 "9.9.9.9",
-		"Google v6":             "2001:4860:4860::8888",
+		"Quad9 v4":              "9.9.9.9",
+		"Quad9 v6":              "2620:fe::fe",
 		"AS112 v4 (reachable)":  "192.31.196.1",
 		"AMT v4 (reachable)":    "192.52.193.1",
-		"6to4 embedding global": "2002:0101:0101::1", // 1.1.1.1
+		"6to4 embedding global": "2002:0909:0909::1", // 9.9.9.9
 		"IPv4-mapped global":    "::ffff:9.9.9.9",
 		"ordinary global v6":    "2a00:1450:4001:80b::200e",
 	}
