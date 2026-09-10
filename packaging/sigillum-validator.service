@@ -13,6 +13,9 @@ ExecStart=/usr/bin/sigillum-validator -config /etc/sigillum-validator/config.tom
 Restart=on-failure
 RestartSec=5s
 UMask=0027
+# The only writable path: the last-known-good root-anchor cache lives here.
+StateDirectory=sigillum-validator
+StateDirectoryMode=0750
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

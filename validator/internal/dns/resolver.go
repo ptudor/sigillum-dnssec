@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"time"
 
@@ -119,7 +120,169 @@ func (r *Resolver) ResolveNS(ctx context.Context, zone string) ([]NSRecord, erro
 			nsRecords = append(nsRecords, NSFromRR(rr.(*dns.NS), SectionAuthority))
 		}
 	}
-	return nsRecords, nil
+	return canonicalNSRecords(nsRecords), nil
+}
+
+// canonicalNSRecords canonicalizes every nameserver name (lower case, fully
+// qualified), drops repeated names and orders the set by name, so the same
+// delegation always yields the same list whatever the response order or
+// spelling (RDAYBLUEX-010).
+func canonicalNSRecords(in []NSRecord) []NSRecord {
+	out := make([]NSRecord, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, ns := range in {
+		name := dns.CanonicalName(ns.Name)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		ns.Name = name
+		out = append(out, ns)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// Fan-out bounds for one zone (RDAYBLUEX-010). DNS data chosen by the
+// requesting client decides how many nameservers and addresses a zone
+// presents; these ceilings bound the resolver queries, the authoritative
+// queries and the goroutines one validation may spend at each level. A zone
+// that exceeds them is examined through a disclosed subset, never silently.
+const (
+	// MaxNameserversPerZone bounds the distinct nameserver names whose
+	// addresses are looked up. The largest real delegations (the root, the
+	// big TLDs) use 13 names.
+	MaxNameserversPerZone = 32
+	// MaxAddressesPerNameserver bounds the distinct addresses kept per name
+	// across both families.
+	MaxAddressesPerNameserver = 16
+	// MaxAddressesPerZone bounds the distinct addresses queried for one zone.
+	MaxAddressesPerZone = 64
+)
+
+// NSSet is the bounded, canonical nameserver set of one zone.
+type NSSet struct {
+	// Records lists the nameservers considered, in name order, each with its
+	// distinct addresses in a fixed order.
+	Records []NSRecord
+	// Addresses is every distinct address in Records exactly once, in the
+	// order it first appears, whatever number of names share it: this is
+	// the query list.
+	Addresses []string
+	// Truncation names each bound the delegation exceeded. When it is not
+	// empty the set is a disclosed partial view of the delegation and no
+	// consensus over "all servers" may be claimed from it.
+	Truncation []string
+}
+
+// Truncated reports whether any bound was exceeded.
+func (s *NSSet) Truncated() bool { return s != nil && len(s.Truncation) > 0 }
+
+// ResolveNSSet resolves the nameservers of zone and their addresses under the
+// fan-out bounds (RDAYBLUEX-010): names are canonicalized, de-duplicated and
+// ordered; only the first MaxNameserversPerZone names are looked up; each
+// name keeps at most MaxAddressesPerNameserver distinct addresses; and the
+// zone's query list holds at most MaxAddressesPerZone distinct addresses.
+// Every exceeded bound is recorded in Truncation. Per-host lookup problems
+// stay on each NSRecord.
+func (r *Resolver) ResolveNSSet(ctx context.Context, zone string) (*NSSet, error) {
+	nsRecords, err := r.ResolveNS(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+	set := &NSSet{}
+	if len(nsRecords) > MaxNameserversPerZone {
+		set.Truncation = append(set.Truncation, fmt.Sprintf("%s delegates %d distinct nameservers; only the first %d by name were considered", zone, len(nsRecords), MaxNameserversPerZone))
+		nsRecords = nsRecords[:MaxNameserversPerZone]
+	}
+	seen := make(map[string]bool)
+	for i := range nsRecords {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		ns := nsRecords[i]
+		addrs, problems, lookupErr := r.ResolveAddressesDetailed(ctx, ns.Name)
+		ns.LookupErrors = problems
+		if lookupErr != nil && len(problems) == 0 {
+			ns.LookupErrors = []string{lookupErr.Error()}
+		}
+		if len(addrs) > MaxAddressesPerNameserver {
+			set.Truncation = append(set.Truncation, fmt.Sprintf("nameserver %s has %d distinct addresses; only the first %d were considered", ns.Name, len(addrs), MaxAddressesPerNameserver))
+			addrs = addrs[:MaxAddressesPerNameserver]
+		}
+		kept := make([]net.IP, 0, len(addrs))
+		for _, ip := range addrs {
+			key := canonicalIP(ip)
+			if seen[key] {
+				kept = append(kept, ip) // shared with an earlier name: listed, queried once
+				continue
+			}
+			if len(set.Addresses) >= MaxAddressesPerZone {
+				continue
+			}
+			seen[key] = true
+			set.Addresses = append(set.Addresses, key)
+			kept = append(kept, ip)
+		}
+		if dropped := len(addrs) - len(kept); dropped > 0 {
+			set.Truncation = append(set.Truncation, fmt.Sprintf("%s presents more than %d distinct nameserver addresses; %d of %s's were not considered", zone, MaxAddressesPerZone, dropped, ns.Name))
+		}
+		ns.Addresses = kept
+		set.Records = append(set.Records, ns)
+	}
+	return set, nil
+}
+
+// canonicalIP returns the textual form used to identify an address: an
+// IPv4-mapped IPv6 address is the IPv4 address it embeds.
+func canonicalIP(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
+}
+
+// UniqueAddresses returns addrs with each distinct address kept once, in the
+// order of first appearance; unparsable entries are kept verbatim and
+// de-duplicated textually.
+func UniqueAddresses(addrs []string) []string {
+	out := make([]string, 0, len(addrs))
+	seen := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		key := a
+		if ip := net.ParseIP(strings.TrimSpace(a)); ip != nil {
+			key = canonicalIP(ip)
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	return out
+}
+
+// uniqueIPs returns ips with each distinct address kept once, ordered by
+// canonical form so the result is independent of response order.
+func uniqueIPs(ips []net.IP) []net.IP {
+	seen := make(map[string]bool, len(ips))
+	out := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		key := canonicalIP(ip)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		out = append(out, ip)
+	}
+	sort.Slice(out, func(i, j int) bool { return canonicalIP(out[i]) < canonicalIP(out[j]) })
+	return out
 }
 
 // answerAddresses collects the A or AAAA records that answer host in msg,
@@ -184,7 +347,9 @@ func (r *Resolver) ResolveAddressesDetailed(ctx context.Context, hostname string
 	if failed == len(families) {
 		return nil, problems, fmt.Errorf("address lookup for %s failed: %s", hostname, strings.Join(problems, "; "))
 	}
-	return addresses, problems, nil
+	// Repeated records and an IPv4-mapped duplicate of an IPv4 address are
+	// one address (RDAYBLUEX-010); the order is canonical, not the wire's.
+	return uniqueIPs(addresses), problems, nil
 }
 
 // ResolveAddresses resolves both A and AAAA records for a hostname. It fails
@@ -194,25 +359,16 @@ func (r *Resolver) ResolveAddresses(ctx context.Context, hostname string) ([]net
 	return addrs, err
 }
 
-// ResolveNSWithAddresses resolves NS records and their addresses. Per-host
-// lookup problems are carried on each NSRecord so callers can surface them.
+// ResolveNSWithAddresses resolves NS records and their addresses under the
+// fan-out bounds. Per-host lookup problems are carried on each NSRecord so
+// callers can surface them; callers that must know whether the set was
+// truncated use ResolveNSSet.
 func (r *Resolver) ResolveNSWithAddresses(ctx context.Context, zone string) ([]NSRecord, error) {
-	nsRecords, err := r.ResolveNS(ctx, zone)
+	set, err := r.ResolveNSSet(ctx, zone)
 	if err != nil {
 		return nil, err
 	}
-
-	// Resolve addresses for each NS
-	for i := range nsRecords {
-		addrs, problems, err := r.ResolveAddressesDetailed(ctx, nsRecords[i].Name)
-		nsRecords[i].Addresses = addrs
-		nsRecords[i].LookupErrors = problems
-		if err != nil && len(problems) == 0 {
-			nsRecords[i].LookupErrors = []string{err.Error()}
-		}
-	}
-
-	return nsRecords, nil
+	return set.Records, nil
 }
 
 // GetRootServers returns the root server addresses

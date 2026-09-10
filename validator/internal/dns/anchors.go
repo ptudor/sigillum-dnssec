@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -210,8 +212,20 @@ func anchorRedirectPolicy(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// MaxAnchorDocumentBytes bounds an anchor document from any source: the
+// fetch body limit and the largest document the cache accepts.
+const MaxAnchorDocumentBytes = 1 << 20
+
 // LoadAnchorsFromURL loads root trust anchors from a URL.
 func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
+	anchors, _, err := FetchAnchors(url)
+	return anchors, err
+}
+
+// FetchAnchors downloads the anchor document at url and returns the accepted
+// anchor set together with the exact bytes that produced it, so a caller may
+// persist precisely what was validated (RDAYBLUEX-011).
+func FetchAnchors(url string) (*RootAnchors, []byte, error) {
 	client := &http.Client{
 		Timeout:       30 * time.Second,
 		CheckRedirect: anchorRedirectPolicy,
@@ -219,37 +233,114 @@ func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
 
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch anchors: %w", err)
+		return nil, nil, fmt.Errorf("failed to fetch anchors: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	// Bound the response body to 1 MiB and REJECT anything larger rather
 	// than parsing its prefix (RDAYBLUEX-034).
-	data, err := ReadBodyLimited(resp.Body, 1<<20, "anchors")
+	data, err := ReadBodyLimited(resp.Body, MaxAnchorDocumentBytes, "anchors")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	anchors, err := ParseAnchors(data, url)
+	if err != nil {
+		return nil, nil, err
+	}
+	return anchors, data, nil
+}
+
+// ParseAnchors decodes and finalizes an anchor document held in memory;
+// source names where it came from for messages and LoadedFrom.
+func ParseAnchors(data []byte, source string) (*RootAnchors, error) {
 	var anchors RootAnchors
 	if err := json.Unmarshal(data, &anchors); err != nil {
 		return nil, fmt.Errorf("failed to parse anchors JSON: %w", err)
 	}
-
-	if err := finalizeAnchors(&anchors, url); err != nil {
+	if err := finalizeAnchors(&anchors, source); err != nil {
 		return nil, err
 	}
 	return &anchors, nil
+}
+
+// WriteAnchorCache atomically persists an anchor document as the
+// last-known-good cache at path (RDAYBLUEX-011). The bytes must be within
+// MaxAnchorDocumentBytes and must themselves load as a usable, pinned anchor
+// set — the cache is only ever written with what would be accepted when read
+// back. The document is written to a private temporary file in the same
+// directory (mode 0600), synced, renamed over path and the directory synced,
+// so a reader sees either the previous cache or the complete new one; on any
+// failure the previous file is left untouched and the temporary file removed.
+func WriteAnchorCache(path string, data []byte) error {
+	if path == "" {
+		return fmt.Errorf("anchor cache path is empty")
+	}
+	if len(data) > MaxAnchorDocumentBytes {
+		return fmt.Errorf("anchor document is %d bytes, above the %d byte cache limit", len(data), MaxAnchorDocumentBytes)
+	}
+	if _, err := ParseAnchors(data, path); err != nil {
+		return fmt.Errorf("refusing to cache an unusable anchor document: %w", err)
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating anchor cache temporary file: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("setting anchor cache mode: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("writing anchor cache: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("syncing anchor cache: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("closing anchor cache: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return fmt.Errorf("replacing anchor cache: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("syncing anchor cache directory: %w", err)
+	}
+	return nil
+}
+
+// syncDir makes a directory entry change durable where the platform
+// supports opening a directory for that purpose.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // LoadAnchorsWithFallback tries to load from file first, then falls back to
@@ -257,19 +348,37 @@ func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
 // pinned anchor — RA6X-041) triggers the fallback; when every source fails
 // the error names both, and the caller keeps whatever it already holds.
 func LoadAnchorsWithFallback(path, url string) (*RootAnchors, error) {
-	// Try file first
+	anchors, _, err := LoadAnchorsWithCache(path, "", url)
+	return anchors, err
+}
+
+// LoadAnchorsWithCache is the offline-capable load order (RDAYBLUEX-011):
+// the operator's file, then the last-known-good cache, then the URL. Every
+// source is validated the same way, so a cached document is trusted only
+// because it passes the binary pins now, never because it was cached. The
+// returned bytes are the fetched document when the URL was the source (the
+// caller persists them), nil otherwise. An empty cachePath disables the
+// cache stage. When every source fails the error names them all.
+func LoadAnchorsWithCache(path, cachePath, url string) (*RootAnchors, []byte, error) {
 	anchors, fileErr := LoadAnchors(path)
 	if fileErr == nil {
-		return anchors, nil
+		return anchors, nil, nil
 	}
-
-	// Fall back to URL
-	anchors, urlErr := LoadAnchorsFromURL(url)
+	var cacheErr error
+	if cachePath != "" {
+		anchors, cacheErr = LoadAnchors(cachePath)
+		if cacheErr == nil {
+			return anchors, nil, nil
+		}
+	}
+	anchors, data, urlErr := FetchAnchors(url)
 	if urlErr != nil {
-		return nil, fmt.Errorf("failed to load anchors from both file (%s: %v) and URL (%s): %w", path, fileErr, url, urlErr)
+		if cachePath != "" {
+			return nil, nil, fmt.Errorf("failed to load anchors from file (%s: %v), cache (%s: %v) and URL (%s): %w", path, fileErr, cachePath, cacheErr, url, urlErr)
+		}
+		return nil, nil, fmt.Errorf("failed to load anchors from both file (%s: %v) and URL (%s): %w", path, fileErr, url, urlErr)
 	}
-
-	return anchors, nil
+	return anchors, data, nil
 }
 
 // GetActivePinnedAnchors returns the anchors that may establish root trust

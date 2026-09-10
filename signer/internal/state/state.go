@@ -69,6 +69,12 @@ type ZoneState struct {
 	// (R-022). Omitempty + absent-tolerant for state.json back-compat.
 	SourceModTime time.Time `json:"source_mtime,omitempty"`
 	SourceSize    int64     `json:"source_size,omitempty"`
+	// SourceDigest is the SHA-256 (hex) of the exact source bytes that were
+	// parsed and published at the last sign (RDAYBLUEX-016): the content
+	// identity change detection uses when metadata alone cannot decide.
+	// Optional: a state written before it existed loads with an empty digest
+	// and establishes a baseline from the current file without re-signing.
+	SourceDigest  string    `json:"source_digest,omitempty"`
 	SignaturesExp time.Time `json:"signatures_expire"`
 	// PublishedDNSKEYTTL is the TTL (seconds) of the DNSKEY RRset actually
 	// published at the last sign. Rollover phase gating uses it so the cache-safe
@@ -763,14 +769,14 @@ func mergeZone(base, disk, mem *ZoneState) *ZoneState {
 func signingEqual(a, b *ZoneState) bool {
 	return a.Path == b.Path && a.Serial == b.Serial && a.PublishedSerial == b.PublishedSerial &&
 		a.LastSigned.Equal(b.LastSigned) && a.SourceModTime.Equal(b.SourceModTime) && a.SourceSize == b.SourceSize &&
-		a.SignaturesExp.Equal(b.SignaturesExp) &&
+		a.SourceDigest == b.SourceDigest && a.SignaturesExp.Equal(b.SignaturesExp) &&
 		a.PublishedDNSKEYTTL == b.PublishedDNSKEYTTL && a.PublishedMaxRRSIGTTL == b.PublishedMaxRRSIGTTL
 }
 
 func copySigning(dst, src *ZoneState) {
 	dst.Path, dst.Serial, dst.PublishedSerial = src.Path, src.Serial, src.PublishedSerial
 	dst.LastSigned, dst.SourceModTime, dst.SourceSize = src.LastSigned, src.SourceModTime, src.SourceSize
-	dst.SignaturesExp = src.SignaturesExp
+	dst.SourceDigest, dst.SignaturesExp = src.SourceDigest, src.SignaturesExp
 	dst.PublishedDNSKEYTTL, dst.PublishedMaxRRSIGTTL = src.PublishedDNSKEYTTL, src.PublishedMaxRRSIGTTL
 }
 

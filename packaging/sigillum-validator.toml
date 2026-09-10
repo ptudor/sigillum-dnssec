@@ -1,6 +1,9 @@
 # Installed as /etc/sigillum-validator/config.toml.
 listen_addr = "127.0.0.1:8791"
 root_anchors_path = "/etc/sigillum-validator/root-anchors.json"
+# Last-known-good cache: every usable download is persisted here and read
+# before the network on later starts, so a restart during an outage validates.
+root_anchors_cache_path = "/var/lib/sigillum-validator/root-anchors.json"
 # Maintainer-operated JSON mirror; accepted roots must also match binary pins.
 root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
 # Configure a recursive resolver reachable from this host (UDP and TCP 53).

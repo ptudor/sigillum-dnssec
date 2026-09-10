@@ -557,16 +557,11 @@ func (v *Validator) followAlias(ctx context.Context, domain, target string, dept
 // sections are never followed (RA6X-015). The result is unauthenticated,
 // which is fine: the answer can be no better than the chain above it.
 func (v *Validator) discoverAliasTarget(ctx context.Context, domain, leafZone string) string {
-	nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, leafZone)
-	if err != nil || len(nsRecords) == 0 {
+	nsSet, err := v.resolver.ResolveNSSet(ctx, leafZone)
+	if err != nil || nsSet == nil || len(nsSet.Records) == 0 {
 		return ""
 	}
-	var nsAddresses []string
-	for _, ns := range nsRecords {
-		for _, addr := range ns.Addresses {
-			nsAddresses = append(nsAddresses, addr.String())
-		}
-	}
+	nsAddresses := nsSet.Addresses
 	// Every server is consulted until one serves an alias at the queried
 	// owner (RDAYBLUEX-002): a usable answer without an applicable alias
 	// (a server that answers the name directly, or lags) does not end the
@@ -859,23 +854,26 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 		return nil // Can't verify without zone DNSKEY
 	}
 
-	// Get nameservers for the zone
-	nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, zone)
-	if err != nil || len(nsRecords) == 0 {
+	// Get nameservers for the zone: the bounded, de-duplicated set
+	// (RDAYBLUEX-010). A truncated set cannot support a per-server verdict
+	// over the zone's servers, so it is reported as unqueryable rather than
+	// judged from an undisclosed subset.
+	nsSet, err := v.resolver.ResolveNSSet(ctx, zone)
+	if err != nil || nsSet == nil || len(nsSet.Records) == 0 {
 		return &RecordValidation{
 			Name:       NormalizeDomain(domain),
 			RecordType: v.leafTypeName(),
 			Error:      fmt.Sprintf("failed to resolve nameservers: %v", err),
 		}
 	}
-
-	// Collect NS addresses
-	var nsAddresses []string
-	for _, ns := range nsRecords {
-		for _, addr := range ns.Addresses {
-			nsAddresses = append(nsAddresses, addr.String())
+	if nsSet.Truncated() {
+		return &RecordValidation{
+			Name:       NormalizeDomain(domain),
+			RecordType: v.leafTypeName(),
+			Error:      fmt.Sprintf("failed to resolve nameservers: the nameserver set exceeds the fan-out bounds (%s)", strings.Join(nsSet.Truncation, "; ")),
 		}
 	}
+	nsAddresses := nsSet.Addresses
 
 	// Query the leaf record type from authoritative servers. In extended mode we
 	// query every server and flag per-server disagreement (R-100); the first
@@ -1294,6 +1292,7 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 
 	// Get nameservers for this zone
 	var nsAddresses []string
+	var nsTruncation []string
 	if zone == "." {
 		// Use root servers
 		nsAddresses = v.rootServerAddresses()
@@ -1310,14 +1309,17 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		}
 		result.Nameservers = append(result.Nameservers, nsResult)
 	} else {
-		// Resolve NS for the zone
-		nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, zone)
+		// Resolve NS for the zone: canonical names, distinct addresses and
+		// the fan-out bounds (RDAYBLUEX-010). The query list holds each
+		// distinct address once, however many names share it.
+		nsSet, err := v.resolver.ResolveNSSet(ctx, zone)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve NS for %s: %w", zone, err)
 		}
+		nsTruncation = nsSet.Truncation
+		nsAddresses = nsSet.Addresses
 
-		// Collect all addresses
-		for _, ns := range nsRecords {
+		for _, ns := range nsSet.Records {
 			nsResult := NameserverResult{
 				Name:      ns.Name,
 				Addresses: make([]AddressResult, 0),
@@ -1328,13 +1330,15 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 				result.Warnings = append(result.Warnings, fmt.Sprintf("nameserver %s: %s", ns.Name, problem))
 			}
 			for _, addr := range ns.Addresses {
-				nsAddresses = append(nsAddresses, addr.String())
 				nsResult.Addresses = append(nsResult.Addresses, AddressResult{
 					IP:     addr.String(),
 					Status: StatusValidating,
 				})
 			}
 			result.Nameservers = append(result.Nameservers, nsResult)
+		}
+		for _, note := range nsTruncation {
+			result.Warnings = append(result.Warnings, "fan-out bound exceeded: "+note)
 		}
 	}
 
@@ -1368,6 +1372,23 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		}
 	}
 	applyServerResults()
+
+	// A delegation beyond the fan-out bounds was examined through a disclosed
+	// subset (RDAYBLUEX-010). The per-server reachability above remains as a
+	// diagnostic, but no verdict — and in particular no consensus over "all
+	// servers" — is drawn from a partial set.
+	if len(nsTruncation) > 0 {
+		result.Status = StatusIndeterminate
+		result.AddError(fmt.Sprintf("the nameserver set exceeds the fan-out bounds; only a disclosed subset was queried (%s)", strings.Join(nsTruncation, "; ")))
+		for i := range serverResults {
+			if serverResults[i].Status == StatusValidating {
+				serverResults[i].Status = StatusIndeterminate
+				serverResults[i].Error = "not judged: the zone's nameserver set was truncated"
+			}
+		}
+		applyServerResults()
+		return result, nil
+	}
 
 	// Usable responses answered NOERROR; those carrying an Answer-section
 	// DNSKEY RRset owned by the zone are candidates for the chain.
@@ -1443,6 +1464,9 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 				return result, nil
 			}
 			result.Disagreements = append(result.Disagreements, ds.Disagreements...)
+			for _, note := range ds.Truncation {
+				result.Warnings = append(result.Warnings, "parent fan-out bound exceeded: "+note)
+			}
 			if len(ds.Observed) == 0 {
 				// No DS in parent: insecure delegation only if the parent authenticatedly
 				// proves the DS RRset is absent (R-081 downgrade guard).
@@ -1508,6 +1532,9 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			return result, nil
 		}
 		result.Disagreements = append(result.Disagreements, ds.Disagreements...)
+		for _, note := range ds.Truncation {
+			result.Warnings = append(result.Warnings, "parent fan-out bound exceeded: "+note)
+		}
 
 		// Store DS validation result
 		if ds.Validation != nil {
@@ -1710,6 +1737,9 @@ type parentDSResult struct {
 	// parent keys were available.
 	AbsenceProof  *NSECProof
 	AbsenceProven bool
+	// Truncation names the fan-out bounds the parent's nameserver set
+	// exceeded (RDAYBLUEX-010); the DS answers came from a disclosed subset.
+	Truncation []string
 }
 
 // parentZoneFromHierarchy returns the zone that precedes zone in the walked
@@ -1736,18 +1766,17 @@ func parentZoneFromHierarchy(zone string, hierarchy []string) string {
 // separates the served DS RRset from the exact authenticated one, and carries
 // the raw parent response for DS-absence proofs (R-081).
 func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, parentZone string, fallbackServers []string, parentDNSKEY []dnspkg.DNSKEYRecord) (*parentDSResult, error) {
-	// First try to get parent NS
+	// First try to get parent NS: the bounded, de-duplicated set
+	// (RDAYBLUEX-010); an exceeded bound is disclosed on the result.
 	var parentNS []string
+	var parentTruncation []string
 	if parentZone == "." {
 		parentNS = v.rootServerAddresses()
 	} else {
-		nsRecords, err := v.resolver.ResolveNSWithAddresses(ctx, parentZone)
-		if err == nil {
-			for _, ns := range nsRecords {
-				for _, addr := range ns.Addresses {
-					parentNS = append(parentNS, addr.String())
-				}
-			}
+		nsSet, err := v.resolver.ResolveNSSet(ctx, parentZone)
+		if err == nil && nsSet != nil {
+			parentNS = nsSet.Addresses
+			parentTruncation = nsSet.Truncation
 		}
 	}
 
@@ -1805,6 +1834,7 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 		return nil, fmt.Errorf("failed to query DS from parent zone")
 	}
 	out := candidates[chosenIdx].result
+	out.Truncation = parentTruncation
 	for i, c := range candidates {
 		if i == chosenIdx {
 			continue
@@ -2161,54 +2191,99 @@ func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone, parentZone 
 // chain is established (RA6X-018). In quick mode, only the first two servers
 // are queried for speed.
 func (v *Validator) ValidateMultipleServers(ctx context.Context, zone string, servers []string) []AddressResult {
+	// Each distinct address is queried once, however it was spelled or how
+	// many names share it (RDAYBLUEX-010).
+	queryServers := dnspkg.UniqueAddresses(servers)
 	// In quick mode, limit to first 2 servers (primary + one fallback)
-	queryServers := servers
-	if v.quickMode && len(servers) > 2 {
-		queryServers = servers[:2]
+	if v.quickMode && len(queryServers) > 2 {
+		queryServers = queryServers[:2]
 	}
 
+	// A server whose turn never comes (the validation was cancelled or timed
+	// out first) is reported as such rather than as a query failure.
 	results := make([]AddressResult, len(queryServers))
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	// Limit concurrency
-	semaphore := make(chan struct{}, v.maxConcurrent)
-
-	for i, server := range queryServers {
-		wg.Add(1)
-		go func(idx int, srv string) {
-			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			queryResult, _ := v.resolver.QueryDNSKEYAuthoritative(ctx, srv, zone)
-			result := AddressResult{
-				IP:     srv,
-				Status: StatusValidating,
-			}
-
-			if queryResult == nil {
-				result.Status = StatusIndeterminate
-				result.Error = "query failed"
-			} else if queryResult.Error != "" {
-				result.Status = StatusIndeterminate
-				result.Error = queryResult.Error
-			} else if queryResult.RCode != 0 {
-				result.Status = StatusIndeterminate
-				result.Error = queryResult.RCodeName
-			} else {
-				result.RTTNs = queryResult.RTT.Nanoseconds()
-				result.Response = queryResult
-			}
-
-			mu.Lock()
-			results[idx] = result
-			mu.Unlock()
-		}(i, server)
+	for i, srv := range queryServers {
+		results[i] = AddressResult{IP: srv, Status: StatusIndeterminate, Error: "not queried: validation ended before this server's turn"}
 	}
+	runBounded(ctx, len(queryServers), v.workerCount(), func(idx int) {
+		queryResult, _ := v.resolver.QueryDNSKEYAuthoritative(ctx, queryServers[idx], zone)
+		result := AddressResult{
+			IP:     queryServers[idx],
+			Status: StatusValidating,
+		}
 
-	wg.Wait()
+		if queryResult == nil {
+			result.Status = StatusIndeterminate
+			result.Error = "query failed"
+		} else if queryResult.Error != "" {
+			result.Status = StatusIndeterminate
+			result.Error = queryResult.Error
+		} else if queryResult.RCode != 0 {
+			result.Status = StatusIndeterminate
+			result.Error = queryResult.RCodeName
+		} else {
+			result.RTTNs = queryResult.RTT.Nanoseconds()
+			result.Response = queryResult
+		}
+		results[idx] = result
+	})
 	return results
+}
+
+// workerCount is the number of authoritative queries one validation runs at
+// once (the configured max_concurrent, at least one).
+func (v *Validator) workerCount() int {
+	if v.maxConcurrent <= 0 {
+		return 1
+	}
+	return v.maxConcurrent
+}
+
+// runBounded runs fn(0..n-1) through at most workers goroutines
+// (RDAYBLUEX-010). No goroutine exists per job: jobs wait in the caller's
+// loop, not as blocked goroutines, and both the hand-off and each worker's
+// next pick observe ctx, so once the context ends no further job starts.
+// Each index is handed to exactly one worker; fn may therefore write its own
+// result slot without locking. It returns when every started job finished.
+func runBounded(ctx context.Context, n, workers int, fn func(idx int)) {
+	if n <= 0 {
+		return
+	}
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case idx, ok := <-jobs:
+					if !ok {
+						return
+					}
+					fn(idx)
+				}
+			}
+		}()
+	}
+feed:
+	for i := 0; i < n; i++ {
+		select {
+		case <-ctx.Done():
+			break feed
+		case jobs <- i:
+		}
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 // dnskeyMaterialSet returns the canonical identity of each key in keys

@@ -5,6 +5,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -198,6 +201,7 @@ type signedZone struct {
 	sourcePath  string
 	srcModTime  time.Time
 	srcSize     int64
+	srcDigest   string
 	dnskeyTTL   uint32
 	maxRRSIGTTL uint32
 }
@@ -218,6 +222,7 @@ func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState,
 		sourcePath: sourcePath,
 		srcModTime: snap.modTime,
 		srcSize:    snap.size,
+		srcDigest:  snap.digest,
 		serial:     snap.serial,
 	}
 	records := snap.records
@@ -322,6 +327,9 @@ func (s *Signer) recordSignedZone(domain string, zoneState *statepkg.ZoneState, 
 			zoneState.SourceModTime = res.srcModTime
 			zoneState.SourceSize = res.srcSize
 		}
+		// The identity of exactly the bytes that were parsed and are now
+		// published (RDAYBLUEX-016).
+		zoneState.SourceDigest = res.srcDigest
 		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
 		zoneState.ForceResign = false
 		// R-006/R-007: the TTLs of the generation just written. Cache horizons
@@ -776,7 +784,8 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneStat
 		"change_ref", changeRef.Format(time.RFC3339))
 
 	sizeChanged := zoneState.SourceSize != 0 && info.Size() != zoneState.SourceSize
-	if info.ModTime().After(changeRef) || sizeChanged {
+	metadataChanged := info.ModTime().After(changeRef) || sizeChanged
+	if metadataChanged {
 		// Quiescence: a very recent change may still be mid-write (a generator
 		// doing `> zone`, an editor save). Re-stat after a short delay; if the
 		// mtime/size changed again the write is ongoing, so defer to the next
@@ -790,16 +799,57 @@ func (s *Signer) NeedsSign(domain, zonePath string, zoneState *statepkg.ZoneStat
 				return false, ""
 			}
 		}
-		return true, "zone file modified"
 	}
 
-	// Steady state: the source is unchanged since it was last parsed, signatures
-	// are not near expiry, and no rollover is pending. We deliberately do NOT
-	// parse the file on every idle poll just to re-read an unchanged serial
-	// (wasteful I/O/CPU at many zones, R-064). The only case this skips is a
-	// content edit that preserves an older mtime/size (e.g. `cp -p` from a
-	// backup); that is picked up at the next signature-refresh re-sign.
-	return false, ""
+	// Content identity (RDAYBLUEX-016). Metadata alone cannot establish that
+	// the source is the one last published: a restored backup, a reproducible
+	// build or `cp -p` can replace the content behind an equal size and an
+	// equal or older mtime. The exact bytes are digested on every poll under
+	// the same bounds and consistency rules as signing, and compared with the
+	// digest recorded when the current output was published:
+	//   - equal digest: the bytes are unchanged whatever the metadata says
+	//     (a touched or re-copied file is not re-signed needlessly; the
+	//     metadata reference is refreshed instead);
+	//   - different digest: the zone is signed;
+	//   - no recorded digest (a state written before digests existed) with
+	//     unchanged metadata: today's bytes become the baseline of the
+	//     current output without re-signing;
+	//   - a read that cannot be completed consistently updates nothing and
+	//     is retried on the next check.
+	digest, err := s.sourceDigest(zonePath)
+	if err != nil {
+		if errors.Is(err, ErrSourceTooLarge) {
+			// Not a transient condition: let the signing attempt fail
+			// visibly (RDAYBLUEX-017) rather than deferring forever.
+			return true, "zone file exceeds the source limit"
+		}
+		if metadataChanged {
+			slog.Debug("[SIGN] Zone file could not be read consistently; deferring to next tick", "domain", domain, "error", err)
+			return false, ""
+		}
+		slog.Debug("[SIGN] Zone file could not be digested; deferring to next tick", "domain", domain, "error", err)
+		return false, ""
+	}
+	switch {
+	case zoneState.SourceDigest == "" && !metadataChanged:
+		s.state.Mutate(func() { zoneState.SourceDigest = digest })
+		return false, ""
+	case zoneState.SourceDigest == "":
+		return true, "zone file modified"
+	case digest == zoneState.SourceDigest:
+		if metadataChanged {
+			s.state.Mutate(func() {
+				zoneState.SourceModTime = info.ModTime()
+				zoneState.SourceSize = info.Size()
+			})
+			slog.Debug("[SIGN] Zone file metadata changed but its content is identical; not re-signing", "domain", domain)
+		}
+		return false, ""
+	case metadataChanged:
+		return true, "zone file modified"
+	default:
+		return true, "zone file content changed (same size and modification time)"
+	}
 }
 
 func (s *Signer) parseZoneFile(domain, path string) ([]dns.RR, uint32, error) {
@@ -817,6 +867,8 @@ type sourceSnapshot struct {
 	serial  uint32
 	modTime time.Time
 	size    int64
+	// digest is the content identity of exactly these bytes (RDAYBLUEX-016).
+	digest string
 }
 
 // outputUnusable reports why the published output for a domain cannot be
@@ -846,57 +898,14 @@ func (s *Signer) outputUnusable(domain string) string {
 // one — which is the documented producer contract; metadata cannot prove a
 // paused in-place writer's valid prefix is complete.
 func (s *Signer) readSourceSnapshot(domain, path string) (*sourceSnapshot, error) {
-	f, err := openSourceFile(path)
+	data, before, err := readSourceBytes(path, s.afterSourceRead)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	before, err := f.Stat()
+	records, serial, err := parseZoneRecords(domain, path, data)
 	if err != nil {
-		return nil, fmt.Errorf("inspecting zone file %s: %w", path, err)
-	}
-	if !before.Mode().IsRegular() {
-		return nil, fmt.Errorf("zone file %s is not a regular file (%s); pipes, devices and directories are not supported as zone sources", path, before.Mode().Type())
-	}
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, fmt.Errorf("reading zone file %s: %w", path, err)
-	}
-	if s.afterSourceRead != nil {
-		s.afterSourceRead(path)
-	}
-	after, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("inspecting zone file %s after read: %w", path, err)
-	}
-	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) || int64(len(data)) != before.Size() {
-		return nil, fmt.Errorf("zone file %s changed while it was being read (size %d→%d); a zone producer must replace the file atomically (write a temporary file, then rename it into place) — not signed, retried on the next check",
-			path, before.Size(), after.Size())
-	}
-
-	var records []dns.RR
-	var serial uint32
-
-	// $INCLUDE is intentionally NOT enabled (SetIncludeAllowed stays false): the
-	// signer manages one self-contained zone file per zone, and enabling
-	// includes would add an arbitrary-file-read surface plus cwd-relative path
-	// ambiguity for a daemon that may run from `/`. A zone using $INCLUDE fails
-	// with miekg's clear "$INCLUDE directive not allowed" error naming the line;
-	// the limitation is documented in CLAUDE.md (R-065). Inline the records.
-	zp := dns.NewZoneParser(bytes.NewReader(data), dns.Fqdn(domain), path)
-	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
-		records = append(records, rr)
-
-		// Extract serial from SOA
-		if soa, ok := rr.(*dns.SOA); ok {
-			serial = soa.Serial
-		}
-	}
-
-	if err := zp.Err(); err != nil {
-		return nil, fmt.Errorf("parsing zone: %w", err)
+		return nil, err
 	}
 
 	// Strip any DNSSEC records the signer manages itself before validation and
@@ -909,7 +918,117 @@ func (s *Signer) readSourceSnapshot(domain, path string) (*sourceSnapshot, error
 		return nil, fmt.Errorf("zone validation failed: %w", err)
 	}
 
-	return &sourceSnapshot{records: records, serial: serial, modTime: before.ModTime(), size: before.Size()}, nil
+	return &sourceSnapshot{records: records, serial: serial, modTime: before.ModTime(), size: before.Size(), digest: sourceDigestOf(data)}, nil
+}
+
+// Source input bounds (RDAYBLUEX-017). A zone file is read completely into
+// memory and its records accumulated before signing; without a bound a
+// mistakenly huge generated zone, a sparse file, or any writer with access
+// to a configured source could exhaust the process for every zone. Package
+// variables (not constants) so tests can lower them; the production values
+// are hard ceilings far above any zone this signer is meant for.
+var (
+	maxZoneFileBytes int64 = 256 << 20 // 256 MiB
+	maxZoneRecords         = 2_000_000
+)
+
+// ErrSourceTooLarge marks a source rejected by the byte or record bound
+// (RDAYBLUEX-017). Unlike an inconsistent read, which is retried silently on
+// the next check, an oversized source is a visible per-zone signing error.
+var ErrSourceTooLarge = errors.New("zone file exceeds the source limit")
+
+// readSourceBytes reads one consistent snapshot of a regular zone file within
+// the source bounds: a descriptor already known to exceed maxZoneFileBytes
+// is rejected before any allocation, the read is limited to max+1 bytes so
+// growth or special filesystem behaviour cannot exceed the bound, and the
+// file must be unchanged (size and mtime) across the read. afterRead, when
+// set, runs between the read and the consistency check (a test seam).
+func readSourceBytes(path string, afterRead func(path string)) ([]byte, os.FileInfo, error) {
+	f, err := openSourceFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+
+	before, err := f.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspecting zone file %s: %w", path, err)
+	}
+	if !before.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("zone file %s is not a regular file (%s); pipes, devices and directories are not supported as zone sources", path, before.Mode().Type())
+	}
+	if before.Size() > maxZoneFileBytes {
+		return nil, nil, fmt.Errorf("%w: zone file %s is %d bytes, above the %d byte source limit; not read", ErrSourceTooLarge, path, before.Size(), maxZoneFileBytes)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxZoneFileBytes+1))
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading zone file %s: %w", path, err)
+	}
+	if int64(len(data)) > maxZoneFileBytes {
+		return nil, nil, fmt.Errorf("%w: zone file %s exceeds the %d byte source limit while being read; not signed", ErrSourceTooLarge, path, maxZoneFileBytes)
+	}
+	if afterRead != nil {
+		afterRead(path)
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspecting zone file %s after read: %w", path, err)
+	}
+	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) || int64(len(data)) != before.Size() {
+		return nil, nil, fmt.Errorf("zone file %s changed while it was being read (size %d→%d); a zone producer must replace the file atomically (write a temporary file, then rename it into place) — not signed, retried on the next check",
+			path, before.Size(), after.Size())
+	}
+	return data, before, nil
+}
+
+// parseZoneRecords parses zone data, stopping as soon as the record count
+// exceeds maxZoneRecords (RDAYBLUEX-017), and returns the SOA serial.
+//
+// $INCLUDE is intentionally NOT enabled (SetIncludeAllowed stays false): the
+// signer manages one self-contained zone file per zone, and enabling
+// includes would add an arbitrary-file-read surface plus cwd-relative path
+// ambiguity for a daemon that may run from `/`. A zone using $INCLUDE fails
+// with miekg's clear "$INCLUDE directive not allowed" error naming the line;
+// the limitation is documented in CLAUDE.md (R-065). Inline the records.
+func parseZoneRecords(domain, path string, data []byte) ([]dns.RR, uint32, error) {
+	var records []dns.RR
+	var serial uint32
+	zp := dns.NewZoneParser(bytes.NewReader(data), dns.Fqdn(domain), path)
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		if len(records) >= maxZoneRecords {
+			return nil, 0, fmt.Errorf("%w: zone file %s holds more than %d records, above the source limit; not signed", ErrSourceTooLarge, path, maxZoneRecords)
+		}
+		records = append(records, rr)
+
+		// Extract serial from SOA
+		if soa, ok := rr.(*dns.SOA); ok {
+			serial = soa.Serial
+		}
+	}
+	if err := zp.Err(); err != nil {
+		return nil, 0, fmt.Errorf("parsing zone: %w", err)
+	}
+	return records, serial, nil
+}
+
+// sourceDigestOf is the content identity of a source snapshot (RDAYBLUEX-016):
+// the SHA-256 of the exact bytes that were parsed, as lowercase hex.
+func sourceDigestOf(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// sourceDigest reads the current source within the same bounds and
+// consistency rules as signing and returns its content identity. A file that
+// changes during the read is an error (retried on the next check), never a
+// wrong identity.
+func (s *Signer) sourceDigest(path string) (string, error) {
+	data, _, err := readSourceBytes(path, s.afterSourceRead)
+	if err != nil {
+		return "", err
+	}
+	return sourceDigestOf(data), nil
 }
 
 // stripInputDNSSEC removes DNSSEC records that the signer generates itself from a
@@ -1054,23 +1173,16 @@ func (s *Signer) validateZone(domain string, records []dns.RR) error {
 // checks that the file is parseable and satisfies the same structural rules as
 // the signing path (shared via validateZoneRecords).
 func ValidateZoneFile(domain, path string) error {
-	f, err := os.Open(path)
+	// The same source bounds as signing apply (RDAYBLUEX-017): an oversized
+	// file or record set is rejected before `add`/`import` do any work.
+	data, _, err := readSourceBytes(path, nil)
 	if err != nil {
 		return fmt.Errorf("opening zone file: %w", err)
 	}
-	defer f.Close()
-
-	apex := dns.Fqdn(domain)
-
-	var records []dns.RR
-	zp := dns.NewZoneParser(f, apex, path)
-	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
-		records = append(records, rr)
-	}
-	if err := zp.Err(); err != nil {
+	records, _, err := parseZoneRecords(domain, path, data)
+	if err != nil {
 		return fmt.Errorf("parsing zone file: %w", err)
 	}
-
 	return validateZoneRecords(domain, records)
 }
 

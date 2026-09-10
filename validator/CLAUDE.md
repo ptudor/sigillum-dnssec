@@ -610,6 +610,7 @@ Configuration is **TOML-first, with environment variables as a fallback** — th
 |----------|---------|-------------|
 | `LISTEN_ADDR` | `:8791` | HTTP listen address |
 | `ROOT_ANCHORS_PATH` | `/etc/sigillum-validator/root-anchors.json` | Path to trust anchors |
+| `ROOT_ANCHORS_CACHE_PATH` | `/var/lib/sigillum-validator/root-anchors.json` | Last-known-good cache written after every usable fetch (empty disables) |
 | `ROOT_ANCHORS_URL` | `https://internet.any53.com/dns/anchors/root-anchors.json` | Fallback URL for anchors |
 | `QUERY_TIMEOUT_SECONDS` | `5` | Per-server query timeout (seconds) |
 | `TOTAL_TIMEOUT_SECONDS` | `30` | Total validation timeout (seconds) |
@@ -912,19 +913,25 @@ The mirror daemon handles:
 - Version archiving for rollback
 
 Actual current behavior (do not mistake the following for what the code does — see
-R-025/R-058):
-- On startup the validator loads the **local file first**; the configured URL is
-  used only when the file is missing/empty/invalid (`LoadAnchorsWithFallback`).
-- It does **not** compare the file's age or `GeneratedAt`, and a nonempty local
-  file is **not** re-fetched or refreshed from the URL — the 24h background
-  "refresh" re-reads the same file.
-- Fetched anchors are **not** written back to a local cache.
-- Every accepted anchor is authenticated against the pinned IANA root DS set
-  (R-024); anchors that do not match a pinned record are rejected/ignored.
-
-The freshness/rollover "prefer-fresh-then-fetch-and-cache" behavior described in
-older revisions of this section is **not implemented** (tracked as R-025). Until it
-is, keep the local anchor file current out of band (e.g. from the mirror).
+R-025/R-058 and RDAYBLUEX-011):
+- On startup the validator loads the **operator file first**
+  (`root_anchors_path`), then the **last-known-good cache**
+  (`root_anchors_cache_path`, default `/var/lib/sigillum-validator/root-anchors.json`),
+  and only then the configured URL (`LoadAnchorsWithCache`).
+- Every usable, pinned document fetched from the URL is written to the cache
+  atomically (private temporary file, fsync, rename, directory fsync, 1 MiB
+  limit, mode 0600). A fetch, parse, pin or write failure never replaces the
+  previous cache, and a write failure never fails the load (it is logged).
+- The 24h background refresh re-reads the operator file or fetches the URL and
+  keeps the current set on failure; it never re-reads the cache, which serves
+  starts only. A nonempty operator file is **not** re-fetched from the URL, and
+  no source's age or `GeneratedAt` is compared.
+- Every accepted anchor, cached or not, is authenticated against the pinned IANA
+  root DS set (R-024); anchors that do not match a pinned record are
+  rejected/ignored. Cached content is trusted only because it passes the pins
+  at load time, never because it was cached.
+- The packaged service declares `StateDirectory=sigillum-validator`, the only
+  path it can write; `-check` never touches the cache.
 
 Both the active KSK-2017 (tag 20326) and its pre-published successor KSK-2024
 (tag 38696) are pinned, so the scheduled **2026-10-11 root KSK rollover** is a
