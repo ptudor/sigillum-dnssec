@@ -27,7 +27,7 @@ func TestR018_PerZoneSingleFlightAndCache(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.get("example.com", compute, time.Minute, time.Second)
+			c.get(1, "example.com", compute, time.Minute, time.Second)
 		}()
 	}
 	wg.Wait()
@@ -37,13 +37,13 @@ func TestR018_PerZoneSingleFlightAndCache(t *testing.T) {
 	}
 
 	// A cached hit within the TTL does not recompute.
-	c.get("example.com", compute, time.Minute, time.Second)
+	c.get(1, "example.com", compute, time.Minute, time.Second)
 	if n := atomic.LoadInt32(&calls); n != 1 {
 		t.Fatalf("cached result within TTL must not recompute, got %d", n)
 	}
 
 	// A different zone computes independently.
-	c.get("other.example", compute, time.Minute, time.Second)
+	c.get(1, "other.example", compute, time.Minute, time.Second)
 	if n := atomic.LoadInt32(&calls); n != 2 {
 		t.Fatalf("a distinct zone must compute independently, got %d total computes", n)
 	}

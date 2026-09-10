@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -267,10 +269,50 @@ func (d *Daemon) Shutdown() {
 	}
 }
 
+// ErrDataDirChanged is returned by Reload when the new configuration names a
+// different data_dir (RDAYBLUEX-004): the process lifetime instance lock and
+// the ownership target cover only the startup directory, so moving the
+// daemon's state to another directory at runtime would leave that directory
+// unlocked for a second instance. It requires a restart.
+var ErrDataDirChanged = errors.New("data_dir changed; restart required")
+
+// sameDirectory reports whether two directory paths denote the same directory
+// once made absolute and symlink-resolved, or refer to the same inode. A path
+// that cannot be resolved is never the same directory.
+func sameDirectory(a, b string) (bool, error) {
+	canon := func(p string) (string, os.FileInfo, error) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return "", nil, err
+		}
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return "", nil, err
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return "", nil, err
+		}
+		return resolved, info, nil
+	}
+	ca, ia, err := canon(a)
+	if err != nil {
+		return false, err
+	}
+	cb, ib, err := canon(b)
+	if err != nil {
+		return false, err
+	}
+	return ca == cb || os.SameFile(ia, ib), nil
+}
+
 // Reload updates the daemon's configuration and state. It waits until Run has
 // published its ready lifecycle state so startup never races a swap, and is a
-// no-op once shutdown has begun (RA6X-040).
-func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
+// no-op once shutdown has begun (RA6X-040). A configuration whose data_dir is
+// not the directory the daemon started in is rejected whole (RDAYBLUEX-004):
+// nothing of it — zones, paths, listeners, hooks, state — is applied, and the
+// previous config/state snapshot stays active.
+func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) error {
 	// Only a startup that is actually in progress is serialized against; a
 	// daemon whose Run has not begun has no startup reads to race.
 	if d.starting.Load() {
@@ -281,7 +323,18 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 	}
 	if d.ctx.Err() != nil {
 		slog.Info("[DAEMON] Ignoring reload: daemon is shutting down or failed to start")
-		return
+		return nil
+	}
+	if cur, _ := d.current(); cur != nil {
+		same, err := sameDirectory(cur.DataDir, cfg.DataDir)
+		if err != nil || !same {
+			slog.Error("[DAEMON] Reload rejected: data_dir cannot change at runtime (the instance lock and ownership target cover only the startup directory); restart the daemon to move it. The previous configuration and state remain active.",
+				"active_data_dir", cur.DataDir, "rejected_data_dir", cfg.DataDir, "resolve_error", err)
+			if err != nil {
+				return fmt.Errorf("%w: cannot establish that %q is the active data_dir %q: %v", ErrDataDirChanged, cfg.DataDir, cur.DataDir, err)
+			}
+			return fmt.Errorf("%w: active %q, new %q", ErrDataDirChanged, cur.DataDir, cfg.DataDir)
+		}
 	}
 	// The swap and the generation bump are one step under pubMu, so a hook
 	// completion or cache fill that checked the generation cannot interleave
@@ -353,6 +406,7 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 	}
 
 	slog.Info("[DAEMON] Configuration and state reloaded", "zones", len(cfg.Zones), "generation", gen)
+	return nil
 }
 
 func (d *Daemon) ensureDirectories(cfg *config.Config) error {

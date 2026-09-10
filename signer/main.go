@@ -776,12 +776,22 @@ func runServe(cmd *cobra.Command, args []string) error {
 					slog.Error("[DAEMON] Reload rejected: --web override fails the loopback guard", "error", err)
 					continue
 				}
+				// data_dir is restart-required (RDAYBLUEX-004): decide before
+				// touching (locking, loading) the other directory at all.
+				if same, err := sameDirectory(cfg.DataDir, newCfg.DataDir); err != nil || !same {
+					slog.Error("[DAEMON] Reload rejected: data_dir changed; the daemon holds the instance lock for the directory it started in and cannot move at runtime. Restart it to apply the new data_dir. The previous configuration and state remain active.",
+						"active_data_dir", cfg.DataDir, "rejected_data_dir", newCfg.DataDir, "resolve_error", err)
+					continue
+				}
 				newState, err := loadStateLocked(newCfg)
 				if err != nil {
 					slog.Error("[DAEMON] Failed to reload state", "error", err)
 					continue
 				}
-				daemon.Reload(newCfg, newState)
+				if err := daemon.Reload(newCfg, newState); err != nil {
+					slog.Error("[DAEMON] Reload rejected", "error", err)
+					continue
+				}
 			case syscall.SIGINT, syscall.SIGTERM:
 				slog.Info("[DAEMON] Received shutdown signal", "signal", sig)
 				// Run Shutdown in the background so we keep reading sigCh: a
