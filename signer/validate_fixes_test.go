@@ -28,7 +28,7 @@ func TestValidationCache_ComputeRecoversFromPanic(t *testing.T) {
 	// the nil cold-cache fallback — like the timeout path — rather than
 	// hanging on a done channel that never closes or caching a result.
 	start := time.Now()
-	if got := c.get(panicking, time.Minute, 5*time.Second); got != nil {
+	if got := c.get(1, panicking, time.Minute, 5*time.Second); got != nil {
 		t.Errorf("panicking compute must not cache a result, got %+v", got)
 	}
 	if el := time.Since(start); el > 2*time.Second {
@@ -41,7 +41,7 @@ func TestValidationCache_ComputeRecoversFromPanic(t *testing.T) {
 		atomic.AddInt32(&calls, 1)
 		return &validate.ValidateOutput{Zones: map[string]*validate.ValidationResult{}}
 	}
-	if got := c.get(healthy, time.Minute, 5*time.Second); got == nil {
+	if got := c.get(1, healthy, time.Minute, 5*time.Second); got == nil {
 		t.Fatal("get after the panic returned nil — inflight was not cleared for a fresh compute")
 	}
 	if n := atomic.LoadInt32(&calls); n != 2 {

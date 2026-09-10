@@ -24,7 +24,7 @@ func TestValidationCache_BoundedAndSingleFlight(t *testing.T) {
 	// Bounded: while compute is blocked, get returns within its wait budget with
 	// the (cold) nil cache rather than hanging on the slow run.
 	start := time.Now()
-	if got := c.get(compute, time.Minute, 100*time.Millisecond); got != nil {
+	if got := c.get(1, compute, time.Minute, 100*time.Millisecond); got != nil {
 		t.Errorf("expected nil while compute is blocked, got non-nil")
 	}
 	if el := time.Since(start); el > 1*time.Second {
@@ -33,14 +33,14 @@ func TestValidationCache_BoundedAndSingleFlight(t *testing.T) {
 
 	// Single-flight: more gets while blocked must not spawn additional computes.
 	for i := 0; i < 5; i++ {
-		c.get(compute, time.Minute, 20*time.Millisecond)
+		c.get(1, compute, time.Minute, 20*time.Millisecond)
 	}
 
 	close(gate) // let the single in-flight compute finish
 
 	var final *validate.ValidateOutput
 	for i := 0; i < 200 && final == nil; i++ {
-		final = c.get(compute, time.Minute, 200*time.Millisecond)
+		final = c.get(1, compute, time.Minute, 200*time.Millisecond)
 		if final == nil {
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -53,7 +53,7 @@ func TestValidationCache_BoundedAndSingleFlight(t *testing.T) {
 	}
 
 	// TTL: a subsequent get within the TTL serves the cache without recomputing.
-	_ = c.get(compute, time.Minute, time.Second)
+	_ = c.get(1, compute, time.Minute, time.Second)
 	if n := atomic.LoadInt32(&computeCount); n != 1 {
 		t.Errorf("fresh cache must not recompute; compute ran %d times", n)
 	}
