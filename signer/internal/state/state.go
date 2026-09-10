@@ -35,12 +35,25 @@ type State struct {
 	// fileSeen records that the state file existed at the last successful
 	// load or save, so a later disappearance is detected (RA6X-026).
 	fileSeen bool
+	// base is the last disk image this State synchronized with, per zone: a
+	// deep copy taken at load, replace, reload and after every committed
+	// save. ReloadFromDisk merges three ways against it (RDAYBLUEX-019): a
+	// field class that only the disk changed is adopted, one that only memory
+	// changed is kept, and one both changed is resolved by a per-class rule.
+	// Causality is therefore never inferred from signing time alone.
+	base map[string]*ZoneState
 }
 
 // ZoneState represents the state of a single zone
 type ZoneState struct {
-	Path   string `json:"path"`
-	Serial uint32 `json:"serial"`
+	// Revision is a monotonic per-zone counter: every Save that persists a
+	// change to the zone increments it past both the in-memory and the
+	// last-synchronized disk value (RDAYBLUEX-019). Documents written before
+	// the field existed load at revision 0 and are merged by content against
+	// the base image, so they remain readable and mergeable.
+	Revision uint64 `json:"revision,omitempty"`
+	Path     string `json:"path"`
+	Serial   uint32 `json:"serial"`
 	// PublishedSerial is the SOA serial actually written to the signed
 	// zone. Equal to Serial under serial_policy = "keep"; under "epoch" it
 	// is bumped on every signing event so secondaries pick up refreshed
@@ -264,7 +277,36 @@ func NewState(path string) *State {
 	return &State{
 		path:  path,
 		Zones: make(map[string]*ZoneState),
+		base:  make(map[string]*ZoneState),
 	}
+}
+
+// cloneZones deep-copies a zone map (the merge base is never aliased to live
+// zone pointers, which the signing goroutine mutates in place).
+func cloneZones(zones map[string]*ZoneState) map[string]*ZoneState {
+	out := make(map[string]*ZoneState, len(zones))
+	for name, z := range zones {
+		out[name] = z.Clone()
+	}
+	return out
+}
+
+// syncBaseLocked records the current in-memory zones as the disk image
+// (caller holds the write lock and has just loaded from or saved to disk).
+func (s *State) syncBaseLocked() {
+	s.base = cloneZones(s.Zones)
+}
+
+// BaseRevision returns the revision the last synchronized disk image held for
+// a zone (0 when the zone was not part of it). Exposed for tests and
+// diagnostics; production code merges through ReloadFromDisk.
+func (s *State) BaseRevision(domain string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if b := s.base[domain]; b != nil {
+		return b.Revision
+	}
+	return 0
 }
 
 // LoadState loads state from a JSON file. The document is validated and
@@ -291,6 +333,7 @@ func LoadState(path string) (*State, error) {
 		return nil, fmt.Errorf("state file %s is invalid (left unchanged): %w", path, err)
 	}
 	state.fileSeen = true
+	state.syncBaseLocked()
 
 	return state, nil
 }
@@ -441,27 +484,39 @@ func (s *State) ReplaceFromDisk() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := os.ReadFile(s.path)
-	if os.IsNotExist(err) {
-		if s.fileSeen {
-			return fmt.Errorf("%w: %s existed at the last successful load and is gone; restore it, or restart the daemon to rebuild state from the key files if the removal was intentional", ErrStateFileMissing, s.path)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("reading state file: %w", err)
-	}
-	diskState := &State{Zones: make(map[string]*ZoneState)}
-	if err := json.Unmarshal(data, diskState); err != nil {
-		return fmt.Errorf("parsing state file: %w", err)
-	}
-	if err := diskState.validateAndNormalize(); err != nil {
-		return fmt.Errorf("state file %s is invalid (left unchanged, in-memory state not replaced): %w", s.path, err)
+	diskState, err := s.readDiskLocked("in-memory state not replaced")
+	if err != nil || diskState == nil {
+		return err
 	}
 	s.Zones = diskState.Zones
 	s.Removed = diskState.Removed
 	s.fileSeen = true
+	s.syncBaseLocked()
 	return nil
+}
+
+// readDiskLocked reads and validates the on-disk document (caller holds the
+// lock). It returns (nil, nil) when the file has never existed, and
+// ErrStateFileMissing when a file seen at the last load/save is gone.
+func (s *State) readDiskLocked(untouched string) (*State, error) {
+	data, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		if s.fileSeen {
+			return nil, fmt.Errorf("%w: %s existed at the last successful load and is gone; restore it, or restart the daemon to rebuild state from the key files if the removal was intentional", ErrStateFileMissing, s.path)
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading state file: %w", err)
+	}
+	diskState := &State{Zones: make(map[string]*ZoneState)}
+	if err := json.Unmarshal(data, diskState); err != nil {
+		return nil, fmt.Errorf("parsing state file: %w", err)
+	}
+	if err := diskState.validateAndNormalize(); err != nil {
+		return nil, fmt.Errorf("state file %s is invalid (left unchanged, %s): %w", s.path, untouched, err)
+	}
+	return diskState, nil
 }
 
 // MarkRemoved takes a zone out of management and records a deletion marker so
@@ -504,8 +559,24 @@ func (s *State) RemovedAt(domain string) (time.Time, bool) {
 	return t, ok
 }
 
-// ReloadFromDisk reloads the state from disk, merging any new zones added by CLI commands.
-// This preserves zones added by CLI while keeping daemon's in-memory updates for managed zones.
+// ReloadFromDisk merges the on-disk state into memory (RDAYBLUEX-019). It is
+// the read-merge step of every read-merge-save transaction: memory may hold
+// results a failed save never persisted, and the disk may hold mutations a
+// CLI command committed since this State last synchronized with it. Both
+// must survive.
+//
+// The merge is three-way against the last synchronized disk image (base):
+//   - a zone the disk did not change since base keeps its in-memory value,
+//     unsaved changes included;
+//   - a zone memory did not change adopts the disk value;
+//   - a zone both sides changed is merged per field class: signing fields
+//     follow the later LastSigned (disk on a tie), key identities and the
+//     rollover record follow the disk (the later, key-file-consistent actor)
+//     and force a re-sign, publication fields follow the later confirmed
+//     generation with cache horizons never lowered, and warnings/errors are a
+//     three-way set merge in which a diagnostic either side removed stays
+//     removed and one either side added is kept;
+//   - a zone created independently on both sides adopts the disk copy.
 //
 // The disk document is validated before anything is merged (RA6X-036); an
 // unreadable or invalid file leaves the in-memory state untouched and returns
@@ -516,24 +587,13 @@ func (s *State) ReloadFromDisk() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := os.ReadFile(s.path)
-	if os.IsNotExist(err) {
-		if s.fileSeen {
-			return fmt.Errorf("%w: %s existed at the last successful load and is gone; restore it, or restart the daemon to rebuild state from the key files if the removal was intentional", ErrStateFileMissing, s.path)
-		}
+	diskState, err := s.readDiskLocked("in-memory state not merged")
+	if err != nil {
+		return err
+	}
+	if diskState == nil {
 		// Never existed yet: a fresh start, nothing to merge.
 		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("reading state file: %w", err)
-	}
-
-	diskState := &State{Zones: make(map[string]*ZoneState)}
-	if err := json.Unmarshal(data, diskState); err != nil {
-		return fmt.Errorf("parsing state file: %w", err)
-	}
-	if err := diskState.validateAndNormalize(); err != nil {
-		return fmt.Errorf("state file %s is invalid (left unchanged, in-memory state not merged): %w", s.path, err)
 	}
 	s.fileSeen = true
 
@@ -564,45 +624,303 @@ func (s *State) ReloadFromDisk() error {
 		}
 	}
 
-	// Merge zones from disk:
-	// - Add zones that only exist on disk (CLI additions via "add" command)
-	// - Update zones where disk has a more recent signing (CLI "resign"/"sign"
-	//   ran while daemon was running — adopt the fresher state so the daemon
-	//   doesn't overwrite it with stale in-memory data on next Save)
+	// Merge zones from disk three ways against the base image.
 	for domain, diskZone := range diskState.Zones {
 		memZone, exists := s.Zones[domain]
+		baseZone := s.base[domain]
 		switch {
 		case !exists:
+			// Only on disk: a CLI `add`, or a zone memory dropped through a
+			// removal marker that the disk has since re-added.
 			s.Zones[domain] = diskZone
-		case diskZone.LastSigned.After(memZone.LastSigned):
+		case baseZone == nil:
+			// Created independently on both sides (a daemon initialization
+			// that was never saved and a CLI `add`): the disk copy is the
+			// later actor and the one whose key files are committed.
 			s.Zones[domain] = diskZone
-		case !rolloverEqual(diskZone.Rollover, memZone.Rollover) && !diskZone.LastSigned.Before(memZone.LastSigned):
-			// A CLI `rollover start/complete` mutated the rollover state without a newer
-			// LastSigned; adopt it so the daemon's Save doesn't revert the rollover while
-			// the key files on disk are already rotated (R-007).
-			s.Zones[domain] = diskZone
+		default:
+			s.Zones[domain] = mergeZone(baseZone, diskZone, memZone)
 		}
 	}
+	// Zones only in memory are unsaved additions (kept and persisted by the
+	// next save), or zones the disk lost since the last synchronization
+	// without a removal marker (the file was replaced or hand-edited). The
+	// latter follow the disk when memory holds nothing unsaved for them;
+	// unsaved signing state is never discarded on an unexplained removal.
+	for domain, memZone := range s.Zones {
+		if _, onDisk := diskState.Zones[domain]; onDisk {
+			continue
+		}
+		if baseZone := s.base[domain]; baseZone != nil && zoneContentEqual(memZone, baseZone) {
+			delete(s.Zones, domain)
+		}
+	}
+
+	// The disk image just read is the new synchronization point: whatever
+	// still differs in memory after the merge is exactly the unsaved work.
+	s.base = cloneZones(diskState.Zones)
 
 	return nil
 }
 
-// rolloverEqual reports whether two rollover states are equivalent for merge purposes.
-func rolloverEqual(a, b *RolloverState) bool {
+// mergeZone resolves one zone present in the base image, on disk and in
+// memory (RDAYBLUEX-019). See ReloadFromDisk for the rules.
+func mergeZone(base, disk, mem *ZoneState) *ZoneState {
+	diskChanged := disk.Revision != base.Revision || !zoneContentEqual(disk, base)
+	if !diskChanged {
+		// Nobody wrote the disk since we synchronized: memory stands, with
+		// or without unsaved changes.
+		return mem
+	}
+	if zoneContentEqual(mem, base) {
+		// Memory has nothing unsaved: the disk is simply newer.
+		return disk
+	}
+
+	dSign, mSign := !signingEqual(disk, base), !signingEqual(mem, base)
+	dKeys, mKeys := !keysRolloverEqual(disk, base), !keysRolloverEqual(mem, base)
+	dPub, mPub := !publicationEqual(disk, base), !publicationEqual(mem, base)
+	dDiag := !diagnosticsEqual(disk, base)
+	dForce, mForce := disk.ForceResign != base.ForceResign, mem.ForceResign != base.ForceResign
+
+	out := mem.Clone()
+	if disk.Revision > out.Revision {
+		out.Revision = disk.Revision
+	}
+
+	// Signing: the later generation wins; on a tie the disk (later actor).
+	signFromDisk := false
+	if dSign && (!mSign || !disk.LastSigned.Before(mem.LastSigned)) {
+		copySigning(out, disk)
+		signFromDisk = true
+	}
+
+	// Keys and rollover record: a disk-side transition is adopted. When both
+	// sides transitioned, the disk's record is the one its key files agree
+	// with, and the zone is re-signed so output matches that record.
+	keyConflict := false
+	if dKeys {
+		copyKeysRollover(out, disk)
+		keyConflict = mKeys
+	}
+
+	// Publication: adopt a disk-only confirmation; when both confirmed,
+	// keep the later generation and never lower a cache horizon. When the
+	// signing and publication classes come from different sides, the
+	// pending flag is recomputed so a confirmation of an older generation
+	// never marks a newer unconfirmed signing as served.
+	switch {
+	case dPub && !mPub:
+		copyPublication(out, disk)
+		if !signFromDisk {
+			out.PendingPublication = out.LastSigned.After(out.PublishedGenerationSignedAt)
+		}
+	case dPub && mPub:
+		mergePublication(out, disk, mem)
+	case !dPub && mPub && signFromDisk:
+		out.PendingPublication = out.LastSigned.After(out.PublishedGenerationSignedAt)
+	}
+
+	// Diagnostics: a three-way set merge (when only memory changed them the
+	// clone already holds memory's value).
+	if dDiag {
+		out.Warnings = mergeDiagnostics(base.Warnings, disk.Warnings, mem.Warnings, false)
+		out.Errors = mergeDiagnostics(base.Errors, disk.Errors, mem.Errors, true)
+	}
+
+	// ForceResign: a side that set it wins; a key/rollover conflict sets it.
+	switch {
+	case keyConflict:
+		out.ForceResign = true
+	case dForce && mForce:
+		out.ForceResign = disk.ForceResign || mem.ForceResign
+	case dForce:
+		out.ForceResign = disk.ForceResign
+	}
+	return out
+}
+
+// Field classes of ZoneState for merging. Every persisted field belongs to
+// exactly one class (or is Revision/ForceResign, handled separately);
+// zoneContentEqual must stay the conjunction of the class comparisons so a
+// new field cannot silently fall outside the merge.
+
+func signingEqual(a, b *ZoneState) bool {
+	return a.Path == b.Path && a.Serial == b.Serial && a.PublishedSerial == b.PublishedSerial &&
+		a.LastSigned.Equal(b.LastSigned) && a.SourceModTime.Equal(b.SourceModTime) && a.SourceSize == b.SourceSize &&
+		a.SignaturesExp.Equal(b.SignaturesExp) &&
+		a.PublishedDNSKEYTTL == b.PublishedDNSKEYTTL && a.PublishedMaxRRSIGTTL == b.PublishedMaxRRSIGTTL
+}
+
+func copySigning(dst, src *ZoneState) {
+	dst.Path, dst.Serial, dst.PublishedSerial = src.Path, src.Serial, src.PublishedSerial
+	dst.LastSigned, dst.SourceModTime, dst.SourceSize = src.LastSigned, src.SourceModTime, src.SourceSize
+	dst.SignaturesExp = src.SignaturesExp
+	dst.PublishedDNSKEYTTL, dst.PublishedMaxRRSIGTTL = src.PublishedDNSKEYTTL, src.PublishedMaxRRSIGTTL
+}
+
+func keyStateEqual(a, b *KeyState) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.ID == b.ID && a.Algorithm == b.Algorithm && a.Created.Equal(b.Created) && a.Expires.Equal(b.Expires) &&
+		a.DSPublished == b.DSPublished && a.RolloverDue.Equal(b.RolloverDue)
+}
+
+// rolloverStateEqual compares every persisted rollover field.
+func rolloverStateEqual(a, b *RolloverState) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
 	return a.Type == b.Type && a.State == b.State &&
-		a.OldKeyID == b.OldKeyID && a.NewKeyID == b.NewKeyID &&
-		a.OldZSKID == b.OldZSKID && a.NewZSKID == b.NewZSKID
+		a.OldKeyID == b.OldKeyID && a.NewKeyID == b.NewKeyID && a.OldZSKID == b.OldZSKID && a.NewZSKID == b.NewZSKID &&
+		a.OldAlgorithm == b.OldAlgorithm && a.NewAlgorithm == b.NewAlgorithm &&
+		a.Started.Equal(b.Started) && a.PhaseStarted.Equal(b.PhaseStarted) && a.PhaseFirstSigned.Equal(b.PhaseFirstSigned) &&
+		a.PhaseHorizon.Equal(b.PhaseHorizon) && a.DSObservedAt.Equal(b.DSObservedAt) && a.ParentDSTTL == b.ParentDSTTL &&
+		a.OldDSRemovedAt.Equal(b.OldDSRemovedAt) && a.Action == b.Action
 }
 
-// Save persists the state to disk
-func (s *State) Save() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func keysRolloverEqual(a, b *ZoneState) bool {
+	return keyStateEqual(a.KSK, b.KSK) && keyStateEqual(a.ZSK, b.ZSK) && rolloverStateEqual(a.Rollover, b.Rollover)
+}
 
+func copyKeysRollover(dst, src *ZoneState) {
+	dst.KSK, dst.ZSK = src.KSK.clone(), src.ZSK.clone()
+	dst.Rollover = nil
+	if src.Rollover != nil {
+		r := *src.Rollover
+		dst.Rollover = &r
+	}
+}
+
+func publicationEqual(a, b *ZoneState) bool {
+	return a.PendingPublication == b.PendingPublication && a.PublishedAt.Equal(b.PublishedAt) &&
+		a.PublishedGenerationSignedAt.Equal(b.PublishedGenerationSignedAt) &&
+		a.ServedDNSKEYTTL == b.ServedDNSKEYTTL && a.ServedMaxRRSIGTTL == b.ServedMaxRRSIGTTL &&
+		a.DNSKEYCacheHorizon.Equal(b.DNSKEYCacheHorizon) && a.RRSIGCacheHorizon.Equal(b.RRSIGCacheHorizon)
+}
+
+func copyPublication(dst, src *ZoneState) {
+	dst.PendingPublication, dst.PublishedAt, dst.PublishedGenerationSignedAt = src.PendingPublication, src.PublishedAt, src.PublishedGenerationSignedAt
+	dst.ServedDNSKEYTTL, dst.ServedMaxRRSIGTTL = src.ServedDNSKEYTTL, src.ServedMaxRRSIGTTL
+	dst.DNSKEYCacheHorizon, dst.RRSIGCacheHorizon = src.DNSKEYCacheHorizon, src.RRSIGCacheHorizon
+}
+
+// mergePublication resolves two independent confirmations: the later confirmed
+// generation supplies the confirmation fields, horizons are the maximum of
+// both, and pending-publication is recomputed from the merged signing state.
+func mergePublication(out, disk, mem *ZoneState) {
+	win := disk
+	if mem.PublishedGenerationSignedAt.After(disk.PublishedGenerationSignedAt) {
+		win = mem
+	}
+	out.PublishedAt, out.PublishedGenerationSignedAt = win.PublishedAt, win.PublishedGenerationSignedAt
+	out.ServedDNSKEYTTL, out.ServedMaxRRSIGTTL = win.ServedDNSKEYTTL, win.ServedMaxRRSIGTTL
+	out.DNSKEYCacheHorizon = laterTime(disk.DNSKEYCacheHorizon, mem.DNSKEYCacheHorizon)
+	out.RRSIGCacheHorizon = laterTime(disk.RRSIGCacheHorizon, mem.RRSIGCacheHorizon)
+	out.PendingPublication = out.LastSigned.After(out.PublishedGenerationSignedAt)
+}
+
+func laterTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+func diagnosticsEqual(a, b *ZoneState) bool {
+	return stringsEqual(a.Warnings, b.Warnings) && stringsEqual(a.Errors, b.Errors)
+}
+
+func stringsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeDiagnostics is a three-way set merge of a warnings or errors list: an
+// entry survives when both sides still hold it or either side added it, and
+// is gone when either side removed it. Memory order is kept, disk additions
+// follow. For operation-scoped errors (opScoped) two entries of the same
+// "<operation>: " prefix collapse to the disk's (the later actor's) entry.
+func mergeDiagnostics(base, disk, mem []string, opScoped bool) []string {
+	in := func(list []string, s string) bool {
+		for _, x := range list {
+			if x == s {
+				return true
+			}
+		}
+		return false
+	}
+	var out []string
+	for _, m := range mem {
+		if in(disk, m) || !in(base, m) {
+			out = append(out, m)
+		}
+	}
+	for _, d := range disk {
+		if !in(base, d) && !in(out, d) {
+			if opScoped {
+				if op, ok := operationOf(d); ok {
+					kept := out[:0:0]
+					for _, x := range out {
+						if xo, xok := operationOf(x); !(xok && xo == op) {
+							kept = append(kept, x)
+						}
+					}
+					out = kept
+				}
+			}
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// operationOf returns the "<operation>" of an operation-scoped error entry.
+func operationOf(e string) (string, bool) {
+	i := strings.Index(e, ": ")
+	if i <= 0 {
+		return "", false
+	}
+	return e[:i], true
+}
+
+// zoneContentEqual reports whether two zone records carry the same persisted
+// content, revision excluded.
+func zoneContentEqual(a, b *ZoneState) bool {
+	return signingEqual(a, b) && keysRolloverEqual(a, b) && publicationEqual(a, b) &&
+		diagnosticsEqual(a, b) && a.ForceResign == b.ForceResign
+}
+
+// Save persists the state to disk. Every zone whose content differs from the
+// last synchronized disk image has its revision advanced past both the
+// in-memory and the disk value before the document is written
+// (RDAYBLUEX-019); after a committed write the document becomes the new
+// synchronization base. A write whose file is visible but whose directory
+// sync failed is committed for these purposes (RA6X-049) and still returned
+// as the *DurabilityError the caller classifies.
+func (s *State) Save() error {
+	s.mu.Lock()
+	for name, z := range s.Zones {
+		b := s.base[name]
+		if b == nil || !zoneContentEqual(z, b) {
+			next := z.Revision
+			if b != nil && b.Revision > next {
+				next = b.Revision
+			}
+			z.Revision = next + 1
+		}
+	}
 	data, err := json.MarshalIndent(s, "", "  ")
+	written := cloneZones(s.Zones)
+	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("marshaling state: %w", err)
 	}
@@ -613,22 +931,18 @@ func (s *State) Save() error {
 	// helper preserves the target directory's uid/gid so `sigillum-signer add` run as root
 	// leaves a state.json the daemon user can still read, and fsyncs so a crash/power loss
 	// can't leave a truncated file (R-040).
-	if err := fsutil.WriteFileAtomicOwned(s.path, data, 0600); err != nil {
-		return fmt.Errorf("writing state file: %w", err)
+	werr := fsutil.WriteFileAtomicOwned(s.path, data, 0600)
+	if werr != nil && !fsutil.IsCommitted(werr) {
+		return fmt.Errorf("writing state file: %w", werr)
 	}
-	s.markFileSeen()
-
-	return nil
-}
-
-// markFileSeen records that the state file now exists on disk. Save holds the
-// read lock, so the flag is set under its own short write lock afterwards.
-func (s *State) markFileSeen() {
-	s.mu.RUnlock()
 	s.mu.Lock()
 	s.fileSeen = true
+	s.base = written
 	s.mu.Unlock()
-	s.mu.RLock()
+	if werr != nil {
+		return fmt.Errorf("writing state file: %w", werr)
+	}
+	return nil
 }
 
 // GetZone returns the state for a zone, or nil if not found.
