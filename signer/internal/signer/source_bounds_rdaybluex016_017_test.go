@@ -245,35 +245,44 @@ func TestRDAYBLUEX016_ContentIdentityDrivesChangeDetection(t *testing.T) {
 	SetAfterSourceRead(lab.s, nil)
 }
 
-// An old state file without a digest establishes a baseline from the
-// current file without re-signing and without losing the current output.
-func TestRDAYBLUEX016_LegacyStateEstablishesBaseline(t *testing.T) {
+// An old state file without a digest must publish once before recording the
+// current source identity. Otherwise a same-metadata replacement made before
+// upgrade could be blessed as the baseline while the old output kept serving.
+func TestRDAYBLUEX016_LegacyStatePublishesBeforeEstablishingBaseline(t *testing.T) {
 	lab := newSourceLab(t)
 	if err := lab.s.SignZone(lab.domain); err != nil {
 		t.Fatal(err)
 	}
 	out, _ := os.ReadFile(lab.s.OutputPath(lab.domain))
 	zs := lab.state.GetZone(lab.domain)
+	source, _ := os.ReadFile(lab.path)
+	changed := strings.Replace(string(source), "192.0.2.1\n", "192.0.2.2\n", 1)
+	if len(changed) != len(source) {
+		t.Fatal("the hidden replacement must preserve source size")
+	}
+	replaceAtomically(t, lab.path, changed, zs.SourceModTime)
 	lab.state.Mutate(func() {
 		zs.SourceDigest = "" // as written by a version before digests existed
 		zs.SignaturesExp = time.Now().Add(24 * time.Hour)
 	})
-	need, _ := lab.s.NeedsSign(lab.domain, lab.path, zs)
-	if need {
-		t.Fatal("unchanged metadata with no recorded digest must not re-sign")
+	need, reason := lab.s.NeedsSign(lab.domain, lab.path, zs)
+	if !need || !strings.Contains(reason, "identity not recorded") {
+		t.Fatalf("a legacy state must publish before recording the baseline (need=%v reason=%q)", need, reason)
 	}
-	if zs.SourceDigest == "" {
-		t.Fatal("the baseline digest must be recorded")
+	if zs.SourceDigest != "" {
+		t.Fatal("change detection must not record a digest before publication")
 	}
 	if now, _ := os.ReadFile(lab.s.OutputPath(lab.domain)); string(now) != string(out) {
-		t.Fatal("establishing the baseline must not touch the output")
+		t.Fatal("change detection itself must not touch the last-known-good output")
 	}
-	// From the baseline on, a preserved-mtime content change is detected.
-	c, _ := os.ReadFile(lab.path)
-	changed := strings.Replace(string(c), "192.0.2.1\n", "192.0.2.2\n", 1)
-	replaceAtomically(t, lab.path, changed, zs.SourceModTime)
-	if need, _ := lab.s.NeedsSign(lab.domain, lab.path, zs); !need {
-		t.Fatal("after the baseline a hidden content change must be detected")
+	if err := lab.s.SignZone(lab.domain); err != nil {
+		t.Fatal(err)
+	}
+	if zs.SourceDigest == "" {
+		t.Fatal("successful publication must record the source digest")
+	}
+	if now, _ := os.ReadFile(lab.s.OutputPath(lab.domain)); !strings.Contains(string(now), "192.0.2.2") {
+		t.Fatal("the baseline digest must describe the newly published source bytes")
 	}
 }
 
