@@ -1,4 +1,4 @@
-root-anchors.json
+/root-anchors.json
 /sigillum-validator
 /dnssec-validator
 build/
