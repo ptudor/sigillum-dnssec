@@ -22,8 +22,9 @@ import (
 
 // failNextDaemonSave retargets the state at a read-only copy so the next
 // atomic save cannot create its temp file (pre-commit failure) while the
-// cycle's authoritative load still succeeds. It returns the restore function.
-func failNextDaemonSave(t *testing.T, state *statepkg.State, orig string) func() {
+// cycle's authoritative load still succeeds. It returns the read-only copy's
+// path and the restore function.
+func failNextDaemonSave(t *testing.T, state *statepkg.State, orig string) (roPath string, restore func()) {
 	t.Helper()
 	if os.Geteuid() == 0 {
 		t.Skip("directory permissions do not restrict root")
@@ -36,7 +37,7 @@ func failNextDaemonSave(t *testing.T, state *statepkg.State, orig string) func()
 	if err != nil {
 		t.Fatal(err)
 	}
-	roPath := filepath.Join(roDir, "state.json")
+	roPath = filepath.Join(roDir, "state.json")
 	if err := os.WriteFile(roPath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +46,7 @@ func failNextDaemonSave(t *testing.T, state *statepkg.State, orig string) func()
 	}
 	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
 	state.SetPath(roPath)
-	return func() { state.SetPath(orig) }
+	return roPath, func() { state.SetPath(orig) }
 }
 
 // appendZoneRecord changes the unsigned zone (size and mtime) so the next
@@ -78,7 +79,7 @@ func TestRDAYBLUEX019_CLIDiagnosticsSurviveDaemonSaveFailure(t *testing.T) {
 
 	// Cycle 2: the source changed, the daemon signs generation 2 in memory,
 	// and its save fails before the rename.
-	restore := failNextDaemonSave(t, state, orig)
+	_, restore := failNextDaemonSave(t, state, orig)
 	appendZoneRecord(t, cfg.Zones[domain].Path, "mail\tIN\tA\t192.0.2.25")
 	d.signAllZones()
 	gen2 := state.GetZone(domain).LastSigned
@@ -151,7 +152,7 @@ func TestRDAYBLUEX019_CLIDiagnosticsSurviveDaemonSaveFailure(t *testing.T) {
 		st.UpdateZone(domain, func(z *statepkg.ZoneState) { z.AddWarning("URGENT: second") })
 	})
 	d.signAllZones() // adopts the warning, saves
-	restore = failNextDaemonSave(t, state, orig)
+	_, restore = failNextDaemonSave(t, state, orig)
 	appendZoneRecord(t, cfg.Zones[domain].Path, "ftp\tIN\tA\t192.0.2.26")
 	d.signAllZones() // generation 3 in memory, save fails
 	gen3 := state.GetZone(domain).LastSigned

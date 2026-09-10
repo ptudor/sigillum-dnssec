@@ -16,6 +16,7 @@ import (
 
 	"github.com/ptudor/sigillum-dnssec/signer/internal/config"
 	"github.com/ptudor/sigillum-dnssec/signer/internal/metrics"
+	statepkg "github.com/ptudor/sigillum-dnssec/signer/internal/state"
 )
 
 // Hook execution (RA6X-034 lifecycle bounds, RA6X-043 shared CLI/daemon
@@ -106,6 +107,11 @@ type SignedZoneRef struct {
 	// LastSigned when the hook was fired); a successful hook confirms exactly
 	// that generation as published (RA6X-004).
 	SignedAt time.Time
+	// Serial is the SOA serial the deployed generation publishes
+	// (ZoneState.PublishedSerial when the hook was fired). Together with
+	// SignedAt and SignedPath it is the identity a completion must still
+	// match before it may confirm anything (RDAYBLUEX-005).
+	Serial uint32
 }
 
 // signedRef builds the hook reference for a zone from its source path, the
@@ -117,6 +123,14 @@ func signedRef(cfg *config.Config, domain, zonePath string, signedAt time.Time) 
 		SignedPath: filepath.Join(cfg.OutputDir, domain+".zone.signed"),
 		SignedAt:   signedAt,
 	}
+}
+
+// zoneRef is signedRef for a zone's current state: the generation identity
+// (SignedAt and published Serial) is taken from the zone record.
+func zoneRef(cfg *config.Config, domain, zonePath string, zs *statepkg.ZoneState) SignedZoneRef {
+	ref := signedRef(cfg, domain, zonePath, zs.LastSigned)
+	ref.Serial = zs.PublishedSerial
+	return ref
 }
 
 // hookCmd returns the command name and arguments for a hook, along with a
@@ -246,71 +260,69 @@ func firePostSignHooks(hooks *config.HooksConfig, outputDir string, signed []Sig
 	if !hookConfigured(hooks) || len(signed) == 0 {
 		return nil
 	}
-	_, _, identity, _ := hookCmd(hooks)
-
-	type invocation struct {
-		kind  string
-		env   []string
-		attrs []any
-		zones []SignedZoneRef
+	if wg != nil {
+		// Asynchronous callers go through a bounded dispatcher (RDAYBLUEX-018).
+		// The daemon owns a long-lived one; this path serves a caller that
+		// only has a wait group.
+		newHookDispatcher(wg).dispatch(hooks, outputDir, signed, 0, onDone)
+		return nil
 	}
-	var invocations []invocation
+	_, _, identity, _ := hookCmd(hooks)
+	var first error
+	for _, inv := range buildHookInvocations(hooks, outputDir, signed) {
+		if err := runHookInvocation(hooks, identity, inv, os.Stdout, onDone); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// hookInvocation is one hook process to run: a coalesced batch or one zone.
+type hookInvocation struct {
+	kind  string
+	env   []string
+	attrs []any
+	zones []SignedZoneRef
+}
+
+// buildHookInvocations applies the coalescing contract: one batch invocation
+// naming every zone, or one per-zone invocation each.
+func buildHookInvocations(hooks *config.HooksConfig, outputDir string, signed []SignedZoneRef) []hookInvocation {
 	if hooks.CoalescePostSign {
 		domains := make([]string, len(signed))
 		for i, z := range signed {
 			domains[i] = z.Domain
 		}
-		invocations = append(invocations, invocation{
+		return []hookInvocation{{
 			kind:  "post_sign_batch",
 			env:   hookEnviron(batchVars(domains, outputDir)...),
 			attrs: []any{"batch_size", len(domains)},
 			zones: signed,
+		}}
+	}
+	invocations := make([]hookInvocation, 0, len(signed))
+	for _, z := range signed {
+		invocations = append(invocations, hookInvocation{
+			kind:  "post_sign",
+			env:   hookEnviron(perZoneVars(&HookEnv{Domain: z.Domain, ZonePath: z.ZonePath, SignedPath: z.SignedPath, OutputDir: outputDir})...),
+			attrs: []any{"domain", z.Domain},
+			zones: []SignedZoneRef{z},
 		})
-	} else {
-		for _, z := range signed {
-			invocations = append(invocations, invocation{
-				kind:  "post_sign",
-				env:   hookEnviron(perZoneVars(&HookEnv{Domain: z.Domain, ZonePath: z.ZonePath, SignedPath: z.SignedPath, OutputDir: outputDir})...),
-				attrs: []any{"domain", z.Domain},
-				zones: []SignedZoneRef{z},
-			})
-		}
 	}
+	return invocations
+}
 
-	run := func(inv invocation, stdout io.Writer) error {
-		start := time.Now()
-		slog.Debug("[HOOK] Executing hook", append([]any{"hook", identity}, inv.attrs...)...)
-		stderr, err := runHook(hooks, inv.env, stdout)
-		logHookResult(inv.kind, identity, inv.attrs, stderr, err, start)
-		if onDone != nil {
-			onDone(inv.zones, err)
-		}
-		return err
+// runHookInvocation runs one invocation to completion, logs it and reports
+// it to onDone with the zones it covered.
+func runHookInvocation(hooks *config.HooksConfig, identity string, inv hookInvocation, stdout io.Writer, onDone func([]SignedZoneRef, error)) error {
+	start := time.Now()
+	slog.Debug("[HOOK] Executing hook", append([]any{"hook", identity}, inv.attrs...)...)
+	stderr, err := runHook(hooks, inv.env, stdout)
+	logHookResult(inv.kind, identity, inv.attrs, stderr, err, start)
+	if onDone != nil {
+		onDone(inv.zones, err)
 	}
-
-	if wg == nil {
-		var first error
-		for _, inv := range invocations {
-			if err := run(inv, os.Stdout); err != nil && first == nil {
-				first = err
-			}
-		}
-		return first
-	}
-	for _, inv := range invocations {
-		inv := inv
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("[HOOK] Panic in post-sign hook", append([]any{"panic", r, "hook", identity}, inv.attrs...)...)
-				}
-			}()
-			_ = run(inv, io.Discard)
-		}()
-	}
-	return nil
+	return err
 }
 
 // executeHookSync runs a per-zone hook synchronously with env's variables and
