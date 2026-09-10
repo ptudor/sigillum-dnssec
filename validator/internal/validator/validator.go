@@ -2,6 +2,7 @@ package validator
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -2344,22 +2345,68 @@ func (v *Validator) queryRDAPSecureDNS(ctx context.Context, zone string, dnsDS [
 		return result
 	}
 
-	// Convert RDAP DS records to our format for comparison
+	// Convert RDAP DS records to our format for comparison. RDAP delivers
+	// machine-width signed integers and free-form digest text; every record
+	// is validated before it is narrowed to DNS wire widths (RDAYBLUEX-028),
+	// and a malformed record is excluded from matching and surfaced as a
+	// diagnostic rather than wrapped into a value that could accidentally
+	// equal a real DNS DS tuple.
 	rdapDS := make([]dnspkg.DSRecord, 0, len(secureDNS.DSData))
-	for _, ds := range secureDNS.DSData {
-		rdapDS = append(rdapDS, dnspkg.DSRecord{
-			KeyTag:     uint16(ds.KeyTag),
-			Algorithm:  uint8(ds.Algorithm),
-			DigestType: uint8(ds.DigestType),
-			Digest:     strings.ToUpper(ds.Digest),
-		})
+	var malformed []string
+	for i, ds := range secureDNS.DSData {
+		rec, err := validateRDAPDS(ds)
+		if err != nil {
+			malformed = append(malformed, fmt.Sprintf("record %d: %v", i+1, err))
+			continue
+		}
+		rdapDS = append(rdapDS, rec)
 	}
 	result.DSData = rdapDS
+	if len(malformed) > 0 {
+		result.Error = fmt.Sprintf("%d malformed RDAP DS record(s) ignored: %s", len(malformed), strings.Join(malformed, "; "))
+	}
 
 	// Compare DS records
 	result.DSMatch = compareDSRecords(dnsDS, rdapDS)
 
 	return result
+}
+
+// rdapDigestLengths are the exact digest byte lengths of the DS digest types
+// this validator compares semantically (RFC 4034 §5.1.4 / RFC 4509 / RFC 6605).
+var rdapDigestLengths = map[int]int{1: 20, 2: 32, 4: 48}
+
+// validateRDAPDS converts one RDAP dsData object into a DS record, rejecting
+// out-of-range integers, unsupported digest types and digests that are not
+// hexadecimal of exactly the type's length (RDAYBLUEX-028).
+func validateRDAPDS(ds rdap.DSData) (dnspkg.DSRecord, error) {
+	if ds.KeyTag < 0 || ds.KeyTag > 0xFFFF {
+		return dnspkg.DSRecord{}, fmt.Errorf("keyTag %d out of range 0..65535", ds.KeyTag)
+	}
+	if ds.Algorithm < 0 || ds.Algorithm > 0xFF {
+		return dnspkg.DSRecord{}, fmt.Errorf("algorithm %d out of range 0..255", ds.Algorithm)
+	}
+	if ds.DigestType < 0 || ds.DigestType > 0xFF {
+		return dnspkg.DSRecord{}, fmt.Errorf("digestType %d out of range 0..255", ds.DigestType)
+	}
+	want, ok := rdapDigestLengths[ds.DigestType]
+	if !ok {
+		return dnspkg.DSRecord{}, fmt.Errorf("digestType %d is not a supported DS digest type (1, 2 or 4)", ds.DigestType)
+	}
+	digest := strings.ToUpper(strings.TrimSpace(ds.Digest))
+	raw, err := hex.DecodeString(digest)
+	if err != nil {
+		return dnspkg.DSRecord{}, fmt.Errorf("digest is not hexadecimal")
+	}
+	if len(raw) != want {
+		return dnspkg.DSRecord{}, fmt.Errorf("digest length %d bytes does not match digest type %d (%d bytes)", len(raw), ds.DigestType, want)
+	}
+	return dnspkg.DSRecord{
+		KeyTag:     uint16(ds.KeyTag),
+		Algorithm:  uint8(ds.Algorithm),
+		DigestType: uint8(ds.DigestType),
+		Digest:     digest,
+	}, nil
 }
 
 // compareDSRecords compares DNS and RDAP DS records

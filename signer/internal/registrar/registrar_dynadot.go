@@ -85,6 +85,12 @@ func NewDynadotClient(cfg *config.RegistrarDynadotConfig) (*DynadotClient, error
 		baseURL = "https://api-sandbox.dynadot.com"
 	}
 	if override := strings.TrimSpace(cfg.BaseURL); override != "" {
+		// The override is validated again here, not only at config load
+		// (RDAYBLUEX-014): credentials never travel over cleartext to a
+		// non-loopback host, whatever path built the config.
+		if err := config.ValidateRegistrarBaseURL(cfg); err != nil {
+			return nil, err
+		}
 		baseURL = strings.TrimRight(override, "/")
 	}
 
@@ -104,13 +110,40 @@ func NewDynadotClient(cfg *config.RegistrarDynadotConfig) (*DynadotClient, error
 		baseURL:       baseURL,
 		userAgent:     ua,
 		sendRequestID: cfg.SendRequestID,
-		http:          &http.Client{Timeout: timeout},
+		// Redirects are never followed (RDAYBLUEX-014): the API has none, and
+		// following one would replay the Authorization and X-Signature
+		// headers — and a 307/308 body — to a target the path-bound
+		// signature was never computed for, possibly over cleartext or to
+		// another origin. A redirect surfaces as a dispatched error.
+		http: &http.Client{Timeout: timeout, CheckRedirect: refuseRedirects},
 		// Share ONE limiter across every DynadotClient in the process: RegistrarFor
 		// builds a fresh client per call, so a per-client limiter would reset the
 		// sliding window on each operation and never actually throttle a bulk push
 		// across operations. One Dynadot account == one rate budget (R-073).
 		limiter: sharedDynadotLimiter,
 	}, nil
+}
+
+// refuseRedirects is the client's redirect policy: none are followed. The
+// error names only the redacted target, never headers or credentials.
+func refuseRedirects(req *http.Request, via []*http.Request) error {
+	return fmt.Errorf("dynadot redirect refused (credentials are never replayed): %s -> %s", via[0].URL.Redacted(), req.URL.Redacted())
+}
+
+// maxDynadotResponseBytes caps a response body; a larger body is rejected,
+// not parsed from its prefix (RDAYBLUEX-034).
+const maxDynadotResponseBytes = 1 << 20
+
+// readBodyLimited reads at most limit bytes and fails when the body is larger.
+func readBodyLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d bytes", limit)
+	}
+	return data, nil
 }
 
 // Name returns the adapter identifier used in config.
@@ -265,8 +298,10 @@ func (c *DynadotClient) do(ctx context.Context, method, path string, body any) (
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readBodyLimited(resp.Body, maxDynadotResponseBytes)
 	if err != nil {
+		// Still an uncertain (dispatched) outcome: the request reached the
+		// registrar; only its answer could not be taken (RDAYBLUEX-034).
 		return nil, &dispatchedError{fmt.Errorf("reading dynadot response: %w", err)}
 	}
 

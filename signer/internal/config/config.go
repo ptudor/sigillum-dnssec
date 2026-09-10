@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -62,14 +63,19 @@ func (r RegistrarConfig) DigestType() uint8 {
 // the X-Signature header. Both are issued under Tools → API in the Dynadot
 // control panel (separate values for sandbox vs production).
 type RegistrarDynadotConfig struct {
-	Enabled     bool     `toml:"enabled"`
-	APIKey      string   `toml:"api_key"`      // required; keep config file mode 0640 or stricter
-	APISecret   string   `toml:"api_secret"`   // required; HMAC key for X-Signature
-	Sandbox     bool     `toml:"sandbox"`      // true → api-sandbox.dynadot.com
-	BaseURL     string   `toml:"base_url"`     // override the API endpoint (a local proxy or a test double); takes precedence over sandbox
-	Timeout     Duration `toml:"timeout"`      // default 30s
-	AutoPublish bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
-	UserAgent   string   `toml:"user_agent"`   // override the default sigillum-signer/<version> UA
+	Enabled   bool   `toml:"enabled"`
+	APIKey    string `toml:"api_key"`    // required; keep config file mode 0640 or stricter
+	APISecret string `toml:"api_secret"` // required; HMAC key for X-Signature
+	Sandbox   bool   `toml:"sandbox"`    // true → api-sandbox.dynadot.com
+	BaseURL   string `toml:"base_url"`   // override the API endpoint (an HTTPS proxy, or a loopback test double); takes precedence over sandbox
+	// AllowInsecureBaseURL permits a plain http:// base_url, and only for a
+	// loopback literal or localhost (RDAYBLUEX-014): every request carries
+	// the API key and an HMAC, so cleartext to any other host would expose
+	// them. Off by default; a development/test-double setting only.
+	AllowInsecureBaseURL bool     `toml:"allow_insecure_base_url"`
+	Timeout              Duration `toml:"timeout"`      // default 30s
+	AutoPublish          bool     `toml:"auto_publish"` // push DS automatically on add/rollover events
+	UserAgent            string   `toml:"user_agent"`   // override the default sigillum-signer/<version> UA
 	// SendRequestID defaults to false because Dynadot's "X-Signature
 	// invalid" errors appear to correlate with header-case mismatches:
 	// Go HTTP/2 sends `x-request-id` (lowercase) while their docs
@@ -87,6 +93,13 @@ type ValidateConfig struct {
 	Resolver string   `toml:"resolver"` // e.g. "127.0.0.1:53", default: system resolver
 	Timeout  Duration `toml:"timeout"`  // default: 5s
 }
+
+// Bounds for heartbeat.interval_minutes when the heartbeat is enabled
+// (RDAYBLUEX-032): a positive, representable interval (one minute to one day).
+const (
+	MinHeartbeatIntervalMinutes = 1
+	MaxHeartbeatIntervalMinutes = 24 * 60
+)
 
 // HeartbeatConfig holds AnyStatus heartbeat monitoring settings
 type HeartbeatConfig struct {
@@ -136,6 +149,49 @@ type DNSSECConfig struct {
 	// waits at least this long after a DS change before dropping the key the
 	// old DS set authenticated (RA6X-003). Default 24h.
 	ParentDSTTL Duration `toml:"parent_ds_ttl"`
+}
+
+// ValidateRegistrarBaseURL checks a Dynadot base_url override (RDAYBLUEX-014):
+// empty means the built-in endpoint; otherwise it must be an absolute URL
+// with a host, no userinfo, no query or fragment, and an https scheme — or
+// http only for a loopback literal/localhost host with allow_insecure_base_url
+// set. Safety is never inferred from a hostname that happens to resolve
+// locally.
+func ValidateRegistrarBaseURL(c *RegistrarDynadotConfig) error {
+	raw := strings.TrimSpace(c.BaseURL)
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("registrar.dynadot.base_url is not a valid URL: %w", err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("registrar.dynadot.base_url must be an absolute URL with a host (got %q)", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("registrar.dynadot.base_url must not carry userinfo")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("registrar.dynadot.base_url must not carry a query or fragment (got %q)", raw)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		host := strings.ToLower(u.Hostname())
+		ip := net.ParseIP(host)
+		loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+		if !c.AllowInsecureBaseURL {
+			return fmt.Errorf("registrar.dynadot.base_url must use https:// (got %q): the API key and request signature travel in every request; a plain http:// URL is allowed only for a loopback host with allow_insecure_base_url = true", raw)
+		}
+		if !loopback {
+			return fmt.Errorf("registrar.dynadot.allow_insecure_base_url permits http:// only for a loopback literal or localhost, not %q", u.Hostname())
+		}
+		return nil
+	default:
+		return fmt.Errorf("registrar.dynadot.base_url scheme must be https (got %q)", u.Scheme)
+	}
 }
 
 // Publication modes (see DNSSECConfig.Publication).
@@ -497,6 +553,38 @@ func (c *Config) Validate() error {
 		// ok
 	default:
 		return fmt.Errorf("registrar digest_type must be 2 (SHA-256) or 4 (SHA-384), got %d", c.Registrar.DigestTypeVal)
+	}
+
+	// Enabled integrations must be complete at load time (RDAYBLUEX-032):
+	// a registrar without credentials or a heartbeat without its endpoint
+	// fails here, before any daemon listener or signing mutation, not at
+	// first use after the source-of-truth work. Errors name the field, never
+	// its value. The endpoint transport rules are RDAYBLUEX-014.
+	if c.Registrar.Dynadot.Enabled {
+		if strings.TrimSpace(c.Registrar.Dynadot.APIKey) == "" {
+			return fmt.Errorf("registrar.dynadot is enabled but api_key is empty")
+		}
+		if strings.TrimSpace(c.Registrar.Dynadot.APISecret) == "" {
+			return fmt.Errorf("registrar.dynadot is enabled but api_secret is empty")
+		}
+	}
+	if err := ValidateRegistrarBaseURL(&c.Registrar.Dynadot); err != nil {
+		return err
+	}
+	if c.Heartbeat.Enabled {
+		if strings.TrimSpace(c.Heartbeat.URL) == "" {
+			return fmt.Errorf("heartbeat is enabled but url is empty")
+		}
+		if strings.TrimSpace(c.Heartbeat.APIKey) == "" {
+			return fmt.Errorf("heartbeat is enabled but api_key is empty")
+		}
+		if strings.TrimSpace(c.Heartbeat.App) == "" {
+			return fmt.Errorf("heartbeat is enabled but app is empty")
+		}
+		if c.Heartbeat.IntervalMinutes < MinHeartbeatIntervalMinutes || c.Heartbeat.IntervalMinutes > MaxHeartbeatIntervalMinutes {
+			return fmt.Errorf("heartbeat.interval_minutes must be between %d and %d when heartbeat is enabled, got %d",
+				MinHeartbeatIntervalMinutes, MaxHeartbeatIntervalMinutes, c.Heartbeat.IntervalMinutes)
+		}
 	}
 
 	// Publication mode (RA6X-004)
