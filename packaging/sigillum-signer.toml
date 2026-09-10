@@ -8,6 +8,9 @@ poll_interval = "5m"
 algorithm = "ED25519"
 ksk_lifetime = "5y"
 zsk_lifetime = "90d"
+# Validity is bounded to 1h–366d; the refresh window must be at least 1m and
+# at least twice poll_interval so an unchanged zone is re-signed before its
+# signatures expire, with room for a full signing pass.
 signature_validity = "14d"
 signature_refresh = "3d"
 nsec_version = "nsec3"

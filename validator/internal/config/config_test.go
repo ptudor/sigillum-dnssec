@@ -19,23 +19,24 @@ func TestGetEnvInt(t *testing.T) {
 
 	t.Run("valid integer is parsed", func(t *testing.T) {
 		t.Setenv(key, "42")
-		if got := getEnvInt(key, 7); got != 42 {
-			t.Fatalf("getEnvInt = %d, want 42", got)
+		if got, err := getEnvInt(key, 7); err != nil || got != 42 {
+			t.Fatalf("getEnvInt = %d, %v, want 42", got, err)
 		}
 	})
 
-	t.Run("malformed value falls back to default", func(t *testing.T) {
+	t.Run("malformed value is an error, not the default", func(t *testing.T) {
 		// A Go-duration string like "5s" is not a valid integer; getEnvInt must
-		// reject it (and log a warning) rather than parse it as a partial number.
+		// reject it rather than parse it as a partial number or fall back
+		// silently (RDAYBLUEX-012).
 		t.Setenv(key, "5s")
-		if got := getEnvInt(key, 7); got != 7 {
-			t.Fatalf("getEnvInt = %d, want default 7", got)
+		if _, err := getEnvInt(key, 7); err == nil {
+			t.Fatal("getEnvInt must fail on a malformed value")
 		}
 	})
 
 	t.Run("unset value uses default", func(t *testing.T) {
-		if got := getEnvInt("DNSSEC_VALIDATOR_TEST_UNSET", 9); got != 9 {
-			t.Fatalf("getEnvInt = %d, want default 9", got)
+		if got, err := getEnvInt("DNSSEC_VALIDATOR_TEST_UNSET", 9); err != nil || got != 9 {
+			t.Fatalf("getEnvInt = %d, %v, want default 9", got, err)
 		}
 	})
 }

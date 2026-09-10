@@ -7,7 +7,9 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math/big"
 	"os"
@@ -302,16 +304,78 @@ func durabilityWarning(err error, path string) bool {
 	return true
 }
 
-// uniqueBackupBase returns a base path derived from prefix that has neither a .key nor a
-// .private file yet, so a backup pair can be written without clobbering an existing one.
+// Filesystem seams for fault injection in the key-transaction tests
+// (RDAYBLUEX-033). Production never reassigns them.
+var (
+	osStat   = os.Stat
+	osLink   = os.Link
+	osRename = os.Rename
+	osRemove = os.Remove
+)
+
+// uniqueBackupBase returns a base path derived from prefix whose .key and
+// .private names this process has just claimed, so a backup pair can be
+// written without clobbering an existing one. The claim is a no-clobber
+// creation (O_CREATE|O_EXCL) of both halves — an existing file of either
+// name, whatever its state, makes the candidate unavailable, and any other
+// error aborts (RDAYBLUEX-033): a stat or create failure never reads as "free".
+// The claimed halves are empty placeholders the caller replaces atomically;
+// releaseReservation drops one that ends up unused.
 func uniqueBackupBase(prefix string) (string, error) {
 	for i := 0; i < 10000; i++ {
 		candidate := fmt.Sprintf("%s.%d", prefix, i)
-		if !FileExists(candidate+".key") && !FileExists(candidate+".private") {
+		claimed, err := reservePair(candidate)
+		if err != nil {
+			return "", err
+		}
+		if claimed {
 			return candidate, nil
 		}
 	}
 	return "", fmt.Errorf("could not allocate a unique backup path for %s", prefix)
+}
+
+// reservePair claims base.key and base.private atomically, releasing the
+// first when the second cannot be claimed.
+func reservePair(base string) (bool, error) {
+	keyFile, privFile := base+".key", base+".private"
+	claimed, err := reserveFile(keyFile)
+	if err != nil || !claimed {
+		return claimed, err
+	}
+	claimed, err = reserveFile(privFile)
+	if err != nil || !claimed {
+		releaseReservation(keyFile)
+		return claimed, err
+	}
+	return true, nil
+}
+
+// reserveFile creates path with no-clobber semantics. It reports false when
+// the name is already taken and an error for any other failure.
+func reserveFile(path string) (bool, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reserving %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return false, fmt.Errorf("reserving %s: %w", path, err)
+	}
+	return true, nil
+}
+
+// releaseReservation removes a placeholder this process claimed, and only
+// while it is still the empty placeholder: a name that has since received
+// content is never deleted.
+func releaseReservation(path string) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+		return
+	}
+	_ = osRemove(path)
 }
 
 // formatPrivateKey formats a private key in BIND-compatible format. An
@@ -455,18 +519,37 @@ func (kg *KeyGenerator) keyFileMtime(path string) time.Time {
 // the "no key files present" case only. An operator who truly wants new
 // keys should `sigillum-signer remove <domain>` + re-add.
 func RecoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *statepkg.KeyState, zsk *statepkg.KeyState, err error) {
+	ksk, zsk, _, err = RecoverOrGenerateKeysReport(keyGen, domain)
+	return ksk, zsk, err
+}
+
+// KeyGeneration records which pairs one RecoverOrGenerateKeysReport call
+// minted — nil for a pair recovered from disk — so a caller that must roll
+// back removes exactly the generations this transaction created, never a
+// pair that merely looked absent beforehand (RDAYBLUEX-033). It is filled as
+// soon as a pair is generated, so it is accurate even when a later step
+// fails.
+type KeyGeneration struct {
+	KSK *statepkg.KeyState
+	ZSK *statepkg.KeyState
+}
+
+// RecoverOrGenerateKeysReport is RecoverOrGenerateKeys plus the record of
+// what it generated.
+func RecoverOrGenerateKeysReport(keyGen *KeyGenerator, domain string) (ksk *statepkg.KeyState, zsk *statepkg.KeyState, generated KeyGeneration, err error) {
 	ksk, err = keyGen.RecoverKeyState(domain, true)
 	if err != nil {
 		slog.Error("[KEY] Existing KSK files present but unreadable; refusing to regenerate",
 			"domain", domain, "error", err,
 			"hint", "check file permissions / ownership, or remove the zone and re-add to mint fresh keys")
-		return nil, nil, fmt.Errorf("KSK recovery failed for %s (refusing to regenerate): %w", domain, err)
+		return nil, nil, generated, fmt.Errorf("KSK recovery failed for %s (refusing to regenerate): %w", domain, err)
 	}
 	if ksk == nil {
 		ksk, err = keyGen.GenerateKSK(domain)
 		if err != nil {
-			return nil, nil, fmt.Errorf("generating KSK for %s: %w", domain, err)
+			return nil, nil, generated, fmt.Errorf("generating KSK for %s: %w", domain, err)
 		}
+		generated.KSK = ksk
 	}
 
 	zsk, err = keyGen.RecoverKeyState(domain, false)
@@ -474,16 +557,25 @@ func RecoverOrGenerateKeys(keyGen *KeyGenerator, domain string) (ksk *statepkg.K
 		slog.Error("[KEY] Existing ZSK files present but unreadable; refusing to regenerate",
 			"domain", domain, "error", err,
 			"hint", "check file permissions / ownership, or remove the zone and re-add to mint fresh keys")
-		return nil, nil, fmt.Errorf("ZSK recovery failed for %s (refusing to regenerate): %w", domain, err)
+		return nil, nil, generated, fmt.Errorf("ZSK recovery failed for %s (refusing to regenerate): %w", domain, err)
 	}
 	if zsk == nil {
 		zsk, err = keyGen.GenerateZSK(domain)
 		if err != nil {
-			return nil, nil, fmt.Errorf("generating ZSK for %s: %w", domain, err)
+			return nil, nil, generated, fmt.Errorf("generating ZSK for %s: %w", domain, err)
 		}
+		generated.ZSK = zsk
 	}
 
-	return ksk, zsk, nil
+	return ksk, zsk, generated, nil
+}
+
+// LivePairHoldsKeyTag reports whether the live pair for domain/keyType is the
+// generation with the given key tag: its public half parses and carries that
+// tag. A missing or unreadable public half is "no", never "yes".
+func (kg *KeyGenerator) LivePairHoldsKeyTag(domain, keyType string, tag uint16) bool {
+	pub, err := kg.loadPublicKeyFromPath(kg.liveBase(domain, keyType))
+	return err == nil && pub != nil && pub.KeyTag() == tag
 }
 
 // LoadKeyPair loads a key pair from disk
@@ -638,7 +730,7 @@ func (kg *KeyGenerator) loadKeyPairFromPath(baseName string) (*dns.DNSKEY, []byt
 // statExists reports whether path exists, distinguishing a genuine absence (false, nil)
 // from a stat error such as permission denied (false, err).
 func statExists(path string) (bool, error) {
-	_, err := os.Stat(path)
+	_, err := osStat(path)
 	if err == nil {
 		return true, nil
 	}

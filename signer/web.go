@@ -28,10 +28,10 @@ import (
 // at a time (single-flight), and a request waits at most validationMaxWait for a
 // fresh result before returning whatever is cached (possibly stale/nil) while
 // the run finishes in the background.
-const (
-	validationCacheTTL = 30 * time.Second
-	validationMaxWait  = 20 * time.Second // < the 30s WriteTimeout
-)
+const validationCacheTTL = 30 * time.Second
+
+// validationMaxWait is a variable only so tests can shorten the budget.
+var validationMaxWait = 20 * time.Second // < the 30s WriteTimeout
 
 // Both caches are keyed by the daemon generation (RDAYBLUEX-025): a result
 // computed under one config/state generation is never served for another,
@@ -215,9 +215,16 @@ func (c *zoneValidationCache) get(gen uint64, domain string, compute func() *val
 	}
 }
 
+// zoneValidateFn is a test seam standing in for Validator.ValidateZone; nil
+// in production.
+var zoneValidateFn func(v *validate.Validator, domain string) *validate.ValidationResult
+
 // cachedValidateZone is the bounded entry point for per-zone validation.
 func cachedValidateZone(v *validate.Validator, domain string, gen uint64) *validate.ValidationResult {
 	return dashboardZoneValidationCache.get(gen, domain, func() *validate.ValidationResult {
+		if zoneValidateFn != nil {
+			return zoneValidateFn(v, domain)
+		}
 		return v.ValidateZone(domain)
 	}, validationCacheTTL, validationMaxWait)
 }
@@ -438,13 +445,21 @@ func apiValidateZoneHandler(w http.ResponseWriter, r *http.Request, cfg *config.
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-
 	v := validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 	// R-018: route through the bounded per-zone single-flight cache instead of
 	// running a fresh live validation on every request.
 	result := cachedValidateZone(v, domain, gen)
+	if result == nil {
+		// Cold start still running past the wait budget (RDAYBLUEX-026): the
+		// same contract as the aggregate endpoint — tell the client to retry
+		// rather than encode a null success body. The background run seeds
+		// the cache; a stale result, when one exists, is still served above.
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "validation in progress, retry shortly", http.StatusServiceUnavailable)
+		return
+	}
 
+	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(result); err != nil {
 		slog.Debug("[WEB] Failed to encode validation response", "error", err)
 	}

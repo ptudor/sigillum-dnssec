@@ -3,10 +3,12 @@ package signer
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -110,21 +112,57 @@ func (kg *KeyGenerator) loadVerifiedPair(base, domain, keyType string) (*dns.DNS
 	return dnskey, priv, nil
 }
 
-// setAside renames an unusable key file to a unique "<path>.<reason>.N" name so
-// it stays available for diagnosis without occupying the slot.
+// setAside moves an unusable key file to a unique "<path>.<reason>.N" name so
+// it stays available for diagnosis without occupying the slot. The
+// destination is claimed with no-clobber semantics (RDAYBLUEX-033): a hard
+// link to the new name fails atomically when anything already exists there,
+// so no existing file — a key, a backup, a dangling or looping symlink — is
+// ever replaced; the original is unlinked only once the link exists, and a
+// failure to unlink leaves the material under both names rather than losing
+// it. Where hard links are unavailable the check is a fail-closed stat
+// followed by a rename; any error other than "exists" aborts with nothing
+// moved.
 func setAside(path, reason string) (string, error) {
 	for i := 0; i < 10000; i++ {
 		dst := fmt.Sprintf("%s.%s.%d", path, reason, i)
-		if FileExists(dst) {
+		err := osLink(path, dst)
+		if err == nil {
+			if rerr := osRemove(path); rerr != nil {
+				slog.Warn("[KEY] Set aside an unusable key file but could not unlink the original; it now exists under both names",
+					"path", path, "moved_to", dst, "error", rerr)
+			}
+			slog.Warn("[KEY] Set aside an unusable key file for diagnosis", "path", path, "moved_to", dst)
+			return dst, nil
+		}
+		if errors.Is(err, fs.ErrExist) {
 			continue
 		}
-		if err := os.Rename(path, dst); err != nil {
+		if !linkUnsupported(err) {
+			return "", fmt.Errorf("setting aside %s as %s: %w", path, dst, err)
+		}
+		exists, serr := statExists(dst)
+		if serr != nil {
+			return "", fmt.Errorf("setting aside %s: stat %s: %w", path, dst, serr)
+		}
+		if exists {
+			continue
+		}
+		if err := osRename(path, dst); err != nil {
 			return "", fmt.Errorf("setting aside %s: %w", path, err)
 		}
 		slog.Warn("[KEY] Set aside an unusable key file for diagnosis", "path", path, "moved_to", dst)
 		return dst, nil
 	}
 	return "", fmt.Errorf("could not allocate a name to set aside %s", path)
+}
+
+// linkUnsupported reports whether a link(2) failure means the filesystem (or
+// its policy) does not offer hard links here, rather than that the operation
+// failed for a reason the caller must treat as fatal.
+func linkUnsupported(err error) bool {
+	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EXDEV) ||
+		errors.Is(err, syscall.EMLINK)
 }
 
 // copyDurable copies one key file atomically and requires the copy to be
@@ -152,6 +190,9 @@ func copyPairUnique(srcBase, prefix string) (string, error) {
 			return "", fmt.Errorf("stat %s%s: %w", srcBase, ext, err)
 		}
 		if !exists {
+			// The claimed placeholder for a half that does not exist at
+			// the source is released; the other half keeps its name.
+			releaseReservation(dst + ext)
 			continue
 		}
 		if err := copyDurable(srcBase+ext, dst+ext); err != nil {

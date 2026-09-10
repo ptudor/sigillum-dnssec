@@ -145,10 +145,15 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get mode parameter (quick or extended)
-	mode := r.URL.Query().Get("mode")
-	if mode == "" {
-		mode = "extended"
+	// Get mode parameter (quick or extended). An unknown value is a client
+	// error, never a silent fallback to the more expensive mode
+	// (RDAYBLUEX-027); parsed before any validation slot is taken.
+	mode, ok := parseValidationMode(r.URL.Query().Get("mode"))
+	if !ok {
+		statusCode = "400"
+		writeProblemDetails(w, ErrTypeBadRequest, "Invalid Mode",
+			http.StatusBadRequest, invalidModeDetail, r.URL.Path)
+		return
 	}
 
 	// Parse and validate the record type parameter (default A). R-083.
@@ -280,7 +285,7 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Set validation mode (quick = first responding NS, extended = all NS)
-		if mode == "quick" {
+		if mode == ModeQuick {
 			v.SetQuickMode(true)
 		}
 
@@ -345,10 +350,14 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get mode parameter (quick or extended)
-	mode := r.URL.Query().Get("mode")
-	if mode == "" {
-		mode = "extended"
+	// Get mode parameter (quick or extended); an unknown value is a client
+	// error (RDAYBLUEX-027), reported before any validation slot is taken.
+	mode, ok := parseValidationMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeProblemDetails(w, ErrTypeBadRequest, "Invalid Mode",
+			http.StatusBadRequest, invalidModeDetail, r.URL.Path)
+		metrics.RecordAPIRequest("/api/validate", r.Method, "400", time.Since(startTime).Seconds())
+		return
 	}
 
 	// Parse and validate the record type parameter (default A). R-083.
@@ -415,6 +424,31 @@ func (h *Handlers) HandleValidateJSON(w http.ResponseWriter, r *http.Request) {
 	metrics.RecordAPIRequest("/api/validate", r.Method, "200", time.Since(startTime).Seconds())
 }
 
+// Validation modes (RDAYBLUEX-027). Both public endpoints accept exactly
+// these values, compared case-insensitively after trimming whitespace; an
+// empty value is the documented default.
+const (
+	ModeQuick    = "quick"
+	ModeExtended = "extended"
+
+	invalidModeDetail = "unsupported mode (supported: quick, extended; default extended)"
+)
+
+// parseValidationMode canonicalizes the mode query parameter: "" → extended,
+// "quick"/"extended" in any letter case → the canonical spelling, anything
+// else → not ok.
+func parseValidationMode(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return ModeExtended, true
+	case ModeQuick:
+		return ModeQuick, true
+	case ModeExtended:
+		return ModeExtended, true
+	}
+	return "", false
+}
+
 // runJSONValidation builds a validator for one JSON request and runs it, or
 // delegates to the test seam.
 func (h *Handlers) runJSONValidation(ctx context.Context, domain, mode string, qtype uint16, anchors *dnspkg.RootAnchors) (*validator.ValidationResult, error) {
@@ -432,7 +466,7 @@ func (h *Handlers) runJSONValidation(ctx context.Context, domain, mode string, q
 	if h.rdapClient != nil {
 		v.SetRDAPClient(h.rdapClient)
 	}
-	if mode == "quick" {
+	if mode == ModeQuick {
 		v.SetQuickMode(true)
 	}
 	v.SetQueryType(qtype)

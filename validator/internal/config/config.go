@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"net"
 	"net/url"
@@ -260,9 +259,28 @@ func Load(configPath string) (*Config, error) {
 func LoadFromEnv() (*Config, error) {
 	cfg := DefaultConfig()
 
+	// Typed values are collected with every parse failure so an operator can
+	// repair a deployment in one pass (RDAYBLUEX-012); a malformed value is
+	// never silently replaced by its default.
+	var errs []error
+	envInt := func(key string, def int) int {
+		v, err := getEnvInt(key, def)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		return v
+	}
+	envBool := func(key string, def bool) bool {
+		v, err := getEnvBool(key, def)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		return v
+	}
+
 	// HTTP Server
 	cfg.ListenAddr = getEnv("LISTEN_ADDR", cfg.ListenAddr)
-	cfg.ShutdownTimeoutSec = getEnvInt("SHUTDOWN_TIMEOUT_SECONDS", cfg.ShutdownTimeoutSec)
+	cfg.ShutdownTimeoutSec = envInt("SHUTDOWN_TIMEOUT_SECONDS", cfg.ShutdownTimeoutSec)
 
 	// Root trust anchors
 	cfg.RootAnchorsPath = getEnv("ROOT_ANCHORS_PATH", cfg.RootAnchorsPath)
@@ -270,19 +288,19 @@ func LoadFromEnv() (*Config, error) {
 	cfg.RootAnchorsURL = getEnv("ROOT_ANCHORS_URL", cfg.RootAnchorsURL)
 
 	// DNS query settings
-	cfg.QueryTimeoutSec = getEnvInt("QUERY_TIMEOUT_SECONDS", cfg.QueryTimeoutSec)
-	cfg.TotalTimeoutSec = getEnvInt("TOTAL_TIMEOUT_SECONDS", cfg.TotalTimeoutSec)
-	cfg.MaxConcurrent = getEnvInt("MAX_CONCURRENT", cfg.MaxConcurrent)
-	cfg.MaxConcurrentValidations = getEnvInt("MAX_CONCURRENT_VALIDATIONS", cfg.MaxConcurrentValidations)
+	cfg.QueryTimeoutSec = envInt("QUERY_TIMEOUT_SECONDS", cfg.QueryTimeoutSec)
+	cfg.TotalTimeoutSec = envInt("TOTAL_TIMEOUT_SECONDS", cfg.TotalTimeoutSec)
+	cfg.MaxConcurrent = envInt("MAX_CONCURRENT", cfg.MaxConcurrent)
+	cfg.MaxConcurrentValidations = envInt("MAX_CONCURRENT_VALIDATIONS", cfg.MaxConcurrentValidations)
 	cfg.RecursiveResolver = getEnv("RECURSIVE_RESOLVER", cfg.RecursiveResolver)
 
 	// RDAP settings
 	cfg.RDAPBaseURL = getEnv("RDAP_BASE_URL", cfg.RDAPBaseURL)
 
 	// Rate limiting
-	cfg.RateLimit.PerSec = getEnvInt("RATE_LIMIT_PER_SEC", cfg.RateLimit.PerSec)
-	cfg.RateLimit.Burst = getEnvInt("RATE_LIMIT_BURST", cfg.RateLimit.Burst)
-	cfg.RateLimit.CleanupSec = getEnvInt("RATE_LIMIT_CLEANUP_SECONDS", cfg.RateLimit.CleanupSec)
+	cfg.RateLimit.PerSec = envInt("RATE_LIMIT_PER_SEC", cfg.RateLimit.PerSec)
+	cfg.RateLimit.Burst = envInt("RATE_LIMIT_BURST", cfg.RateLimit.Burst)
+	cfg.RateLimit.CleanupSec = envInt("RATE_LIMIT_CLEANUP_SECONDS", cfg.RateLimit.CleanupSec)
 
 	// Logging
 	cfg.Logging.Format = getEnv("LOG_FORMAT", cfg.Logging.Format)
@@ -298,13 +316,16 @@ func LoadFromEnv() (*Config, error) {
 	cfg.MetricsAllowedCIDRs = getEnvCSV("METRICS_ALLOWED_CIDRS", cfg.MetricsAllowedCIDRs)
 
 	// Heartbeat monitoring (AnyStatus)
-	cfg.Heartbeat.Enabled = getEnvBool("HEARTBEAT_ENABLED", cfg.Heartbeat.Enabled)
+	cfg.Heartbeat.Enabled = envBool("HEARTBEAT_ENABLED", cfg.Heartbeat.Enabled)
 	cfg.Heartbeat.URL = getEnv("HEARTBEAT_URL", cfg.Heartbeat.URL)
 	cfg.Heartbeat.APIKey = getEnv("HEARTBEAT_API_KEY", cfg.Heartbeat.APIKey)
 	cfg.Heartbeat.App = getEnv("HEARTBEAT_APP", cfg.Heartbeat.App)
 	cfg.Heartbeat.StatusURL = getEnv("HEARTBEAT_STATUS_URL", cfg.Heartbeat.StatusURL)
 	cfg.Heartbeat.InstanceID = getEnv("HEARTBEAT_INSTANCE_ID", cfg.Heartbeat.InstanceID)
-	cfg.Heartbeat.IntervalMinutes = getEnvInt("HEARTBEAT_INTERVAL_MINUTES", cfg.Heartbeat.IntervalMinutes)
+	cfg.Heartbeat.IntervalMinutes = envInt("HEARTBEAT_INTERVAL_MINUTES", cfg.Heartbeat.IntervalMinutes)
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("environment configuration: %w", errors.Join(errs...))
+	}
 
 	if err := cfg.applyNestedToFlat(); err != nil {
 		return nil, err
@@ -643,29 +664,46 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-func getEnvInt(key string, defaultVal int) int {
-	if val := os.Getenv(key); val != "" {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
-		}
-		// A present-but-unparseable value almost always means a misconfiguration
-		// (e.g. "5s" where an integer is expected). Don't fall back silently.
-		slog.Warn("[CONFIG] ignoring malformed integer environment variable; using default",
-			"var", key, "value", val, "default", defaultVal)
+// getEnvInt reads an integer environment variable. An absent or empty
+// variable yields the default; a present value that is not an integer (a
+// duration string, a decimal, whitespace only, or a value outside the int
+// range) is a configuration error naming the variable and the expected
+// syntax (RDAYBLUEX-012). The value itself is never echoed.
+func getEnvInt(key string, defaultVal int) (int, error) {
+	val, ok := os.LookupEnv(key)
+	if !ok || val == "" {
+		return defaultVal, nil
 	}
-	return defaultVal
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return 0, fmt.Errorf("%s is set to whitespace only; unset it or give a whole number", key)
+	}
+	i, err := strconv.Atoi(trimmed)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("%s is outside the supported integer range; give a whole number that fits a %d-bit integer", key, strconv.IntSize)
+		}
+		return 0, fmt.Errorf("%s is not a whole number (integers only: no units, decimals or duration suffixes)", key)
+	}
+	return i, nil
 }
 
-func getEnvBool(key string, defaultVal bool) bool {
-	if val := os.Getenv(key); val != "" {
-		switch strings.ToLower(val) {
-		case "true", "1", "yes", "on":
-			return true
-		case "false", "0", "no", "off":
-			return false
-		}
+// getEnvBool reads a boolean environment variable. An absent or empty
+// variable yields the default; the accepted spellings are true/false, 1/0,
+// yes/no and on/off, case-insensitively, and anything else is a
+// configuration error naming the variable (RDAYBLUEX-012).
+func getEnvBool(key string, defaultVal bool) (bool, error) {
+	val, ok := os.LookupEnv(key)
+	if !ok || val == "" {
+		return defaultVal, nil
 	}
-	return defaultVal
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s is not a boolean (accepted: true/false, 1/0, yes/no, on/off)", key)
 }
 
 func getEnvCSV(key string, defaultVal []string) []string {

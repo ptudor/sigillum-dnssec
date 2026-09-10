@@ -46,6 +46,7 @@ type Daemon struct {
 	mu              sync.RWMutex
 	server          *http.Server
 	tickerReset     chan time.Duration // signals the signing loop to reset its ticker
+	wakeRecompute   chan struct{}      // signals the signing loop to re-plan its refresh wake-up (RDAYBLUEX-021)
 	signingLoopDead atomic.Bool        // true if signing loop goroutine has exited
 	lastSigningRun  atomic.Int64       // unix timestamp of last signing loop iteration
 	// stateFault holds the reason the authoritative state could not be loaded
@@ -126,15 +127,16 @@ func (d *Daemon) StateFault() string {
 func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		cfg:         cfg,
-		state:       state,
-		signer:      signerpkg.NewSigner(cfg, state),
-		rollover:    newRolloverManager(cfg, state),
-		heartbeat:   NewHeartbeatClient(&cfg.Heartbeat),
-		ctx:         ctx,
-		cancel:      cancel,
-		tickerReset: make(chan time.Duration, 1),
-		ready:       make(chan struct{}),
+		cfg:           cfg,
+		state:         state,
+		signer:        signerpkg.NewSigner(cfg, state),
+		rollover:      newRolloverManager(cfg, state),
+		heartbeat:     NewHeartbeatClient(&cfg.Heartbeat),
+		ctx:           ctx,
+		cancel:        cancel,
+		tickerReset:   make(chan time.Duration, 1),
+		wakeRecompute: make(chan struct{}, 1),
+		ready:         make(chan struct{}),
 	}
 	d.hooks = newHookDispatcher(&d.hookWG)
 	d.healthProbes = newDirProbeCache()
@@ -404,6 +406,12 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) error {
 		d.tickerReset <- cfg.PollInterval.Duration
 		slog.Info("[DAEMON] Poll interval updated", "old", oldCfg.PollInterval.String(), "new", cfg.PollInterval.String())
 	}
+	// The zone set, state or refresh window may have changed: re-plan the
+	// refresh wake-up (RDAYBLUEX-021).
+	select {
+	case d.wakeRecompute <- struct{}{}:
+	default:
+	}
 
 	// A changed output directory is reconciled now: the destination is created
 	// (or the failure surfaced) and every zone's output is found missing there
@@ -523,8 +531,18 @@ func (d *Daemon) runSigningLoop() {
 	ticker := time.NewTicker(d.takeSnapshot().cfg.PollInterval.Duration)
 	defer ticker.Stop()
 
+	// Besides the poll ticker, a wake-up is scheduled at the earliest
+	// refresh threshold of any zone (RDAYBLUEX-021), so an unchanged zone is
+	// re-signed when its signatures reach the refresh window even when the
+	// poll interval is long. Source-change polling is unchanged.
+	wake := time.NewTimer(time.Hour)
+	wake.Stop()
+	defer wake.Stop()
+	schedule := func() { d.scheduleRefreshWake(wake) }
+
 	// Initial sign
 	d.signAllZonesSafe()
+	schedule()
 
 	for {
 		select {
@@ -532,10 +550,89 @@ func (d *Daemon) runSigningLoop() {
 			return
 		case <-ticker.C:
 			d.signAllZonesSafe()
+			schedule()
+		case <-wake.C:
+			d.signAllZonesSafe()
+			schedule()
 		case newInterval := <-d.tickerReset:
 			ticker.Reset(newInterval)
+			schedule()
+		case <-d.wakeRecompute:
+			schedule()
 		}
 	}
+}
+
+// beforeSignZone is a test seam invoked once a zone has been found to need
+// signing, before its signing starts.
+var beforeSignZone func(domain string)
+
+// scheduleRefreshWake arms wake for the earliest refresh threshold among the
+// configured zones (SignaturesExp − signature_refresh), or disarms it when
+// no zone has a future threshold: a threshold already in the past belongs to
+// the pass that just ran (or to the poll ticker's retry), not to a hot loop.
+func (d *Daemon) scheduleRefreshWake(wake *time.Timer) {
+	if !wake.Stop() {
+		select {
+		case <-wake.C:
+		default:
+		}
+	}
+	snap := d.takeSnapshot()
+	due := nextRefreshDue(snap.cfg, snap.state, time.Now())
+	if due.IsZero() {
+		return
+	}
+	wake.Reset(time.Until(due))
+}
+
+// nextRefreshDue returns the earliest future refresh threshold among the
+// configured zones, or the zero time when there is none.
+func nextRefreshDue(cfg *config.Config, state *statepkg.State, now time.Time) time.Time {
+	var due time.Time
+	for domain := range cfg.Zones {
+		zs := state.GetZone(domain)
+		if zs == nil || zs.SignaturesExp.IsZero() {
+			continue
+		}
+		t := zs.SignaturesExp.Add(-cfg.DNSSEC.SignatureRefresh.Duration)
+		if !t.After(now) {
+			continue
+		}
+		if due.IsZero() || t.Before(due) {
+			due = t
+		}
+	}
+	return due
+}
+
+// zonesByUrgency orders the configured zones so the one whose signatures
+// expire soonest is processed first (RDAYBLUEX-021): a slow zone earlier in
+// an arbitrary order can no longer push a later zone past its expiration.
+// Zones without a recorded expiration (never signed) come first, then by
+// ascending expiration, ties by name.
+func zonesByUrgency(cfg *config.Config, state *statepkg.State) []string {
+	domains := make([]string, 0, len(cfg.Zones))
+	for domain := range cfg.Zones {
+		domains = append(domains, domain)
+	}
+	expiry := func(domain string) time.Time {
+		if zs := state.GetZone(domain); zs != nil {
+			return zs.SignaturesExp
+		}
+		return time.Time{}
+	}
+	sort.SliceStable(domains, func(i, j int) bool {
+		ei, ej := expiry(domains[i]), expiry(domains[j])
+		switch {
+		case ei.IsZero() != ej.IsZero():
+			return ei.IsZero()
+		case !ei.Equal(ej):
+			return ei.Before(ej)
+		}
+		return domains[i] < domains[j]
+	})
+	return domains
 }
 
 // signAllZonesSafe wraps signAllZones with panic recovery so the signing loop
@@ -632,7 +729,7 @@ func (d *Daemon) signAllZones() {
 	// DNSSEC_BATCH_SIZE instead.
 	var signedZones []SignedZoneRef
 signLoop:
-	for domain := range snap.cfg.Zones {
+	for _, domain := range zonesByUrgency(snap.cfg, snap.state) {
 		// Stop promptly on shutdown rather than iterating every remaining zone
 		// (each sign + heartbeat can take seconds). We still fall through to the
 		// Save and coalesced hook below so the zones already signed this cycle
@@ -808,6 +905,9 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	}
 
 	slog.Info("[DAEMON] Signing zone", "domain", domain, "reason", reason)
+	if beforeSignZone != nil {
+		beforeSignZone(domain)
+	}
 
 	// Send heartbeat for signing start. Use the snapshot's client (captured
 	// under the lock) rather than d.heartbeat, which Reload reassigns (R-018).
