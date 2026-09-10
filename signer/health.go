@@ -278,11 +278,11 @@ func (c *dirProbeCache) probe(dir string) error {
 	err := dirProbeFn(dir)
 
 	c.mu.Lock()
-	// A probe completing after an invalidation stores into the fresh entry
-	// only if it is still the one registered for the directory.
-	if cur := c.entries[dir]; cur == e {
-		e.err, e.at, e.inflight = err, time.Now(), nil
-	}
+	// Always publish the result to this entry so callers already waiting on
+	// its in-flight channel observe the same outcome as the probe owner. If an
+	// invalidation replaced the map, e is detached and therefore does not seed
+	// the fresh entry; the next request still re-probes.
+	e.err, e.at, e.inflight = err, time.Now(), nil
 	c.mu.Unlock()
 	close(done)
 	return err

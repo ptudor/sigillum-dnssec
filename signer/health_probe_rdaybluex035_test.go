@@ -271,3 +271,37 @@ func TestRDAYBLUEX035_InFlightProbeIsSharedNotDuplicated(t *testing.T) {
 		t.Fatal("a probe that completed after an invalidation must not be served from the cache")
 	}
 }
+
+func TestRDAYBLUEX035_InFlightFailureRemainsConsistentAcrossInvalidation(t *testing.T) {
+	want := errors.New("probe failed while cache was invalidated")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	orig := dirProbeFn
+	dirProbeFn = func(string) error {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-release
+		return want
+	}
+	t.Cleanup(func() { dirProbeFn = orig })
+
+	c := newDirProbeCache()
+	results := make(chan error, 2)
+	go func() { results <- c.probe("/failing/dir") }()
+	<-started
+	go func() { results <- c.probe("/failing/dir") }()
+
+	// Give the second caller time to join the registered in-flight probe,
+	// then invalidate before that probe reports its failure.
+	time.Sleep(20 * time.Millisecond)
+	c.invalidate()
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-results; !errors.Is(err, want) {
+			t.Fatalf("caller %d got %v, want the shared probe failure", i+1, err)
+		}
+	}
+}
