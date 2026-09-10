@@ -1238,9 +1238,20 @@ ns1	IN	A	192.0.2.1
 	// A signed zone's output must exist for that (RA6X-035): a fresh-looking
 	// state whose output is missing regenerates it.
 	now := time.Now().UTC()
+	sourceInfo, err := os.Stat(zonePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceDigest, err := signer.sourceDigest(zonePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	zoneState := &statepkg.ZoneState{
 		Serial:        2024011501,
 		LastSigned:    now,
+		SourceModTime: sourceInfo.ModTime(),
+		SourceSize:    sourceInfo.Size(),
+		SourceDigest:  sourceDigest,
 		SignaturesExp: now.Add(14 * 24 * time.Hour),
 	}
 	needs, reason = signer.NeedsSign("example.com", zonePath, zoneState)
