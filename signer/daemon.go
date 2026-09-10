@@ -59,6 +59,11 @@ type Daemon struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 	starting  atomic.Bool // Run has begun its startup sequence
+	// startupMu closes the pre-start gap between Reload observing starting=false
+	// and publishing a new snapshot. A pre-start reload holds it through the
+	// swap; Run holds it while marking startup and taking its one startup
+	// snapshot. Once startup has begun, Reload releases it and waits on ready.
+	startupMu sync.Mutex
 	// lastSaveFailed records that the previous cycle could not persist its
 	// results (RA6X-025). Every cycle merges the disk into memory three ways
 	// (RDAYBLUEX-019), so the flag no longer selects the reload strategy; it
@@ -147,7 +152,15 @@ func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 // Run starts the daemon's main loop
 func (d *Daemon) Run() (err error) {
 	slog.Info("[DAEMON] starting")
+	d.startupMu.Lock()
 	d.starting.Store(true)
+	// Every startup reference to state a Reload may swap goes through ONE
+	// guarded snapshot (RA6X-040). Taking it inside startupMu means a Reload
+	// that began just before Run either publishes its whole snapshot first or
+	// observes startup and waits for readiness; it cannot swap between this
+	// snapshot and worker startup.
+	snap := d.takeSnapshot()
+	d.startupMu.Unlock()
 
 	// A startup that fails, or that finds shutdown already requested, must
 	// wake any Reload waiting for readiness and never start a worker
@@ -158,11 +171,6 @@ func (d *Daemon) Run() (err error) {
 		}
 		d.markReady()
 	}()
-
-	// Every startup reference to state a Reload may swap goes through ONE
-	// guarded snapshot (RA6X-040); Reload itself waits for readiness, so the
-	// snapshot is also what the workers start from.
-	snap := d.takeSnapshot()
 
 	// Ensure directories exist
 	if err := d.ensureDirectories(snap.cfg); err != nil {
@@ -337,14 +345,24 @@ func sameDirectory(a, b string) (bool, error) {
 // nothing of it — zones, paths, listeners, hooks, state — is applied, and the
 // previous config/state snapshot stays active.
 func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) error {
-	// Only a startup that is actually in progress is serialized against; a
-	// daemon whose Run has not begun has no startup reads to race.
+	// A reload that begins before Run holds startupMu through its config/state
+	// publication. If Run has begun, release the guard and wait for the startup
+	// snapshot's workers to be published before swapping anything.
+	d.startupMu.Lock()
+	startupGuardHeld := true
 	if d.starting.Load() {
+		d.startupMu.Unlock()
+		startupGuardHeld = false
 		select {
 		case <-d.ready:
 		case <-d.ctx.Done():
 		}
 	}
+	defer func() {
+		if startupGuardHeld {
+			d.startupMu.Unlock()
+		}
+	}()
 	if d.ctx.Err() != nil {
 		slog.Info("[DAEMON] Ignoring reload: daemon is shutting down or failed to start")
 		return nil
@@ -377,6 +395,10 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) error {
 	gen := d.generation.Add(1)
 	d.mu.Unlock()
 	d.pubMu.Unlock()
+	if startupGuardHeld {
+		d.startupMu.Unlock()
+		startupGuardHeld = false
+	}
 
 	// Deployments still queued for the old generation are obsolete: the new
 	// generation's first cycle re-derives what to deploy, and a completion
