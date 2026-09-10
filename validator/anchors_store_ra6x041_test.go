@@ -15,6 +15,9 @@ const ra6x041KSK2017 = "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237
 
 // RA6X-041: a failed refresh keeps the last-known-good set and its load time.
 func TestRA6X041_FailedRefreshRetainsLastKnownGood(t *testing.T) {
+	// The built-in document (RDAYBLUEX-011) would satisfy every refresh;
+	// disable it so the failing-refresh path under test is reached.
+	t.Cleanup(dns.SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`)))
 	dir := t.TempDir()
 	path := filepath.Join(dir, "anchors.json")
 	good := `{"zone":".","anchors":[{"id":"KSK-2017","keyTag":20326,"algorithm":8,"digestType":2,"digest":"` + ra6x041KSK2017 + `","validFrom":"2017-02-02T00:00:00Z"}]}`

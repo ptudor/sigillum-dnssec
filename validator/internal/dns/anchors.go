@@ -353,12 +353,17 @@ func LoadAnchorsWithFallback(path, url string) (*RootAnchors, error) {
 }
 
 // LoadAnchorsWithCache is the offline-capable load order (RDAYBLUEX-011):
-// the operator's file, then the last-known-good cache, then the URL. Every
-// source is validated the same way, so a cached document is trusted only
-// because it passes the binary pins now, never because it was cached. The
-// returned bytes are the fetched document when the URL was the source (the
-// caller persists them), nil otherwise. An empty cachePath disables the
-// cache stage. When every source fails the error names them all.
+// the operator's file, then the last-known-good cache, then the document
+// built into the binary, and only then the URL. Every source is validated
+// the same way, so a cached or built-in document is trusted only because it
+// passes the binary pins now. Because the built-in document is itself a
+// usable pinned set, the URL is reached only when that document has no
+// currently active pinned anchor — which, as the pins share the binary,
+// means the binary is due for an update, not that a download should be
+// trusted more. The returned bytes are the fetched document when the URL was
+// the source (the caller persists them), nil otherwise. An empty cachePath
+// disables the cache stage. When every source fails the error names them
+// all.
 func LoadAnchorsWithCache(path, cachePath, url string) (*RootAnchors, []byte, error) {
 	anchors, fileErr := LoadAnchors(path)
 	if fileErr == nil {
@@ -371,12 +376,16 @@ func LoadAnchorsWithCache(path, cachePath, url string) (*RootAnchors, []byte, er
 			return anchors, nil, nil
 		}
 	}
+	anchors, builtinErr := LoadEmbeddedAnchors()
+	if builtinErr == nil {
+		return anchors, nil, nil
+	}
 	anchors, data, urlErr := FetchAnchors(url)
 	if urlErr != nil {
 		if cachePath != "" {
-			return nil, nil, fmt.Errorf("failed to load anchors from file (%s: %v), cache (%s: %v) and URL (%s): %w", path, fileErr, cachePath, cacheErr, url, urlErr)
+			return nil, nil, fmt.Errorf("failed to load anchors from file (%s: %v), cache (%s: %v), the built-in document (%v) and URL (%s): %w", path, fileErr, cachePath, cacheErr, builtinErr, url, urlErr)
 		}
-		return nil, nil, fmt.Errorf("failed to load anchors from both file (%s: %v) and URL (%s): %w", path, fileErr, url, urlErr)
+		return nil, nil, fmt.Errorf("failed to load anchors from file (%s: %v), the built-in document (%v) and URL (%s): %w", path, fileErr, builtinErr, url, urlErr)
 	}
 	return anchors, data, nil
 }

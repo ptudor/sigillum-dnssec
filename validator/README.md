@@ -55,14 +55,18 @@ prefix. Trust forwarded client addresses only from your actual proxy CIDRs.
 
 The validator reads the JSON format represented by `internal/dns.RootAnchors`.
 It first tries `root_anchors_path`, then the last-known-good cache at
-`root_anchors_cache_path`, then the configured HTTPS `root_anchors_url`. Every
-usable download is written to the cache atomically (private temporary file,
-fsync, rename), so a restart while the mirror or the network is unavailable
-still validates from the set that was last authenticated; a fetch, parse, pin
-or write failure never replaces the previous cache. The packaged service keeps
-the cache under `/var/lib/sigillum-validator`, its only writable path. The
-default URL is the maintainer-operated Any53 mirror. IANA’s XML file is not a
-drop-in replacement for this JSON format.
+`root_anchors_cache_path`, then the reviewed anchor document built into the
+executable, and only then the configured HTTPS `root_anchors_url`. The built-in
+document lists exactly the pinned root keys, so a fresh installation establishes
+root trust with no network access at all and the URL is reached only when the
+built-in set has no active pinned anchor, which also means the executable is due
+for an update. Every usable download is written to the cache atomically (private
+temporary file, fsync, rename), so a restart while the mirror or the network is
+unavailable still validates from the set that was last authenticated; a fetch,
+parse, pin or write failure never replaces the previous cache. The packaged
+service keeps the cache under `/var/lib/sigillum-validator`, its only writable
+path. The default URL is the maintainer-operated Any53 mirror. IANA’s XML file is
+not a drop-in replacement for this JSON format.
 
 Loaded anchors are filtered for validity and checked against the root DS values
 pinned in the executable. Downloaded metadata cannot introduce an arbitrary root

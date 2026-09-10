@@ -146,6 +146,9 @@ func TestLoadAnchorsFromURL_ServerError(t *testing.T) {
 }
 
 func TestLoadAnchorsWithFallback(t *testing.T) {
+	// The built-in anchor document (RDAYBLUEX-011) would satisfy this load;
+	// disable it so the fallback behaviour under test is reached.
+	t.Cleanup(SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`)))
 	anchors := testAnchors()
 	data, err := json.Marshal(anchors)
 	if err != nil {

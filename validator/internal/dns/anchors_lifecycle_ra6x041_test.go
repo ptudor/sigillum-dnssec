@@ -49,6 +49,9 @@ func TestRA6X041_UnusableDocumentsFailToLoad(t *testing.T) {
 }
 
 func TestRA6X041_UnusableFileFallsBackToURL(t *testing.T) {
+	// Behind the operator file sits the built-in document (RDAYBLUEX-011);
+	// disable it so the URL fallback under test is reached.
+	t.Cleanup(SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`)))
 	future := "2999-01-01T00:00:00Z"
 	good := `{"zone":".","anchors":[{"id":"KSK-2017","keyTag":20326,"algorithm":8,"digestType":2,"digest":"` + realKSK2017Digest + `","validFrom":"2017-02-02T00:00:00Z"}]}`
 	empty := `{"zone":".","anchors":[]}`
