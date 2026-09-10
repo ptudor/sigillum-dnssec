@@ -279,7 +279,7 @@ Stream DNSSEC validation results.
 |-------|----------|---------|-------------|
 | `domain` | Yes | - | Domain name to validate |
 | `type` | No | `A` | Record type to validate (A, AAAA, MX, etc.) |
-| `mode` | No | `extended` | `quick` (first responding NS) or `extended` (all NS) |
+| `mode` | No | `extended` | `quick` (first responding NS) or `extended` (all NS); matched case-insensitively, any other value is a 400 |
 
 **Response:** `text/event-stream`
 
@@ -625,8 +625,11 @@ Configuration is **TOML-first, with environment variables as a fallback** — th
 | `HEARTBEAT_INTERVAL_MINUTES` | `5` | Background heartbeat interval (minutes) |
 
 **Note:** The DNS/rate-limit timeouts are read as **integers** with `_SECONDS`/`_MINUTES`
-suffixes (parsed by `getEnvInt`), not Go duration strings. A value like `5s` is rejected
-and logged as malformed, then the default is used — use plain integers.
+suffixes (parsed by `getEnvInt`), not Go duration strings. A present value that is not
+a whole number (`5s`, `1.5`, whitespace, out of range) or not a recognised boolean
+(`true/false`, `1/0`, `yes/no`, `on/off`) is a startup error naming the variable;
+every malformed variable is reported at once (RDAYBLUEX-012). Only an absent or
+empty variable receives its default.
 
 ### Configuration Pattern Reference
 

@@ -86,8 +86,8 @@ poll_interval = "5m"
 algorithm = "ED25519"           # or ECDSAP256SHA256, ECDSAP384SHA384
 ksk_lifetime = "5y"             # How long before KSK rollover reminder
 zsk_lifetime = "90d"            # ZSK rolls automatically
-signature_validity = "14d"      # How long signatures are valid
-signature_refresh = "3d"        # Re-sign when this much validity remains
+signature_validity = "14d"     # How long signatures are valid (1h–366d; the whole window must fit RFC 1982 serial arithmetic)
+signature_refresh = "3d"       # Re-sign when this much validity remains (>= 1m and >= 2 × poll_interval)
 nsec_version = "nsec3"          # "nsec" or "nsec3"
 nsec3_iterations = 0            # RFC 9276 recommends 0
 nsec3_salt = ""                 # Empty salt recommended

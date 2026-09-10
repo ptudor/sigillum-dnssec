@@ -204,6 +204,9 @@ type signedZone struct {
 	srcDigest   string
 	dnskeyTTL   uint32
 	maxRRSIGTTL uint32
+	// sigExpiration is the earliest expiration among the RRSIGs actually
+	// written (RDAYBLUEX-015); state never claims validity beyond it.
+	sigExpiration time.Time
 }
 
 // prepareSignedZone reads one consistent snapshot of the unsigned zone at
@@ -305,8 +308,82 @@ func (s *Signer) prepareSignedZone(domain string, zoneState *statepkg.ZoneState,
 	if err := s.verifySignedZoneWithModel(model, domain, input, signedRecords, keys); err != nil {
 		return nil, fmt.Errorf("post-sign verification failed (previous signed zone kept): %w", err)
 	}
+	res.sigExpiration = earliestRRSIGExpiration(signedRecords)
+	if res.sigExpiration.IsZero() {
+		return nil, fmt.Errorf("post-sign verification failed (previous signed zone kept): the signed zone carries no RRSIG")
+	}
 	res.records = signedRecords
 	return res, nil
+}
+
+// earliestRRSIGExpiration returns the earliest expiration among the RRSIGs
+// in records, or the zero time when there is none. The 32-bit serial value
+// is placed on the absolute timeline relative to now (RFC 1982), as the
+// verifier already established every window is currently valid.
+func earliestRRSIGExpiration(records []dns.RR) time.Time {
+	now := time.Now().UTC()
+	var earliest time.Time
+	for _, rr := range records {
+		sig, ok := rr.(*dns.RRSIG)
+		if !ok {
+			continue
+		}
+		exp := serialTime(sig.Expiration, now)
+		if earliest.IsZero() || exp.Before(earliest) {
+			earliest = exp
+		}
+	}
+	return earliest
+}
+
+// serialTime places a 32-bit RRSIG time on the absolute timeline as the
+// instant nearest to ref under RFC 1982 serial arithmetic.
+func serialTime(serial uint32, ref time.Time) time.Time {
+	distance := int64(int32(serial - uint32(ref.Unix())))
+	return time.Unix(ref.Unix()+distance, 0).UTC()
+}
+
+// signingWindowTolerance bounds how far a signature's inception or
+// expiration may sit from the values the policy dictates for a pass that
+// started now — the allowance for a slow signing pass or a briefly paused
+// process. Beyond it the window is not the intended one (RDAYBLUEX-015).
+const signingWindowTolerance = 10 * time.Minute
+
+// checkRRSIGWindow requires sig to be currently valid under serial
+// arithmetic and to carry exactly the intended window: an inception one
+// backdate in the past and an expiration one validity in the future, each
+// within signingWindowTolerance of now, and a span of backdate + validity.
+// Expired, not-yet-valid, wrapped and unexpectedly long or short windows are
+// all rejected before the zone can replace the published output.
+func (s *Signer) checkRRSIGWindow(sig *dns.RRSIG, now time.Time) error {
+	where := fmt.Sprintf("RRSIG for %s %s (keytag %d)", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered], sig.KeyTag)
+	if !sig.ValidityPeriod(now) {
+		return fmt.Errorf("%s is not currently valid: inception %s, expiration %s, now %s", where,
+			dns.TimeToString(sig.Inception), dns.TimeToString(sig.Expiration), now.Format(time.RFC3339))
+	}
+	validity := s.cfg.DNSSEC.SignatureValidity.Duration
+	tol := int64(signingWindowTolerance / time.Second)
+	span := int64(sig.Expiration - sig.Inception) // modulo 2^32, as serial arithmetic
+	wantSpan := int64((config.SignatureInceptionBackdate + validity) / time.Second)
+	if span <= 0 || span >= 1<<31 {
+		return fmt.Errorf("%s has a wrapped validity window: inception %s, expiration %s", where,
+			dns.TimeToString(sig.Inception), dns.TimeToString(sig.Expiration))
+	}
+	if span-wantSpan > tol || wantSpan-span > tol {
+		return fmt.Errorf("%s has an unexpected validity window of %s, want %s (signature_validity %s plus the %s inception backdate)", where,
+			time.Duration(span)*time.Second, time.Duration(wantSpan)*time.Second, validity, config.SignatureInceptionBackdate)
+	}
+	wantInception := uint32(now.Add(-config.SignatureInceptionBackdate).Unix())
+	if d := int64(int32(sig.Inception - wantInception)); d > tol || -d > tol {
+		return fmt.Errorf("%s has an inception %s away from the intended %s", where,
+			time.Duration(d)*time.Second, dns.TimeToString(wantInception))
+	}
+	wantExpiration := uint32(now.Add(validity).Unix())
+	if d := int64(int32(sig.Expiration - wantExpiration)); d > tol || -d > tol {
+		return fmt.Errorf("%s has an expiration %s away from the intended %s", where,
+			time.Duration(d)*time.Second, dns.TimeToString(wantExpiration))
+	}
+	return nil
 }
 
 // recordSignedZone updates the zone state after a signed zone has been
@@ -330,7 +407,9 @@ func (s *Signer) recordSignedZone(domain string, zoneState *statepkg.ZoneState, 
 		// The identity of exactly the bytes that were parsed and are now
 		// published (RDAYBLUEX-016).
 		zoneState.SourceDigest = res.srcDigest
-		zoneState.SignaturesExp = now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
+		// The earliest expiration actually written, never a later
+		// recomputation from the configured validity (RDAYBLUEX-015).
+		zoneState.SignaturesExp = res.sigExpiration.UTC()
 		zoneState.ForceResign = false
 		// R-006/R-007: the TTLs of the generation just written. Cache horizons
 		// (RA6X-027) are raised from the previously served generation's TTLs at
@@ -1197,8 +1276,11 @@ func (s *Signer) signRecordsWithModel(m *zoneModel, domain string, records []dns
 	rrsets, _ := groupRRsets(records)
 	keysInOrder := sortedRRsetKeys(rrsets)
 
-	inception := time.Now().UTC().Add(-1 * time.Hour) // 1 hour in the past for clock skew
-	expiration := time.Now().UTC().Add(s.cfg.DNSSEC.SignatureValidity.Duration)
+	// One clock reading for the whole pass: the window every RRSIG carries
+	// is exactly backdate + validity (RDAYBLUEX-015).
+	now := time.Now().UTC()
+	inception := now.Add(-config.SignatureInceptionBackdate) // in the past for clock skew
+	expiration := now.Add(s.cfg.DNSSEC.SignatureValidity.Duration)
 
 	var signedRecords []dns.RR
 	signedRecords = append(signedRecords, records...)
@@ -1306,15 +1388,20 @@ func (s *Signer) verifySignedZoneWithModel(m *zoneModel, domain string, input, s
 		}
 	}
 
-	// (1) Every RRSIG must verify against a published DNSKEY. Remember which
+	// (1) Every RRSIG must verify against a published DNSKEY and carry the
+	// intended, currently valid window (RDAYBLUEX-015). Remember which
 	// algorithm and key role produced a verifying signature per RRset.
 	const roleKSK, roleZSK = 1, 2
 	covered := make(map[rrsetKey]map[uint8]int)
+	verifyNow := time.Now().UTC()
 	for _, sig := range rrsigs {
 		k := rrsetKey{canonicalName(sig.Hdr.Name), sig.TypeCovered}
 		rrset := rrsets[k]
 		if len(rrset) == 0 {
 			return fmt.Errorf("RRSIG for %s %s covers no RRset in the signed zone", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered])
+		}
+		if err := s.checkRRSIGWindow(sig, verifyNow); err != nil {
+			return err
 		}
 		wire := canonicalRRset(rrset)
 		candidates := dnskeysByTag[sig.KeyTag]

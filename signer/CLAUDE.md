@@ -152,8 +152,8 @@ poll_interval = "5m"
 algorithm = "ED25519"          # Smaller signatures, faster; fall back to ECDSAP256SHA256 if registrar doesn't support alg 15
 ksk_lifetime = "5y"            # 1y, 3y, 5y — how long before rollover reminder
 zsk_lifetime = "90d"           # ZSK rolls automatically, no registrar interaction
-signature_validity = "14d"     # How long signatures are valid
-signature_refresh = "3d"       # Re-sign when this much validity remains
+signature_validity = "14d"     # How long signatures are valid (1h–366d; the whole window must fit RFC 1982 serial arithmetic)
+signature_refresh = "3d"       # Re-sign when this much validity remains (>= 1m and >= 2 × poll_interval)
 nsec_version = "nsec3"         # "nsec" or "nsec3"
 # Serial handling for signed output. "keep" (default) passes the unsigned
 # serial through unchanged. "epoch" publishes max(now, serial+1, last+1) on

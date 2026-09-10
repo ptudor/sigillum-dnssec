@@ -40,7 +40,11 @@ func TestKeyPairAbsent(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if got := keyPairAbsent(keysDir, "example.com", "ksk"); got != tc.want {
+			got, err := keyPairAbsent(keysDir, "example.com", "ksk")
+			if err != nil {
+				t.Fatalf("keyPairAbsent(%v): %v", tc.files, err)
+			}
+			if got != tc.want {
 				t.Errorf("keyPairAbsent(%v) = %v, want %v", tc.files, got, tc.want)
 			}
 		})
@@ -66,18 +70,29 @@ func TestUnwindAdd_PreservesPrivateOnlyOrphan(t *testing.T) {
 	state.SetZone("example.com", &statepkg.ZoneState{Path: "/zones/example.com.db"})
 
 	// Exactly what runAdd computes before RecoverOrGenerateKeys fails on the
-	// incomplete pair: the KSK slot is NOT empty (orphan half present), the
-	// ZSK slot is.
-	kskGenerated := keyPairAbsent(keysDir, "example.com", "ksk")
-	zskGenerated := keyPairAbsent(keysDir, "example.com", "zsk")
-	if kskGenerated {
-		t.Fatal("kskGenerated must be false with a .private orphan present")
+	// incomplete pair: the preflight sees the KSK slot NOT empty (orphan half
+	// present) and the ZSK slot empty, and the transaction record is empty
+	// because recovery refused before anything was minted (RDAYBLUEX-033).
+	kskAbsent, err := keyPairAbsent(keysDir, "example.com", "ksk")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !zskGenerated {
-		t.Fatal("zskGenerated must be true with no ZSK files present")
+	zskAbsent, err := keyPairAbsent(keysDir, "example.com", "zsk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kskAbsent {
+		t.Fatal("the KSK slot must not read as absent with a .private orphan present")
+	}
+	if !zskAbsent {
+		t.Fatal("the ZSK slot must read as absent with no ZSK files present")
+	}
+	_, _, generated, err := signerpkg.RecoverOrGenerateKeysReport(signerpkg.NewKeyGenerator(cfg), "example.com")
+	if err == nil || generated.KSK != nil || generated.ZSK != nil {
+		t.Fatalf("recovery must refuse the orphan before minting anything: %+v %v", generated, err)
 	}
 
-	unwindAdd(cfg, state, "example.com", kskGenerated, zskGenerated, nil, false)
+	unwindAdd(cfg, state, "example.com", generated, nil, false)
 
 	if !signerpkg.FileExists(orphan) {
 		t.Fatal("unwindAdd deleted the surviving .private orphan — the only recoverable copy of the key")

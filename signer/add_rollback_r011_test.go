@@ -33,7 +33,7 @@ func TestR011_UnwindRestoresPreExistingOutput(t *testing.T) {
 	state.SetZone("example.com", &statepkg.ZoneState{Path: "/zones/example.com.db"})
 
 	// origOutput was snapshotted BEFORE the overwrite; outputExisted=true.
-	unwindAdd(cfg, state, "example.com", false, false, []byte(prev), true)
+	unwindAdd(cfg, state, "example.com", signerpkg.KeyGeneration{}, []byte(prev), true)
 
 	got, err := os.ReadFile(signedPath)
 	if err != nil {
@@ -59,7 +59,7 @@ func TestR011_UnwindRemovesNewlyCreatedOutput(t *testing.T) {
 	state := statepkg.NewState(cfg.StatePath())
 	state.SetZone("new.example", &statepkg.ZoneState{Path: "/zones/new.example.db"})
 
-	unwindAdd(cfg, state, "new.example", false, false, nil, false)
+	unwindAdd(cfg, state, "new.example", signerpkg.KeyGeneration{}, nil, false)
 
 	if signerpkg.FileExists(signedPath) {
 		t.Fatal("newly-created output should be removed on rollback (no predecessor)")

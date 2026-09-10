@@ -625,17 +625,18 @@ func (c *Config) Validate() error {
 	if c.DNSSEC.ZSKLifetime.Duration <= 0 {
 		return fmt.Errorf("zsk_lifetime must be positive")
 	}
-	if c.DNSSEC.SignatureValidity.Duration <= 0 {
-		return fmt.Errorf("signature_validity must be positive")
+	// Per-zone lifetime overrides (RDAYBLUEX-030): zero (or omitted) inherits
+	// the global value; a negative value is a typo, not "inherit".
+	for domain, zone := range c.Zones {
+		if zone.KSKLifetime.Duration < 0 {
+			return fmt.Errorf("zone %q: ksk_lifetime must not be negative (got %s; omit it or set it to 0 to inherit dnssec.ksk_lifetime)", domain, zone.KSKLifetime.String())
+		}
+		if zone.ZSKLifetime.Duration < 0 {
+			return fmt.Errorf("zone %q: zsk_lifetime must not be negative (got %s; omit it or set it to 0 to inherit dnssec.zsk_lifetime)", domain, zone.ZSKLifetime.String())
+		}
 	}
-	if c.DNSSEC.SignatureRefresh.Duration <= 0 {
-		return fmt.Errorf("signature_refresh must be positive")
-	}
-
-	// Validate signature_refresh < signature_validity
-	if c.DNSSEC.SignatureRefresh.Duration >= c.DNSSEC.SignatureValidity.Duration {
-		return fmt.Errorf("signature_refresh (%s) must be less than signature_validity (%s)",
-			c.DNSSEC.SignatureRefresh.String(), c.DNSSEC.SignatureValidity.String())
+	if err := ValidateSignatureTiming(c.DNSSEC.SignatureValidity.Duration, c.DNSSEC.SignatureRefresh.Duration, c.PollInterval.Duration); err != nil {
+		return err
 	}
 
 	// Rollover timings must be positive and correctly ordered (R-014). A
@@ -784,6 +785,73 @@ func ValidateLoopbackAddr(addr, fieldName string) error {
 	return nil
 }
 
+// Signature timing policy (RDAYBLUEX-015, RDAYBLUEX-021).
+const (
+	// SignatureInceptionBackdate is how far into the past every RRSIG's
+	// inception is set, so a resolver whose clock lags still accepts a
+	// freshly published signature.
+	SignatureInceptionBackdate = time.Hour
+	// MinSignatureValidity and MinSignatureRefresh are the granularity below
+	// which a configuration cannot produce output that is meaningfully valid:
+	// signatures shorter than the inception backdate, or refresh windows
+	// shorter than a poll cycle, are effectively expired as published.
+	MinSignatureValidity = time.Hour
+	MinSignatureRefresh  = time.Minute
+	// MaxSignatureValidity is the documented operational maximum. RRSIG
+	// times are 32-bit serial numbers whose unambiguous interval is under
+	// 2^31 seconds (~68 years); a year keeps the whole inception/expiration
+	// window far from that boundary and matches RFC 6781's guidance that
+	// signature lifetimes are days to weeks, not epochs.
+	MaxSignatureValidity = 366 * 24 * time.Hour
+	// maxSerialWindow is half the 32-bit serial space in seconds: the
+	// representability bound for the inception..expiration window.
+	maxSerialWindow = int64(1) << 31
+	// RefreshPollFactor is how many poll intervals signature_refresh must
+	// cover: one to reach the next check after the threshold passes, and one
+	// as the documented allowance for a full signing pass and ticker jitter.
+	RefreshPollFactor = 2
+)
+
+// ValidateSignatureTiming checks signature_validity and signature_refresh
+// against each other and against poll_interval:
+//   - validity is at least MinSignatureValidity, at most
+//     MaxSignatureValidity, and the whole signed window (validity plus the
+//     inception backdate) is strictly representable under RFC 1982 serial
+//     arithmetic (RDAYBLUEX-015);
+//   - refresh is at least MinSignatureRefresh, less than validity, and at
+//     least RefreshPollFactor poll intervals, so an unchanged zone is always
+//     considered for re-signing — with room for a full signing pass — before
+//     its earliest signature expires (RDAYBLUEX-021).
+func ValidateSignatureTiming(validity, refresh, poll time.Duration) error {
+	if validity <= 0 {
+		return fmt.Errorf("signature_validity must be positive")
+	}
+	if refresh <= 0 {
+		return fmt.Errorf("signature_refresh must be positive")
+	}
+	if validity < MinSignatureValidity {
+		return fmt.Errorf("signature_validity (%s) must be at least %s", validity, MinSignatureValidity)
+	}
+	// Representability first, so an absurd value is named for what it is.
+	window := int64(validity/time.Second) + int64(SignatureInceptionBackdate/time.Second)
+	if validity/time.Second >= time.Duration(maxSerialWindow) || window >= maxSerialWindow {
+		return fmt.Errorf("signature_validity (%s) is not representable as a DNSSEC signature window: inception..expiration must span less than 2^31 seconds (RFC 1982 serial arithmetic)", validity)
+	}
+	if validity > MaxSignatureValidity {
+		return fmt.Errorf("signature_validity (%s) must be at most %s", validity, MaxSignatureValidity)
+	}
+	if refresh < MinSignatureRefresh {
+		return fmt.Errorf("signature_refresh (%s) must be at least %s", refresh, MinSignatureRefresh)
+	}
+	if refresh >= validity {
+		return fmt.Errorf("signature_refresh (%s) must be less than signature_validity (%s)", refresh, validity)
+	}
+	if poll > 0 && refresh < RefreshPollFactor*poll {
+		return fmt.Errorf("signature_refresh (%s) must be at least %d × poll_interval (%s): one interval to reach the next check after the refresh threshold passes and one as the allowance for a full signing pass and ticker jitter, or signatures can expire between checks", refresh, RefreshPollFactor, poll)
+	}
+	return nil
+}
+
 // GetZoneKSKLifetime returns the KSK lifetime for a zone, using zone-specific override if set
 func (c *Config) GetZoneKSKLifetime(domain string) time.Duration {
 	if zone, ok := c.Zones[domain]; ok && zone.KSKLifetime.Duration > 0 {
@@ -837,22 +905,62 @@ func CanonicalZoneIdentity(domain string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
 }
 
-// ValidateDomainName checks that a domain name is safe for use in file paths.
-// Rejects path traversal attempts and characters that are invalid in DNS names.
+// Managed-zone name grammar (RDAYBLUEX-029). One canonical validator is
+// applied at every boundary — configuration loading, `add`, `import` — before
+// any key, output, config or state file changes:
+//   - ASCII only: letters, digits, hyphen and underscore, separated by dots;
+//     IDNA names are given as A-labels (xn--…), never U-labels; escaped
+//     octets (backslash) are not accepted;
+//   - labels are 1..63 octets; the wire form (with the root label) is at most
+//     255 octets, i.e. at most 253 characters of text;
+//   - no empty label: no leading dot, no "..", at most one trailing dot,
+//     which is accepted and ignored for identity (CanonicalZoneIdentity);
+//   - a label neither starts nor ends with a hyphen; a leading underscore
+//     (service-style labels such as _acme or _tcp) is accepted;
+//   - case is accepted and canonicalized for identity;
+//   - the root zone (".") is not managed.
+//
+// Everything this accepts is also accepted by dns.IsDomainName (the parser
+// and the persisted-state check) and is safe as a file name component: no
+// path separators, no traversal, no NUL.
+const (
+	MaxZoneLabelLength = 63
+	MaxZoneNameLength  = 253 // text form without the trailing dot; 255 wire octets
+)
+
+// ValidateDomainName checks that a domain name is a supported managed-zone
+// name (see the grammar above).
 func ValidateDomainName(domain string) error {
 	if domain == "" {
 		return fmt.Errorf("domain name must not be empty")
 	}
-	if strings.Contains(domain, "..") {
-		return fmt.Errorf("domain name must not contain '..'")
+	if domain == "." {
+		return fmt.Errorf("the root zone is not a supported managed zone")
 	}
 	if strings.ContainsAny(domain, "/\\") {
-		return fmt.Errorf("domain name must not contain path separators")
+		return fmt.Errorf("domain name must not contain path separators or escapes")
 	}
-	// DNS names: letters, digits, hyphens, dots, and underscores (for SRV/DKIM)
+	if strings.Contains(domain, "..") {
+		return fmt.Errorf("domain name must not contain '..' (empty label)")
+	}
+	if strings.HasPrefix(domain, ".") {
+		return fmt.Errorf("domain name must not start with '.' (empty label)")
+	}
 	for _, c := range domain {
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_') {
-			return fmt.Errorf("domain name contains invalid character %q", c)
+			return fmt.Errorf("domain name contains invalid character %q (ASCII letters, digits, '-', '_' and '.' only; give IDNA names as A-labels)", c)
+		}
+	}
+	name := strings.TrimSuffix(domain, ".")
+	if len(name) > MaxZoneNameLength {
+		return fmt.Errorf("domain name is %d characters, above the %d character limit (255 wire octets)", len(name), MaxZoneNameLength)
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) > MaxZoneLabelLength {
+			return fmt.Errorf("label %q is %d octets, above the %d octet limit", label, len(label), MaxZoneLabelLength)
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("label %q must not start or end with a hyphen", label)
 		}
 	}
 	return nil
