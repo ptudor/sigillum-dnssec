@@ -566,6 +566,10 @@ func (v *Validator) discoverAliasTarget(ctx context.Context, domain, leafZone st
 			nsAddresses = append(nsAddresses, addr.String())
 		}
 	}
+	// Every server is consulted until one serves an alias at the queried
+	// owner (RDAYBLUEX-002): a usable answer without an applicable alias
+	// (a server that answers the name directly, or lags) does not end the
+	// search. Only a structurally valid target is accepted.
 	for _, addr := range nsAddresses {
 		select {
 		case <-ctx.Done():
@@ -576,92 +580,213 @@ func (v *Validator) discoverAliasTarget(ctx context.Context, domain, leafZone st
 		if err != nil || qr == nil || qr.Error != "" || qr.RCode != dns.RcodeSuccess {
 			continue
 		}
-		if cnames := answerCNAMEsOwnedBy(qr.CNAME, domain); len(cnames) > 0 {
-			return cnames[0].Target
+		for _, c := range answerCNAMEsOwnedBy(qr.CNAME, domain) {
+			target := dns.Fqdn(c.Target)
+			// A valid, unescaped wire name (no escaped octets or empty labels).
+			if _, ok := dns.IsDomainName(target); !ok || strings.Contains(target, "\\") || strings.Contains(target, "..") {
+				continue
+			}
+			return target
 		}
-		return ""
 	}
 	return ""
 }
 
-// queryLeafAllServers queries the leaf record from the authoritative servers.
-// In quick mode it returns the first usable answer. In extended mode it queries
-// EVERY server, returns the first usable answer whose positive data verifies
-// under the zone's keys (or the first usable answer when none does, so the
-// failure is reported), and flags every other server whose answer differs by
-// content or whose signature fails — the "query every NS, flag inconsistencies"
-// feature (R-100, RA6X-018). Disagreement here is diagnostic: it never changes
-// the verdict that the chosen answer earns on its own.
+// queryLeafAllServers queries the leaf record from the authoritative servers
+// and returns the candidate to validate plus per-server disagreements.
+//
+// Each usable answer is classified by fully authenticating the path it
+// represents (RDAYBLUEX-002): the queried positive RRset, an ordinary CNAME
+// at the owner, a DNAME RRset plus its RFC 6672 synthesized CNAME (or an
+// authenticated YXDOMAIN), or an NSEC/NSEC3 denial of existence. Only a
+// candidate whose complete path authenticates outranks another; an
+// unsupported or structurally empty answer is a failure, never an implicit
+// success. Quick mode stops at the first authenticated candidate (or, when
+// none authenticates, returns the first usable answer so the failure is
+// reported); extended mode queries every server, selects the first
+// authenticated candidate (falling back likewise), and flags every other
+// server whose answer differs by content or whose path does not authenticate
+// — the "query every NS, flag inconsistencies" feature (R-100, RA6X-018).
+// Disagreement is diagnostic: it never changes the verdict the chosen answer
+// earns on its own. A cancelled context ends the query loop at once.
 func (v *Validator) queryLeafAllServers(ctx context.Context, nsAddresses []string, domain, zone string, dnskeys []dnspkg.DNSKEYRecord) (*dnspkg.QueryResult, []string) {
-	var usable []*dnspkg.QueryResult
+	type candidate struct {
+		qr  *dnspkg.QueryResult
+		err error // nil when the candidate's complete path authenticated
+	}
+	var usable []candidate
+	chosenIdx := -1
+queryLoop:
 	for _, addr := range nsAddresses {
 		select {
 		case <-ctx.Done():
-			break
+			break queryLoop
 		default:
 		}
 		result, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, v.leafType())
 		if err != nil || result == nil || result.Error != "" {
 			continue
 		}
-		usable = append(usable, result)
-		if v.quickMode {
-			return result, nil
+		c := candidate{qr: result, err: v.leafCandidateError(result, domain, zone, dnskeys)}
+		usable = append(usable, c)
+		if c.err == nil && chosenIdx < 0 {
+			chosenIdx = len(usable) - 1
+			if v.quickMode {
+				break
+			}
 		}
 	}
 	if len(usable) == 0 {
 		return nil, nil
 	}
-
-	// Pick the first answer whose positive data verifies; a server serving
-	// the right data with a broken signature must not block a valid path.
-	chosen := usable[0]
-	for _, qr := range usable {
-		if v.leafSignatureError(qr, domain, zone, dnskeys) == nil {
-			chosen = qr
-			break
-		}
+	if chosenIdx < 0 {
+		// Nothing authenticated: report the failure of the first usable answer.
+		chosenIdx = 0
 	}
+	chosen := usable[chosenIdx].qr
 
 	chosenFP := v.leafFingerprint(chosen)
 	var disagreements []string
-	for _, qr := range usable {
-		if qr == chosen {
+	for i, c := range usable {
+		if i == chosenIdx {
 			continue
 		}
-		if fp := v.leafFingerprint(qr); fp != chosenFP {
+		if fp := v.leafFingerprint(c.qr); fp != chosenFP {
 			disagreements = append(disagreements, fmt.Sprintf(
 				"%s (%s) returned a different %s answer (%s) than %s (%s) (%s)",
-				qr.Server, qr.IP, v.leafTypeName(), qr.RCodeName,
+				c.qr.Server, c.qr.IP, v.leafTypeName(), c.qr.RCodeName,
 				chosen.Server, chosen.IP, chosen.RCodeName))
 			continue
 		}
-		if err := v.leafSignatureError(qr, domain, zone, dnskeys); err != nil {
+		if c.err != nil {
 			disagreements = append(disagreements, fmt.Sprintf(
 				"%s (%s) returned the same %s answer as %s (%s) but its signature does not verify: %v",
-				qr.Server, qr.IP, v.leafTypeName(), chosen.Server, chosen.IP, err))
+				c.qr.Server, c.qr.IP, v.leafTypeName(), chosen.Server, chosen.IP, c.err))
 		}
 	}
 	return chosen, disagreements
 }
 
-// leafSignatureError verifies the positive data in a leaf answer (the queried
-// type at the owner, or the CNAME at the owner) under the zone's keys. Denial
-// answers carry no positive RRset and are not judged here; they return nil.
-func (v *Validator) leafSignatureError(qr *dnspkg.QueryResult, domain, zone string, dnskeys []dnspkg.DNSKEYRecord) error {
-	if qr.RCode != dns.RcodeSuccess || len(qr.RawResponse) == 0 {
+// leafCandidateError classifies one server's leaf answer by fully
+// authenticating the path it represents under the zone's keys
+// (RDAYBLUEX-002). It returns nil only when that complete path verifies:
+//
+//   - a denial (NXDOMAIN, or NOERROR with no answer for the type and no
+//     CNAME): the NSEC or NSEC3 proof must verify;
+//   - YXDOMAIN: an Answer-section DNAME above the name must verify and its
+//     substitution must genuinely exceed the name length limit;
+//   - the queried type at the owner: the RRset must verify (including a
+//     wildcard expansion's no-closer-match proof);
+//   - a CNAME at the owner below an Answer-section DNAME: the DNAME RRset
+//     must verify and the CNAME must be exactly its substitution;
+//   - an ordinary CNAME at the owner: the CNAME RRset must verify.
+//
+// Every other shape (no raw response, no records of any of these kinds) is
+// an error. The same primitives that verifyActualRecord uses for the chosen
+// answer are used here, so ranking and verification cannot disagree.
+func (v *Validator) leafCandidateError(qr *dnspkg.QueryResult, domain, zone string, dnskeys []dnspkg.DNSKEYRecord) error {
+	if len(qr.RawResponse) == 0 {
+		return fmt.Errorf("no raw response to authenticate")
+	}
+	leafCNAMEs := answerCNAMEsOwnedBy(qr.CNAME, domain)
+
+	if qr.RCode == dns.RcodeYXDomain {
+		dnameOwner := dnameAncestorInAnswer(qr, domain)
+		if dnameOwner == "" {
+			return fmt.Errorf("YXDOMAIN without a DNAME in the answer")
+		}
+		target, err := v.authenticatedDNAMETarget(qr, zone, dnameOwner, dnskeys)
+		if err != nil {
+			return err
+		}
+		if _, err := substituteDNAME(domain, dnameOwner, target); err == nil {
+			return fmt.Errorf("YXDOMAIN although the DNAME substitution fits the name length limit")
+		}
 		return nil
 	}
-	switch {
-	case answerHasTypeAt(qr.RawResponse, v.leafType(), domain):
-		_, err := verifyRRsetFromResponseB(v.budget, qr.RawResponse, v.leafType(), dnskeys, domain, zone, true)
-		return err
-	case len(answerCNAMEsOwnedBy(qr.CNAME, domain)) > 0:
-		if dnameAncestorInAnswer(qr, domain) != "" {
-			return nil // authenticated through the DNAME path instead
+
+	if isDenialForType(qr, v.leafType()) {
+		if nsecCands := denialNSECCandidates(qr.NSEC); len(nsecCands) > 0 {
+			proof := verifyNSECDenialWithRRSIGB(v.budget, domain, v.leafType(), nsecCands, dnskeys, zone, qr.RawResponse, qr.RCode)
+			if !proof.Verified {
+				return fmt.Errorf("NSEC denial does not verify: %s", proof.Error)
+			}
+			return nil
 		}
-		_, err := verifyRRsetFromResponseB(v.budget, qr.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
-		return err
+		if nsec3Cands := denialNSEC3Candidates(qr.NSEC3); len(nsec3Cands) > 0 {
+			proof := verifyNSEC3DenialWithRRSIGB(v.budget, domain, v.leafType(), nsec3Cands, dnskeys, zone, qr.RawResponse, qr.RCode)
+			if !proof.Verified {
+				return fmt.Errorf("NSEC3 denial does not verify: %s", proof.Error)
+			}
+			return nil
+		}
+		return fmt.Errorf("%s denial without NSEC/NSEC3 records", qr.RCodeName)
+	}
+
+	if answerHasTypeAt(qr.RawResponse, v.leafType(), domain) {
+		verified, err := verifyRRsetFromResponseB(v.budget, qr.RawResponse, v.leafType(), dnskeys, domain, zone, true)
+		if err != nil {
+			return err
+		}
+		return v.wildcardPathError(verified, domain, zone, qr, dnskeys)
+	}
+
+	if len(leafCNAMEs) > 0 {
+		if dnameOwner := dnameAncestorInAnswer(qr, domain); dnameOwner != "" {
+			target, err := v.authenticatedDNAMETarget(qr, zone, dnameOwner, dnskeys)
+			if err != nil {
+				return err
+			}
+			expected, err := substituteDNAME(domain, dnameOwner, target)
+			if err != nil {
+				return err
+			}
+			if len(leafCNAMEs) != 1 || dns.CanonicalName(leafCNAMEs[0].Target) != dns.CanonicalName(expected) {
+				return fmt.Errorf("synthesized CNAME does not match the authenticated DNAME substitution %s", expected)
+			}
+			return nil
+		}
+		verified, err := verifyRRsetFromResponseB(v.budget, qr.RawResponse, dns.TypeCNAME, dnskeys, domain, zone, true)
+		if err != nil {
+			return err
+		}
+		return v.wildcardPathError(verified, domain, zone, qr, dnskeys)
+	}
+
+	return fmt.Errorf("no %s RRset, CNAME, DNAME or denial records for %s in the answer", v.leafTypeName(), domain)
+}
+
+// authenticatedDNAMETarget verifies the DNAME RRset at dnameOwner under the
+// zone's keys and returns its single target.
+func (v *Validator) authenticatedDNAMETarget(qr *dnspkg.QueryResult, zone, dnameOwner string, dnskeys []dnspkg.DNSKEYRecord) (string, error) {
+	verified, err := verifyRRsetFromResponseB(v.budget, qr.RawResponse, dns.TypeDNAME, dnskeys, dnameOwner, zone, true)
+	if err != nil {
+		return "", fmt.Errorf("DNAME RRSIG verification failed for %s: %w", dnameOwner, err)
+	}
+	target := ""
+	for _, rr := range verified.Records {
+		if d, ok := rr.(*dns.DNAME); ok {
+			if target != "" {
+				return "", fmt.Errorf("DNAME RRset at %s holds more than one record", dnameOwner)
+			}
+			target = d.Target
+		}
+	}
+	if target == "" {
+		return "", fmt.Errorf("verified DNAME RRset at %s holds no DNAME record", dnameOwner)
+	}
+	return target, nil
+}
+
+// wildcardPathError completes a positive candidate's path: a wildcard
+// expansion must carry a verified no-closer-match proof (RFC 4035
+// §3.1.3.3), exactly as verifyActualRecord requires of the chosen answer.
+func (v *Validator) wildcardPathError(verified *VerifiedRRset, domain, zone string, qr *dnspkg.QueryResult, dnskeys []dnspkg.DNSKEYRecord) error {
+	scratch := &RecordValidation{}
+	sig := dnspkg.RRSIGFromRR(verified.Signature, dnspkg.SectionAnswer, time.Now())
+	v.verifyWildcard(scratch, domain, zone, sig, qr, dnskeys)
+	if scratch.Error != "" {
+		return fmt.Errorf("%s", scratch.Error)
 	}
 	return nil
 }
@@ -1320,7 +1445,7 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 			if len(ds.Observed) == 0 {
 				// No DS in parent: insecure delegation only if the parent authenticatedly
 				// proves the DS RRset is absent (R-081 downgrade guard).
-				v.finalizeNoDSDelegation(result, zone, parentZone, parentDNSKEY, ds.Response)
+				v.finalizeNoDSDelegation(result, zone, parentZone, parentDNSKEY, ds)
 				if result.Status == StatusInsecure {
 					markUsable(StatusInsecure, "")
 				} else {
@@ -1391,7 +1516,7 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		if len(ds.Observed) == 0 {
 			// No DS: insecure delegation only if the parent authenticatedly proves the
 			// DS RRset is absent (R-081 downgrade guard).
-			v.finalizeNoDSDelegation(result, zone, parentZone, parentDNSKEY, ds.Response)
+			v.finalizeNoDSDelegation(result, zone, parentZone, parentDNSKEY, ds)
 			if result.Status == StatusInsecure {
 				markUsable(StatusInsecure, "")
 			}
@@ -1578,6 +1703,12 @@ type parentDSResult struct {
 	// Disagreements records parent servers whose DS answer differed from, or
 	// failed to authenticate against, the one used (extended mode, RA6X-018).
 	Disagreements []Disagreement
+	// AbsenceProof is the NSEC/NSEC3 proof of DS absence evaluated for a
+	// negative candidate during selection (RDAYBLUEX-001), and AbsenceProven
+	// whether it verified; nil when the answer served a DS RRset or no
+	// parent keys were available.
+	AbsenceProof  *NSECProof
+	AbsenceProven bool
 }
 
 // parentZoneFromHierarchy returns the zone that precedes zone in the walked
@@ -1604,10 +1735,6 @@ func parentZoneFromHierarchy(zone string, hierarchy []string) string {
 // separates the served DS RRset from the exact authenticated one, and carries
 // the raw parent response for DS-absence proofs (R-081).
 func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, parentZone string, fallbackServers []string, parentDNSKEY []dnspkg.DNSKEYRecord) (*parentDSResult, error) {
-	validation := &DSValidation{
-		ParentZone: parentZone,
-	}
-
 	// First try to get parent NS
 	var parentNS []string
 	if parentZone == "." {
@@ -1628,52 +1755,97 @@ func (v *Validator) queryDSFromParentWithValidation(ctx context.Context, zone, p
 		parentNS = fallbackServers
 	}
 
-	// Query DS from parent nameservers. The first usable answer establishes
-	// the DS RRset; in extended mode the remaining parent servers are queried
-	// too and judged against it (RA6X-018).
-	var out *parentDSResult
-	for idx, addr := range parentNS {
-		result, err := v.resolver.QueryDSAuthoritative(ctx, addr, zone)
-		if out != nil {
-			// Extended mode: judge this parent server against the chosen answer.
-			if d := judgeParentDSServer(v.budget, out, addr, result, err, zone, parentZone, parentDNSKEY); d != nil {
-				out.Disagreements = append(out.Disagreements, *d)
-			}
-			continue
+	// Candidate selection is authentication-aware (RDAYBLUEX-001). Every
+	// parent server's answer is a candidate: a positive DS RRset is
+	// authenticated under the parent's keys, a negative answer (NODATA or
+	// NXDOMAIN) by its NSEC/NSEC3 proof of DS absence. The first candidate
+	// that authenticates is selected — in quick mode querying stops there,
+	// in extended mode every server is queried — and every other answer is
+	// retained as a diagnostic comparison against the selection, so a bad
+	// earlier response can never block a later good one. When nothing
+	// authenticates, the first usable answer is returned with its failed
+	// validation so the verdict machinery reports that failure rather than
+	// a different meaning; when no server answers at all, an error.
+	type dsCandidate struct {
+		addr   string
+		qr     *dnspkg.QueryResult
+		err    error
+		result *parentDSResult // nil for a transport/rcode failure
+		auth   bool
+	}
+	var candidates []dsCandidate
+	chosenIdx := -1
+	for _, addr := range parentNS {
+		if ctx.Err() != nil {
+			break
 		}
-		if err == nil && result.Error == "" && result.RCode == 0 {
-			out = &parentDSResult{
-				Observed:   answerDSOwnedBy(result.DS, zone),
-				Validation: validation,
-				Response:   result,
-			}
-			validation.DSCount = len(out.Observed)
-
-			// Verify DS RRSIG if we have parent's DNSKEY and a DS RRset was served.
-			if len(parentDNSKEY) > 0 && len(out.Observed) > 0 {
-				out.Authenticated = verifyDSRRSIGSetB(v.budget, validation, zone, parentZone, parentDNSKEY, result.RawResponse)
-			}
-			if v.quickMode || idx == len(parentNS)-1 {
-				return out, nil
-			}
-			continue
+		qr, err := v.resolver.QueryDSAuthoritative(ctx, addr, zone)
+		c := dsCandidate{addr: addr, qr: qr, err: err}
+		if err == nil && qr != nil && qr.Error == "" && (qr.RCode == dns.RcodeSuccess || qr.RCode == dns.RcodeNameError) {
+			c.result, c.auth = v.classifyParentDSAnswer(qr, zone, parentZone, parentDNSKEY)
 		}
-		// NXDOMAIN or no DS records
-		if result != nil && result.RCode == dns.RcodeNameError {
-			return &parentDSResult{Validation: validation, Response: result}, nil // Zone doesn't exist in parent
+		candidates = append(candidates, c)
+		if c.auth && chosenIdx < 0 {
+			chosenIdx = len(candidates) - 1
+			if v.quickMode {
+				break
+			}
 		}
 	}
-	if out != nil {
-		return out, nil
+	if chosenIdx < 0 {
+		for i, c := range candidates {
+			if c.result != nil {
+				chosenIdx = i
+				break
+			}
+		}
 	}
-
-	return nil, fmt.Errorf("failed to query DS from parent zone")
+	if chosenIdx < 0 {
+		return nil, fmt.Errorf("failed to query DS from parent zone")
+	}
+	out := candidates[chosenIdx].result
+	for i, c := range candidates {
+		if i == chosenIdx {
+			continue
+		}
+		if d := v.judgeParentDSServer(out, c.addr, c.qr, c.err, zone, parentZone, parentDNSKEY); d != nil {
+			out.Disagreements = append(out.Disagreements, *d)
+		}
+	}
+	return out, nil
 }
 
-// judgeParentDSServer compares one additional parent server's DS answer with
-// the chosen one (RA6X-018): it must answer, serve the same DS RRset for the
-// child, and (when the parent's keys are known) its signature must verify.
-func judgeParentDSServer(b *VerifyBudget, chosen *parentDSResult, addr string, qr *dnspkg.QueryResult, err error, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord) *Disagreement {
+// classifyParentDSAnswer builds the candidate result for one parent server's
+// usable (NOERROR or NXDOMAIN) DS answer and reports whether its path
+// authenticates (RDAYBLUEX-001): a served DS RRset must verify under the
+// parent's keys; an empty or NXDOMAIN answer must carry a verified
+// NSEC/NSEC3 proof of DS absence. Without parent keys nothing can
+// authenticate and the answer is a plain (unauthenticated) candidate.
+func (v *Validator) classifyParentDSAnswer(qr *dnspkg.QueryResult, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord) (*parentDSResult, bool) {
+	validation := &DSValidation{ParentZone: parentZone}
+	out := &parentDSResult{Validation: validation, Response: qr}
+	if qr.RCode == dns.RcodeSuccess {
+		out.Observed = answerDSOwnedBy(qr.DS, zone)
+		validation.DSCount = len(out.Observed)
+	}
+	if len(parentDNSKEY) == 0 {
+		return out, false
+	}
+	if len(out.Observed) > 0 {
+		out.Authenticated = verifyDSRRSIGSetB(v.budget, validation, zone, parentZone, parentDNSKEY, qr.RawResponse)
+		return out, len(out.Authenticated) > 0
+	}
+	proof, ok := v.verifyDSAbsence(zone, parentZone, parentDNSKEY, qr)
+	out.AbsenceProof, out.AbsenceProven = proof, ok
+	return out, ok
+}
+
+// judgeParentDSServer compares one other parent server's DS answer with the
+// chosen one (RA6X-018): it must answer, serve the same DS RRset for the
+// child, and (when the parent's keys are known) its signature must verify —
+// or, for a negative answer beside a chosen negative one, its NSEC/NSEC3
+// proof of DS absence must verify (RDAYBLUEX-001).
+func (v *Validator) judgeParentDSServer(chosen *parentDSResult, addr string, qr *dnspkg.QueryResult, err error, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord) *Disagreement {
 	d := &Disagreement{Server: "parent " + parentZone, IP: addr}
 	switch {
 	case err != nil:
@@ -1694,15 +1866,30 @@ func judgeParentDSServer(b *VerifyBudget, chosen *parentDSResult, addr string, q
 		d.Issue, d.Expected, d.Got = "parent server served a different DS RRset", dsSummary(chosen.Observed), dsSummary(observed)
 		return d
 	}
-	if len(parentDNSKEY) > 0 && len(observed) > 0 {
-		v := &DSValidation{ParentZone: parentZone}
-		if got := verifyDSRRSIGSetB(b, v, zone, parentZone, parentDNSKEY, qr.RawResponse); got == nil {
-			if isBudgetExhaustedText(v.Error) {
+	if len(parentDNSKEY) == 0 {
+		return nil
+	}
+	if len(observed) > 0 {
+		val := &DSValidation{ParentZone: parentZone}
+		if got := verifyDSRRSIGSetB(v.budget, val, zone, parentZone, parentDNSKEY, qr.RawResponse); got == nil {
+			if isBudgetExhaustedText(val.Error) {
 				return nil // out of budget: no verdict on this server
 			}
-			d.Issue, d.Expected, d.Got = "parent server's DS RRSIG does not verify", "valid signature", v.Error
+			d.Issue, d.Expected, d.Got = "parent server's DS RRSIG does not verify", "valid signature", val.Error
 			return d
 		}
+		return nil
+	}
+	// Both answers are negative: this server must prove the absence too.
+	if proof, ok := v.verifyDSAbsence(zone, parentZone, parentDNSKEY, qr); !ok {
+		if proof != nil && isBudgetExhaustedText(proof.Error) {
+			return nil
+		}
+		d.Issue, d.Expected = "parent server's proof of DS absence does not verify", "authenticated NSEC/NSEC3 proof of DS absence"
+		if proof != nil {
+			d.Got = proof.Error
+		}
+		return d
 	}
 	return nil
 }
@@ -1914,7 +2101,7 @@ func rejectedNote(rejected []string) string {
 // "insecure" requires an authenticated proof that the DS RRset is genuinely absent
 // (R-081). Without such a proof the result is indeterminate (no denial at all) or bogus
 // (a denial that contradicts itself or fails to verify) — never a silent downgrade.
-func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord, qr *dnspkg.QueryResult) {
+func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord, ds *parentDSResult) {
 	if len(parentDNSKEY) == 0 {
 		// The parent is not itself secured (insecure ancestor); there is no chain of
 		// trust to protect below it, so an unsigned delegation is genuinely insecure.
@@ -1922,7 +2109,19 @@ func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone, parentZone 
 		return
 	}
 
-	proof, ok := v.verifyDSAbsence(zone, parentZone, parentDNSKEY, qr)
+	var qr *dnspkg.QueryResult
+	if ds != nil {
+		qr = ds.Response
+	}
+	// Candidate selection already authenticated the chosen answer's absence
+	// proof (RDAYBLUEX-001); reuse it rather than spending the budget twice.
+	var proof *NSECProof
+	var ok bool
+	if ds != nil && ds.AbsenceProof != nil {
+		proof, ok = ds.AbsenceProof, ds.AbsenceProven
+	} else {
+		proof, ok = v.verifyDSAbsence(zone, parentZone, parentDNSKEY, qr)
+	}
 	if proof != nil {
 		result.DenialProof = proof
 	}

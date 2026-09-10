@@ -274,14 +274,14 @@ func TestFinalizeNoDSDelegation(t *testing.T) {
 	qr, parentKey := buildDSAbsenceResponse(t, child, parentZone,
 		[]uint16{miekgdns.TypeNS, miekgdns.TypeRRSIG})
 	r2 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r2, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, qr)
+	v.finalizeNoDSDelegation(r2, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, &parentDSResult{Response: qr})
 	if r2.Status != StatusInsecure {
 		t.Fatalf("valid absence proof should yield insecure, got %s", r2.Status)
 	}
 
 	// Secure parent, no denial at all → indeterminate (possible downgrade), not insecure.
 	r3 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r3, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, &dnspkg.QueryResult{})
+	v.finalizeNoDSDelegation(r3, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, &parentDSResult{Response: &dnspkg.QueryResult{}})
 	if r3.Status != StatusIndeterminate {
 		t.Fatalf("missing absence proof should yield indeterminate, got %s", r3.Status)
 	}
@@ -290,7 +290,7 @@ func TestFinalizeNoDSDelegation(t *testing.T) {
 	qrDS, keyDS := buildDSAbsenceResponse(t, child, parentZone,
 		[]uint16{miekgdns.TypeNS, miekgdns.TypeDS, miekgdns.TypeRRSIG})
 	r4 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r4, child, parentZone, []dnspkg.DNSKEYRecord{keyDS}, qrDS)
+	v.finalizeNoDSDelegation(r4, child, parentZone, []dnspkg.DNSKEYRecord{keyDS}, &parentDSResult{Response: qrDS})
 	if r4.Status != StatusBogus {
 		t.Fatalf("a DS-bit NSEC should yield bogus, got %s", r4.Status)
 	}

@@ -423,7 +423,7 @@ func TestVerifyDSAbsenceNSEC3IterationCap(t *testing.T) {
 	// Through finalizeNoDSDelegation the over-cap NSEC3 yields the fail-closed
 	// non-insecure outcome (bogus), never an insecure downgrade.
 	r := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, overCap)
+	v.finalizeNoDSDelegation(r, child, parentZone, []dnspkg.DNSKEYRecord{parentKey}, &parentDSResult{Response: overCap})
 	if r.Status != StatusBogus {
 		t.Fatalf("over-cap NSEC3 DS-absence proof should yield bogus, got %s", r.Status)
 	}
@@ -436,7 +436,7 @@ func TestVerifyDSAbsenceNSEC3IterationCap(t *testing.T) {
 		t.Fatalf("a signed NSEC3 with iterations=10 must still prove DS absence, got error: %s", proof10.Error)
 	}
 	r10 := NewZoneResult(child)
-	v.finalizeNoDSDelegation(r10, child, parentZone, []dnspkg.DNSKEYRecord{signedParentKey}, qr)
+	v.finalizeNoDSDelegation(r10, child, parentZone, []dnspkg.DNSKEYRecord{signedParentKey}, &parentDSResult{Response: qr})
 	if r10.Status != StatusInsecure {
 		t.Fatalf("valid NSEC3 absence proof should yield insecure, got %s", r10.Status)
 	}

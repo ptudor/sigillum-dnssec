@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -56,6 +57,27 @@ func (s *SSEWriter) armDeadline() {
 	_ = s.rc.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 }
 
+// flush pushes the buffered event to the client and reports failure
+// (RDAYBLUEX-009). http.Flusher.Flush returns nothing, so a flush that times
+// out or fails on the socket used to be invisible and the handler could not
+// cancel the validation. The ResponseController's Flush surfaces the error of
+// writers that implement FlushError (net/http's own response writer does);
+// a writer that only implements Flush is flushed best-effort, as the Go HTTP
+// abstraction provides no stronger signal there.
+func (s *SSEWriter) flush() error {
+	if s.rc != nil {
+		err := s.rc.Flush()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, http.ErrNotSupported) {
+			return fmt.Errorf("failed to flush event: %w", err)
+		}
+	}
+	s.flusher.Flush()
+	return nil
+}
+
 // SetStreamID sets a per-stream SSE id that is emitted with every subsequent
 // event. The browser echoes the most recently received id back in the
 // Last-Event-ID request header when its EventSource auto-reconnects; stamping a
@@ -91,8 +113,7 @@ func (s *SSEWriter) WriteEvent(eventType string, data interface{}) error {
 		return fmt.Errorf("failed to write event data: %w", err)
 	}
 
-	s.flusher.Flush()
-	return nil
+	return s.flush()
 }
 
 // WriteRawEvent writes a raw SSE event
@@ -101,8 +122,7 @@ func (s *SSEWriter) WriteRawEvent(eventType, data string) error {
 	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventType, data); err != nil {
 		return fmt.Errorf("failed to write raw event: %w", err)
 	}
-	s.flusher.Flush()
-	return nil
+	return s.flush()
 }
 
 // WriteComment writes an SSE comment (for keep-alive)
@@ -111,8 +131,7 @@ func (s *SSEWriter) WriteComment(comment string) error {
 	if _, err := fmt.Fprintf(s.w, ": %s\n\n", comment); err != nil {
 		return fmt.Errorf("failed to write comment: %w", err)
 	}
-	s.flusher.Flush()
-	return nil
+	return s.flush()
 }
 
 // WriteRetry sets the reconnection time in milliseconds
@@ -121,8 +140,7 @@ func (s *SSEWriter) WriteRetry(ms int) error {
 	if _, err := fmt.Fprintf(s.w, "retry: %d\n\n", ms); err != nil {
 		return fmt.Errorf("failed to write retry: %w", err)
 	}
-	s.flusher.Flush()
-	return nil
+	return s.flush()
 }
 
 // WriteID sets the event ID for reconnection
@@ -131,6 +149,5 @@ func (s *SSEWriter) WriteID(id string) error {
 	if _, err := fmt.Fprintf(s.w, "id: %s\n", id); err != nil {
 		return fmt.Errorf("failed to write ID: %w", err)
 	}
-	s.flusher.Flush()
-	return nil
+	return s.flush()
 }
