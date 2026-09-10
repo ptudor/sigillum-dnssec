@@ -287,3 +287,272 @@ The review is analysis only. No source files were changed.
 **Fix specification:** Validate RDAP configuration as an absolute HTTPS URL and reject userinfo, fragments, and ambiguous path forms. Keep local HTTP test support only through an explicit loopback-only development option or injected test transport. Reject redirects by default, or allow only a bounded same-origin HTTPS policy whose final resolved destinations also pass a public-egress check at dial time. If hostname endpoints are permitted, defend at the actual dial boundary against DNS rebinding and every resolved non-public address, while retaining an explicit operator allowlist for intentional internal deployments. Preserve RDAP optionality, current default URL/path contract, response-size/time limits, and public validation result schema.
 
 **Verification:** Add config/client tests for cleartext, relative, userinfo, cross-origin and scheme-downgrade redirects; direct and hostname-resolved loopback/private/link-local destinations; a DNS-rebinding-style resolver; redirect loops; and an allowed normal HTTPS endpoint. Assert rejected targets receive no request and validation continues with a visible RDAP diagnostic rather than failing DNSSEC validation itself. Run `go test -race ./...` in `validator`.
+
+### RDAYBLUEX-021 — The refresh window can be shorter than the daemon's polling interval
+
+**Severity:** Medium
+
+**Location:** `signer/internal/config/config.go:491-509`, method `Config.Validate`; `signer/internal/signer/sign.go:699-716`, method `Signer.NeedsSign`; `signer/daemon.go:402-423`, method `Daemon.runSigningLoop`
+
+**Problem:** Configuration only requires `signature_refresh < signature_validity`; it does not require the refresh window to cover the interval between signing checks. `NeedsSign` evaluates the refresh threshold only when the daemon's fixed poll ticker runs. If `signature_refresh` is shorter than `poll_interval` (or does not also cover one worst-case multi-zone signing pass), a signature can cross its expiration between checks. The signer then knowingly serves expired signatures until that zone is reached in the next pass. Small positive values, including sub-second validity/refresh pairs, pass validation and make this deterministic.
+
+**Evidence:** `Config.Validate` checks positivity and ordering at lines 491-509 but never relates either value to `PollInterval`. `NeedsSign` returns true only once `now` is after `SignaturesExp - SignatureRefresh`; it does not schedule a timer at that instant. `runSigningLoop` calls the check on one `PollInterval` ticker, and zones are processed serially during a cycle. For example, validity `10m`, refresh `1m`, and poll `5m` can first notice the refresh threshold at or after expiration depending on ticker phase and cycle duration.
+
+**Fix specification:** Enforce or schedule a safety margin that guarantees an unchanged, healthy zone is considered for re-signing before its earliest actual RRSIG expiration. At minimum, reject `signature_refresh < poll_interval`; the safe constraint should additionally include documented clock/ticker jitter and an upper bound or measured allowance for one full signing pass. A stronger implementation may schedule the next wake-up from the minimum persisted signature expiration rather than relying solely on the poll interval, but ordinary source-change polling behavior must remain unchanged. Define a sensible minimum signature validity and refresh granularity so sub-second configurations cannot produce effectively expired output. Preserve the TOML keys, normal defaults, output format, and manual `sign`/`resign` behavior.
+
+**Verification:** Add boundary config tests for refresh just below/equal/above the required margin, sub-second pairs, and a multi-zone worst-case allowance. With a fake clock/ticker, sign just before a poll, advance through `expiration-refresh`, and assert a signing pass starts and publishes before expiration. Include a deliberately slow earlier zone and assert a later zone still does not expire. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-022 — The public-only DNS egress policy permits deprecated site-local IPv6 destinations
+
+**Severity:** Medium
+
+**Location:** `validator/internal/dns/egress.go:78-133`, variables `reservedV4`, `reservedV6` and function `NonPublic`; `validator/internal/dns/egress.go:135-160`, method `EgressPolicy.Permit`
+
+**Problem:** The public validator's SSRF defense is a hand-maintained denylist, but the IPv6 list omits `fec0::/10`, the deprecated site-local range. `NonPublic` consequently returns false for an address such as `fec0::1`, and an attacker-controlled delegation can make the service attempt UDP/TCP port 53 on that destination. A host or network that still routes site-local space exposes an internal DNS interaction despite the documented public-only default. **Needs investigation:** the complete denylist should also be compared with the current IPv4 and IPv6 special-purpose registries; the implementation has no mechanism to keep classification synchronized as special ranges change.
+
+**Evidence:** `reservedV6` contains unspecified, loopback, mapped, well-known translation, discard, documentation, unique-local, link-local, and multicast ranges, but no `fec0::/10`. `NonPublic` accepts every non-nil IPv6 address not contained in that slice. `Permit` then allows it when `AllowPrivate` is false because `!NonPublic(ip)` is true. Authoritative addresses originate in the submitted domain's NS address data.
+
+**Fix specification:** Classify destinations from an explicit globally reachable/forwardable policy rather than assuming all addresses absent from a short denylist are public. At minimum add `fec0::/10`; audit both address families against the current authoritative special-purpose registries and add regression vectors for every non-global category. Canonicalize and classify embedded/translated address forms at the actual dial boundary so alternate representations cannot bypass the result. Keep the configured recursive resolver trusted, retain explicit CIDR allowlisting and `allow_private_destinations`, and do not block ordinary global-unicast authoritative servers.
+
+**Verification:** Add a table-driven test asserting `fec0::1` is rejected by both `NonPublic` and `Permit`, then add one vector per special-purpose category and representative global-unicast controls. Drive a real validator request whose delegation supplies the site-local address and use a dial spy to prove neither UDP nor TCP is attempted unless that exact range is explicitly allowlisted. Run `go test -race ./...` in `validator`.
+
+### RDAYBLUEX-023 — Positive integer settings can overflow into invalid `time.Duration` values
+
+**Severity:** Medium
+
+**Location:** `validator/internal/config/config.go:243-299`, function `LoadFromEnv`; `validator/internal/config/config.go:307-331`, method `Config.applyNestedToFlat`; `validator/internal/config/config.go:352-380` and `validator/internal/config/config.go:428-431`, method `Config.Validate`; `validator/ratelimit.go:35-49` and `validator/ratelimit.go:117-120`, rate-limiter startup
+
+**Problem:** The validator validates the positive integer source fields but not the derived durations after multiplication. A sufficiently large positive seconds/minutes value overflows `time.Duration` into zero, a negative duration, or an unrelated small positive duration while the source integer still passes validation. A negative `rate_limit.cleanup_seconds` result reaches `time.NewTicker` in a goroutine and panics the entire service. Wrapped query, total, shutdown, or heartbeat durations silently disable, shorten, or immediately expire their intended time bounds.
+
+**Evidence:** `applyNestedToFlat` directly multiplies `int` values by `time.Second`/`time.Minute` at lines 310-317 and 331. `Validate` checks only that `QueryTimeoutSec`, `TotalTimeoutSec`, `ShutdownTimeoutSec`, `RateLimit.CleanupSec`, and enabled `Heartbeat.IntervalMinutes` are greater than zero. It never checks the derived `time.Duration` fields or guards multiplication. `NewRateLimiter` immediately starts `cleanupLoop`, whose first statement constructs `time.NewTicker(rl.cleanup)` and panics for a non-positive wrapped value.
+
+**Fix specification:** Perform checked integer-to-duration conversion before assigning any derived field. Reject values greater than `math.MaxInt64 / unit`, reject any derived non-positive value, and impose defensible operational maxima so technically representable multi-century timeouts are not accepted accidentally. Apply the same helper to seconds and minutes from both TOML and environment loading. Return a field-specific configuration error before constructing the server or any goroutine. Preserve the integer config/env interfaces, existing normal values, and the current duration fields consumed by the rest of the program.
+
+**Verification:** Add tests at `max/unit`, `max/unit+1`, `MaxInt`, and representative ordinary values for every converted field through both file and environment loaders. Assert overflow is a load error and that no goroutine or ticker is started. Include a subprocess regression proving a huge positive cleanup value exits with a configuration error rather than a runtime panic. Run `go test -race ./...` in `validator`.
+
+### RDAYBLUEX-024 — `parent_ds_ttl` can truncate to zero or wrap before a key-retirement gate
+
+**Severity:** Medium
+
+**Location:** `signer/internal/config/config.go:165-170`, method `Config.ParentDSTTLFallback`; `signer/internal/config/config.go:476-478`, method `Config.Validate`; `signer/main.go:1337-1362`, forced rollover completion; `signer/internal/signer/rollover.go:172-237` and `signer/internal/signer/rollover.go:676-728`, rollover completion/checks
+
+**Problem:** `parent_ds_ttl` is accepted at any non-negative `time.Duration`, then converted to whole seconds and narrowed to `uint32`. A positive duration below one second becomes zero. A duration above `math.MaxUint32` seconds wraps modulo 2^32. Either result can reduce the required parent-DS cache wait to zero or a much shorter interval, allowing old KSK/algorithm material to be retired while resolvers can still hold the old DS RRset. The path is especially relevant to `rollover complete --force`, whose safety depends entirely on this fallback.
+
+**Evidence:** Validation rejects only negative values. `runRolloverComplete` and both `Complete*KSK/Algorithm*Rollover` paths use `uint32(cfg.ParentDSTTLFallback() / time.Second)`. The resulting value is persisted as `RolloverState.ParentDSTTL`, and `CheckKSKRollover`/`CheckAlgorithmRollover` add that many seconds to the observation time. With `500ms`, integer division yields zero and the `DSPropagation` branch can transition immediately; large values wrap during the cast.
+
+**Fix specification:** Validate `parent_ds_ttl` as an exact whole-second value in the representable `uint32` range before any rollover begins. Reject nonzero values below one second, fractional-second values if the format is intended to be second-granular, and values above `math.MaxUint32` seconds; also impose a documented operational maximum appropriate for DS TTLs. Centralize the checked conversion and make every fallback caller use it without a second narrowing cast. Old state containing zero must continue to use the conservative default rather than mean “no wait”; out-of-policy nonzero legacy values must fail closed and require operator repair. Preserve the TOML key, state JSON field type/name, observed parent TTL behavior, and the explicit `--force` surface.
+
+**Verification:** Add config and rollover tests for `500ms`, `1s`, fractional seconds, exactly `MaxUint32` seconds, one second above it, and a normal 24-hour value. With a fake clock, assert invalid values cannot enter propagation and that legacy zero uses 24 hours. Confirm the old KSK/algorithm remains published until the full accepted delay elapses. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-025 — Dashboard validation caches are not scoped to a daemon generation
+
+**Severity:** Low
+
+**Location:** `signer/web.go:36-103`, global `dashboardValidationCache`; `signer/web.go:105-178`, global `dashboardZoneValidationCache`; `signer/web.go:212-239`, reload-aware handler construction; `signer/daemon.go:247-318`, method `Daemon.Reload`
+
+**Problem:** The web handlers intentionally fetch the current config/state on every request, but both live-DNS caches are process globals keyed by neither config nor state generation. Immediately after reload, the aggregate endpoint can return the previous zone set and the per-zone endpoint can return a result computed with the previous resolver, keys, paths, and state. An old in-flight computation can also populate the cache after reload. Per-zone entries are never evicted; although only currently managed domains can create entries, repeated remove/re-add churn grows the map for the lifetime of the process.
+
+**Evidence:** `dashboardValidationCache` has one result/in-flight slot for the process. `zoneValidationCache.byZone` is keyed only by the domain string and has no delete/expiry sweep. `NewWebServer` calls `d.current()` for fresh pointers, then `cachedValidateAll`/`cachedValidateZone` consult these globals without an identity argument. `Daemon.Reload` swaps config and state but does not invalidate them. Their 30-second TTL therefore applies across configuration generations.
+
+**Fix specification:** Key validation results and single-flight work by an immutable daemon generation plus the relevant domain; increment the generation only after a successful reload is published. A completion from an old generation must not fill a current-generation entry. Invalidate aggregate results immediately on reload, remove per-zone entries for removed zones, and bound/evict superseded generations. Preserve the 30-second within-generation caching/single-flight behavior, endpoint schemas, live validation semantics, and the rule that handlers resolve current state per request. This can share the generation token required by RDAYBLUEX-005.
+
+**Verification:** Prime both caches under generation A, reload generation B with a changed resolver and zone set, and assert the next request computes B rather than serving A. Hold an A computation in flight across reload and prove its completion cannot populate B. Repeatedly add/remove unique domains and assert the entry count remains bounded. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-026 — A cold per-zone validation timeout returns `200 null`
+
+**Severity:** Low
+
+**Location:** `signer/web.go:124-170`, method `zoneValidationCache.get`; `signer/web.go:365-380`, aggregate API handler; `signer/web.go:382-403`, per-zone API handler
+
+**Problem:** When the first per-zone validation exceeds the 20-second wait budget, the cache returns its nil stale value and the handler JSON-encodes it as `null` with HTTP 200. Clients cannot distinguish “validation is still running” from a successful nullable result. The aggregate endpoint detects the identical condition and correctly returns 503 with `Retry-After`, so the sibling APIs have contradictory contracts.
+
+**Evidence:** `zoneValidationCache.get` explicitly returns `stale`, which may be nil, on timeout. `apiValidateZoneHandler` unconditionally calls `Encode(result)`. In contrast, `apiValidateHandler` checks `output == nil` at lines 368-373 and returns `503 Service Unavailable` plus `Retry-After: 5`.
+
+**Fix specification:** Make the per-zone handler treat a nil cache result exactly like the aggregate handler: return 503 and a bounded `Retry-After`, with a non-JSON-null error body consistent with the signer's API conventions. Let the background validation finish and seed the cache. Do not change successful response JSON, cache timing, or the distinction between unknown zone (404) and validation in progress (503).
+
+**Verification:** Block a cold per-zone computation beyond `validationMaxWait` and assert status 503, `Retry-After`, and no `null` success body. Release the computation and assert the next request returns the normal JSON result with 200. Add the equivalent stale-result case and preserve the intended stale fallback if that remains part of the contract. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-027 — Unknown validation modes silently select the more expensive mode
+
+**Severity:** Low
+
+**Location:** `validator/handlers.go:139-143` and `validator/handlers.go:262-264`, SSE handler; `validator/handlers.go:330-334` and `validator/handlers.go:417-419`, JSON handler
+
+**Problem:** The public handlers document `quick` and `extended`, but validate neither. Only exact `quick` enables quick mode; every other nonempty token silently runs extended validation. Typos therefore change both semantics and outbound work rather than producing a client error, and the SSE and JSON routes consume a global validation slot before the mistake is reported—because it is never reported.
+
+**Evidence:** Both handlers default an empty value to `extended`. Their only subsequent branch is `if mode == "quick" { SetQuickMode(true) }`; no branch rejects a value such as `quik`, `EXTENDED`, or an arbitrarily long token. The validator consequently uses its default extended behavior.
+
+**Fix specification:** Parse the mode once through a shared helper before acquiring a validation slot. Accept exactly the documented canonical values (and empty as the existing default); return the existing 400 problem-details shape for everything else. If case-insensitivity is intentionally supported, normalize and document it consistently for both endpoints. Preserve the default, successful quick/extended behavior, metrics endpoint labels, and response schemas.
+
+**Verification:** Add identical handler tables for empty, `quick`, `extended`, case variants, typo, and oversized values. Assert invalid modes return 400 without calling the validation seam or consuming a semaphore slot, while valid modes reach the seam with the expected normalized value. Run `go test -race ./...` in `validator`.
+
+### RDAYBLUEX-028 — RDAP DS integers and digests are narrowed without validation
+
+**Severity:** Low
+
+**Location:** `validator/internal/rdap/types.go:18-24`, type `DSData`; `validator/internal/validator/validator.go:2115-2163`, method `Validator.queryRDAPSecureDNS`
+
+**Problem:** RDAP supplies DS fields as signed, machine-width integers and arbitrary strings, but the validator casts them directly to DNS wire-width unsigned values. Negative and oversized values wrap modulo 2^16 or 2^8 and can accidentally equal a real DNS DS tuple. Digest text is uppercased without checking supported digest type, exact length, or hexadecimal encoding. Since RDAP is a diagnostic cross-check rather than the trust chain, this cannot make DNSSEC cryptographically Secure, but it can produce a false `DSMatch` and misleading troubleshooting output from malformed or hostile RDAP data.
+
+**Evidence:** `DSData` declares `KeyTag`, `Algorithm`, and `DigestType` as `int`. Lines 2152-2155 convert with `uint16(...)` and `uint8(...)` and copy the digest. No range or structure check precedes `compareDSRecords`. For example, key tag `65537` narrows to `1`, and algorithm `271` narrows to `15`.
+
+**Fix specification:** Validate every RDAP DS record before conversion: key tag 0..65535, algorithm and digest type 0..255, a supported digest type where semantic comparison is claimed, and exact hexadecimal length/decodability for that type. Malformed entries must be excluded from matching and surfaced in `RDAPSecureDNS.Error` or a compatible diagnostic field; they must not turn the core DNSSEC verdict Bogus or Indeterminate. Preserve the public result schema if possible, uppercase normalization for valid digests, and all valid RDAP comparison behavior.
+
+**Verification:** Add RDAP fixtures with negative, one-above-maximum, wrapping-to-a-real-value, unknown digest type, odd/non-hex digest, wrong digest length, and a valid control. Assert none of the malformed records match DNS data and the diagnostic identifies the rejected record, while the core DNSSEC status is unchanged. Run `go test -race ./...` in `validator`.
+
+### RDAYBLUEX-029 — Signer zone-name validation does not enforce DNS wire limits
+
+**Severity:** Low
+
+**Location:** `signer/internal/config/config.go:558-562`, config zone loop; `signer/internal/config/config.go:703-728`, functions `CanonicalZoneIdentity` and `ValidateDomainName`; `signer/internal/state/state.go:329-339`, function `validateZoneEntry`
+
+**Problem:** The configuration boundary calls a path-safety character filter rather than a DNS-name validator. It accepts labels longer than 63 octets, names longer than 255 wire octets, leading empty labels, leading/trailing hyphens without an explicit policy, and the root spelling without explicitly deciding whether root-zone management is supported. Some accepted names later fail miekg/dns parsing or state validation after key/signing work has begun, producing deferred, inconsistent failures across config, state, filenames, and registrar paths.
+
+**Evidence:** `ValidateDomainName` checks nonempty, `".."`, path separators, and a character allowlist only. It never measures labels or the encoded name and never delegates to `dns.IsDomainName`. Persisted state separately calls `dns.IsDomainName`, so the two abstraction boundaries disagree. The validator HTTP boundary already enforces 63-character labels and a total length, demonstrating the repository has a stricter parallel rule.
+
+**Fix specification:** Define the exact supported managed-zone name grammar, then apply one canonical validator before any filesystem or state mutation. Enforce DNS wire limits and empty-label rules; decide and test whether underscores, leading/trailing hyphens, escaped octets, IDNA A-labels, trailing root dots, and the root zone are supported rather than changing them accidentally. Continue the existing path-separator/traversal defense. Preserve canonical collision rejection, existing valid ASCII zone spellings, output/key filename conventions, config schema, and backward handling of already persisted valid names.
+
+**Verification:** Add shared config/CLI tables at 63/64-byte label and 255/256-byte wire boundaries, leading/trailing hyphens, empty labels, underscore service-style labels, case/trailing dot, IDNA, escaped characters, and root. Assert invalid names fail before key, output, config-edit, or state files change, and every name accepted by config is also accepted by state validation and the DNS parser. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-030 — Negative per-zone key lifetimes silently mean “inherit”
+
+**Severity:** Low
+
+**Location:** `signer/internal/config/config.go:188-196`, type `ZoneConfig`; `signer/internal/config/config.go:485-509` and `signer/internal/config/config.go:558-587`, method `Config.Validate`; `signer/internal/config/config.go:657-670`, methods `GetZoneKSKLifetime` and `GetZoneZSKLifetime`
+
+**Problem:** Global key lifetimes must be positive, but zone-specific overrides are not validated. The getters apply an override only when it is greater than zero, so a negative configured value silently becomes the global default. Zero has a legitimate “unset/inherit” meaning; negative values almost certainly indicate a typo and should not be indistinguishable from unset in a security-timing setting.
+
+**Evidence:** `ZoneConfig` exposes both duration overrides. `Config.Validate` checks the two global values but its per-zone loop checks only name, path, registrar, algorithm, and serial policy. The getters use `zone.KSKLifetime.Duration > 0` and `zone.ZSKLifetime.Duration > 0`; all non-positive values fall through to the global value without a warning or error.
+
+**Fix specification:** Preserve zero as the backward-compatible inherit sentinel and reject every negative per-zone KSK/ZSK lifetime with a zone-qualified configuration error. Apply any operational upper/lower bounds chosen for global lifetimes equally to nonzero per-zone values. Do not change existing positive overrides, getter APIs, TOML keys, or the meaning of omitted/zero values.
+
+**Verification:** Add per-zone tables for omitted, zero, negative, and positive lifetimes for both roles. Assert omitted/zero inherit, negative fails configuration loading, and positive overrides. Include reload and config-edit validation so an invalid override cannot partially replace a live daemon snapshot. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-031 — `resign` and `import` exit successfully after deployment-hook failure
+
+**Severity:** Low
+
+**Location:** `signer/main.go:419-447`, function `runPostSignHook`; `signer/main.go:835-877`, function `runResign`; `signer/main.go:1613-1815`, function `runImport`; compare `signer/main.go:1129-1138` and other rollover callers
+
+**Problem:** `runPostSignHook` returns false specifically so callers can report that the signed generation was not deployed, but `resign` and `import` discard it and return nil. `resign` then prints “re-signed successfully”; `import` prints its success block before the hook even runs. Automation using exit status therefore treats a pending/failed deployment as complete, unlike the `sign` command's hook error behavior and rollover commands that withhold downstream DS automation.
+
+**Evidence:** `runPostSignHook` records a deployment operation error and returns false on hook failure. `runResign` assigns its result to `_` at line 872 and returns nil. `runImport` does the same at line 1813 after printing success. Other mutation paths capture `hookOK` and avoid registrar progression; the all-zones `sign` path returns its hook error.
+
+**Fix specification:** Establish one documented CLI contract for a committed signing/import followed by failed deployment. `resign` and `import` should return a distinct non-nil error (or an explicitly documented partial-success exit code) after preserving all committed key/config/state/output files and the pending-publication marker; they must not roll back a valid signed generation merely because deployment failed. Print wording that distinguishes “signed/imported” from “confirmed served” and gives the retry path. Preserve hook environment/coalescing, on-disk transaction semantics, daemon retries, and command arguments/output paths.
+
+**Verification:** Run each command with a successful sign/import and a failing hook. Assert files/state remain committed and pending, the deployment error is persisted, the process status is nonzero, and stdout/stderr does not claim unqualified success. Repeat with a successful hook and no configured hook to retain existing successful exits. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-032 — Enabled signer integrations are not fully validated at startup
+
+**Severity:** Low
+
+**Location:** `signer/internal/config/config.go:409-616`, method `Config.Validate`; `signer/internal/registrar/registrar_dynadot.go:62-113`, function `NewDynadotClient`; `signer/heartbeat.go:42-68` and `signer/heartbeat.go:133-202`, heartbeat construction/start
+
+**Problem:** The signer accepts an enabled registrar without credentials and an enabled heartbeat with an empty URL/API key/app or non-positive interval. Those conditions are discovered only when a command constructs the registrar or after the daemon has started heartbeat work. The registrar then fails after the source-of-truth signing operation, and heartbeat monitoring may continuously fail while the daemon logs itself as started. This is inconsistent with the validator module, which rejects incomplete enabled-heartbeat configuration.
+
+**Evidence:** `Config.Validate` checks registrar timeout/digest/zone binding but not enabled adapter credentials. `NewDynadotClient` later rejects an empty key or secret. Signer validation only checks heartbeat scheme when a nonempty URL exists; it does not require URL, key, app, or interval. `HeartbeatClient.Start` announces the configured app/interval and runs even though `Send` can fail to build the empty URL request; its loop silently replaces non-positive/overflowed intervals with five minutes.
+
+**Fix specification:** When an integration is enabled, validate all fields required for it to function before daemon startup or any signing mutation: registrar key/secret and endpoint invariants; heartbeat URL, API key, app, and a checked positive interval. Trim/normalize exactly once and never echo secret values in errors. Keep disabled integrations permissive, preserve defaults where they are explicitly documented, and do not change credential storage, config keys, adapter interfaces, or heartbeat payloads. Endpoint transport/redirect hardening remains covered by RDAYBLUEX-014.
+
+**Verification:** Add config-load matrices for enabled/disabled integrations with each required field missing, whitespace-only secrets, invalid intervals, valid defaults, and valid complete settings. Assert enabled invalid cases fail before daemon listeners/workers or signer mutations start and that errors identify only the field, never its value. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-033 — Boolean existence checks fail open in key rollback and backup naming
+
+**Severity:** Low — **Needs investigation**
+
+**Location:** `signer/internal/signer/keys.go:305-315`, function `uniqueBackupBase`; `signer/internal/signer/keys.go:580-584`, function `FileExists`; `signer/internal/signer/keytx.go:113-128`, function `setAside`; `signer/main.go:483-535`, functions `keyPairAbsent` and `unwindAdd`
+
+**Problem:** `FileExists` maps every `os.Stat` error to “absent.” Callers use that boolean for decisions that are safe only after a confirmed `ENOENT`: selecting a supposedly unused backup name, renaming an unusable private key to that name, and deciding that failed `add` rollback may delete live key filenames. A transient I/O error, permission/ACL anomaly, symlink loop, or other non-`ENOENT` failure can therefore make preservation logic proceed as if data did not exist. On platforms where rename replaces an existing destination, `setAside` can overwrite the file it intended to preserve. The practical exploitability depends on which stat failures can coexist with later successful rename/remove in the deployment filesystems; that is the investigation item, not the fail-open logic itself.
+
+**Evidence:** `FileExists` is exactly `_, err := os.Stat(path); return err == nil`. `uniqueBackupBase` and `setAside` treat false as a free destination, then eventually use atomic writes or `os.Rename` that can replace. `keyPairAbsent` returns true when both calls return false, and `unwindAdd` later removes those live names. In contrast, `RecoverKeyState`, `pairFiles`, and other key-transaction paths use `statExists`, which distinguishes `os.IsNotExist` from other errors and fails closed.
+
+**Fix specification:** Replace boolean existence queries in every preservation/destruction decision with `(exists, error)` semantics: only `ENOENT` means absent; all other errors abort the operation while leaving source and destination untouched. Allocate backup destinations with no-clobber creation/rename semantics where available, or reserve a unique destination atomically before moving data. `add` rollback must remove a key pair only when the transaction records that it created that exact generation, not merely from a preflight absence guess. Preserve exported `FileExists` behavior if tests/external callers require it, but do not use it at safety boundaries. Do not delete or rewrite existing backup/key artifacts during migration.
+
+**Verification:** Inject `EACCES`, `EIO`, symlink-loop, and transient-stat errors separately into source/destination checks, followed by a would-succeed rename/remove seam. Assert no existing key or backup is overwritten/deleted and the operation returns the stat error. Add a destination race/no-clobber test and a failed-add test proving only transaction-created key IDs are removed. Run on Linux, macOS, and FreeBSD under `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-034 — HTTP body limits do not reject responses larger than the advertised maximum
+
+**Severity:** Low
+
+**Location:** `validator/internal/dns/anchors.go:214-252`, function `LoadAnchorsFromURL`; `validator/internal/rdap/client.go:15-17` and `validator/internal/rdap/client.go:71-83`, RDAP response loading; `signer/internal/registrar/registrar_dynadot.go:268-291`, registrar response loading
+
+**Problem:** Each loader reads through `io.LimitReader(limit)` but never reads `limit+1` or otherwise detects truncation. Memory remains bounded, but a response larger than the stated maximum is accepted whenever its first exactly-limited bytes form valid JSON (for example a valid object padded to end exactly at the boundary, followed by ignored bytes). That defeats the intended “oversized endpoint is rejected” contract and can make diagnostics or trust-source provenance claim a malformed upstream response loaded successfully. Anchor authenticity remains protected by binary pins, so the impact is robustness rather than a new root of trust.
+
+**Evidence:** Anchor loading reads exactly `1<<20`, RDAP reads `maxRDAPResponseBytes`, and registrar reads `1<<20`; each immediately unmarshals the returned prefix. None checks whether one more response byte exists. Existing comments describe oversized responses as hostile and the limit as protection, but the implementation is a truncation cap only.
+
+**Fix specification:** Read at most `limit+1`, reject when the byte count exceeds `limit`, and unmarshal only a confirmed complete body. Use a shared bounded-read helper if practical, with field/source-specific error context and no body contents that may contain secrets. Keep the current limits, timeouts, valid response parsing, anchor pin requirement, and registrar uncertain-dispatch classification; a registrar oversize response occurs after dispatch and must remain an uncertain outcome for destructive recovery logic.
+
+**Verification:** For all three clients, serve valid JSON whose closing byte is at the limit followed by one extra byte and assert an explicit oversized-response error. Test exactly-at-limit valid content, limit-minus-one, large non-JSON content, and short-read errors. For a destructive registrar call, assert oversize is still wrapped as dispatched and triggers the existing reconciliation path. Run `go test -race ./...` in both modules.
+
+### RDAYBLUEX-035 — Remote health checks perform unthrottled filesystem mutations
+
+**Severity:** Low
+
+**Location:** `signer/internal/config/config.go:180-186` and `signer/internal/config/config.go:604-613`, remote health configuration; `signer/health.go:51-119` and `signer/health.go:149-186`, health handlers; `signer/health.go:202-226`, function `checkDirWritable`
+
+**Problem:** Every detailed health request creates and deletes temporary files in the output, data, and keys directories; every simple health request does so in output and data. When `health.allow_remote` intentionally exposes the unauthenticated listener, any reachable client can drive sustained write/journal/inode churn on the same filesystems used for state, keys, and signed output. There is no rate limit, result cache, or single-flight check. Even on loopback, aggressive orchestrator probes multiply disk writes and can contend with signing.
+
+**Evidence:** Both handlers call `checkDirWritable` on every request. That function uses `os.CreateTemp` and `os.Remove`; the detailed route calls it three times and the simple route twice. The configuration permits non-loopback binding with `allow_remote = true`, and these health handlers have no request throttling.
+
+**Fix specification:** Retain a real effective-permission write probe, but bound its frequency and concurrency: single-flight the check and cache its result for a short documented interval shorter than operational alert tolerances. Invalidate/recompute on reload or a write failure from real signing/state operations. Consider a hard request rate limit when remote exposure is allowed. Preserve endpoint paths, status/body contracts, ACL-sensitive checking (do not replace it solely with mode-bit inspection), and immediate reporting of known state/signing-loop failures.
+
+**Verification:** Issue hundreds of concurrent health requests with instrumented filesystem calls and assert at most one probe set occurs per cache interval while every caller gets a consistent result. Change permissions after expiry and assert the next probe reports unhealthy. Test reload invalidation, real write-failure invalidation, remote mode, and the current loopback default. Run `go test -race ./...` in `signer`.
+
+## Summary by severity
+
+| ID | Severity | Finding |
+|---|---|---|
+| RDAYBLUEX-001 | High | First unauthenticated parent response determines DS result |
+| RDAYBLUEX-002 | High | Leaf selection promotes unverified denial/DNAME paths |
+| RDAYBLUEX-003 | High | Publication and rollover gates accept partial delegation coverage |
+| RDAYBLUEX-004 | High | `data_dir` reload moves work outside the lifetime lock |
+| RDAYBLUEX-005 | High | Old-generation hook completion mutates new-generation state |
+| RDAYBLUEX-006 | High | Hooks can deploy output whose state was not durably published |
+| RDAYBLUEX-007 | High | Registrar automation builds the wrong final DS set |
+| RDAYBLUEX-008 | High | Old-DS absence ignores colliding/unsupported DS records |
+| RDAYBLUEX-013 | High | Configured hook overrides explicit publication modes |
+| RDAYBLUEX-014 | High | Registrar credentials can cross cleartext/redirect boundaries |
+| RDAYBLUEX-009 | Medium | SSE flush failures are invisible |
+| RDAYBLUEX-010 | Medium | One request can create unbounded DNS fan-out |
+| RDAYBLUEX-011 | Medium | Packaged validator has no durable offline anchor source |
+| RDAYBLUEX-012 | Medium | Malformed environment values silently fall back |
+| RDAYBLUEX-015 | Medium | Signature times can wrap and evade self-verification |
+| RDAYBLUEX-016 | Medium | Same-size, preserved-mtime changes remain unsigned |
+| RDAYBLUEX-017 | Medium | Zone input has no byte/record bound |
+| RDAYBLUEX-018 | Medium | Hook processes overlap without a process-wide bound |
+| RDAYBLUEX-019 | Medium | State merge can erase same-generation CLI mutations |
+| RDAYBLUEX-020 | Medium | RDAP URL/redirects provide blind HTTP egress |
+| RDAYBLUEX-021 | Medium | Refresh window can be shorter than polling interval |
+| RDAYBLUEX-022 | Medium | IPv6 site-local destinations bypass public-only egress |
+| RDAYBLUEX-023 | Medium | Integer duration conversion can overflow and panic |
+| RDAYBLUEX-024 | Medium | Parent-DS TTL narrowing can collapse retirement delay |
+| RDAYBLUEX-025 | Low | Validation cache crosses daemon generations and retains churn |
+| RDAYBLUEX-026 | Low | Cold per-zone validation returns `200 null` |
+| RDAYBLUEX-027 | Low | Unknown mode silently selects extended validation |
+| RDAYBLUEX-028 | Low | RDAP DS fields narrow/wrap without validation |
+| RDAYBLUEX-029 | Low | Managed zone names are not fully DNS-validated |
+| RDAYBLUEX-030 | Low | Negative per-zone lifetimes silently inherit defaults |
+| RDAYBLUEX-031 | Low | `resign`/`import` succeed after deployment failure |
+| RDAYBLUEX-032 | Low | Enabled integrations are validated only when first used |
+| RDAYBLUEX-033 | Low | Key existence checks fail open on `Stat` errors |
+| RDAYBLUEX-034 | Low | HTTP body caps accept some oversized responses |
+| RDAYBLUEX-035 | Low | Health checks cause unthrottled filesystem writes |
+
+| Severity | Count |
+|---|---:|
+| Critical | 0 |
+| High | 10 |
+| Medium | 14 |
+| Low | 11 |
+| **Total** | **35** |
+
+## Suggested fix order and dependencies
+
+1. **Make state and publication transitions transactional:** RDAYBLUEX-019 first (explicit revisions/merge semantics), then RDAYBLUEX-013 (mode ownership), RDAYBLUEX-006 (save-before-deploy), RDAYBLUEX-005 (generation-bound completion), and RDAYBLUEX-018 (bounded single-flight dispatch). RDAYBLUEX-025 should reuse the same daemon generation token. These changes touch the same state/hook lifecycle and should land together or behind compatibility tests.
+2. **Correct DS lifecycle gates before further registrar automation:** RDAYBLUEX-003 establishes trustworthy all-server observations; then fix RDAYBLUEX-007 and RDAYBLUEX-008 together so phase-correct desired sets and absence semantics agree. Apply RDAYBLUEX-024 before exercising forced completion. RDAYBLUEX-031 can then align CLI partial-success reporting with the corrected publication model.
+3. **Repair validator candidate authentication:** implement RDAYBLUEX-001 and RDAYBLUEX-002 as one authentication-aware multi-server selection design. Their candidate classifier should reuse the existing positive/denial/DNAME verification paths rather than introduce a second crypto implementation. Keep RDAYBLUEX-009 in the same integration test pass so transport cancellation cannot hide the corrected result.
+4. **Close credential and outbound-network boundaries:** fix RDAYBLUEX-014 first for credential-bearing registrar requests. Fix RDAYBLUEX-022's shared IP classification next, then use that classification at the RDAP dial boundary for RDAYBLUEX-020. RDAYBLUEX-028 and RDAYBLUEX-034 finish validation of data returned by those endpoints. RDAYBLUEX-032 should enforce the resulting endpoint requirements at startup.
+5. **Bound attacker/operator-controlled work:** land RDAYBLUEX-017 before RDAYBLUEX-016 so content hashing never reintroduces unbounded reads. Then address RDAYBLUEX-010's DNS graph/query/goroutine budgets, RDAYBLUEX-023's checked duration conversion, and RDAYBLUEX-035's filesystem-probe single-flight/cache. RDAYBLUEX-011 belongs here because anchor size/durability rules should match the bounded loaders.
+6. **Make signing time policy internally consistent:** fix RDAYBLUEX-015 first so state records actual verified RRSIG expirations; then RDAYBLUEX-021 can safely schedule refresh from those values. Apply RDAYBLUEX-030 to all key-lifetime bounds at the same config boundary.
+7. **Finish fail-closed input and file handling:** RDAYBLUEX-029 before any key/path derivation changes, followed by RDAYBLUEX-033's no-clobber/stat-error work. RDAYBLUEX-012 should be fixed alongside RDAYBLUEX-023 so every typed environment/config input follows the same reject-invalid policy.
+8. **Normalize remaining API contracts:** RDAYBLUEX-026 and RDAYBLUEX-027 are independent, low-risk handler changes. Verify them together with RDAYBLUEX-009 because all affect public response/error semantics.
