@@ -368,10 +368,71 @@ func ValidateRootAnchorsCachePath(cachePath, anchorsPath string) error {
 	if !filepath.IsAbs(cachePath) {
 		return fmt.Errorf("root_anchors_cache_path must be an absolute path (got %q)", cachePath)
 	}
-	if anchorsPath != "" && filepath.Clean(cachePath) == filepath.Clean(anchorsPath) {
-		return fmt.Errorf("root_anchors_cache_path must differ from root_anchors_path (%q): the operator's anchor file is never written by the service", anchorsPath)
+	if anchorsPath != "" {
+		same, err := sameFilesystemPath(cachePath, anchorsPath)
+		if err != nil {
+			return fmt.Errorf("comparing root_anchors_cache_path with root_anchors_path: %w", err)
+		}
+		if same {
+			return fmt.Errorf("root_anchors_cache_path must differ from root_anchors_path (%q): the operator's anchor file is never written by the service", anchorsPath)
+		}
 	}
 	return nil
+}
+
+// sameFilesystemPath compares path identities even when the final file does
+// not exist yet. It resolves the longest existing parent and appends the
+// missing suffix, so two spellings through a directory symlink cannot make
+// the writable cache alias the operator-owned anchor file.
+func sameFilesystemPath(a, b string) (bool, error) {
+	resolve := func(path string) (string, error) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		cur := filepath.Clean(abs)
+		var missing []string
+		for {
+			resolved, err := filepath.EvalSymlinks(cur)
+			if err == nil {
+				parts := append([]string{resolved}, missing...)
+				return filepath.Join(parts...), nil
+			}
+			if !os.IsNotExist(err) {
+				return "", err
+			}
+			parent := filepath.Dir(cur)
+			if parent == cur {
+				return "", err
+			}
+			missing = append([]string{filepath.Base(cur)}, missing...)
+			cur = parent
+		}
+	}
+
+	ca, err := resolve(a)
+	if err != nil {
+		return false, err
+	}
+	cb, err := resolve(b)
+	if err != nil {
+		return false, err
+	}
+	if ca == cb {
+		return true, nil
+	}
+	ia, ea := os.Stat(a)
+	ib, eb := os.Stat(b)
+	if ea == nil && eb == nil {
+		return os.SameFile(ia, ib), nil
+	}
+	if ea != nil && !os.IsNotExist(ea) {
+		return false, ea
+	}
+	if eb != nil && !os.IsNotExist(eb) {
+		return false, eb
+	}
+	return false, nil
 }
 
 // checkedDuration converts an integer count of unit into a time.Duration,
