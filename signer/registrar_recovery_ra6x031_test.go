@@ -104,6 +104,7 @@ enabled = true
 api_key = "test-key"
 api_secret = "test-secret"
 base_url = %q
+allow_insecure_base_url = true
 timeout = "5s"
 
 [zones.%q]

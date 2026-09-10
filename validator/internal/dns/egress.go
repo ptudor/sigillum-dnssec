@@ -3,6 +3,7 @@ package dns
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 )
 
@@ -12,13 +13,21 @@ import (
 // so without a policy a public validator could be steered at loopback,
 // link-local or private DNS services reachable only from its own network.
 //
-// The default policy for the public service is public-only: loopback,
-// link-local, private (RFC 1918, ULA, CGNAT), unspecified, multicast and
-// reserved destinations are refused, IPv4-mapped IPv6 addresses are judged
-// as their IPv4 form, and the check runs at the one dial boundary every
-// query — UDP and its TCP retry — passes through. Trusted destinations (the
-// operator's configured recursive resolver) and an explicit allowlist of
-// CIDRs for private diagnostic deployments are exempt.
+// The default policy for the public service is public-only. Classification
+// is an explicit globally-reachable policy (RDAYBLUEX-022), not a short
+// denylist: an address is public only when it is global unicast in the
+// sense of the Go standard library (not unspecified, loopback, multicast or
+// link-local), not private (RFC 1918, ULA) and not in any special-purpose
+// range of the IANA IPv4/IPv6 registries that is not globally reachable
+// (CGNAT, documentation, benchmarking, deprecated site-local, ORCHID, the
+// local-use translation prefix, …). Translated and embedded forms are judged
+// by what they carry: IPv4-mapped IPv6 as the IPv4 address, 6to4 by its
+// embedded IPv4 address, and NAT64/Teredo refused as a whole because their
+// reachability cannot be decided from the address. The check runs at the
+// one dial boundary every query — UDP and its TCP retry — passes through.
+// Trusted destinations (the operator's configured recursive resolver) and
+// an explicit allowlist of CIDRs for private diagnostic deployments are
+// exempt.
 type EgressPolicy struct {
 	// AllowPrivate disables the non-public check entirely (a deliberately
 	// internal deployment).
@@ -75,57 +84,95 @@ func canonicalHost(server string) string {
 	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
-// reservedV4 are IPv4 ranges that are never public unicast destinations.
-var reservedV4 = mustCIDRs(
-	"0.0.0.0/8",      // this network
-	"10.0.0.0/8",     // private
-	"100.64.0.0/10",  // CGNAT
-	"127.0.0.0/8",    // loopback
-	"169.254.0.0/16", // link-local
-	"172.16.0.0/12",  // private
-	"192.0.0.0/24",   // IETF protocol assignments
-	"192.168.0.0/16", // private
-	"198.18.0.0/15",  // benchmarking
-	"224.0.0.0/4",    // multicast
-	"240.0.0.0/4",    // reserved, includes broadcast
+// Special-purpose IPv4 ranges that are not globally reachable (IANA IPv4
+// Special-Purpose Address Registry, RFC 6890 and successors), beyond what
+// netip's IsGlobalUnicast/IsPrivate already exclude.
+var reservedV4 = mustPrefixes(
+	"0.0.0.0/8",          // "this network"
+	"10.0.0.0/8",         // private (RFC 1918)
+	"100.64.0.0/10",      // shared address space / CGNAT (RFC 6598)
+	"127.0.0.0/8",        // loopback
+	"169.254.0.0/16",     // link-local
+	"172.16.0.0/12",      // private (RFC 1918)
+	"192.0.0.0/24",       // IETF protocol assignments (incl. DS-Lite 192.0.0.0/29)
+	"192.0.2.0/24",       // documentation TEST-NET-1
+	"192.88.99.0/24",     // deprecated 6to4 relay anycast (RFC 7526)
+	"192.168.0.0/16",     // private (RFC 1918)
+	"198.18.0.0/15",      // benchmarking (RFC 2544)
+	"198.51.100.0/24",    // documentation TEST-NET-2
+	"203.0.113.0/24",     // documentation TEST-NET-3
+	"224.0.0.0/4",        // multicast
+	"240.0.0.0/4",        // reserved (RFC 1112), includes limited broadcast
+	"255.255.255.255/32", // limited broadcast
 )
 
-// reservedV6 are IPv6 ranges that are never public unicast destinations.
-var reservedV6 = mustCIDRs(
-	"::/128",        // unspecified
-	"::1/128",       // loopback
-	"::ffff:0:0/96", // IPv4-mapped (judged as IPv4 above; refused if it gets here)
-	"64:ff9b::/96",  // NAT64 well-known prefix (maps to IPv4; refused conservatively)
-	"100::/64",      // discard-only
-	"2001:db8::/32", // documentation
-	"fc00::/7",      // unique local
-	"fe80::/10",     // link-local
-	"ff00::/8",      // multicast
+// Special-purpose IPv6 ranges that are not globally reachable (IANA IPv6
+// Special-Purpose Address Registry), beyond netip's own exclusions.
+var reservedV6 = mustPrefixes(
+	"::/128",         // unspecified
+	"::1/128",        // loopback
+	"::ffff:0:0/96",  // IPv4-mapped (judged as IPv4 above; refused if it gets here)
+	"64:ff9b::/96",   // NAT64 well-known prefix (reachability undecidable; refused)
+	"64:ff9b:1::/48", // local-use IPv4/IPv6 translation (RFC 8215)
+	"100::/64",       // discard-only (RFC 6666)
+	"2001::/32",      // Teredo (reachability undecidable; refused)
+	"2001:2::/48",    // benchmarking (RFC 5180)
+	"2001:10::/28",   // ORCHID (deprecated, RFC 4843)
+	"2001:20::/28",   // ORCHIDv2 (RFC 7343, not routable)
+	"2001:db8::/32",  // documentation
+	"3fff::/20",      // documentation (RFC 9637)
+	"5f00::/16",      // segment routing SIDs (RFC 9602, not globally reachable)
+	"fc00::/7",       // unique local
+	"fe80::/10",      // link-local
+	"fec0::/10",      // deprecated site-local (RFC 3879)
+	"ff00::/8",       // multicast
 )
 
-func mustCIDRs(cidrs ...string) []*net.IPNet {
-	nets, err := ParseEgressAllowlist(cidrs)
-	if err != nil {
-		panic(err)
+// sixToFourPrefix carries an embedded IPv4 address (RFC 3056) that decides
+// the destination's reachability.
+var sixToFourPrefix = netip.MustParsePrefix("2002::/16")
+
+func mustPrefixes(cidrs ...string) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(cidrs))
+	for _, c := range cidrs {
+		out = append(out, netip.MustParsePrefix(c))
 	}
-	return nets
+	return out
 }
 
-// NonPublic reports whether ip is outside public unicast space.
+// NonPublic reports whether ip is outside globally reachable unicast space.
+// Embedded and translated forms are canonicalized first: an IPv4-mapped IPv6
+// address is judged as its IPv4 address and a 6to4 address by the IPv4
+// address it embeds. Anything that is not global unicast, is private, or
+// falls in a non-globally-reachable special-purpose range is non-public;
+// an unparseable address is non-public too.
 func NonPublic(ip net.IP) bool {
-	if ip == nil {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return true
 	}
-	if v4 := ip.To4(); v4 != nil {
-		for _, n := range reservedV4 {
-			if n.Contains(v4) {
+	return nonPublicAddr(addr.Unmap())
+}
+
+func nonPublicAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return true
+	}
+	if addr.Is4() {
+		for _, p := range reservedV4 {
+			if p.Contains(addr) {
 				return true
 			}
 		}
 		return false
 	}
-	for _, n := range reservedV6 {
-		if n.Contains(ip) {
+	if sixToFourPrefix.Contains(addr) {
+		b := addr.As16()
+		embedded := netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]})
+		return nonPublicAddr(embedded)
+	}
+	for _, p := range reservedV6 {
+		if p.Contains(addr) {
 			return true
 		}
 	}
@@ -158,4 +205,13 @@ func (p *EgressPolicy) Permit(server string) error {
 		}
 	}
 	return fmt.Errorf("egress policy: refusing to query %s: non-public destination (loopback, link-local, private or reserved address); allow it with private_destination_allowlist if this deployment should reach it", ip)
+}
+
+// PermitIP is Permit for an already-parsed address (the HTTP dial boundary
+// of the RDAP client uses it after resolving a hostname, RDAYBLUEX-020).
+func (p *EgressPolicy) PermitIP(ip net.IP) error {
+	if ip == nil {
+		return fmt.Errorf("egress policy: refusing to dial an unparseable address")
+	}
+	return p.Permit(ip.String())
 }

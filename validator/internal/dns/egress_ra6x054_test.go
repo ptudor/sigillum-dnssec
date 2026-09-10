@@ -13,7 +13,7 @@ import (
 
 func TestEgressPolicy_Permit(t *testing.T) {
 	p := PublicOnlyPolicy("127.0.0.1", "resolver.internal")
-	allowed := []string{"198.51.100.7", "2620:fe::fe", "[2001:4860:4860::8888]:53", "8.8.8.8:53",
+	allowed := []string{"1.1.1.1", "2620:fe::fe", "[2001:4860:4860::8888]:53", "8.8.8.8:53",
 		"127.0.0.1", "127.0.0.1:5353", "resolver.internal"} // the last three are trusted
 	for _, a := range allowed {
 		if err := p.Permit(a); err != nil {

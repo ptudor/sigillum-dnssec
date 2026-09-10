@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -39,8 +40,12 @@ type Config struct {
 	MaxConcurrentValidations int    `toml:"max_concurrent_validations"` // global cap on in-flight validations (R-086)
 	RecursiveResolver        string `toml:"recursive_resolver"`
 
-	// RDAP settings
-	RDAPBaseURL string `toml:"rdap_base_url"`
+	// RDAP settings. The base URL must be an absolute https:// URL without
+	// userinfo, query or fragment (RDAYBLUEX-020); a plain http:// URL is
+	// accepted only for a loopback host and only with the explicit
+	// development override below (TOML-only, no environment fallback).
+	RDAPBaseURL               string `toml:"rdap_base_url"`
+	RDAPAllowInsecureLoopback bool   `toml:"rdap_allow_insecure_loopback"`
 
 	// Parsed durations
 	QueryTimeout time.Duration `toml:"-"`
@@ -436,6 +441,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("root_anchors_url must use https:// (got %q)", c.RootAnchorsURL)
 	}
 
+	// The RDAP base URL is a server-side egress target chosen by configuration
+	// (RDAYBLUEX-020): absolute, HTTPS, no userinfo/query/fragment, no
+	// ambiguous path. Cleartext is allowed only to a loopback host behind the
+	// explicit development override.
+	if err := ValidateRDAPBaseURL(c.RDAPBaseURL, c.RDAPAllowInsecureLoopback); err != nil {
+		return err
+	}
+
 	// R-047: if heartbeat monitoring is enabled, fail startup on a misconfiguration
 	// rather than silently disabling it (NewClient returns a disabled client for
 	// missing key/app) or leaking the API key in cleartext. Require a nonempty API
@@ -457,6 +470,52 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// ValidateRDAPBaseURL checks an RDAP base URL (RDAYBLUEX-020). Empty means
+// RDAP is disabled. Otherwise the URL must be absolute with an https scheme
+// (or http only for a loopback literal/localhost host when
+// allowInsecureLoopback is set), carry a host, and have no userinfo, query,
+// fragment or ".." path segment.
+func ValidateRDAPBaseURL(raw string, allowInsecureLoopback bool) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("rdap_base_url is not a valid URL: %w", err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("rdap_base_url must be an absolute URL with a host (got %q)", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("rdap_base_url must not carry userinfo")
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.RawFragment != "" {
+		return fmt.Errorf("rdap_base_url must not carry a query or fragment (got %q)", raw)
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == ".." || seg == "." {
+			return fmt.Errorf("rdap_base_url path must not contain %q segments (got %q)", seg, raw)
+		}
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		host := strings.ToLower(u.Hostname())
+		ip := net.ParseIP(host)
+		loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+		if !allowInsecureLoopback {
+			return fmt.Errorf("rdap_base_url must use https:// (got %q); a plain http:// URL is allowed only for a loopback host with rdap_allow_insecure_loopback = true", raw)
+		}
+		if !loopback {
+			return fmt.Errorf("rdap_allow_insecure_loopback permits http:// only for a loopback literal or localhost, not %q", u.Hostname())
+		}
+		return nil
+	default:
+		return fmt.Errorf("rdap_base_url scheme must be https (got %q)", u.Scheme)
+	}
 }
 
 // Helper functions for environment variable parsing

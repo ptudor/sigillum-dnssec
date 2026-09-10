@@ -370,9 +370,18 @@ func TestConfigValidation_HeartbeatHTTPS(t *testing.T) {
 		}
 	}
 
+	// An enabled heartbeat must also be complete (RDAYBLUEX-032); these
+	// subtests exercise only the URL scheme rule.
+	enable := func(cfg *config.Config) {
+		cfg.Heartbeat.Enabled = true
+		cfg.Heartbeat.APIKey = "hb-key"
+		cfg.Heartbeat.App = "signer"
+		cfg.Heartbeat.IntervalMinutes = 5
+	}
+
 	t.Run("HTTP heartbeat URL rejected by default", func(t *testing.T) {
 		cfg := base()
-		cfg.Heartbeat.Enabled = true
+		enable(cfg)
 		cfg.Heartbeat.URL = "http://example.com/heartbeat/"
 		err := cfg.Validate()
 		if err == nil {
@@ -385,7 +394,7 @@ func TestConfigValidation_HeartbeatHTTPS(t *testing.T) {
 
 	t.Run("HTTP heartbeat URL allowed with AllowInsecure", func(t *testing.T) {
 		cfg := base()
-		cfg.Heartbeat.Enabled = true
+		enable(cfg)
 		cfg.Heartbeat.URL = "http://example.com/heartbeat/"
 		cfg.Heartbeat.AllowInsecure = true
 		if err := cfg.Validate(); err != nil {
@@ -395,7 +404,7 @@ func TestConfigValidation_HeartbeatHTTPS(t *testing.T) {
 
 	t.Run("HTTPS heartbeat URL accepted by default", func(t *testing.T) {
 		cfg := base()
-		cfg.Heartbeat.Enabled = true
+		enable(cfg)
 		cfg.Heartbeat.URL = "https://example.com/heartbeat/"
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("HTTPS URL should be accepted, got: %v", err)

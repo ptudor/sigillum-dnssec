@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -235,8 +234,9 @@ func LoadAnchorsFromURL(url string) (*RootAnchors, error) {
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// Limit response body to 1MB to prevent memory exhaustion
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// Bound the response body to 1 MiB and REJECT anything larger rather
+	// than parsing its prefix (RDAYBLUEX-034).
+	data, err := ReadBodyLimited(resp.Body, 1<<20, "anchors")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}

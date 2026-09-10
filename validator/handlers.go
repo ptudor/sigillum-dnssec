@@ -56,9 +56,14 @@ func (h *Handlers) SetActivityObserver(o activityObserver) { h.activity = o }
 
 // NewHandlers creates new HTTP handlers
 func NewHandlers(anchorsStore *AnchorsStore, config *config.Config) *Handlers {
+	egress := egressPolicyFromConfig(config)
 	var rdapClient *rdap.Client
 	if config.RDAPBaseURL != "" {
 		rdapClient = rdap.NewClient(config.RDAPBaseURL, config.QueryTimeout)
+		// The RDAP GET is server-side egress steered by configuration: the
+		// same public-only destination policy applies at its dial boundary
+		// (RDAYBLUEX-020).
+		rdapClient.SetEgressPolicy(egress)
 	}
 	max := config.MaxConcurrentValidations
 	if max <= 0 {
@@ -69,7 +74,7 @@ func NewHandlers(anchorsStore *AnchorsStore, config *config.Config) *Handlers {
 		config:        config,
 		rdapClient:    rdapClient,
 		validationSem: make(chan struct{}, max),
-		egress:        egressPolicyFromConfig(config),
+		egress:        egress,
 	}
 }
 
