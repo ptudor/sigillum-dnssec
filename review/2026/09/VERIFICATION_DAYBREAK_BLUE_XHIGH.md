@@ -61,12 +61,14 @@ The verification compared each finding's problem, fix specification, verificatio
 - `f9a7d00` requires successful output publication before a legacy source digest becomes authoritative (RDAYBLUEX-016).
 - `2a87fdf` updates an older change-detection fixture to model the now-required digest metadata; this was the only regression found by the final full suite after the production correction.
 
-## Tests and remaining limitation
+## Tests and packaging
 
 - `go vet ./...` passed in both Go modules.
 - `go mod verify` passed in both Go modules.
 - `go test -race -count=1 ./...` passed in both Go modules at the verified revision.
 - Focused race-enabled tests for the newly corrected mixed-case signing, startup/reload ordering, health invalidation, anchor aliases, and legacy digest publication passed repeatedly.
 - `gofmt -l` over both modules and `git diff --check` were clean.
+- A pinned GoReleaser v2.18.1 container using Go 1.27.1 built every release target from the exact `72534be` Git bundle; every artifact matched `dist/checksums.txt`.
+- `scripts/test-packages.sh` passed with those packages in Debian 13 and Fedora 43 containers on a Linux amd64 Docker host under enforcing SELinux. It verified installation, accounts, permissions, service units, configuration retention on reinstall, no unintended service activation, CLI entry points, and state preservation after removal.
 
-The package install/reinstall/removal exercise mentioned as not run in the fix log could not run here: its script requires Docker on a Linux amd64 host, while this verifier is Darwin arm64 and Docker is absent. The package/service/config changes and test script were inspected, and the anchor behavior is exercised through unit and process-level tests. CI retains the Linux package job. This is a verification-environment limitation, not a `SKIPPED` finding.
+The package exercise originally recorded as not run in the fix log is therefore closed. There are no skipped findings or outstanding verification limitations.
