@@ -192,7 +192,13 @@ type RolloverState struct {
 	DSObservedAt   time.Time `json:"ds_observed_at,omitempty"`
 	ParentDSTTL    uint32    `json:"parent_ds_ttl,omitempty"`
 	OldDSRemovedAt time.Time `json:"old_ds_removed_at,omitempty"`
-	Action         string    `json:"action"` // Human-readable next step
+	// DSRemovalPushedAt records when registrar automation successfully
+	// replaced the parent's DS set with the new-only set for this rollover's
+	// old-DS-removal phase (RDAYBLUEX-007). Zero until then, so a failed or
+	// interrupted update is retried on a later cycle (or after a restart)
+	// and a successful one is never repeated.
+	DSRemovalPushedAt time.Time `json:"ds_removal_pushed_at,omitempty"`
+	Action            string    `json:"action"` // Human-readable next step
 }
 
 // ConfirmPublication records that the generation signed at signedAt is
@@ -420,6 +426,15 @@ func validateKeyState(role string, k *KeyState) error {
 // the new key. Anything else is ambiguous and must not be signed through.
 func validateRolloverState(z *ZoneState) error {
 	r := z.Rollover
+	// A persisted parent DS TTL above the 31-bit DNS TTL range cannot have
+	// been observed or configured: it is a wrapped or corrupt value and must
+	// not shorten (or absurdly lengthen) a retirement wait (RDAYBLUEX-024).
+	// Zero remains "unrecorded" and means the conservative default at the
+	// gates. Operator repair: set parent_ds_ttl in the record to the parent's
+	// real DS TTL in seconds.
+	if r.ParentDSTTL > maxDNSTTLSeconds {
+		return fmt.Errorf("rollover parent_ds_ttl %d exceeds the maximum DNS TTL (%d); the value is corrupt and must be repaired", r.ParentDSTTL, maxDNSTTLSeconds)
+	}
 	switch {
 	case r.Type == "ksk" && (r.State == KSKRolloverStateDSAddWait || r.State == KSKRolloverStateDSPropagation || r.State == KSKRolloverStateRetiring):
 		if r.OldKeyID == r.NewKeyID {
@@ -777,7 +792,7 @@ func rolloverStateEqual(a, b *RolloverState) bool {
 		a.OldAlgorithm == b.OldAlgorithm && a.NewAlgorithm == b.NewAlgorithm &&
 		a.Started.Equal(b.Started) && a.PhaseStarted.Equal(b.PhaseStarted) && a.PhaseFirstSigned.Equal(b.PhaseFirstSigned) &&
 		a.PhaseHorizon.Equal(b.PhaseHorizon) && a.DSObservedAt.Equal(b.DSObservedAt) && a.ParentDSTTL == b.ParentDSTTL &&
-		a.OldDSRemovedAt.Equal(b.OldDSRemovedAt) && a.Action == b.Action
+		a.OldDSRemovedAt.Equal(b.OldDSRemovedAt) && a.DSRemovalPushedAt.Equal(b.DSRemovalPushedAt) && a.Action == b.Action
 }
 
 func keysRolloverEqual(a, b *ZoneState) bool {
@@ -1184,3 +1199,6 @@ func (z *ZoneState) AddError(msg string) {
 func (z *ZoneState) ClearErrors() {
 	z.Errors = nil
 }
+
+// maxDNSTTLSeconds is the largest TTL DNS can express (RFC 2181 §8).
+const maxDNSTTLSeconds = uint32(1<<31 - 1)

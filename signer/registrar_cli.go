@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ptudor/sigillum-dnssec/signer/internal/registrar"
+	signerpkg "github.com/ptudor/sigillum-dnssec/signer/internal/signer"
 	statepkg "github.com/ptudor/sigillum-dnssec/signer/internal/state"
 
 	"github.com/miekg/dns"
@@ -323,32 +324,76 @@ func printJSON(v any) error {
 // — the signer's source-of-truth work (signing) already succeeded, and the
 // operator can retry via `registrar push`.
 func MaybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string, op string) {
+	_, _ = autoPublishDS(cfg, state, domain, op, true)
+}
+
+// dsAutoPublisher adapts the auto-publish logic to the rollover manager's
+// DSPublisher seam (RDAYBLUEX-007), so the daemon's and `sign`'s automatic
+// phase transitions can push the phase-correct DS set.
+type dsAutoPublisher struct {
+	cfg   *config.Config
+	state *statepkg.State
+}
+
+func (p dsAutoPublisher) PublishDS(domain, op string) (bool, error) {
+	return autoPublishDS(p.cfg, p.state, domain, op, false)
+}
+
+// autoPublishDS performs registrar DS automation for one event on a zone.
+// The desired set is always the phase-correct one (registrar.BuildDSSet):
+//
+//   - "add", "rollover_start": additive publish of the desired set.
+//   - "rollover_complete": the rollover entered its DS-propagation wait. A
+//     KSK rollover's desired set is now new-only and is installed with
+//     ReplaceDS (the old DS is removed); an algorithm rollover still retains
+//     both DS through this wait, so the set is (re)published additively and
+//     nothing is removed yet.
+//   - signerpkg.OpRolloverOldDSRemoval: an algorithm rollover entered its
+//     old-DS-removal wait; the new-only set is installed with ReplaceDS.
+//
+// published reports whether an update was performed (false: no registrar,
+// or auto_publish off). Failures are recorded as zone warnings (a zero-DS
+// emergency as an URGENT sticky warning) and returned; interactive callers
+// also get stdout/stderr messages.
+func autoPublishDS(cfg *config.Config, state *statepkg.State, domain, op string, interactive bool) (bool, error) {
+	warn := func(msg string) {
+		if interactive {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+		}
+		recordRegistrarWarning(state, domain, msg)
+	}
 	reg, err := registrar.RegistrarFor(cfg, domain)
 	if err != nil {
 		msg := fmt.Sprintf("registrar auto-publish failed: registrar lookup failed: %v", err)
-		fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
-		recordRegistrarWarning(state, domain, msg)
-		return
+		warn(msg)
+		return false, err
 	}
 	if reg == nil {
-		return
+		return false, nil
 	}
 	if !registrarAutoPublish(cfg, reg.Name()) {
-		fmt.Printf("Registrar %s is configured but auto_publish is off; run `sigillum-signer registrar push %s` to publish DS.\n", reg.Name(), domain)
-		return
+		if interactive {
+			fmt.Printf("Registrar %s is configured but auto_publish is off; run `sigillum-signer registrar push %s` to publish DS.\n", reg.Name(), domain)
+		}
+		return false, nil
 	}
 
 	want, err := registrar.BuildDSSet(cfg, state, domain)
 	if err != nil {
 		msg := fmt.Sprintf("registrar auto-publish failed: cannot build DS set: %v", err)
-		fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
-		recordRegistrarWarning(state, domain, msg)
-		return
+		warn(msg)
+		return false, err
 	}
 
 	ctx, cancel := registrarContext()
 	defer cancel()
 
+	zs := state.GetZone(domain)
+	var rollover *statepkg.RolloverState
+	if zs != nil {
+		rollover = zs.Rollover
+	}
+	replace := false
 	switch op {
 	case "add", "rollover_start":
 		// Additive publish. For `add`, this avoids the failure mode where a
@@ -359,21 +404,34 @@ func MaybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string
 		// or `... registrar clear` after verifying with `... registrar verify`.
 		// For `rollover_start`, additive is required so the old KSK's DS
 		// stays published throughout the rollover window.
-		slog.Info("[REGISTRAR] auto-publishing DS (additive)", "domain", domain, "registrar", reg.Name(), "op", op)
-		if err := reg.AddDS(ctx, domain, want); err != nil {
-			msg := fmt.Sprintf("registrar auto-publish failed: %v", err)
-			fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
-			recordRegistrarWarning(state, domain, msg)
-			return
-		}
 	case "rollover_complete":
-		// Rollover finalization: remove the old KSK's DS and leave only the
-		// new one. ReplaceDS is PUT-first internally, so a publish failure
-		// aborts before any destructive DELETE — except a transient failure of
-		// the post-DELETE restore, which strands the zone with zero DS at the
-		// parent (ErrRegistrarDSEmpty). Escalate that case to Error with
-		// remediation, since the zone is actively going bogus (R-004 + R-032).
-		slog.Info("[REGISTRAR] auto-publishing DS (replace)", "domain", domain, "registrar", reg.Name(), "op", op)
+		// The phase-correct set decides (RDAYBLUEX-007): new-only for a KSK
+		// rollover (replace), still both for an algorithm rollover (additive).
+		replace = !registrar.IncludesOldDS(rollover)
+	case signerpkg.OpRolloverOldDSRemoval:
+		replace = true
+	default:
+		err := fmt.Errorf("unknown auto-publish op %q", op)
+		if interactive {
+			fmt.Fprintf(os.Stderr, "warning: %s; skipping\n", err)
+		}
+		return false, err
+	}
+
+	if !replace {
+		slog.Info("[REGISTRAR] auto-publishing DS (additive)", "domain", domain, "registrar", reg.Name(), "op", op, "records", len(want))
+		if err := reg.AddDS(ctx, domain, want); err != nil {
+			warn(fmt.Sprintf("registrar auto-publish failed: %v", err))
+			return false, err
+		}
+	} else {
+		// Replace: install exactly the new-only set. ReplaceDS is PUT-first
+		// internally, so a publish failure aborts before any destructive
+		// DELETE — except a transient failure of the post-DELETE restore,
+		// which strands the zone with zero DS at the parent
+		// (ErrRegistrarDSEmpty). Escalate that case to Error with remediation,
+		// since the zone is actively going bogus (R-004 + R-032).
+		slog.Info("[REGISTRAR] auto-publishing DS (replace with the phase-correct set)", "domain", domain, "registrar", reg.Name(), "op", op, "records", len(want))
 		if err := reg.ReplaceDS(ctx, domain, want); err != nil {
 			if errors.Is(err, registrar.ErrRegistrarDSEmpty) {
 				slog.Error("[REGISTRAR] DS restore failed — parent left with ZERO DS; zone will go bogus until republished",
@@ -383,17 +441,16 @@ func MaybeAutoPublishDS(cfg *config.Config, state *statepkg.State, domain string
 				recordRegistrarWarning(state, domain,
 					fmt.Sprintf("URGENT: registrar left zone with ZERO DS at parent; run `sigillum-signer registrar push %s` immediately: %v", domain, err))
 			} else {
-				msg := fmt.Sprintf("registrar auto-publish failed: %v", err)
-				fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
-				recordRegistrarWarning(state, domain, msg)
+				warn(fmt.Sprintf("registrar auto-publish failed: %v", err))
 			}
-			return
+			return false, err
 		}
-	default:
-		fmt.Fprintf(os.Stderr, "warning: unknown auto-publish op %q; skipping\n", op)
-		return
 	}
-	fmt.Printf("DS records published at %s for %s.\n", reg.Name(), domain)
+	if interactive {
+		fmt.Printf("DS records published at %s for %s.\n", reg.Name(), domain)
+	}
+	slog.Info("[REGISTRAR] DS records published", "domain", domain, "registrar", reg.Name(), "op", op)
+	return true, nil
 }
 
 // registrarAutoPublish returns the auto_publish flag for the named adapter.

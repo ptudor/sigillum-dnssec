@@ -959,6 +959,8 @@ func (d *Daemon) runHealthServer(ln net.Listener) {
 func newRolloverManager(cfg *config.Config, state *statepkg.State) *signerpkg.RolloverManager {
 	rm := signerpkg.NewRolloverManager(cfg, state)
 	rm.SetParentDSProbe(validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration))
+	// Registrar DS automation at the automatic phase transitions (RDAYBLUEX-007).
+	rm.SetDSPublisher(dsAutoPublisher{cfg: cfg, state: state})
 	return rm
 }
 

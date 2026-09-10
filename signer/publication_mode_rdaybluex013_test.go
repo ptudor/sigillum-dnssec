@@ -241,6 +241,12 @@ func TestRDAYBLUEX013_Daemon_HookMode_Unchanged(t *testing.T) {
 	}
 }
 
+// servedByHook is runPostSignHook's "served" result for a zone.
+func servedByHook(cfg *config.Config, state *statepkg.State, domain string) bool {
+	served, _ := runPostSignHook(cfg, state, domain, cfg.Zones[domain].Path)
+	return served
+}
+
 // The CLI helper reports "served" by mode.
 func TestRDAYBLUEX013_CLI_RunPostSignHookByMode(t *testing.T) {
 	t.Run("immediate: failing hook records the error but does not block", func(t *testing.T) {
@@ -248,7 +254,7 @@ func TestRDAYBLUEX013_CLI_RunPostSignHookByMode(t *testing.T) {
 		if err := signerpkg.NewSigner(cfg, state).SignZone(domain); err != nil {
 			t.Fatal(err)
 		}
-		if !runPostSignHook(cfg, state, domain, cfg.Zones[domain].Path) {
+		if !servedByHook(cfg, state, domain) {
 			t.Fatal("immediate mode: the write is the publication; a failed hook must not report the zone as unpublished")
 		}
 		zs := state.GetZone(domain)
@@ -267,7 +273,7 @@ func TestRDAYBLUEX013_CLI_RunPostSignHookByMode(t *testing.T) {
 		if err := signerpkg.NewSigner(cfg, state).SignZone(domain); err != nil {
 			t.Fatal(err)
 		}
-		if runPostSignHook(cfg, state, domain, cfg.Zones[domain].Path) {
+		if servedByHook(cfg, state, domain) {
 			t.Fatal("probe mode: a successful hook must not report the zone as served while the probe fails")
 		}
 		zs := state.GetZone(domain)
@@ -278,7 +284,7 @@ func TestRDAYBLUEX013_CLI_RunPostSignHookByMode(t *testing.T) {
 			t.Fatalf("the probe must have run once, got %d", prober.calls)
 		}
 		prober.set(true)
-		if !runPostSignHook(cfg, state, domain, cfg.Zones[domain].Path) {
+		if !servedByHook(cfg, state, domain) {
 			t.Fatal("probe mode: the probe confirming must report the zone as served")
 		}
 		zs = state.GetZone(domain)
@@ -296,7 +302,7 @@ func TestRDAYBLUEX013_CLI_RunPostSignHookByMode(t *testing.T) {
 		if err := signerpkg.NewSigner(cfg, state).SignZone(domain); err != nil {
 			t.Fatal(err)
 		}
-		if !runPostSignHook(cfg, state, domain, cfg.Zones[domain].Path) {
+		if !servedByHook(cfg, state, domain) {
 			t.Fatal("probe mode: the probe is the authority even when the hook failed")
 		}
 		zs := state.GetZone(domain)
@@ -309,7 +315,7 @@ func TestRDAYBLUEX013_CLI_RunPostSignHookByMode(t *testing.T) {
 		if err := signerpkg.NewSigner(cfg, state).SignZone(domain); err != nil {
 			t.Fatal(err)
 		}
-		if !runPostSignHook(cfg, state, domain, cfg.Zones[domain].Path) || state.GetZone(domain).PendingPublication {
+		if !servedByHook(cfg, state, domain) || state.GetZone(domain).PendingPublication {
 			t.Fatal("hook mode: a successful hook confirms")
 		}
 		cfg.Hooks.PostSignCmd = []string{"/bin/sh", "-c", "exit 1"}
@@ -318,7 +324,7 @@ func TestRDAYBLUEX013_CLI_RunPostSignHookByMode(t *testing.T) {
 		if err := signerpkg.NewSigner(cfg, state).SignZone(domain); err != nil {
 			t.Fatal(err)
 		}
-		if runPostSignHook(cfg, state, domain, cfg.Zones[domain].Path) || !state.GetZone(domain).PendingPublication {
+		if servedByHook(cfg, state, domain) || !state.GetZone(domain).PendingPublication {
 			t.Fatal("hook mode: a failed hook leaves the zone pending")
 		}
 	})

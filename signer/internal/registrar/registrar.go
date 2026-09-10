@@ -57,9 +57,35 @@ func RegistrarFor(cfg *config.Config, domain string) (Registrar, error) {
 	}
 }
 
-// BuildDSSet computes the DS record set the registrar should hold for a zone,
-// given the KSK(s) currently in use. During a KSK or algorithm rollover, both
-// old and new KSK belong in the set; otherwise just the active KSK.
+// IncludesOldDS reports whether a rollover phase still requires the OLD KSK's
+// DS at the parent (RDAYBLUEX-007). The desired set is phase-aware:
+//
+//	KSK rollover:        ds_add_wait → old + new;
+//	                     ds_propagation_wait, retiring → new only (the new DS
+//	                     was observed at every parent server; the workflow
+//	                     authorizes old-DS removal from here and a later
+//	                     `registrar push` must never resurrect the old DS)
+//	Algorithm rollover:  algo_ds_add_wait, algo_ds_propagation_wait → old + new
+//	                     (RFC 6781 §4.1.4: both DS through the first parent-DS
+//	                     propagation wait); algo_old_ds_removal_wait,
+//	                     algo_retiring → new only
+//	No rollover:         active KSK only
+func IncludesOldDS(r *statepkg.RolloverState) bool {
+	if r == nil {
+		return false
+	}
+	switch r.Type {
+	case "ksk":
+		return r.State == statepkg.KSKRolloverStateDSAddWait
+	case "algorithm":
+		return r.State == statepkg.AlgoRolloverStateDSAddWait || r.State == statepkg.AlgoRolloverStateDSPropagation
+	}
+	return false
+}
+
+// BuildDSSet computes the DS record set the registrar should hold for a zone
+// in its CURRENT rollover phase (see IncludesOldDS): the active KSK always,
+// plus the old KSK while its DS must remain at the parent.
 func BuildDSSet(cfg *config.Config, state *statepkg.State, domain string) ([]*dns.DS, error) {
 	zoneState := state.GetZone(domain)
 	if zoneState == nil {
@@ -81,10 +107,12 @@ func BuildDSSet(cfg *config.Config, state *statepkg.State, domain string) ([]*dn
 	}
 	out = append(out, ksk.ToDS(digestType))
 
-	// During KSK or algorithm rollover, include the old KSK's DS as well —
-	// until `rollover complete` is run, both DS records must be present at
-	// the parent so resolvers mid-transition can validate either chain.
-	if zoneState.Rollover != nil && (zoneState.Rollover.Type == "ksk" || zoneState.Rollover.Type == "algorithm") {
+	// While the rollover phase still requires it, include the old KSK's DS as
+	// well — both DS records must be present at the parent so resolvers
+	// mid-transition can validate either chain. Once the phase authorizes
+	// old-DS removal the set is new-only, so neither automation nor an
+	// explicit `registrar push` re-adds the old DS (RDAYBLUEX-007).
+	if IncludesOldDS(zoneState.Rollover) {
 		oldKSK, err := keyGen.LoadPublicKeyByID(domain, "ksk", zoneState.Rollover.OldKeyID)
 		if err != nil {
 			// The old KSK's DS MUST stay at the parent until `rollover complete`.

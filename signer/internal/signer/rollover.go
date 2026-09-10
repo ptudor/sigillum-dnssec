@@ -24,8 +24,12 @@ type ParentDSObservation struct {
 	AbsentOnAll  map[uint16]bool
 	// TTL is the largest DS RRset TTL any parent server returned (0 if none).
 	TTL uint32
-	// Servers lists the parent servers that answered.
+	// Servers lists the parent servers (addresses) that answered.
 	Servers []string
+	// ByNameserver maps every delegated parent nameserver name to the
+	// addresses it was queried at (RDAYBLUEX-003): the observation covers
+	// every NS identity of the delegation, not merely a set of addresses.
+	ByNameserver map[string][]string
 }
 
 // ParentDSProbe queries every authoritative server of the parent zone for the
@@ -35,6 +39,20 @@ type ParentDSProbe interface {
 	ProbeParentDS(domain string, ksks []*dns.DNSKEY) (ParentDSObservation, error)
 }
 
+// DSPublisher pushes the phase-correct DS set for a zone to its registrar
+// (RDAYBLUEX-007). The signer package cannot import the registrar package
+// (import cycle), so the root injects one. published reports whether an
+// update was actually performed — false when the zone has no registrar
+// automation (no registrar, or auto_publish off), which is not an error.
+type DSPublisher interface {
+	PublishDS(domain, op string) (published bool, err error)
+}
+
+// OpRolloverOldDSRemoval is the DSPublisher operation for the automatic
+// transition into an algorithm rollover's old-DS-removal phase: the parent's
+// DS set is replaced with the new-only set.
+const OpRolloverOldDSRemoval = "rollover_old_ds_removal"
+
 // RolloverManager handles key rollover operations
 type RolloverManager struct {
 	cfg   *config.Config
@@ -42,6 +60,9 @@ type RolloverManager struct {
 	// probe answers parent-DS questions for automatic KSK/algorithm phase
 	// advancement; nil means those phases wait until one is provided.
 	probe ParentDSProbe
+	// publisher performs registrar DS automation at the safe phase
+	// transitions (RDAYBLUEX-007); nil means no automation.
+	publisher DSPublisher
 	// failpoint is a test-only fault-injection seam propagated to the key
 	// generator's transaction steps (see keytx.go); nil in production.
 	failpoint func(step string) error
@@ -49,6 +70,10 @@ type RolloverManager struct {
 
 // SetParentDSProbe installs the parent-DS probe used by CheckAlgorithmRollover.
 func (rm *RolloverManager) SetParentDSProbe(p ParentDSProbe) { rm.probe = p }
+
+// SetDSPublisher installs the registrar DS automation used at automatic
+// phase transitions.
+func (rm *RolloverManager) SetDSPublisher(p DSPublisher) { rm.publisher = p }
 
 // keyGen returns a KeyGenerator sharing this manager's fault-injection seam.
 func (rm *RolloverManager) keyGen() *KeyGenerator {
@@ -187,7 +212,7 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string, dsObservedAt time.
 		return fmt.Errorf("rollover not in ds_add_wait state (currently %s; retirement is automatic from here)", zoneState.Rollover.State)
 	}
 	if parentDSTTL == 0 {
-		parentDSTTL = uint32(rm.cfg.ParentDSTTLFallback() / time.Second)
+		parentDSTTL = rm.cfg.ParentDSTTLFallbackSeconds()
 	}
 
 	slog.Info("[ROLLOVER] KSK rollover: new DS present at the parent; waiting out the parent DS TTL before retiring the old KSK",
@@ -223,7 +248,7 @@ func (rm *RolloverManager) CheckKSKRollover(domain string) error {
 	now := time.Now().UTC()
 	switch r.State {
 	case statepkg.KSKRolloverStateDSPropagation:
-		retireAt := r.DSObservedAt.Add(time.Duration(r.ParentDSTTL) * time.Second)
+		retireAt := r.DSObservedAt.Add(effectiveParentDSTTL(r.ParentDSTTL))
 		if now.Before(retireAt) {
 			return nil
 		}
@@ -690,7 +715,7 @@ func (rm *RolloverManager) CompleteAlgorithmRollover(domain string, dsObservedAt
 		return fmt.Errorf("rollover not in algo_ds_add_wait state (currently %s; retirement is automatic from here)", zoneState.Rollover.State)
 	}
 	if parentDSTTL == 0 {
-		parentDSTTL = uint32(rm.cfg.ParentDSTTLFallback() / time.Second)
+		parentDSTTL = rm.cfg.ParentDSTTLFallbackSeconds()
 	}
 
 	slog.Info("[ROLLOVER] Algorithm rollover: new DS present at the parent; waiting out the parent DS TTL",
@@ -712,6 +737,45 @@ func (rm *RolloverManager) CompleteAlgorithmRollover(domain string, dsObservedAt
 	return rm.state.Save()
 }
 
+// pushOldDSRemoval asks the injected registrar automation (if any) to
+// replace the parent's DS set with the new-only set for an algorithm rollover
+// in its old-DS-removal phase (RDAYBLUEX-007). It is idempotent: a success is
+// recorded in DSRemovalPushedAt and never repeated; a failure is left for the
+// publisher to surface as a zone warning and is retried on the next check.
+// The phase itself never advances on the push — only the every-parent-server
+// probe seeing the old DS gone does that.
+func (rm *RolloverManager) pushOldDSRemoval(domain string, zoneState *statepkg.ZoneState) error {
+	r := zoneState.Rollover
+	if rm.publisher == nil || r == nil || !r.DSRemovalPushedAt.IsZero() {
+		return nil
+	}
+	published, err := rm.publisher.PublishDS(domain, OpRolloverOldDSRemoval)
+	if err != nil {
+		slog.Warn("[ROLLOVER] Algorithm rollover: registrar DS update to the new-only set failed; retrying next cycle (the old DS stays at the parent until it succeeds)",
+			"domain", domain, "error", err)
+		return nil
+	}
+	if !published {
+		return nil
+	}
+	rm.state.Mutate(func() {
+		r.DSRemovalPushedAt = time.Now().UTC()
+		r.Action = fmt.Sprintf("Automatic: registrar asked to hold only the new DS (algorithm %s); the old-algorithm keys are retired one parent DS TTL after the old DS is gone from every parent server", r.NewAlgorithm)
+	})
+	return rm.state.Save()
+}
+
+// effectiveParentDSTTL is the wait a persisted parent DS TTL imposes
+// (RDAYBLUEX-024): a legacy zero — written before the value was recorded, or
+// by a version whose fallback truncated — never means "no wait"; it means the
+// conservative default.
+func effectiveParentDSTTL(seconds uint32) time.Duration {
+	if seconds == 0 {
+		return config.DefaultParentDSTTL
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // CheckAlgorithmRollover advances the automatic phases of an algorithm
 // rollover (RA6X-003). It needs a parent-DS probe to see the old DS gone.
 func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
@@ -721,7 +785,7 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 	}
 	r := zoneState.Rollover
 	now := time.Now().UTC()
-	ttl := time.Duration(r.ParentDSTTL) * time.Second
+	ttl := effectiveParentDSTTL(r.ParentDSTTL)
 	switch r.State {
 	case statepkg.AlgoRolloverStateDSPropagation:
 		if now.Before(r.DSObservedAt.Add(ttl)) {
@@ -732,9 +796,19 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 			r.PhaseStarted = now
 			r.Action = fmt.Sprintf("Remove the OLD DS record (algorithm %s, key tag %d) at your registrar; the old-algorithm keys are retired automatically one parent DS TTL after it is gone from every parent server", r.OldAlgorithm, r.OldKeyID)
 		})
-		return rm.state.Save()
+		if err := rm.state.Save(); err != nil {
+			return err
+		}
+		// The safe transition for registrar automation (RDAYBLUEX-007): the
+		// parent's DS set may now become new-only.
+		return rm.pushOldDSRemoval(domain, zoneState)
 	case statepkg.AlgoRolloverStateOldDSRemoval:
 		if r.OldDSRemovedAt.IsZero() {
+			// A failed or interrupted registrar update is retried until it
+			// succeeds; the phase cannot advance while the old DS is served.
+			if err := rm.pushOldDSRemoval(domain, zoneState); err != nil {
+				return err
+			}
 			if rm.probe == nil {
 				return nil
 			}
@@ -754,18 +828,19 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 			if ttlSeen == 0 {
 				ttlSeen = r.ParentDSTTL
 			}
+			retireAfter := now.Add(effectiveParentDSTTL(maxUint32(ttlSeen, r.ParentDSTTL)))
 			slog.Info("[ROLLOVER] Algorithm rollover: old DS gone from every parent server; waiting out the parent DS TTL before retiring the old algorithm",
-				"domain", domain, "retire_after", now.Add(time.Duration(ttlSeen)*time.Second).Format(time.RFC3339))
+				"domain", domain, "retire_after", retireAfter.Format(time.RFC3339))
 			rm.state.Mutate(func() {
 				r.OldDSRemovedAt = now
 				if ttlSeen > r.ParentDSTTL {
 					r.ParentDSTTL = ttlSeen
 				}
-				r.Action = fmt.Sprintf("Automatic: old DS gone; old-algorithm keys are retired after %s", now.Add(time.Duration(r.ParentDSTTL)*time.Second).Format(time.RFC3339))
+				r.Action = fmt.Sprintf("Automatic: old DS gone; old-algorithm keys are retired after %s", retireAfter.Format(time.RFC3339))
 			})
 			return rm.state.Save()
 		}
-		if now.Before(r.OldDSRemovedAt.Add(time.Duration(r.ParentDSTTL) * time.Second)) {
+		if now.Before(r.OldDSRemovedAt.Add(effectiveParentDSTTL(r.ParentDSTTL))) {
 			return nil
 		}
 		slog.Info("[ROLLOVER] Algorithm rollover: retiring the old-algorithm keys", "domain", domain, "old_algorithm", r.OldAlgorithm)
@@ -790,4 +865,11 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 		return rm.state.Save()
 	}
 	return nil
+}
+
+func maxUint32(a, b uint32) uint32 {
+	if a > b {
+		return a
+	}
+	return b
 }

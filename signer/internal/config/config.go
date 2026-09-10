@@ -162,12 +162,54 @@ func (c *Config) PublicationMode() string {
 	return PublicationImmediate
 }
 
-// ParentDSTTLFallback is the DS TTL assumed when the parent's cannot be observed.
-func (c *Config) ParentDSTTLFallback() time.Duration {
-	if c.DNSSEC.ParentDSTTL.Duration > 0 {
-		return c.DNSSEC.ParentDSTTL.Duration
+// Bounds for dnssec.parent_ds_ttl (RDAYBLUEX-024). The value is persisted as
+// whole seconds in a uint32 and gates key retirement, so it must be an exact
+// whole-second value that cannot truncate to zero or wrap: at least one
+// second, at most the documented operational maximum (a week — real parent
+// DS TTLs are hours to two days), and never above the 31-bit DNS TTL range.
+const (
+	DefaultParentDSTTL = 24 * time.Hour
+	MinParentDSTTL     = time.Second
+	MaxParentDSTTL     = 7 * 24 * time.Hour
+	// MaxDNSTTLSeconds is the largest TTL DNS can express (RFC 2181 §8); a
+	// persisted parent DS TTL above it cannot have been observed and is
+	// treated as corrupt.
+	MaxDNSTTLSeconds = uint32(1<<31 - 1)
+)
+
+// ValidateParentDSTTL reports whether a configured parent_ds_ttl is in
+// policy: zero (unset, the default applies) or a whole number of seconds
+// between MinParentDSTTL and MaxParentDSTTL.
+func ValidateParentDSTTL(d time.Duration) error {
+	switch {
+	case d == 0:
+		return nil
+	case d < 0:
+		return fmt.Errorf("dnssec.parent_ds_ttl must not be negative")
+	case d < MinParentDSTTL:
+		return fmt.Errorf("dnssec.parent_ds_ttl must be at least %s (it is persisted as whole seconds and would truncate to zero), got %s", MinParentDSTTL, d)
+	case d%time.Second != 0:
+		return fmt.Errorf("dnssec.parent_ds_ttl must be a whole number of seconds, got %s", d)
+	case d > MaxParentDSTTL:
+		return fmt.Errorf("dnssec.parent_ds_ttl must be at most %s, got %s", MaxParentDSTTL, d)
 	}
-	return 24 * time.Hour
+	return nil
+}
+
+// ParentDSTTLFallback is the DS TTL assumed when the parent's cannot be
+// observed: the configured value when it is in policy, else the default.
+func (c *Config) ParentDSTTLFallback() time.Duration {
+	if d := c.DNSSEC.ParentDSTTL.Duration; d > 0 && ValidateParentDSTTL(d) == nil {
+		return d
+	}
+	return DefaultParentDSTTL
+}
+
+// ParentDSTTLFallbackSeconds is ParentDSTTLFallback as the whole seconds a
+// rollover record persists. It is the only conversion callers use, and it
+// can neither truncate to zero nor wrap: the fallback is always in policy.
+func (c *Config) ParentDSTTLFallbackSeconds() uint32 {
+	return uint32(c.ParentDSTTLFallback() / time.Second)
 }
 
 // WebConfig holds web UI settings
@@ -473,8 +515,8 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
-	if c.DNSSEC.ParentDSTTL.Duration < 0 {
-		return fmt.Errorf("dnssec.parent_ds_ttl must not be negative")
+	if err := ValidateParentDSTTL(c.DNSSEC.ParentDSTTL.Duration); err != nil {
+		return err
 	}
 
 	// Validate serial policy (global and per-zone)
