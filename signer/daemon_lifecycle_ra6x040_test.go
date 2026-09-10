@@ -160,6 +160,75 @@ func TestRA6X040_ReloadWaitsForReadiness(t *testing.T) {
 	}
 }
 
+// A Reload that starts immediately before Run must publish its complete
+// snapshot before Run captures the startup heartbeat/config. Holding pubMu
+// stalls that publication at the old race window and makes the ordering
+// deterministic: Run cannot mark startup or take its snapshot while the
+// pre-start Reload owns startupMu.
+func TestRA6X040_PreStartReloadPublishesBeforeRunSnapshot(t *testing.T) {
+	d, cfg, state, _ := signableZoneDaemon(t)
+	cfg.Health.Listen = freePort(t)
+	cfg.Web.Enabled = false
+
+	newCfg := *cfg
+	newCfg.PollInterval = config.Duration{Duration: 2 * time.Hour}
+
+	d.pubMu.Lock()
+	pubMuHeld := true
+	defer func() {
+		if pubMuHeld {
+			d.pubMu.Unlock()
+		}
+	}()
+
+	reloaded := make(chan error, 1)
+	go func() { reloaded <- d.Reload(&newCfg, state) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for d.startupMu.TryLock() {
+		d.startupMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("Reload never acquired the startup publication guard")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- d.Run() }()
+	time.Sleep(50 * time.Millisecond)
+	if d.starting.Load() {
+		t.Fatal("Run began startup while a pre-start Reload was waiting to publish")
+	}
+
+	d.pubMu.Unlock()
+	pubMuHeld = false
+	if err := <-reloaded; err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	select {
+	case <-d.ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never published readiness")
+	}
+	if got := d.Generation(); got != 2 {
+		t.Fatalf("startup generation = %d, want the pre-start reload generation 2", got)
+	}
+	active, _ := d.current()
+	if active.PollInterval.Duration != 2*time.Hour {
+		t.Fatalf("startup poll interval = %v, want pre-start reload value 2h", active.PollInterval.Duration)
+	}
+
+	d.Shutdown()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after shutdown")
+	}
+}
+
 // The heartbeat client Run starts must be the one Shutdown stops. Run starts
 // the client captured in its startup snapshot; if a Reload lands between the
 // snapshot and that Start, the daemon starts a client it no longer references
