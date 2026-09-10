@@ -1946,7 +1946,7 @@ func (s *Signer) generateNSEC3ChainWithModel(m *zoneModel, domain string, record
 	// Add NSEC3PARAM at zone apex
 	nsec3param := &dns.NSEC3PARAM{
 		Hdr: dns.RR_Header{
-			Name:   dns.Fqdn(domain),
+			Name:   apex,
 			Rrtype: dns.TypeNSEC3PARAM,
 			Class:  dns.ClassINET,
 			Ttl:    0, // RFC 5155 §4.2: SHOULD be zero
@@ -1986,7 +1986,7 @@ func (s *Signer) generateNSEC3ChainWithModel(m *zoneModel, domain string, record
 
 		nsec3 := &dns.NSEC3{
 			Hdr: dns.RR_Header{
-				Name:   hn.hashed + "." + dns.Fqdn(domain),
+				Name:   hn.hashed + "." + apex,
 				Rrtype: dns.TypeNSEC3,
 				Class:  dns.ClassINET,
 				Ttl:    soaMinTTL, // RFC 4035 §2.3
