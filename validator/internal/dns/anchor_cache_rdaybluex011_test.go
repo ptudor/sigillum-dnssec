@@ -77,6 +77,8 @@ func TestRDAYBLUEX011_WriteAnchorCacheIsAtomicPrivateAndValidated(t *testing.T) 
 }
 
 func TestRDAYBLUEX011_LoadOrderFileCacheURL(t *testing.T) {
+	// An unusable built-in document, so the cache and URL stages are reached.
+	t.Cleanup(SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`)))
 	dir := t.TempDir()
 	file := filepath.Join(dir, "operator.json")
 	cache := filepath.Join(dir, "cache.json")
@@ -122,8 +124,8 @@ func TestRDAYBLUEX011_LoadOrderFileCacheURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, err := LoadAnchorsWithCache(file, cache, srv.URL); err == nil ||
-		!strings.Contains(err.Error(), "cache") || !strings.Contains(err.Error(), "URL") || !strings.Contains(err.Error(), "file") {
-		t.Fatalf("all three sources must be named: %v", err)
+		!strings.Contains(err.Error(), "cache") || !strings.Contains(err.Error(), "URL") || !strings.Contains(err.Error(), "file") || !strings.Contains(err.Error(), "built-in") {
+		t.Fatalf("all four sources must be named: %v", err)
 	}
 	// An empty cache path disables the stage.
 	serve = cacheGoodDoc

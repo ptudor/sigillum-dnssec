@@ -62,14 +62,15 @@ func readiness(store *AnchorsStore) string {
 }
 
 func TestRDAYBLUEX011_CleanStartOfflineHasNothing(t *testing.T) {
+	t.Cleanup(dns.SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`))) // reach the cache/URL stages
 	dir := t.TempDir()
 	dead := httptest.NewServer(http.NotFoundHandler())
 	url := dead.URL
 	dead.Close()
 	store := NewAnchorsStore(filepath.Join(dir, "operator.json"), url)
 	store.SetCachePath(filepath.Join(dir, "cache.json"))
-	if err := store.Load(); err == nil || !strings.Contains(err.Error(), "cache") {
-		t.Fatalf("with no file, no cache and no network the load fails naming every source: %v", err)
+	if err := store.Load(); err == nil || !strings.Contains(err.Error(), "cache") || !strings.Contains(err.Error(), "built-in") {
+		t.Fatalf("with no file, no cache, no usable built-in document and no network the load fails naming every source: %v", err)
 	}
 	if store.Get() != nil || readiness(store) != "unavailable" {
 		t.Fatalf("nothing is served: %v / %s", store.Get(), readiness(store))
@@ -84,6 +85,7 @@ func TestRDAYBLUEX011_CleanStartOfflineHasNothing(t *testing.T) {
 }
 
 func TestRDAYBLUEX011_FetchThenRestartOffline(t *testing.T) {
+	t.Cleanup(dns.SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`))) // reach the cache/URL stages
 	dir := t.TempDir()
 	operator := filepath.Join(dir, "operator.json")
 	cache := filepath.Join(dir, "cache.json")
@@ -136,6 +138,7 @@ func TestRDAYBLUEX011_FetchThenRestartOffline(t *testing.T) {
 }
 
 func TestRDAYBLUEX011_BadRefreshesNeverReplaceTheGoodSet(t *testing.T) {
+	t.Cleanup(dns.SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`))) // reach the cache/URL stages
 	dir := t.TempDir()
 	cache := filepath.Join(dir, "cache.json")
 	mirror := newAnchorMirror(t)
@@ -189,6 +192,7 @@ func TestRDAYBLUEX011_BadRefreshesNeverReplaceTheGoodSet(t *testing.T) {
 }
 
 func TestRDAYBLUEX011_CacheWriteFailureDoesNotFailTheLoad(t *testing.T) {
+	t.Cleanup(dns.SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`))) // reach the cache/URL stages
 	if os.Geteuid() == 0 {
 		t.Skip("directory permissions do not restrict root")
 	}
@@ -218,6 +222,7 @@ func TestRDAYBLUEX011_CacheWriteFailureDoesNotFailTheLoad(t *testing.T) {
 }
 
 func TestRDAYBLUEX011_OperatorFileTakesPrecedenceAndIsNeverCached(t *testing.T) {
+	t.Cleanup(dns.SetEmbeddedAnchorsForTest([]byte(`{"zone":".","anchors":[]}`))) // reach the cache/URL stages
 	dir := t.TempDir()
 	operator := filepath.Join(dir, "operator.json")
 	cache := filepath.Join(dir, "cache.json")

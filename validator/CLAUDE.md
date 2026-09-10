@@ -920,7 +920,11 @@ R-025/R-058 and RDAYBLUEX-011):
 - On startup the validator loads the **operator file first**
   (`root_anchors_path`), then the **last-known-good cache**
   (`root_anchors_cache_path`, default `/var/lib/sigillum-validator/root-anchors.json`),
-  and only then the configured URL (`LoadAnchorsWithCache`).
+  then the **reviewed document built into the executable**
+  (`internal/dns/root-anchors.json`, whose unexpired anchors are exactly the
+  pins; updating it is a reviewed code change like updating a pin), and only
+  then the configured URL (`LoadAnchorsWithCache`). In practice the URL is
+  reached only when the built-in set has no active pinned anchor.
 - Every usable, pinned document fetched from the URL is written to the cache
   atomically (private temporary file, fsync, rename, directory fsync, 1 MiB
   limit, mode 0600). A fetch, parse, pin or write failure never replaces the

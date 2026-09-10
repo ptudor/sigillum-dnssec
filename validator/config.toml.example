@@ -5,7 +5,10 @@
 listen_addr = "127.0.0.1:8791"
 shutdown_timeout_seconds = 30
 
-# Root trust anchors
+# Root trust anchors. Load order: this optional operator file, the cache
+# below, the reviewed document built into the executable, and only then the
+# URL. The built-in document already carries the pinned root keys, so a fresh
+# installation needs no network access and the URL is a last resort.
 root_anchors_path = "/etc/sigillum-validator/root-anchors.json"
 root_anchors_url = "https://internet.any53.com/dns/anchors/root-anchors.json"
 # Last-known-good cache (absolute path in a directory the service can write,
