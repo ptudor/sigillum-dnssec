@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,10 @@ type Daemon struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	hookWG sync.WaitGroup // tracks async post-sign hook goroutines (R-026)
+	// hooks is the bounded, single-flight dispatcher every asynchronous
+	// post-sign hook goes through (RDAYBLUEX-018); its workers are tracked
+	// on hookWG.
+	hooks *hookDispatcher
 
 	mu              sync.RWMutex
 	server          *http.Server
@@ -52,11 +57,29 @@ type Daemon struct {
 	readyOnce sync.Once
 	starting  atomic.Bool // Run has begun its startup sequence
 	// lastSaveFailed records that the previous cycle could not persist its
-	// results, so the next cycle merges rather than adopting the disk state
-	// wholesale (RA6X-025: newer unsaved signing results are never replaced
-	// by older disk data).
+	// results (RA6X-025). Every cycle merges the disk into memory three ways
+	// (RDAYBLUEX-019), so the flag no longer selects the reload strategy; it
+	// remains the readiness/diagnostic signal that unsaved work exists.
 	lastSaveFailed atomic.Bool
+	// deferredHooks holds, by domain, the deployments a cycle collected but
+	// could not launch because its state save did not commit (RDAYBLUEX-006):
+	// a hook must never deploy a generation whose state is not durable. They
+	// are launched by the first later cycle whose save commits. Owned by the
+	// signing goroutine.
+	deferredHooks map[string]SignedZoneRef
+	// generation is the immutable identity of the active config/state pair
+	// (RDAYBLUEX-005): 1 at construction, incremented by Reload once the new
+	// snapshot is published. Asynchronous work (hook completions, dashboard
+	// validation caches) is bound to the generation it started under and is
+	// discarded when a different generation is active by the time it
+	// completes. pubMu serializes Reload's swap against those identity checks
+	// and the state mutations they guard.
+	generation atomic.Uint64
+	pubMu      sync.Mutex
 }
+
+// Generation returns the identity of the active config/state pair.
+func (d *Daemon) Generation() uint64 { return d.generation.Load() }
 
 // markReady publishes the ready lifecycle state (idempotent).
 func (d *Daemon) markReady() {
@@ -79,7 +102,7 @@ func (d *Daemon) StateFault() string {
 // NewDaemon creates a new daemon instance
 func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Daemon{
+	d := &Daemon{
 		cfg:         cfg,
 		state:       state,
 		signer:      signerpkg.NewSigner(cfg, state),
@@ -90,6 +113,9 @@ func NewDaemon(cfg *config.Config, state *statepkg.State) *Daemon {
 		tickerReset: make(chan time.Duration, 1),
 		ready:       make(chan struct{}),
 	}
+	d.hooks = newHookDispatcher(&d.hookWG)
+	d.generation.Store(1)
+	return d
 }
 
 // Run starts the daemon's main loop
@@ -257,6 +283,10 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 		slog.Info("[DAEMON] Ignoring reload: daemon is shutting down or failed to start")
 		return
 	}
+	// The swap and the generation bump are one step under pubMu, so a hook
+	// completion or cache fill that checked the generation cannot interleave
+	// with a reload and land in the new generation (RDAYBLUEX-005).
+	d.pubMu.Lock()
 	d.mu.Lock()
 	oldCfg := d.cfg
 	oldHeartbeat := d.heartbeat
@@ -267,7 +297,14 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 	d.signer = signerpkg.NewSigner(cfg, state)
 	d.rollover = newRolloverManager(cfg, state)
 	d.heartbeat = newHeartbeat
+	gen := d.generation.Add(1)
 	d.mu.Unlock()
+	d.pubMu.Unlock()
+
+	// Deployments still queued for the old generation are obsolete: the new
+	// generation's first cycle re-derives what to deploy, and a completion
+	// from the old one is discarded (RDAYBLUEX-005, RDAYBLUEX-018).
+	d.hooks.purgeQueued()
 
 	// Stop the old client and start the new one outside the lock. Both Stop()
 	// and Start() send a synchronous heartbeat with up to a 10s HTTP timeout;
@@ -315,7 +352,7 @@ func (d *Daemon) Reload(cfg *config.Config, state *statepkg.State) {
 			"old", oldCfg.Health.Listen, "new", cfg.Health.Listen)
 	}
 
-	slog.Info("[DAEMON] Configuration and state reloaded", "zones", len(cfg.Zones))
+	slog.Info("[DAEMON] Configuration and state reloaded", "zones", len(cfg.Zones), "generation", gen)
 }
 
 func (d *Daemon) ensureDirectories(cfg *config.Config) error {
@@ -442,6 +479,9 @@ type snapshot struct {
 	signer    *signerpkg.Signer
 	rollover  *signerpkg.RolloverManager
 	heartbeat *HeartbeatClient
+	// gen identifies the config/state generation the snapshot belongs to
+	// (RDAYBLUEX-005).
+	gen uint64
 }
 
 func (d *Daemon) takeSnapshot() snapshot {
@@ -453,6 +493,7 @@ func (d *Daemon) takeSnapshot() snapshot {
 		signer:    d.signer,
 		rollover:  d.rollover,
 		heartbeat: d.heartbeat,
+		gen:       d.generation.Load(),
 	}
 }
 
@@ -490,19 +531,12 @@ func (d *Daemon) signAllZones() {
 	// Nothing is mutated; the failure is exposed via readiness and the read
 	// is retried next cycle.
 	//
-	// Under the lock the disk is authoritative (RA6X-025): it holds every CLI
-	// mutation since our last save, including ones the merge heuristics could
-	// not see (warnings added/cleared, removals, phase metadata). Adopt it
-	// wholesale — unless the previous cycle failed to persist its results, in
-	// which case memory holds newer signing results that must not be replaced
-	// by older disk data, and the merge is used instead.
-	var reloadErr error
-	if d.lastSaveFailed.Load() {
-		reloadErr = snap.state.ReloadFromDisk()
-	} else {
-		reloadErr = snap.state.ReplaceFromDisk()
-	}
-	if reloadErr != nil {
+	// Under the lock the disk holds every CLI mutation since our last save
+	// (RA6X-025) and memory may hold results a failed save never persisted.
+	// The three-way merge (RDAYBLUEX-019) keeps both: whatever only the disk
+	// changed is adopted, whatever only memory changed is kept, and neither
+	// side's mutations are inferred from signing time alone.
+	if reloadErr := snap.state.ReloadFromDisk(); reloadErr != nil {
 		msg := fmt.Sprintf("authoritative state could not be loaded: %v", reloadErr)
 		d.setStateFault(msg)
 		slog.Error("[DAEMON] Skipping signing cycle: state on disk is unreadable or invalid; no zone, key or state file will be mutated until it is repaired", "error", reloadErr)
@@ -533,39 +567,44 @@ signLoop:
 		}
 		if d.checkAndSignZoneSafe(snap, domain) {
 			if zs := snap.state.GetZone(domain); zs != nil {
-				signedZones = append(signedZones, signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs.LastSigned))
+				signedZones = append(signedZones, zoneRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs))
 			}
 		}
 	}
 
-	// RA6X-004: a generation whose deployment never got confirmed (hook
-	// failure, restart, probe not yet satisfied) is retried every cycle until
-	// it is, without re-signing.
-	signedSet := map[string]bool{}
+	// Deployments to launch this cycle (RDAYBLUEX-006): the zones signed
+	// now, the deployments a previous cycle deferred because its save did not
+	// commit, and — in hook mode (RA6X-004) — every generation whose
+	// deployment never got confirmed (hook failure, restart), retried every
+	// cycle without re-signing. Nothing is launched before the state that
+	// describes these generations has been committed below.
+	toDeploy := map[string]SignedZoneRef{}
 	for _, z := range signedZones {
-		signedSet[z.Domain] = true
+		toDeploy[z.Domain] = z
+	}
+	for domain, z := range d.deferredHooks {
+		if _, configured := snap.cfg.Zones[domain]; !configured {
+			continue
+		}
+		if cur, ok := toDeploy[domain]; !ok || z.SignedAt.After(cur.SignedAt) {
+			toDeploy[domain] = z
+		}
 	}
 	switch snap.cfg.PublicationMode() {
 	case config.PublicationHook:
 		for domain := range snap.cfg.Zones {
 			zs := snap.state.GetZone(domain)
-			if zs == nil || !zs.PendingPublication || signedSet[domain] || snap.cfg.Hooks.CoalescePostSign {
+			if zs == nil || !zs.PendingPublication {
+				continue
+			}
+			if _, already := toDeploy[domain]; already {
 				continue
 			}
 			slog.Info("[DAEMON] Retrying deployment hook for a zone whose publication is not yet confirmed", "domain", domain)
-			_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir,
-				[]SignedZoneRef{signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs.LastSigned)}, &d.hookWG, d.confirmPublication)
-		}
-		if snap.cfg.Hooks.CoalescePostSign {
-			for domain := range snap.cfg.Zones {
-				zs := snap.state.GetZone(domain)
-				if zs != nil && zs.PendingPublication && !signedSet[domain] {
-					signedZones = append(signedZones, signedRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs.LastSigned))
-				}
-			}
+			toDeploy[domain] = zoneRef(snap.cfg, domain, snap.cfg.Zones[domain].Path, zs)
 		}
 	case config.PublicationProbe:
-		d.probePendingPublications(snap)
+		probePendingPublications(snap.cfg, snap.state, configuredZones(snap.cfg))
 	}
 
 	// Check for automatic ZSK rollovers
@@ -602,11 +641,12 @@ rolloverLoop:
 	}
 
 	// Defense-in-depth: re-reload immediately before Save to adopt any CLI write that
-	// slipped in (the merge keeps our fresher-signed zones and adopts a disk zone whose
-	// rollover differs — see ReloadFromDisk), then persist the merged whole map. If
+	// slipped in (the three-way merge keeps our unsaved work and adopts what only
+	// the disk changed — see ReloadFromDisk), then persist the merged whole map. If
 	// the file became unreadable/invalid during the cycle, do NOT overwrite it with
 	// our snapshot (RA6X-026): keep the disk evidence, surface the fault, and let the
 	// next cycle retry. The signed output already written this cycle stays in place.
+	committed := false
 	if err := snap.state.ReloadFromDisk(); err != nil {
 		msg := fmt.Sprintf("authoritative state could not be re-loaded before save: %v", err)
 		d.setStateFault(msg)
@@ -616,6 +656,7 @@ rolloverLoop:
 		if fsutil.IsCommitted(err) {
 			// The state file is in place; only its durability is uncertain (RA6X-049).
 			d.lastSaveFailed.Store(false)
+			committed = true
 			slog.Warn("[DAEMON] State saved but its durability across power loss is uncertain", "error", err)
 		} else {
 			d.lastSaveFailed.Store(true)
@@ -623,12 +664,35 @@ rolloverLoop:
 		}
 	} else {
 		d.lastSaveFailed.Store(false)
+		committed = true
 	}
 
-	// Fire the coalesced post-sign hook after state is saved — this way
-	// any consumer that introspects state.json sees the just-signed zones.
-	if snap.cfg.Hooks.CoalescePostSign && len(signedZones) > 0 {
-		_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir, signedZones, &d.hookWG, d.confirmPublication)
+	// Deploy only what the committed state describes (RDAYBLUEX-006). A
+	// generation whose state is not on disk stays pending in memory and its
+	// deployment is deferred to the first cycle whose save commits, so a hook
+	// can never publish output that the authoritative state does not know,
+	// and a later confirmation cannot be applied to an older on-disk record.
+	// Launches go through the bounded single-flight dispatcher
+	// (RDAYBLUEX-018): a generation already queued or running, or in retry
+	// backoff after its own failure, is not started again this cycle.
+	// Coalescing (one batch invocation) or per-zone invocations follow the
+	// hook contract as before.
+	if !committed {
+		if len(toDeploy) > 0 {
+			d.deferredHooks = toDeploy
+			slog.Warn("[DAEMON] Deployment hooks withheld: the state describing the signed generations was not saved; they are launched once a save commits",
+				"zones", len(toDeploy))
+		}
+	} else {
+		d.deferredHooks = nil
+		if len(toDeploy) > 0 {
+			refs := make([]SignedZoneRef, 0, len(toDeploy))
+			for _, z := range toDeploy {
+				refs = append(refs, z)
+			}
+			sort.Slice(refs, func(i, j int) bool { return refs[i].Domain < refs[j].Domain })
+			d.hooks.dispatch(&snap.cfg.Hooks, snap.cfg.OutputDir, refs, snap.cfg.PollInterval.Duration, d.hookCompletion(snap))
+		}
 	}
 
 	// Update Prometheus metrics
@@ -736,13 +800,9 @@ func (d *Daemon) checkAndSignZone(snap snapshot, domain string) (bool, error) {
 	// (differs from the unsigned serial under serial_policy = "epoch").
 	snap.heartbeat.SigningComplete(domain, zoneState.PublishedSerial)
 
-	// Execute per-zone post-sign hook only when NOT coalescing — the caller
-	// will fire one batched hook at end-of-cycle when coalesce is on.
-	if !snap.cfg.Hooks.CoalescePostSign {
-		_ = firePostSignHooks(&snap.cfg.Hooks, snap.cfg.OutputDir,
-			[]SignedZoneRef{signedRef(snap.cfg, domain, zoneCfg.Path, zoneState.LastSigned)}, &d.hookWG, d.confirmPublication)
-	}
-
+	// The deployment hook is NOT launched here (RDAYBLUEX-006): the caller
+	// collects every signed zone and launches the hooks — per zone or as one
+	// coalesced batch — only after the cycle's state save has committed.
 	return true, nil
 }
 
@@ -848,79 +908,151 @@ func newRolloverManager(cfg *config.Config, state *statepkg.State) *signerpkg.Ro
 	return rm
 }
 
-// confirmPublication records, under the cross-process state lock, that the
-// hook deployed the given generations successfully (RA6X-004). It runs from
-// the hook goroutine after the cycle's Save, so it re-adopts the on-disk state
-// first (a CLI may have written since), applies the confirmation to the exact
-// generation each hook covered, and persists. A hook failure leaves the zone
-// pending so the next cycle retries the deployment.
-func (d *Daemon) confirmPublication(zones []SignedZoneRef, hookErr error) {
-	snap := d.takeSnapshot()
-	lock, err := acquireStateLock(snap.cfg.DataDir, 10*time.Second)
+// hookCompletion returns the completion callback for hooks fired from a cycle
+// running on snap (RDAYBLUEX-013). The hook is always the deployment
+// mechanism, but it is the publication AUTHORITY only in effective hook mode:
+// in immediate mode the atomic file replacement already confirmed the
+// generation and in probe mode only the every-authoritative-server serial
+// probe may. In those modes a completed hook merely records or clears the
+// deployment error.
+func (d *Daemon) hookCompletion(snap snapshot) func([]SignedZoneRef, error) {
+	confirms := snap.cfg.PublicationMode() == config.PublicationHook
+	return func(zones []SignedZoneRef, hookErr error) {
+		d.recordHookResult(snap, zones, hookErr, confirms)
+	}
+}
+
+// recordHookResult records, under the cross-process state lock, the outcome
+// of a hook that deployed the given generations (RA6X-004). It runs from the
+// hook goroutine after the cycle's Save.
+//
+// The completion is bound to the snapshot that launched it (RDAYBLUEX-005):
+// under pubMu (which Reload also holds while it swaps and bumps the
+// generation) the active generation must still be the launching one, and for
+// each zone the domain must still be configured with the same output path
+// and the zone's current generation (LastSigned and published serial) must
+// still be the one the hook deployed; in hook mode a confirmation also
+// requires the publication to still be pending. Anything else is a stale
+// completion — from before a reload, for a removed/re-added or re-pathed
+// zone, or for a superseded signing — and is logged and discarded, whether
+// it succeeded or failed: it must neither certify output the active
+// configuration never deployed nor overwrite a newer generation's status.
+//
+// The on-disk state is merged into memory first (a CLI may have written
+// since; RDAYBLUEX-006: the merge never replaces newer unsaved memory with an
+// older disk snapshot). A matching failure is recorded as the zone's
+// deployment error; a matching success clears it and, when confirms is set
+// (hook mode), confirms the exact generation — only the publication fields
+// of that zone change. The result is persisted. A failed hook in hook mode
+// leaves the zone pending so the next cycle retries the deployment; in the
+// other modes publication is untouched.
+func (d *Daemon) recordHookResult(launched snapshot, zones []SignedZoneRef, hookErr error, confirms bool) {
+	// The cross-process lock may wait for a running cycle; take it before
+	// pubMu so a Reload is never held up by that wait.
+	lock, err := acquireStateLock(launched.cfg.DataDir, 10*time.Second)
 	if err != nil {
-		slog.Warn("[DAEMON] Could not acquire state lock to record publication; the deployment is retried next cycle", "error", err)
+		slog.Warn("[DAEMON] Could not acquire state lock to record the hook result; the deployment is retried next cycle", "error", err)
 		return
 	}
 	defer lock.release()
-	if err := snap.state.ReplaceFromDisk(); err != nil {
-		slog.Warn("[DAEMON] Could not reload state to record publication; the deployment is retried next cycle", "error", err)
+
+	d.pubMu.Lock()
+	defer d.pubMu.Unlock()
+	cur := d.takeSnapshot()
+	if cur.gen != launched.gen {
+		slog.Warn("[DAEMON] Discarding a hook completion from a superseded configuration generation; the active generation retries its own deployments",
+			"hook_generation", launched.gen, "active_generation", cur.gen, "zones", len(zones), "hook_error", hookErr)
+		return
+	}
+	state := cur.state
+	if err := state.ReloadFromDisk(); err != nil {
+		slog.Warn("[DAEMON] Could not reload state to record the hook result; the deployment is retried next cycle", "error", err)
 		return
 	}
 	now := time.Now().UTC()
 	changed := false
 	for _, z := range zones {
-		zs := snap.state.GetZone(z.Domain)
-		if zs == nil {
+		zs := state.GetZone(z.Domain)
+		zoneCfg, configured := cur.cfg.Zones[z.Domain]
+		switch {
+		case zs == nil || !configured:
+			slog.Warn("[DAEMON] Discarding a hook completion for a zone that is no longer managed", "domain", z.Domain)
+			continue
+		case zoneRef(cur.cfg, z.Domain, zoneCfg.Path, zs).SignedPath != z.SignedPath:
+			slog.Warn("[DAEMON] Discarding a hook completion that deployed a different output path", "domain", z.Domain, "deployed", z.SignedPath)
+			continue
+		case !zs.LastSigned.Equal(z.SignedAt) || zs.PublishedSerial != z.Serial:
+			slog.Info("[DAEMON] Discarding a hook completion for a superseded signing; the current generation is deployed separately",
+				"domain", z.Domain, "deployed_generation", z.SignedAt.Format(time.RFC3339Nano), "current_generation", zs.LastSigned.Format(time.RFC3339Nano))
 			continue
 		}
 		if hookErr != nil {
-			// The deployment failed: record it as its own operation (RA6X-048)
-			// and leave the zone pending so the next cycle retries the hook.
-			snap.state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, "post-sign hook failed: "+hookErr.Error()) })
+			// The deployment failed: record it as its own operation (RA6X-048).
+			// In hook mode the zone stays pending so the next cycle retries.
+			state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, "post-sign hook failed: "+hookErr.Error()) })
 			changed = true
 			continue
 		}
-		if z.SignedAt.IsZero() {
-			continue
+		if confirms && !zs.PendingPublication {
+			slog.Info("[DAEMON] Hook completed for a generation that is already confirmed", "domain", z.Domain)
 		}
-		snap.state.Mutate(func() {
-			zs.ConfirmPublication(z.SignedAt, now)
+		state.Mutate(func() {
 			zs.ClearOperationError(statepkg.OpDeployment)
+			if confirms && zs.PendingPublication && !z.SignedAt.IsZero() {
+				zs.ConfirmPublication(z.SignedAt, now)
+			}
 		})
 		changed = true
-		slog.Info("[DAEMON] Publication confirmed by hook", "domain", z.Domain, "generation_signed_at", z.SignedAt.Format(time.RFC3339))
+		if confirms {
+			slog.Info("[DAEMON] Publication confirmed by hook", "domain", z.Domain, "generation_signed_at", z.SignedAt.Format(time.RFC3339))
+		}
 	}
 	if !changed {
 		return
 	}
-	if err := snap.state.Save(); err != nil && !fsutil.IsCommitted(err) {
-		slog.Error("[DAEMON] Failed to persist publication confirmation; the deployment is retried next cycle", "error", err)
+	if err := state.Save(); err != nil && !fsutil.IsCommitted(err) {
+		slog.Error("[DAEMON] Failed to persist the hook result; the deployment is retried next cycle", "error", err)
 	}
+}
+
+// publicationProber answers whether every authoritative server of a zone
+// serves the published serial (dnssec.publication = "probe").
+type publicationProber interface {
+	ProbePublishedSerial(domain string, serial uint32) (bool, string, error)
+}
+
+// newPublicationProber builds the probe-mode prober. A package variable so
+// tests can substitute a deterministic prober; production uses the validator.
+var newPublicationProber = func(cfg *config.Config, state *statepkg.State) publicationProber {
+	return validate.NewValidator(cfg, state, cfg.Validation.Resolver, cfg.Validation.Timeout.Duration)
 }
 
 // probePendingPublications confirms pending generations by asking every
 // authoritative server of each zone for the published serial
-// (dnssec.publication = "probe", RA6X-004).
-func (d *Daemon) probePendingPublications(snap snapshot) {
-	v := validate.NewValidator(snap.cfg, snap.state, snap.cfg.Validation.Resolver, snap.cfg.Validation.Timeout.Duration)
+// (dnssec.publication = "probe", RA6X-004). Shared by the daemon cycle and
+// the CLI (RDAYBLUEX-013: a hook never substitutes for the probe).
+func probePendingPublications(cfg *config.Config, state *statepkg.State, domains []string) (confirmed []string) {
+	prober := newPublicationProber(cfg, state)
 	now := time.Now().UTC()
-	for domain := range snap.cfg.Zones {
-		zs := snap.state.GetZone(domain)
+	for _, domain := range domains {
+		zs := state.GetZone(domain)
 		if zs == nil || !zs.PendingPublication {
 			continue
 		}
-		ok, details, err := v.ProbePublishedSerial(domain, zs.PublishedSerial)
+		ok, details, err := prober.ProbePublishedSerial(domain, zs.PublishedSerial)
 		if err != nil {
-			slog.Warn("[DAEMON] Publication probe failed; retrying next cycle", "domain", domain, "error", err)
+			slog.Warn("[PUBLICATION] Publication probe failed; retrying later", "domain", domain, "error", err)
 			continue
 		}
 		if !ok {
-			slog.Info("[DAEMON] Published generation not yet served by every authoritative server", "domain", domain, "details", details)
+			slog.Info("[PUBLICATION] Published generation not yet served by every authoritative server", "domain", domain, "details", details)
 			continue
 		}
-		snap.state.Mutate(func() { zs.ConfirmPublication(zs.LastSigned, now) })
-		slog.Info("[DAEMON] Publication confirmed by authoritative probe", "domain", domain, "details", details)
+		state.Mutate(func() { zs.ConfirmPublication(zs.LastSigned, now) })
+		confirmed = append(confirmed, domain)
+		slog.Info("[PUBLICATION] Publication confirmed by authoritative probe", "domain", domain, "details", details)
 	}
+	return confirmed
 }
 
 // configuredZones lists the zones the configuration manages.

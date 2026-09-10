@@ -419,32 +419,80 @@ func preflightConfigAppend(path string) error {
 // runPostSignHook fires the configured post-sign hook synchronously for one
 // zone a CLI command just signed, under the same contract the daemon uses
 // (RA6X-043): a batch invocation naming the single domain when coalescing is
-// on, the per-zone invocation otherwise. A successful hook confirms the
-// generation as published and persists that (RA6X-004); a failure is logged,
-// the zone stays pending (the daemon retries the deployment) and false is
-// returned so callers can hold back steps that assume the zone is served.
-// With no hook configured the signing result already counts as published.
+// on, the per-zone invocation otherwise. It reports whether the generation
+// is confirmed served under the EFFECTIVE publication mode (RDAYBLUEX-013),
+// so callers can hold back steps (DS automation) that assume the zone is
+// served:
+//   - hook mode: a successful hook confirms the generation (RA6X-004); a
+//     failure leaves it pending and the daemon retries the deployment.
+//   - immediate mode: the atomic write already confirmed the generation. The
+//     hook is only a deployment step: its failure is recorded as the zone's
+//     deployment error but neither un-publishes the generation nor blocks
+//     DS automation.
+//   - probe mode: the hook (when configured) is run as the deployment
+//     mechanism and never confirms; the every-authoritative-server serial
+//     probe is run synchronously and is the sole confirmation authority. When
+//     it does not confirm, the zone stays pending for the daemon (or the next
+//     `sign`) to probe again.
 func runPostSignHook(cfg *config.Config, state *statepkg.State, domain, zonePath string) bool {
-	if !hookConfigured(&cfg.Hooks) {
-		return true
-	}
 	zs := state.GetZone(domain)
 	if zs == nil {
 		return false
 	}
-	slog.Info("[CLI] Executing post-sign hook", "domain", domain)
-	ref := signedRef(cfg, domain, zonePath, zs.LastSigned)
-	if err := firePostSignHooks(&cfg.Hooks, cfg.OutputDir, []SignedZoneRef{ref}, nil, nil); err != nil {
-		slog.Error("[CLI] Post-sign hook failed; the zone is not confirmed served and stays pending deployment", "domain", domain, "error", err)
-		fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; the signed zone is written but not confirmed served (the daemon retries the hook)\n", domain)
-		state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, "post-sign hook failed: "+err.Error()) })
-		if perr := persistState(state); perr != nil {
-			slog.Error("[CLI] Failed to persist deployment error", "error", perr)
+	mode := cfg.PublicationMode()
+	if hookConfigured(&cfg.Hooks) {
+		slog.Info("[CLI] Executing post-sign hook", "domain", domain)
+		ref := signedRef(cfg, domain, zonePath, zs.LastSigned)
+		if err := firePostSignHooks(&cfg.Hooks, cfg.OutputDir, []SignedZoneRef{ref}, nil, nil); err != nil {
+			state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, "post-sign hook failed: "+err.Error()) })
+			if perr := persistState(state); perr != nil {
+				slog.Error("[CLI] Failed to persist deployment error", "error", perr)
+			}
+			switch mode {
+			case config.PublicationImmediate:
+				slog.Error("[CLI] Post-sign hook failed; the generation is published (immediate mode) but the deployment step did not complete", "domain", domain, "error", err)
+				fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; the signed zone is published (publication = \"immediate\") but the hook did not complete\n", domain)
+				return true
+			case config.PublicationProbe:
+				slog.Error("[CLI] Post-sign hook failed; publication is decided by the authoritative-server probe", "domain", domain, "error", err)
+				fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; checking whether every authoritative server serves the published serial anyway\n", domain)
+			default:
+				slog.Error("[CLI] Post-sign hook failed; the zone is not confirmed served and stays pending deployment", "domain", domain, "error", err)
+				fmt.Fprintf(os.Stderr, "warning: post-sign hook failed for %s; the signed zone is written but not confirmed served (the daemon retries the hook)\n", domain)
+				return false
+			}
+		} else {
+			switch mode {
+			case config.PublicationHook:
+				confirmPublicationCLI(state, []SignedZoneRef{ref})
+				return true
+			default:
+				// The hook is not the publication authority in this mode; it
+				// only clears its own deployment error.
+				state.Mutate(func() { zs.ClearOperationError(statepkg.OpDeployment) })
+				if perr := persistState(state); perr != nil {
+					slog.Error("[CLI] Failed to persist deployment status", "error", perr)
+				}
+			}
 		}
-		return false
 	}
-	confirmPublicationCLI(state, []SignedZoneRef{ref})
-	return true
+	switch mode {
+	case config.PublicationImmediate:
+		return true
+	case config.PublicationProbe:
+		confirmed := probePendingPublications(cfg, state, []string{domain})
+		if err := persistState(state); err != nil {
+			slog.Error("[CLI] Failed to persist publication status", "error", err)
+		}
+		if len(confirmed) == 0 {
+			fmt.Fprintf(os.Stderr, "notice: %s is signed but not yet confirmed served by every authoritative server (publication = \"probe\"); the daemon or the next `sigillum-signer sign` re-checks\n", domain)
+			return false
+		}
+		return true
+	}
+	// Hook mode without a configured hook cannot happen (config validation
+	// requires one); nothing confirmed.
+	return false
 }
 
 // recordSigningFailure persists a zone's signing error the way the daemon
@@ -458,6 +506,45 @@ func recordSigningFailure(state *statepkg.State, domain string, err error) {
 	state.Mutate(func() { zs.SetOperationError(statepkg.OpSigning, err.Error()) })
 	if perr := persistState(state); perr != nil {
 		slog.Error("[CLI] Failed to persist signing error", "domain", domain, "error", perr)
+	}
+}
+
+// recordHookResultCLI applies a CLI hook pass's outcome by publication mode
+// (RDAYBLUEX-013): failed zones get a deployment error; succeeded zones clear
+// it and, in hook mode only, are confirmed published. The state is persisted.
+func recordHookResultCLI(cfg *config.Config, state *statepkg.State, succeeded, failed []SignedZoneRef, hookErr error) {
+	for _, z := range failed {
+		zs := state.GetZone(z.Domain)
+		if zs == nil {
+			continue
+		}
+		msg := "post-sign hook failed"
+		if hookErr != nil {
+			msg += ": " + hookErr.Error()
+		}
+		state.Mutate(func() { zs.SetOperationError(statepkg.OpDeployment, msg) })
+	}
+	if cfg.PublicationMode() == config.PublicationHook {
+		if len(succeeded) > 0 {
+			confirmPublicationCLI(state, succeeded)
+		} else if len(failed) > 0 {
+			if err := persistState(state); err != nil {
+				slog.Error("[CLI] Failed to persist deployment error", "error", err)
+			}
+		}
+		return
+	}
+	for _, z := range succeeded {
+		zs := state.GetZone(z.Domain)
+		if zs == nil {
+			continue
+		}
+		state.Mutate(func() { zs.ClearOperationError(statepkg.OpDeployment) })
+	}
+	if len(succeeded)+len(failed) > 0 {
+		if err := persistState(state); err != nil {
+			slog.Error("[CLI] Failed to persist deployment status", "error", err)
+		}
 	}
 }
 
@@ -798,17 +885,28 @@ func runSign(cmd *cobra.Command, args []string) error {
 			}
 			refs = append(refs, signedRef(cfg, domain, cfg.Zones[domain].Path, signedAt))
 		}
-		var confirmed []SignedZoneRef
+		var succeeded, failed []SignedZoneRef
 		hookErr = firePostSignHooks(&cfg.Hooks, cfg.OutputDir, refs, nil, func(zones []SignedZoneRef, err error) {
 			if err == nil {
-				confirmed = append(confirmed, zones...)
+				succeeded = append(succeeded, zones...)
+			} else {
+				failed = append(failed, zones...)
 			}
 		})
 		if hookErr != nil {
 			slog.Error("[CLI] Post-sign hook failed", "error", hookErr)
 		}
-		if len(confirmed) > 0 {
-			confirmPublicationCLI(state, confirmed)
+		// The hook confirms publication only in effective hook mode
+		// (RDAYBLUEX-013); in the other modes it only owns its deployment error.
+		recordHookResultCLI(cfg, state, succeeded, failed, hookErr)
+	}
+	// Probe mode: the every-authoritative-server serial probe is the only
+	// confirmation authority, for the zones signed now and for any still
+	// pending from earlier runs.
+	if cfg.PublicationMode() == config.PublicationProbe {
+		probePendingPublications(cfg, state, configuredZones(cfg))
+		if err := persistState(state); err != nil {
+			slog.Error("[CLI] Failed to persist publication status", "error", err)
 		}
 	}
 
