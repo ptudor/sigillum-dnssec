@@ -78,3 +78,100 @@ The review is analysis only. No source files were changed.
 
 **Verification:** Use a blocking hook test: launch a hook for generation A, reload generation B with a fresh pending publication for the same domain, release A successfully, and assert B remains pending and all B timestamps/cache horizons are unchanged. Repeat with a removed/re-added domain, a changed output path, and a newer signing of the same domain. Then complete B and assert exactly B is confirmed and persisted. Run `go test -race ./...` in `signer`.
 
+### RDAYBLUEX-006 — Hook execution is not conditioned on durable state publication
+
+**Severity:** High
+
+**Location:** `signer/daemon.go:604-632`, method `Daemon.signAllZones`; `signer/daemon.go:739-744`, method `Daemon.checkAndSignZone`; `signer/daemon.go:851-899`, method `Daemon.confirmPublication`
+
+**Problem:** The daemon can deploy a newly signed zone even though the state describing that generation was not saved. Non-coalesced hooks are launched inline before the end-of-cycle state reload/save, and coalesced hooks are launched after the save attempt regardless of whether it failed. The asynchronous confirmation then replaces memory from the older disk file before recording success. If a pre-commit save failure left the old valid `state.json` in place, a successful deployment callback can discard the newer in-memory signing and rollover state, add a confirmation to the older state, and save that regression. The served zone and authoritative state can then disagree, and `lastSaveFailed` cannot repair the loss because memory has already been replaced.
+
+**Evidence:** Lines 739-744 invoke a non-coalesced hook immediately after `SignZone`, whereas the cycle's `ReloadFromDisk` and `Save` do not occur until lines 610-626. Lines 628-632 invoke a coalesced hook without checking which branch of the preceding reload/save chain ran. A non-committed `Save` error sets `lastSaveFailed` but does not suppress the hook. When either hook finishes, `confirmPublication` unconditionally calls `ReplaceFromDisk` at lines 865-868 and later saves that adopted state. The cycle's cross-process lock serializes these operations but does not make the unsaved state durable; it merely causes the callback to run after the older file remains on disk.
+
+**Fix specification:** Treat successful state publication as a prerequisite for deployment hooks. Collect both per-zone and coalesced hook invocations during the cycle, but launch them only after the merged state file has been successfully committed; a post-rename durability warning may proceed because the file is visible, while a pre-commit save or pre-save reload failure must leave every affected generation pending and retry the entire save/deploy sequence on a later cycle. A publication callback must never replace known-newer unsaved memory with an older disk snapshot. Apply confirmation through a generation-aware state transaction that merges only the matching publication fields. Preserve synchronous CLI ordering, hook arguments/environment, coalescing semantics, on-disk schema compatibility, and at-least-once deployment retries.
+
+**Verification:** Inject a pre-commit state-save failure while an older valid state file exists. Assert that no hook starts, the old disk file is not rewritten as confirmed, the new in-memory signing/rollover fields remain intact, and the generation remains pending. Repair the save path and assert that a later cycle saves first, runs the hook once, and confirms the same generation. Cover coalesced and non-coalesced modes plus the post-rename durability-warning path. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-007 — Registrar automation never constructs the phase-correct final DS set
+
+**Severity:** High
+
+**Location:** `signer/internal/registrar/registrar.go:60-102`, function `BuildDSSet`; `signer/registrar_cli.go:341-390`, function `MaybeAutoPublishDS`; `signer/main.go:1364-1405`, rollover completion path; `signer/internal/signer/rollover.go:715-778`, method `CheckAlgorithmRollover`
+
+**Problem:** `BuildDSSet` includes the old KSK whenever any KSK or algorithm rollover object exists, regardless of phase. The `rollover_complete` path says it removes the old DS and calls `ReplaceDS`, but supplies this both-old-and-new set. KSK automation therefore leaves the old DS behind, and an explicit later `registrar push` can re-add it throughout retirement. Algorithm automation also performs its only replace too early with the same two-record set; when the state later reaches `algo_old_ds_removal_wait`, no registrar action is triggered. With `auto_publish` enabled, the workflow can wait forever for an old DS it never removes.
+
+**Evidence:** Lines 84-100 of `BuildDSSet` append the backed-up old KSK based only on rollover type. `MaybeAutoPublishDS` lines 369-377 describe a new-only final set but use that builder unchanged. `runRolloverComplete` invokes `MaybeAutoPublishDS(..., "rollover_complete")` immediately after moving a KSK or algorithm rollover into its DS-propagation phase. For algorithms, `CheckAlgorithmRollover` lines 726-735 later changes the phase to `AlgoRolloverStateOldDSRemoval`, but that automatic transition only saves state; it does not invoke registrar automation. Lines 736-766 then require observing the old DS absent before progress can continue.
+
+**Fix specification:** Make desired-DS construction explicitly phase-aware. For KSK rollover, retain old+new through DS-add waiting, then construct new-only once the new DS has been observed on all parents and the workflow authorizes old-DS removal; continue returning new-only through retirement so `registrar push` cannot resurrect the old DS. For algorithm rollover, retain both records through the first parent-DS propagation wait, perform the new-only replace when entering old-DS-removal waiting, and keep it new-only thereafter. Invoke auto-publication at that safe phase transition, make it idempotent across daemon restarts/retries, and persist a visible warning without advancing past a failed registrar update. Do not change registrar interfaces, CLI command names/output contracts, configuration keys, state schema compatibility, or manual operation for zones without auto-publication.
+
+**Verification:** Add a phase table test for ordinary, KSK, and algorithm states asserting the exact desired DS identities. Add end-to-end fake-registrar tests proving KSK completion replaces with new-only, algorithm completion initially retains both, the later automatic transition replaces with new-only exactly once, a transient failure retries without retiring keys, and `registrar push` never re-adds old DS in a removal/retirement phase. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-008 — Old-DS absence ignores records using an unexpected digest type
+
+**Severity:** High
+
+**Location:** `signer/internal/validate/parentds.go:103-163`, function `Validator.ProbeParentDS`; `signer/internal/signer/rollover.go:736-778`, algorithm rollover old-DS-removal phase
+
+**Problem:** The signer declares an old KSK's DS absent only by failing to find the exact SHA-256 or SHA-384 DS values it computed. A parent can still hold a DS for the same key tag and algorithm using SHA-1, an unknown future digest type, or a malformed/wrong digest. Such a record still affects resolver behavior, but the probe reports `AbsentOnAll=true` and can begin the final TTL before retiring the old algorithm. Retirement while a residual old-algorithm DS is served can make clients selecting that record go Bogus.
+
+**Evidence:** Lines 114-123 generate expected records only for digest types 2 and 4. Lines 141-157 increment `presentCount` only for a full key-tag, algorithm, digest-type, and digest match. Lines 159-162 equate a zero exact-match count with absence. `CheckAlgorithmRollover` consumes `AbsentOnAll[oldKeyID]` at lines 745-766 as the safety gate for starting old-key retirement. A DS with the old key tag and algorithm but digest type 1 is present in the answer and nevertheless produces a zero count.
+
+**Fix specification:** Separate two predicates: new-key presence must continue to require an exact supported digest derived from the DNSKEY, while old-key absence must conservatively require that no DS with the old DNSKEY's key tag and algorithm exists on any parent response, irrespective of digest type or digest value. Treat key-tag collisions conservatively as still present; waiting is safer than retiring a potentially referenced key. Preserve the `ParentDSObservation` API if possible, its every-parent fail-closed requirement, supported positive digest policy, and TTL behavior. Document and test the distinction so future digest support cannot weaken removal safety.
+
+**Verification:** Return parent RRsets containing only an old-key SHA-1 DS, an unknown digest type, a wrong digest with the matching tag/algorithm, and a colliding tag/algorithm. Assert `AbsentOnAll` is false and algorithm retirement does not advance. Also assert an unrelated tag/algorithm does not block absence and that exact SHA-256/SHA-384 still establishes `PresentOnAll` for a new key. Run `go test -race ./...` in `signer`.
+
+### RDAYBLUEX-009 — SSE flush failures are invisible to cancellation and concurrency accounting
+
+**Severity:** Medium
+
+**Location:** `validator/sse.go:18-46`, type `SSEWriter`; `validator/sse.go:68-135`, methods `WriteEvent`, `WriteRawEvent`, `WriteComment`, `WriteRetry`, and `WriteID`; validation stream handlers that cancel work on returned write errors
+
+**Problem:** Each SSE method checks buffered writes but flushes through `http.Flusher.Flush`, whose interface returns no error. The same writer already has a `ResponseController`, whose `Flush` reports errors from the underlying connection. If writes enter a buffer but the actual socket flush times out or fails, the method returns nil, so handler logic cannot cancel the validation. Expensive DNS work and a global validation semaphore slot can remain occupied until the independent validation timeout, amplifying slow/disconnected-client load.
+
+**Evidence:** `NewSSEWriter` stores both `flusher` and `rc`. Every write method arms a deadline and checks `fmt.Fprintf`, then calls `s.flusher.Flush()` at lines 94, 104, 114, 124, or 134 and returns nil unconditionally. The comments at lines 10-15 explicitly rely on write/flush errors releasing validation work, but the flush path cannot satisfy that contract.
+
+**Fix specification:** Flush through `http.ResponseController.Flush` and return a wrapped error from every SSE method when it fails. Keep the existing `http.Flusher` capability check if required for compatibility, and retain the per-event sliding deadline, headers, exact wire framing, stream IDs, and public handler behavior. Handler cancellation must occur on either write or flush failure and release activity/semaphore accounting exactly once. Writers that genuinely cannot expose flush errors may retain best-effort behavior only where the Go HTTP abstraction provides no stronger signal.
+
+**Verification:** Add a response-writer wrapper for which `Write` succeeds and `FlushError` returns a sentinel error. Assert every SSE method returns that error. In a stream-handler test, block validation after the first event, inject the flush error, and assert its context is cancelled, the active-validation count drops, and another request can acquire the global slot promptly. Run `go test -race ./...` in `validator`.
+
+### RDAYBLUEX-010 — A delegation can create unbounded per-request DNS fan-out
+
+**Severity:** Medium
+
+**Location:** `validator/internal/dns/resolver.go:160-215`, functions `ResolveAddressesDetailed` and `ResolveNSWithAddresses`; `validator/internal/validator/validator.go:1956-2012`, function `ValidateMultipleServers`; validation orchestration paths that flatten NS addresses
+
+**Problem:** Extended validation accepts an unbounded number of NS records and address records from DNS, does not de-duplicate them before work scheduling, and creates one goroutine per resulting address. `max_concurrent` limits only goroutines that have acquired the local semaphore; all others remain allocated and blocked, and semaphore acquisition is not context-aware. A client-chosen zone with a very large delegation/address set can therefore consume large numbers of goroutines, memory, resolver queries, and timeout-length waiters per validation. The global validation limit multiplies rather than bounds that fan-out.
+
+**Evidence:** `ResolveNSWithAddresses` iterates every returned NS and performs A and AAAA lookups with no count limit at lines 199-213. Address slices are appended without de-duplication at lines 168-187. `ValidateMultipleServers` sizes a result for every address and starts a goroutine for each at lines 1970-2008. Each goroutine blocks on `semaphore <- struct{}{}` at line 1981 without selecting on `ctx.Done()`. Quick mode caps the final server slice at two, but extended mode has no equivalent resource ceiling.
+
+**Fix specification:** Canonicalize and de-duplicate NS names and IP addresses, introduce explicit defensible per-validation maxima, and schedule authoritative queries through a bounded worker pool rather than one goroutine per input. Queue acquisition and result collection must observe context cancellation. If DNS data exceeds a limit, expose truncation/resource-budget exhaustion and return an Indeterminate outcome; do not claim consensus from an undisclosed partial set. Account for IPv4/IPv6 duplicates, repeated RRs, one IP shared by multiple NS names, and deterministic ordering. Preserve quick-mode semantics, public JSON field shapes, global validation limiting, and configured resolver/timeouts.
+
+**Verification:** Construct a fake delegation with thousands of NS/address records and duplicates. Assert goroutine growth and simultaneous queries remain within fixed bounds, cancellation prevents queued queries from starting, duplicates are queried once, the result reports the exceeded budget, and it cannot become Secure based only on the truncated subset. Run `go test -race ./...` in `validator`, including a repeated stress test under the race detector.
+
+### RDAYBLUEX-011 — Packaged validator startup has no offline last-known-good trust anchors
+
+**Severity:** Medium
+
+**Location:** `validator/internal/config/config.go:131-146`, default anchor sources; `validator/internal/dns/anchors.go:173-273`, anchor loading functions; `validator/anchors_store.go:27-44`, method `AnchorsStore.Load`; `.goreleaser.yaml:83-120`, validator package contents; `packaging/sigillum-validator-postinstall.sh:1-13`; `packaging/sigillum-validator.service:7-27`
+
+**Problem:** The packaged configuration points first to `/etc/sigillum-validator/root-anchors.json`, but packages neither install that file nor persist a validated URL result there or in the created state directory. Last-known-good behavior exists only in process memory. A clean installation, or any restart after a previously successful network fetch, has no anchors when the mirror or network is unavailable; the service starts but validation remains unavailable. This turns a transient external outage during startup into a complete validation outage despite having authenticated the same anchor set previously.
+
+**Evidence:** `LoadAnchorsWithFallback` reads the configured file and then fetches the URL, returning the downloaded object only in memory. `AnchorsStore.Load` assigns it to `s.anchors` but performs no atomic persistence. The validator package contents include configuration, service, and documentation but no anchor JSON. Post-install creates `/var/lib/sigillum-validator` but does not seed it, and the service's strict filesystem policy declares no validator-writable state path. Startup deliberately continues after anchor load failure and retries, while requests cannot validate without anchors.
+
+**Fix specification:** Provide an offline authenticated last-known-good path. Either ship a release-reviewed anchor document that passes the binary pins or atomically persist every successfully parsed, structurally valid, currently usable, pinned download to a dedicated state file, preferring that cache before the network on later starts. Persistence must use restrictive permissions, fsync/rename discipline, size limits, and never replace the previous good file on fetch, parse, pin, or durability failure. If runtime persistence is chosen, configure the service with the minimum writable state directory and use that path rather than making `/etc` writable. Keep the embedded pins as the trust boundary, preserve operator-supplied anchor-file precedence and config compatibility, and do not silently trust network content merely because it was cached.
+
+**Verification:** Build and inspect both package formats for the selected bootstrap/cache mechanism. Test clean installation with network unavailable, a successful fetch followed by restart with network unavailable, corrupt/truncated replacement attempts, expired/future-only documents, and cache-write failures. Assert a valid prior set survives every failed refresh, file owner/mode and service sandbox permit only the intended writes, and validation/readiness work offline. Run `go test -race ./...` in `validator` plus package-install tests in an isolated image.
+
+### RDAYBLUEX-012 — Malformed typed environment values silently activate defaults
+
+**Severity:** Medium
+
+**Location:** `validator/internal/config/config.go:243-300`, function `LoadFromEnv`; `validator/internal/config/config.go:462-494`, functions `getEnvInt` and `getEnvBool`
+
+**Problem:** When the validator runs without a configuration file, a present but malformed integer environment variable is logged and replaced with the default, while a malformed boolean is replaced silently. A deployment typo can therefore change timeouts, request/query concurrency, rate limits, shutdown behavior, heartbeat enablement, or heartbeat cadence without preventing startup. This is especially dangerous for resource controls: an intended lower limit can become a much larger default while the orchestrator reports the service healthy.
+
+**Evidence:** `LoadFromEnv` uses `getEnvInt` for every duration/count/limit and `getEnvBool` for heartbeat enablement. `getEnvInt` lines 471-481 logs that it is ignoring a malformed present value and returns the default, despite the adjacent comment saying such values should not fall back silently. `getEnvBool` lines 484-493 returns the default for every unrecognized nonempty value with no log or error. The later `Validate` sees only valid defaults, so it cannot detect the original misconfiguration.
+
+**Fix specification:** Make typed environment parsing return an error that names the variable and expected syntax whenever a nonempty value cannot be parsed; accumulate multiple errors if practical so operators can repair a deployment in one pass. Continue applying defaults only when variables are absent or intentionally empty according to the existing contract. Preserve currently accepted boolean aliases, environment variable names, file-first configuration precedence, default values, and the `Config` public fields. Never log secret-valued environment variables while reporting parse errors.
+
+**Verification:** Add table-driven `LoadFromEnv` tests for malformed, overflow, whitespace, and valid integer values plus every accepted and rejected boolean spelling. Assert malformed `MAX_CONCURRENT`, rate-limit, timeout, shutdown, heartbeat interval, and heartbeat enabled values fail startup rather than use defaults; absent values must still receive existing defaults. Run `go test -race ./...` in `validator`.
