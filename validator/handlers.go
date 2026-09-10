@@ -38,6 +38,10 @@ type Handlers struct {
 	// validateFn runs a JSON validation; nil means the real validator. Tests
 	// replace it to control timing (RA6X-020).
 	validateFn func(ctx context.Context, domain, mode string, qtype uint16, anchors *dnspkg.RootAnchors) (*validator.ValidationResult, error)
+	// sseValidateFn runs a streaming validation, emitting events through
+	// emit; nil means the real validator. Tests replace it to block after an
+	// event and observe cancellation (RDAYBLUEX-009).
+	sseValidateFn func(ctx context.Context, domain, mode string, qtype uint16, anchors *dnspkg.RootAnchors, emit func(validator.SSEEvent)) (*validator.ValidationResult, error)
 
 	// validationSem globally caps concurrent validations (R-086). Each extended
 	// validation fans out to every authoritative NS of every zone in the chain,
@@ -243,37 +247,46 @@ func (h *Handlers) HandleValidateSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create validator
-	v := validator.NewValidator(
-		h.config.QueryTimeout,
-		h.config.TotalTimeout,
-		h.config.MaxConcurrent,
-		anchors,
-		h.config.RecursiveResolver,
-	)
-
-	v.SetEgressPolicy(h.egress)
-
-	// Set RDAP client for out-of-band DS verification
-	if h.rdapClient != nil {
-		v.SetRDAPClient(h.rdapClient)
-	}
-
-	// Set validation mode (quick = first responding NS, extended = all NS)
-	if mode == "quick" {
-		v.SetQuickMode(true)
-	}
-
-	// Set the leaf record type to validate (R-083).
-	v.SetQueryType(qtype)
-
-	// Set up event callback
-	v.SetEventCallback(func(event validator.SSEEvent) {
+	// Every event goes out through the SSE writer; a failed write OR flush
+	// cancels the validation (RDAYBLUEX-009).
+	emit := func(event validator.SSEEvent) {
 		cancelOnWriteError(sse.WriteEvent(event.Type, event.Data), event.Type)
-	})
+	}
 
-	// Run validation
-	result, err := v.Validate(ctx, domain)
+	// Run validation (or the test seam).
+	var result *validator.ValidationResult
+	if h.sseValidateFn != nil {
+		result, err = h.sseValidateFn(ctx, domain, mode, qtype, anchors, emit)
+	} else {
+		// Create validator
+		v := validator.NewValidator(
+			h.config.QueryTimeout,
+			h.config.TotalTimeout,
+			h.config.MaxConcurrent,
+			anchors,
+			h.config.RecursiveResolver,
+		)
+
+		v.SetEgressPolicy(h.egress)
+
+		// Set RDAP client for out-of-band DS verification
+		if h.rdapClient != nil {
+			v.SetRDAPClient(h.rdapClient)
+		}
+
+		// Set validation mode (quick = first responding NS, extended = all NS)
+		if mode == "quick" {
+			v.SetQuickMode(true)
+		}
+
+		// Set the leaf record type to validate (R-083).
+		v.SetQueryType(qtype)
+
+		// Set up event callback
+		v.SetEventCallback(emit)
+
+		result, err = v.Validate(ctx, domain)
+	}
 	if err != nil && result == nil {
 		statusCode = "500"
 		LogError("handlers", err, "action", "validate_sse", "request_id", requestID, "domain", domain)
