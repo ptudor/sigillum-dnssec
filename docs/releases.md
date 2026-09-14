@@ -72,16 +72,16 @@ all release targets, refresh the compiled dependency notices, and rebuild the
 packages so they carry the updated notices:
 
 ```sh
-make snapshot
-python3 scripts/update-notices.py
-make snapshot
-python3 scripts/update-notices.py --check
+make update-notices
 ```
 
+This target builds, regenerates the notices, rebuilds packages with the refreshed
+file, and checks the result against every release binary.
+
 Use the Go version in `.go-version` for both builds and notice generation. If your
-Go distribution installs its `LICENSE` outside `GOROOT`, pass its location using
-`--go-license /path/to/go/LICENSE`. Review upstream license changes and commit the
-module files and refreshed notices together.
+Go distribution installs its `LICENSE` outside `GOROOT`, use
+`make update-notices GO_LICENSE=/path/to/go/LICENSE`. Review upstream license
+changes and commit the module files and refreshed notices together.
 
 ## Publish a version
 
