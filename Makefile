@@ -98,6 +98,9 @@ help:
 	@echo "  test               Run tests in all projects"
 	@echo "  clean              Remove build artifacts"
 	@echo "  deps               Update Go dependencies"
+	@echo "  release-check      Validate release configuration"
+	@echo "  snapshot           Build all release binaries and packages"
+	@echo "  update-notices     Rebuild releases and refresh dependency notices"
 	@echo "  help               Show this help"
 	@echo ""
 	@echo "Projects:"
@@ -105,9 +108,19 @@ help:
 
 # GitHub uses the same GoReleaser configuration as local snapshot builds.
 GORELEASER ?= goreleaser
-.PHONY: release-check snapshot
+PYTHON ?= python3
+GO_LICENSE ?=
+.PHONY: release-check snapshot update-notices
 release-check:
 	$(GORELEASER) check
 
 snapshot:
 	$(GORELEASER) release --snapshot --clean
+
+# Keep these steps ordered, including under make -j: packages must contain the
+# refreshed notices before the final check compares them with build metadata.
+update-notices:
+	$(MAKE) snapshot
+	$(PYTHON) scripts/update-notices.py $(if $(GO_LICENSE),--go-license "$(GO_LICENSE)")
+	$(MAKE) snapshot
+	$(PYTHON) scripts/update-notices.py --check $(if $(GO_LICENSE),--go-license "$(GO_LICENSE)")

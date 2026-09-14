@@ -27,8 +27,9 @@ both modules together; build from the checked-out tree for a matching pair.
 
 Contributions are accepted under the project's [MIT license](LICENSE). Retain
 third-party copyright and license notices. After a dependency or Go toolchain
-update, run `make snapshot`, then `python3 scripts/update-notices.py` and review
-the changes to `THIRD_PARTY_NOTICES.md`. Rebuild the snapshot to include the updated
-notices. CI compares those notices against every release binary's module metadata.
+update, run `make update-notices` and review the changes to
+`THIRD_PARTY_NOTICES.md`. This builds every release target, refreshes the notices,
+rebuilds the packages, and checks the result. CI compares those notices against
+every release binary's module metadata.
 If your Go distribution stores its license outside `GOROOT`, pass
-`--go-license /path/to/go/LICENSE` to the script.
+`GO_LICENSE=/path/to/go/LICENSE` to `make update-notices`.
