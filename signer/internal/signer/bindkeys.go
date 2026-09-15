@@ -13,13 +13,14 @@ import (
 )
 
 // Taking over a zone that another tool signed (dnssec-keygen/dnssec-signzone,
-// ldns-keygen/ldns-signzone, ...) must change nothing a resolver can see: the
-// KSK whose DS the parent holds keeps signing the DNSKEY RRset, and the ZSK
-// that signs the served zone keeps signing it. `import --keys-dir` points at
-// the other tool's key directory; ScanBindKeys describes every pair found
-// there and SelectImportKeys chooses, from what the parent and the zone's own
-// servers are observed to hold, the pair that satisfies that rule — or says
-// exactly why none does. Everything here is pure except the file reads.
+// ldns-keygen/ldns-signzone, ...) is anchored at the parent: the KSK whose DS
+// the parent holds determines the algorithm. A usable ZSK of that algorithm
+// completes the chain; the one signing the served zone is preferred only when
+// it is compatible, because the served deployment may be what import needs to
+// repair. `import --keys-dir` points at the other tool's key directory;
+// ScanBindKeys describes every pair found there and SelectImportKeys chooses
+// the pair — or says exactly why none works. Everything here is pure except
+// the file reads.
 
 // bindKeyFile matches BIND/ldns key file names: K<owner>.+<alg>+<tag>.<ext>.
 var bindKeyFile = regexp.MustCompile(`^K(.+)\.\+(\d{3})\+(\d{5})\.(key|private)$`)
@@ -183,6 +184,9 @@ type ServedKeys struct {
 	// the SOA and the DNSKEY RRset, whatever their validity.
 	SOASigners    []uint16
 	DNSKEYSigners []uint16
+	// SOASerials is the union of apex serials returned by the authoritative
+	// servers. Import uses it to avoid publishing a serial they will not take.
+	SOASerials []uint32
 	// StaleSignatures is set when signatures are served but every one of them
 	// is outside its validity window: the zone is already failing validation.
 	StaleSignatures bool
@@ -237,10 +241,12 @@ type ImportSelection struct {
 
 // SelectImportKeys chooses the KSK and ZSK to import from cands. An explicit
 // choice is honoured after the same checks; otherwise the KSK is the usable
-// one whose DS every parent server holds, and the ZSK the usable one of the
-// same algorithm that signs the served zone (then one that is published,
-// then the newest). Without a parent observation the choice must be
-// unambiguous or explicit. The error names what stands in the way.
+// one whose DS every parent server holds. That parent-trusted KSK fixes the
+// algorithm; among usable ZSKs of that algorithm, the one signing the served
+// zone is preferred, then one published there, then the newest. Thus an
+// incompatible served deployment never displaces the recoverable chain.
+// Without a parent observation the choice must be unambiguous or explicit.
+// The error names what stands in the way.
 func SelectImportKeys(cands []*ImportCandidate, obs ImportObservation, ksk, zsk TagChoice) (*ImportSelection, error) {
 	sel := &ImportSelection{}
 	var err error

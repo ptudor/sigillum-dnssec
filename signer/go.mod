@@ -6,6 +6,11 @@ go 1.25.0
 // The go directive above records the minimum required by dependencies.
 toolchain go1.27.1
 
+// Imported zones may still depend on legacy RSA keys below Go's modern
+// 1024-bit floor. The signer never generates them, but takeover must be able
+// to use them when they are the working half of a parent-trusted chain.
+godebug rsa1024min=0
+
 require (
 	github.com/miekg/dns v1.1.73
 	github.com/pelletier/go-toml/v2 v2.4.3

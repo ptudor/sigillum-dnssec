@@ -20,6 +20,7 @@ type parentLab struct {
 	port      string
 	resolver  string
 	servers   []*dns.Server
+	requireCD bool
 }
 
 func newParentLab(t *testing.T) *parentLab {
@@ -87,6 +88,14 @@ func newParentLab(t *testing.T) *parentLab {
 	rsrv := &dns.Server{PacketConn: rpc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
+		lab.mu.Lock()
+		requireCD := lab.requireCD
+		lab.mu.Unlock()
+		if requireCD && !r.CheckingDisabled {
+			m.Rcode = dns.RcodeServerFailure
+			w.WriteMsg(m)
+			return
+		}
 		q := r.Question[0]
 		switch {
 		case q.Qtype == dns.TypeNS:
@@ -127,6 +136,12 @@ func (l *parentLab) serve(addr string, rrs ...dns.RR) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.rrsByAddr[addr] = rrs
+}
+
+func (l *parentLab) resolverRequiresCD() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.requireCD = true
 }
 
 func (l *parentLab) validator() *Validator {

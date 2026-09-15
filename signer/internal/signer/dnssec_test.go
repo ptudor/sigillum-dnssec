@@ -2207,6 +2207,25 @@ func TestSerialPolicy_Epoch(t *testing.T) {
 	}
 }
 
+func TestValidateImportSerial(t *testing.T) {
+	now := time.Unix(1789400000, 0)
+	const source = uint32(1298859687)
+	const served = uint32(1786129989)
+
+	if _, err := ValidateImportSerial("example.com", "keep", source, []uint32{served}, now); err == nil || !strings.Contains(err.Error(), `serial_policy = "epoch"`) {
+		t.Fatalf("a takeover must reject a serial rollback under keep: %v", err)
+	}
+	if got, err := ValidateImportSerial("example.com", "epoch", source, []uint32{served}, now); err != nil || got != uint32(now.Unix()) {
+		t.Fatalf("epoch policy should advance the served serial: got %d, err %v", got, err)
+	}
+	if got, err := ValidateImportSerial("example.com", "keep", uint32(now.Unix()+1), []uint32{served}, now); err != nil || got != uint32(now.Unix()+1) {
+		t.Fatalf("a newer source serial should be preserved: got %d, err %v", got, err)
+	}
+	if _, err := ValidateImportSerial("example.com", "epoch", source, []uint32{uint32(now.Unix() + 1)}, now); err == nil || !strings.Contains(err.Error(), "projected SOA serial") {
+		t.Fatalf("epoch must reject an authoritative serial ahead of its projection: %v", err)
+	}
+}
+
 // TestSerialPolicy_EpochRejectsNonEpochSerials verifies the MUST-USE-epoch
 // contract: date-format (YYYYMMDDnn) and tiny sequential serials fail
 // signing with an instructive error, leaving prior output intact.

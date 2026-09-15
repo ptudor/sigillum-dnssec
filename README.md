@@ -44,9 +44,9 @@ the same name for its executable, Linux package, service, and service account.
   signers. Choose NSEC or NSEC3. ZSK rotation is automatic; KSK and algorithm
   rollovers expose the operator steps and parent-DS checks.
 - **Migration without a DS change.** `import --keys-dir` reads the key directory
-  of the previous signer, checks the parent's DS and what the zone's servers
-  publish, and keeps the KSK the parent names and the ZSK signing the served
-  zone, so resolvers see no difference.
+  of the previous signer and anchors the takeover at the KSK named by the
+  parent's DS. It chooses a compatible ZSK from the directory and can repair a
+  currently served deployment that conflicts with that trusted chain.
 - **Publication-aware rollover.** Configure whether a successful reload hook,
   an authoritative SOA probe, or writing the signed file confirms publication.
   Rollover timing follows that choice.

@@ -535,26 +535,51 @@ const epochSerialFloor = 946684800
 // epoch policy MUST carry a unix epoch serial in the unsigned file (e.g.
 // from `date +%s`); anything else is rejected here, which fails this zone's
 // signing while the previously signed output keeps serving.
-func (s *Signer) publishedSerial(domain string, serial uint32, zoneState *statepkg.ZoneState) (uint32, error) {
-	if s.cfg.GetZoneSerialPolicy(domain) != "epoch" {
+func nextPublishedSerial(domain, policy string, serial, previous uint32, now time.Time) (uint32, error) {
+	if policy != "epoch" {
 		return serial, nil
 	}
 
-	now := uint32(time.Now().Unix())
-	if serial < epochSerialFloor || serial > now+86400 {
+	nowSerial := uint32(now.Unix())
+	if serial < epochSerialFloor || serial > nowSerial+86400 {
 		return 0, fmt.Errorf(
 			"zone %s: serial_policy \"epoch\" requires a unix epoch SOA serial in the unsigned zone, got %d (expected %d..%d); set the serial to epoch seconds, e.g. `date +%%s`",
-			domain, serial, epochSerialFloor, now+86400)
+			domain, serial, epochSerialFloor, nowSerial+86400)
 	}
 
-	next := now
+	next := nowSerial
 	if !serialGt(next, serial) {
 		next = serial + 1
 	}
-	if prev := zoneState.PublishedSerial; prev != 0 && !serialGt(next, prev) {
-		next = prev + 1
+	if previous != 0 && !serialGt(next, previous) {
+		next = previous + 1
 	}
 	return next, nil
+}
+
+func (s *Signer) publishedSerial(domain string, serial uint32, zoneState *statepkg.ZoneState) (uint32, error) {
+	return nextPublishedSerial(domain, s.cfg.GetZoneSerialPolicy(domain), serial, zoneState.PublishedSerial, time.Now())
+}
+
+// ValidateImportSerial projects the first serial an imported zone will
+// publish and requires it to advance every serial observed at the current
+// authoritative servers. Otherwise secondaries can keep serving the old
+// generation even though the import itself succeeded.
+func ValidateImportSerial(domain, policy string, source uint32, served []uint32, now time.Time) (uint32, error) {
+	projected, err := nextPublishedSerial(domain, policy, source, 0, now)
+	if err != nil {
+		return 0, err
+	}
+	for _, current := range served {
+		if serialGt(projected, current) {
+			continue
+		}
+		if policy == "epoch" {
+			return projected, fmt.Errorf("projected SOA serial %d under serial_policy %q does not advance the currently served serial %d; correct the source serial or clock before importing", projected, policy, current)
+		}
+		return projected, fmt.Errorf("source SOA serial %d under serial_policy %q does not advance the currently served serial %d; update the source serial or use serial_policy = \"epoch\" before importing", source, policy, current)
+	}
+	return projected, nil
 }
 
 // setSOASerial rewrites the serial on the zone's SOA record in place.
@@ -1249,17 +1274,27 @@ func (s *Signer) validateZone(domain string, records []dns.RR) error {
 // checks that the file is parseable and satisfies the same structural rules as
 // the signing path (shared via validateZoneRecords).
 func ValidateZoneFile(domain, path string) error {
+	_, err := ValidateZoneFileWithSerial(domain, path)
+	return err
+}
+
+// ValidateZoneFileWithSerial performs ValidateZoneFile and also returns the
+// unique apex SOA serial for import preflight checks.
+func ValidateZoneFileWithSerial(domain, path string) (uint32, error) {
 	// The same source bounds as signing apply (RDAYBLUEX-017): an oversized
 	// file or record set is rejected before `add`/`import` do any work.
 	data, _, err := readSourceBytes(path, nil)
 	if err != nil {
-		return fmt.Errorf("opening zone file: %w", err)
+		return 0, fmt.Errorf("opening zone file: %w", err)
 	}
-	records, _, err := parseZoneRecords(domain, path, data)
+	records, serial, err := parseZoneRecords(domain, path, data)
 	if err != nil {
-		return fmt.Errorf("parsing zone file: %w", err)
+		return 0, fmt.Errorf("parsing zone file: %w", err)
 	}
-	return validateZoneRecords(domain, records)
+	if err := validateZoneRecords(domain, records); err != nil {
+		return 0, err
+	}
+	return serial, nil
 }
 
 // signRecordsWithKeys signs all RRsets using the provided keys, handling
