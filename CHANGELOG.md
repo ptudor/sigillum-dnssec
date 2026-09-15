@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-09-15
 
 - `sigillum-signer import --keys-dir` takes over a zone signed by another tool:
   every BIND-style key pair in the directory is listed, the parent's DS records
@@ -18,6 +18,25 @@
   BIND's multi-field layout on disk. RSASHA1
   and RSASHA1-NSEC3-SHA1 keys are read and listed but never signed with.
 - The parent DS probe reports the DS records the parent holds.
+- Coordinate publication hooks with committed state and the exact signed output;
+  bound hook dispatch, preserve concurrent CLI state updates, and require a
+  restart when changing the signer's `data_dir`.
+- Check every authoritative nameserver during publication and parent-DS probes;
+  keep registrar DS updates aligned with the rollover phase and report failed
+  CLI deployment hooks with a nonzero exit status.
+- Detect source changes by content digest, bound zone input size and record
+  count, refresh signatures by their actual expiry, and fix NSEC3 signing for
+  mixed-case zone names.
+- Select validator responses by authenticated DNSSEC evidence, bound
+  authoritative query fanout, and release streaming resources on flush failure.
+- Embed reviewed, pinned root anchors for offline validator startup and add an
+  atomic last-known-good cache that remains separate from operator anchor files.
+- Tighten integration URL, redirect, outbound-address, response-size, timing,
+  and typed-environment validation. Invalid configurations now fail explicitly.
+- Update the validator's `golang.org/x/net` dependency to v0.59.0 and refresh
+  compiled dependency notices; add `make update-notices` to automate the refresh.
+- Add BIND RSA import and rollover interoperability checks to CI alongside the
+  native race tests, cross-builds, package lifecycle tests, and security scans.
 
 ## 1.0.0 — 2026-09-06
 
