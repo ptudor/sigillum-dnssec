@@ -29,6 +29,9 @@
   mixed-case zone names.
 - Select validator responses by authenticated DNSSEC evidence, bound
   authoritative query fanout, and release streaming resources on flush failure.
+- Stop zone discovery at its context deadline even when a socket timeout arrives
+  before the context's cancellation signal; never return a guessed chain for
+  an expired discovery.
 - Embed reviewed, pinned root anchors for offline validator startup and add an
   atomic last-known-good cache that remains separate from operator anchor files.
 - Tighten integration URL, redirect, outbound-address, response-size, timing,
