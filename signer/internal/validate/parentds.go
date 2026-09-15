@@ -5,6 +5,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 	signerpkg "github.com/ptudor/sigillum-dnssec/signer/internal/signer"
@@ -287,6 +288,7 @@ func (v *Validator) ProbeParentDS(domain string, ksks []*dns.DNSKEY) (signerpkg.
 	qname := dns.Fqdn(domain)
 	exactCount := map[uint16]int{} // servers holding an exact supported digest for the key
 	anyCount := map[uint16]int{}   // servers holding any DS with the key's tag and algorithm
+	seenDS := map[string]bool{}    // DS records already listed in obs.DSRecords
 	for _, server := range parents {
 		msg, err := queryDirect(server, qname, dns.TypeDS, v.timeout)
 		if err != nil {
@@ -294,6 +296,13 @@ func (v *Validator) ProbeParentDS(domain string, ksks []*dns.DNSKEY) (signerpkg.
 		}
 		obs.Servers = append(obs.Servers, server)
 		dsRecords := ownerRecords[*dns.DS](msg, qname)
+		for _, ds := range dsRecords {
+			id := fmt.Sprintf("%d %d %d %s", ds.KeyTag, ds.Algorithm, ds.DigestType, strings.ToLower(ds.Digest))
+			if !seenDS[id] {
+				seenDS[id] = true
+				obs.DSRecords = append(obs.DSRecords, ds)
+			}
+		}
 		for _, ds := range dsRecords {
 			if ds.Hdr.Ttl > obs.TTL {
 				obs.TTL = ds.Hdr.Ttl
@@ -354,4 +363,78 @@ func (v *Validator) ProbePublishedSerial(domain string, serial uint32) (bool, st
 		}
 	}
 	return true, fmt.Sprintf("serial %d served by %d server(s)", serial, len(servers)), nil
+}
+
+// ProbeServedKeys asks every authoritative server of domain for its DNSKEY
+// and SOA RRsets and reports what is published and which key tags sign them
+// today, for an import that must not change what resolvers can validate
+// (signer.SelectImportKeys). Unlike the rollover probes it tolerates servers
+// that do not answer — the result is advisory and names them — but it fails
+// when the delegation cannot be discovered or no server answers at all.
+func (v *Validator) ProbeServedKeys(domain string) (signerpkg.ServedKeys, error) {
+	var served signerpkg.ServedKeys
+	qname := dns.Fqdn(domain)
+	targets, err := v.discoverNS(qname)
+	if err != nil {
+		return served, err
+	}
+	addrs, _, namesOf := flattenTargets(targets)
+	now := time.Now()
+	seen := map[string]bool{}
+	sawSignature, sawValid := false, false
+	note := func(sig *dns.RRSIG) {
+		sawSignature = true
+		if sig.ValidityPeriod(now) {
+			sawValid = true
+		}
+	}
+	for _, server := range addrs {
+		dnskeyMsg, err := queryDirect(server, qname, dns.TypeDNSKEY, v.timeout)
+		var soaMsg *dns.Msg
+		if err == nil {
+			soaMsg, err = queryDirect(server, qname, dns.TypeSOA, v.timeout)
+		}
+		if err != nil {
+			served.Unreachable = append(served.Unreachable, fmt.Sprintf("%s (%s): %v", server, strings.Join(namesOf[server], ","), err))
+			continue
+		}
+		served.Servers = append(served.Servers, server)
+		for _, k := range ownerRecords[*dns.DNSKEY](dnskeyMsg, qname) {
+			id := fmt.Sprintf("%d %d %d %s", k.Flags, k.Protocol, k.Algorithm, k.PublicKey)
+			if !seen[id] {
+				seen[id] = true
+				served.DNSKEYs = append(served.DNSKEYs, k)
+			}
+			if k.Hdr.Ttl > served.DNSKEYTTL {
+				served.DNSKEYTTL = k.Hdr.Ttl
+			}
+		}
+		for _, sig := range ownerRecords[*dns.RRSIG](dnskeyMsg, qname) {
+			if sig.TypeCovered == dns.TypeDNSKEY {
+				served.DNSKEYSigners = appendTag(served.DNSKEYSigners, sig.KeyTag)
+				note(sig)
+			}
+		}
+		for _, sig := range ownerRecords[*dns.RRSIG](soaMsg, qname) {
+			if sig.TypeCovered == dns.TypeSOA {
+				served.SOASigners = appendTag(served.SOASigners, sig.KeyTag)
+				note(sig)
+			}
+		}
+	}
+	if len(served.Servers) == 0 {
+		return served, fmt.Errorf("no authoritative server of %s answered: %s", domain, strings.Join(served.Unreachable, "; "))
+	}
+	served.StaleSignatures = sawSignature && !sawValid
+	return served, nil
+}
+
+// appendTag adds tag to tags unless it is already there.
+func appendTag(tags []uint16, tag uint16) []uint16 {
+	for _, t := range tags {
+		if t == tag {
+			return tags
+		}
+	}
+	return append(tags, tag)
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/ptudor/sigillum-dnssec/signer/internal/dnssectest"
 	signerpkg "github.com/ptudor/sigillum-dnssec/signer/internal/signer"
 	statepkg "github.com/ptudor/sigillum-dnssec/signer/internal/state"
-	"github.com/spf13/cobra"
 )
 
 // --- RA6X-034: hook lifetime bounds ------------------------------------------
@@ -334,9 +333,7 @@ func TestCLISingleZoneCommands_HookContract(t *testing.T) {
 				t.Fatal(err)
 			}
 			z.zones["imported.example"] = impZone
-			cmd := &cobra.Command{}
-			cmd.Flags().String("ksk", kskBase, "")
-			cmd.Flags().String("zsk", zskBase, "")
+			cmd := importCmdForTest(t, map[string]string{"ksk": kskBase, "zsk": zskBase})
 			if err := runImport(cmd, []string{"imported.example", impZone}); err != nil {
 				t.Fatal(err)
 			}

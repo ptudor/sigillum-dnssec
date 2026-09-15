@@ -87,14 +87,24 @@ func TestED25519PrivateFile_BINDCompatibleSeed(t *testing.T) {
 	}
 	// Re-serializing it (e.g. a staged copy) converts to the seed without
 	// changing the identity; a corrupted expanded key is left untouched.
-	if seed := privateBytesOf(formatPrivateKey(legacy, priv)); len(seed) != ed25519.SeedSize {
+	if seed := privateBytesOf(mustFormatPrivateKey(t, legacy, priv)); len(seed) != ed25519.SeedSize {
 		t.Fatalf("re-serialized legacy key must be the seed, got %d bytes", len(seed))
 	}
 	corrupt := append([]byte(nil), priv...)
 	corrupt[0] ^= 1
-	if raw := privateBytesOf(formatPrivateKey(legacy, corrupt)); len(raw) != ed25519.PrivateKeySize {
+	if raw := privateBytesOf(mustFormatPrivateKey(t, legacy, corrupt)); len(raw) != ed25519.PrivateKeySize {
 		t.Fatal("an inconsistent expanded key must not be silently rewritten as a seed")
 	}
+}
+
+// mustFormatPrivateKey formats a private key file or fails the test.
+func mustFormatPrivateKey(t *testing.T, dnskey *dns.DNSKEY, priv []byte) string {
+	t.Helper()
+	content, err := formatPrivateKey(dnskey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return content
 }
 
 // privateBytesOf extracts the PrivateKey bytes from a formatted file.

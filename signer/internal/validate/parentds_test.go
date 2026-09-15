@@ -16,6 +16,7 @@ type parentLab struct {
 	mu        sync.Mutex
 	dsByAddr  map[string][]*dns.DS // per auth server address
 	soaByAddr map[string]uint32
+	rrsByAddr map[string][]dns.RR // extra records served by an auth server (child-zone DNSKEY/SOA/RRSIG)
 	port      string
 	resolver  string
 	servers   []*dns.Server
@@ -23,7 +24,7 @@ type parentLab struct {
 
 func newParentLab(t *testing.T) *parentLab {
 	t.Helper()
-	lab := &parentLab{dsByAddr: map[string][]*dns.DS{}, soaByAddr: map[string]uint32{}}
+	lab := &parentLab{dsByAddr: map[string][]*dns.DS{}, soaByAddr: map[string]uint32{}, rrsByAddr: map[string][]dns.RR{}}
 	var pc4, pc6 net.PacketConn
 	var err error
 	for attempt := 0; attempt < 20; attempt++ {
@@ -60,6 +61,11 @@ func newParentLab(t *testing.T) *parentLab {
 			case dns.TypeSOA:
 				if serial, ok := lab.soaByAddr[addr]; ok {
 					m.Answer = append(m.Answer, &dns.SOA{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 60}, Ns: "ns1.parent.test.", Mbox: "h.parent.test.", Serial: serial, Refresh: 1, Retry: 1, Expire: 1, Minttl: 1})
+				}
+			}
+			for _, rr := range lab.rrsByAddr[addr] {
+				if sig, ok := rr.(*dns.RRSIG); ok && sig.TypeCovered == q.Qtype || rr.Header().Rrtype == q.Qtype {
+					m.Answer = append(m.Answer, rr)
 				}
 			}
 			w.WriteMsg(m)
@@ -113,6 +119,14 @@ func (l *parentLab) set(addr string, ds ...*dns.DS) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.dsByAddr[addr] = ds
+}
+
+// serve replaces the child-zone records (DNSKEY, SOA, RRSIG) one auth server
+// answers with.
+func (l *parentLab) serve(addr string, rrs ...dns.RR) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rrsByAddr[addr] = rrs
 }
 
 func (l *parentLab) validator() *Validator {

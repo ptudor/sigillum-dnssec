@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- `sigillum-signer import --keys-dir` takes over a zone signed by another tool:
+  every BIND-style key pair in the directory is listed, the parent's DS records
+  and the zone's authoritative servers are consulted, and the KSK the parent
+  names and the ZSK signing the served zone are chosen (or checked, with
+  `--ksk`/`--zsk` key tags). `--dry-run` shows the inventory and plan,
+  `--offline` skips the network checks, and a KSK the parent does not name is
+  refused without `--force`.
+- Sign with RSASHA256 and RSASHA512 keys, so a zone taken over with RSA keys
+  keeps its algorithm through ordinary rollovers (RSA keys the signer mints are
+  2048-bit); RSA private keys use BIND's multi-field layout on disk. RSASHA1
+  and RSASHA1-NSEC3-SHA1 keys are read and listed but never signed with.
+- The parent DS probe reports the DS records the parent holds.
+
 ## 1.0.0 — 2026-09-06
 
 - First public release of Sigillum: automatic DNSSEC zone signing, key lifecycle

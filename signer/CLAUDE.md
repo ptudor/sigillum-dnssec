@@ -117,6 +117,11 @@ sigillum-signer add example.com /etc/sigillum-signer/zones/com/example/zone.db
 # keys). A running daemon still holds the old config in memory until you SIGHUP it.
 sigillum-signer remove example.com
 
+# Take over a zone another tool signed, keeping the KSK the parent's DS names and
+# the ZSK signing the served zone (README: "Migrating from another signer")
+sigillum-signer import example.com /path/to/zone.db --keys-dir /var/named/keys/example.com --dry-run
+sigillum-signer import example.com /path/to/zone.db --keys-dir /var/named/keys/example.com
+
 # Key rollover commands
 sigillum-signer rollover start example.com    # Begin KSK or ZSK rollover
 sigillum-signer rollover status example.com   # Show rollover state
@@ -149,7 +154,7 @@ poll_interval = "5m"
 
 # DNSSEC parameters
 [dnssec]
-algorithm = "ED25519"          # Smaller signatures, faster; fall back to ECDSAP256SHA256 if registrar doesn't support alg 15
+algorithm = "ED25519"          # Smaller signatures, faster; fall back to ECDSAP256SHA256 if registrar doesn't support alg 15. RSASHA256/RSASHA512 exist for zones taken over from other signers; SHA-1 algorithms are never signed with
 ksk_lifetime = "5y"            # 1y, 3y, 5y — how long before rollover reminder
 zsk_lifetime = "90d"           # ZSK rolls automatically, no registrar interaction
 signature_validity = "14d"     # How long signatures are valid (1h–366d; the whole window must fit RFC 1982 serial arithmetic)
@@ -569,6 +574,7 @@ heartbeat.go         # AnyStatus heartbeat client
 status.go            # status/output DTOs (sit above state + validate)
 zone_identity.go     # canonical-conflict check (bridges config + state)
 registrar_cli.go     # `registrar` subcommands — CLI glue over the registrar pkg
+import_cli.go        # `import` — key inventory, parent/served probes, plan, transaction
 filelock_*.go        # state-dir lock (build-tagged unix/windows)
 syslog_*.go          # syslog handler (build-tagged unix/windows)
 

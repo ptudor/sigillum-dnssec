@@ -252,7 +252,10 @@ func (kg *KeyGenerator) StageKeyPair(domain, keyType string, dnskey *dns.DNSKEY,
 
 	keyContent := fmt.Sprintf("; Key tag: %d\n; Algorithm: %s\n; Created: %s\n%s\n",
 		tag, AlgorithmName(dnskey.Algorithm), time.Now().UTC().Format(time.RFC3339), dnskey.String())
-	privContent := formatPrivateKey(dnskey, privateKey)
+	privContent, err := formatPrivateKey(dnskey, privateKey)
+	if err != nil {
+		return "", fmt.Errorf("formatting %s private key %d for %s: %w", keyType, tag, domain, err)
+	}
 	if err := fsutil.WriteFileAtomicOwned(base+".private", []byte(privContent), 0600); err != nil {
 		return "", fmt.Errorf("staging private key %s.private: %w", base, err)
 	}

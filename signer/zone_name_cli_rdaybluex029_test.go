@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/spf13/cobra"
-
 	statepkg "github.com/ptudor/sigillum-dnssec/signer/internal/state"
 )
 
@@ -54,9 +52,7 @@ func TestRDAYBLUEX029_CLIRefusesBadNamesBeforeAnyMutation(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "invalid domain name") {
 			t.Fatalf("add %q must be refused as an invalid domain name, got %v", name, err)
 		}
-		cmd := &cobra.Command{}
-		cmd.Flags().String("ksk", "", "")
-		cmd.Flags().String("zsk", "", "")
+		cmd := importCmdForTest(t, nil)
 		err = runImport(cmd, []string{name, zonePath})
 		if err == nil || !strings.Contains(err.Error(), "invalid domain name") {
 			t.Fatalf("import %q must be refused as an invalid domain name, got %v", name, err)

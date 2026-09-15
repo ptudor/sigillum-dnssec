@@ -15,10 +15,11 @@ Minimal, opinionated DNSSEC signing daemon for sysadmins managing zones on NSD o
 
 - Automatic signing on zone file changes or before signature expiry
 - Automatic ZSK rollover (pre-publish method); semi-automatic KSK rollover with DS record guidance
-- ED25519 by default (ECDSA P-256/P-384 also supported); NSEC or NSEC3 denial of existence
+- ED25519 by default (ECDSA P-256/P-384 also supported; RSASHA256/RSASHA512 for zones taken over from other signers); NSEC or NSEC3 denial of existence
+- `import --keys-dir` takes over a zone signed by another tool, keeping the KSK the parent's DS names and the ZSK signing the served zone
 - Web dashboard for status and DS record copying; post-sign hooks for DNS server reload
 
-**Commands**: `serve`, `sign`, `add`, `remove`, `status`, `ds`, `dnskey`, `rollover`
+**Commands**: `serve`, `sign`, `add`, `remove`, `import`, `status`, `ds`, `dnskey`, `rollover`
 
 Uses `github.com/miekg/dns` and `github.com/pelletier/go-toml/v2` (same TOML library as the other daemons; despite older notes, no project here is on BurntSushi).
 

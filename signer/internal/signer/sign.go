@@ -1696,6 +1696,15 @@ func (s *Signer) signRRSIG(rrsig *dns.RRSIG, rrset []dns.RR, key *dns.DNSKEY, pr
 		}
 		ecdsaKey.PublicKey.X, ecdsaKey.PublicKey.Y = ecdsaKey.PublicKey.Curve.ScalarBaseMult(privateKey)
 		return rrsig.Sign(ecdsaKey, rrset)
+	case dns.RSASHA256, dns.RSASHA512:
+		// The in-memory RSA form is PKCS #1 DER (see rsa.go); the SHA-1 RSA
+		// algorithms are deliberately absent here — validateLoadedKey refuses
+		// them before any signing key is loaded.
+		rsaKey, err := rsaPrivateKeyFromBytes(privateKey)
+		if err != nil {
+			return err
+		}
+		return rrsig.Sign(rsaKey, rrset)
 	default:
 		return fmt.Errorf("unsupported algorithm: %d", key.Algorithm)
 	}

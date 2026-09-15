@@ -72,16 +72,24 @@ func sourceKeys(t *testing.T, domain string) (kskBase, zskBase string, kskTag, z
 
 func (f *importFixture) run(t *testing.T) error {
 	t.Helper()
-	cmd := &cobra.Command{}
-	cmd.Flags().String("ksk", "", "")
-	cmd.Flags().String("zsk", "", "")
-	if err := cmd.Flags().Set("ksk", f.kskBase); err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Flags().Set("zsk", f.zskBase); err != nil {
-		t.Fatal(err)
-	}
+	cmd := importCmdForTest(t, map[string]string{"ksk": f.kskBase, "zsk": f.zskBase})
 	return runImport(cmd, []string{f.domain, f.zonePath})
+}
+
+// importCmdForTest builds the real import command with --offline set (tests
+// have no parent zone to consult) and the given flags.
+func importCmdForTest(t *testing.T, flags map[string]string) *cobra.Command {
+	t.Helper()
+	cmd := newImportCmd()
+	if err := cmd.Flags().Set("offline", "true"); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range flags {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return cmd
 }
 
 func (f *importFixture) keysDir() string { return filepath.Join(f.dir, "keys") }

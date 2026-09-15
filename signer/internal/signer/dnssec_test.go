@@ -426,8 +426,9 @@ func TestAlgorithmFromName(t *testing.T) {
 		{"ED25519", dns.ED25519, false},
 		{"ECDSAP256SHA256", dns.ECDSAP256SHA256, false},
 		{"ECDSAP384SHA384", dns.ECDSAP384SHA384, false},
-		{"RSASHA256", 0, true}, // R-062: RSA is not supported by this signer
-		{"RSASHA512", 0, true}, // R-062: RSA is not supported by this signer
+		{"RSASHA256", dns.RSASHA256, false}, // RSA is supported for zones migrated from other signers
+		{"RSASHA512", dns.RSASHA512, false},
+		{"RSASHA1", 0, true}, // SHA-1 is never signed with
 		{"INVALID", 0, true},
 		{"ed25519", 0, true}, // Case sensitive
 	}

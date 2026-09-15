@@ -121,7 +121,9 @@ func TestValidateLoadedKey(t *testing.T) {
 		{"ZSK file in KSK slot", mk("example.com.", 256, dns.ED25519), "example.com", "ksk", true},
 		{"KSK file in ZSK slot", mk("example.com.", 257, dns.ED25519), "example.com", "zsk", true},
 		{"wrong owner", mk("evil.com.", 257, dns.ED25519), "example.com", "ksk", true},
-		{"unsupported algorithm (RSA)", mk("example.com.", 257, dns.RSASHA256), "example.com", "ksk", true},
+		{"RSA (supported for migrated zones)", mk("example.com.", 257, dns.RSASHA256), "example.com", "ksk", false},
+		{"RSASHA1 refused (SHA-1)", mk("example.com.", 257, dns.RSASHA1), "example.com", "ksk", true},
+		{"RSASHA1-NSEC3-SHA1 refused (SHA-1)", mk("example.com.", 256, dns.RSASHA1NSEC3SHA1), "example.com", "zsk", true},
 		{"unknown role", mk("example.com.", 257, dns.ED25519), "example.com", "csk", true},
 	}
 	for _, c := range cases {
