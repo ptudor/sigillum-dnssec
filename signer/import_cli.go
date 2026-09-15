@@ -36,8 +36,8 @@ func newImportCmd() *cobra.Command {
 		Use:   "import <domain> <zone-path>",
 		Short: "Take over a zone signed by another tool, keeping its keys and DS",
 		Long: `Take over a zone that another tool (dnssec-keygen/dnssec-signzone,
-ldns-keygen/ldns-signzone, ...) signed, keeping the keys it uses so the DS
-records at the parent stay valid and nothing changes for resolvers.
+ldns-keygen/ldns-signzone, ...) signed, keeping the parent-trusted chain
+valid even when the zone currently being served is broken.
 
 Point --keys-dir at the directory holding the other tool's key files:
 
@@ -45,10 +45,13 @@ Point --keys-dir at the directory holding the other tool's key files:
   Kexample.com.+008+67890.key      Kexample.com.+008+67890.private
 
 Every pair for the zone is listed. Unless --offline is given, the parent's
-DS records and the zone's authoritative servers are consulted, and the KSK
-whose DS the parent holds and the ZSK that signs the served zone are chosen;
---ksk and --zsk (key tags) override the choice. --dry-run shows the inventory
-and the plan without changing anything.
+DS records and the zone's authoritative servers are consulted. The parent's
+DS chooses the KSK and algorithm first; a usable ZSK of that algorithm is then
+chosen, preferring the one served today only when it belongs to that trusted
+chain. A conflicting served deployment is reported, not preserved. --ksk and
+--zsk (key tags) override the choice. --dry-run shows the inventory and plan
+without changing anything. The planned SOA serial must advance every serial
+observed at the authoritative servers.
 
 Without --keys-dir, --ksk and --zsk name the two key files directly, as paths
 without the .key/.private extension.
@@ -128,7 +131,14 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	cfg, state, unlock, err := loadConfigStateLocked()
+	var cfg *config.Config
+	var state *statepkg.State
+	unlock := func() {}
+	if opts.dryRun {
+		cfg, state, err = loadConfigAndState()
+	} else {
+		cfg, state, unlock, err = loadConfigStateLocked()
+	}
 	if err != nil {
 		return err
 	}
@@ -139,8 +149,9 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("zone file does not exist: %s", zonePath)
 	}
 
-	// Validate zone file
-	if err := signerpkg.ValidateZoneFile(domain, zonePath); err != nil {
+	// Validate zone file and retain its serial for the takeover preflight.
+	sourceSerial, err := signerpkg.ValidateZoneFileWithSerial(domain, zonePath)
+	if err != nil {
 		return fmt.Errorf("invalid zone file: %w", err)
 	}
 
@@ -175,6 +186,14 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot choose the keys to import: %w", err)
 	}
 	printImportPlan(os.Stdout, domain, sel)
+	serialPolicy := cfg.GetZoneSerialPolicy(domain)
+	projectedSerial, err := signerpkg.ValidateImportSerial(domain, serialPolicy, sourceSerial, obs.Served.SOASerials, time.Now())
+	if err != nil {
+		return fmt.Errorf("refusing to import: %w", err)
+	}
+	if len(obs.Served.SOASerials) > 0 {
+		fmt.Printf("SOA handoff: %d (%s policy) advances served serial %s\n\n", projectedSerial, serialPolicy, uint32sString(obs.Served.SOASerials))
+	}
 	if sel.DSMissing && !opts.force {
 		return fmt.Errorf("refusing to import: the parent's DS records do not name KSK %d, so the signed zone would be bogus; pass --force only if you are changing the parent's DS to: %s",
 			sel.KSK.Tag, sel.KSK.DNSKEY.ToDS(dns.SHA256).String())
@@ -476,8 +495,8 @@ func printImportInventory(w io.Writer, domain, dir string, cands []*signerpkg.Im
 		if len(tags) == 0 {
 			fmt.Fprintf(w, "  Served (%d servers): no DNSKEY RRset\n", len(s.Servers))
 		} else {
-			fmt.Fprintf(w, "  Served (%d servers): DNSKEY %s (TTL %ds); SOA signed by %s; DNSKEY signed by %s",
-				len(s.Servers), strings.Join(tags, ", "), s.DNSKEYTTL, tagsOrNone(s.SOASigners), tagsOrNone(s.DNSKEYSigners))
+			fmt.Fprintf(w, "  Served (%d servers): DNSKEY %s (TTL %ds); SOA serial %s signed by %s; DNSKEY signed by %s",
+				len(s.Servers), strings.Join(tags, ", "), s.DNSKEYTTL, uint32sString(s.SOASerials), tagsOrNone(s.SOASigners), tagsOrNone(s.DNSKEYSigners))
 			if s.StaleSignatures {
 				fmt.Fprint(w, "; every signature is expired")
 			}
@@ -534,6 +553,17 @@ func tagsOrNone(tags []uint16) string {
 	parts := make([]string, 0, len(tags))
 	for _, t := range tags {
 		parts = append(parts, strconv.Itoa(int(t)))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func uint32sString(values []uint32) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.FormatUint(uint64(value), 10))
 	}
 	return strings.Join(parts, ", ")
 }

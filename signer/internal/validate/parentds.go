@@ -66,12 +66,15 @@ func exchangeTC(c *dns.Client, m *dns.Msg, server string) (*dns.Msg, error) {
 	return r, nil
 }
 
-// resolverQuery asks the configured recursive resolver and requires a
-// NOERROR answer to the question asked.
-func (v *Validator) resolverQuery(qname string, qtype uint16) (*dns.Msg, error) {
+// resolverQueryWithCD asks the configured recursive resolver and requires a
+// NOERROR answer to the question asked. checkingDisabled is used only by the
+// import advisory probe: that probe must still discover a zone whose current
+// DNSSEC deployment is bogus, because repairing that deployment is its job.
+func (v *Validator) resolverQueryWithCD(qname string, qtype uint16, checkingDisabled bool) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(qname), qtype)
 	m.RecursionDesired = true
+	m.CheckingDisabled = checkingDisabled
 	c := &dns.Client{Timeout: v.timeout}
 	r, err := exchangeTC(c, m, v.resolverAddr())
 	if err != nil {
@@ -81,6 +84,17 @@ func (v *Validator) resolverQuery(qname string, qtype uint16) (*dns.Msg, error) 
 		return nil, fmt.Errorf("%s %s lookup: %s", qname, dns.TypeToString[qtype], dns.RcodeToString[r.Rcode])
 	}
 	return r, nil
+}
+
+// resolverQuery performs ordinary validating recursive discovery.
+func (v *Validator) resolverQuery(qname string, qtype uint16) (*dns.Msg, error) {
+	return v.resolverQueryWithCD(qname, qtype, false)
+}
+
+// resolverQueryUnchecked requests data even when the recursive resolver finds
+// the current DNSSEC chain bogus. The result is advisory, never a trust anchor.
+func (v *Validator) resolverQueryUnchecked(qname string, qtype uint16) (*dns.Msg, error) {
+	return v.resolverQueryWithCD(qname, qtype, true)
 }
 
 // nsNamesOf extracts the canonical NS names of zone from an NS answer: the
@@ -121,8 +135,19 @@ func nsNamesOf(r *dns.Msg, zone string) []string {
 // records owned by the queried name are accepted (an NS name must not be an
 // alias, RFC 2181 §10.3).
 func (v *Validator) discoverNS(zone string) ([]nsTarget, error) {
+	return v.discoverNSWith(zone, v.resolverQuery)
+}
+
+// discoverNSUnchecked is the import-only discovery path for inspecting a
+// deployment that may already be bogus. Its answers only drive advisory
+// observations; parent-DS checks and rollover safety gates use discoverNS.
+func (v *Validator) discoverNSUnchecked(zone string) ([]nsTarget, error) {
+	return v.discoverNSWith(zone, v.resolverQueryUnchecked)
+}
+
+func (v *Validator) discoverNSWith(zone string, query func(string, uint16) (*dns.Msg, error)) ([]nsTarget, error) {
 	zone = dns.Fqdn(zone)
-	r, err := v.resolverQuery(zone, dns.TypeNS)
+	r, err := query(zone, dns.TypeNS)
 	if err != nil {
 		return nil, fmt.Errorf("NS lookup for %s: %w", zone, err)
 	}
@@ -172,7 +197,7 @@ func (v *Validator) discoverNS(zone string) ([]nsTarget, error) {
 				}
 				continue
 			}
-			ar, err := v.resolverQuery(name, qtype)
+			ar, err := query(name, qtype)
 			if err != nil {
 				return nil, fmt.Errorf("nameserver %s of %s could not be resolved (delegation coverage incomplete): %w", name, zone, err)
 			}
@@ -367,14 +392,15 @@ func (v *Validator) ProbePublishedSerial(domain string, serial uint32) (bool, st
 
 // ProbeServedKeys asks every authoritative server of domain for its DNSKEY
 // and SOA RRsets and reports what is published and which key tags sign them
-// today, for an import that must not change what resolvers can validate
-// (signer.SelectImportKeys). Unlike the rollover probes it tolerates servers
-// that do not answer — the result is advisory and names them — but it fails
-// when the delegation cannot be discovered or no server answers at all.
+// today. Discovery requests checking disabled so an already-bogus deployment
+// can still be inspected; the result is advisory and cannot override the
+// parent-trusted algorithm (signer.SelectImportKeys). Unlike the rollover
+// probes it tolerates servers that do not answer — the result names them — but
+// it fails when the delegation cannot be discovered or no server answers.
 func (v *Validator) ProbeServedKeys(domain string) (signerpkg.ServedKeys, error) {
 	var served signerpkg.ServedKeys
 	qname := dns.Fqdn(domain)
-	targets, err := v.discoverNS(qname)
+	targets, err := v.discoverNSUnchecked(qname)
 	if err != nil {
 		return served, err
 	}
@@ -421,6 +447,9 @@ func (v *Validator) ProbeServedKeys(domain string) (signerpkg.ServedKeys, error)
 				note(sig)
 			}
 		}
+		for _, soa := range ownerRecords[*dns.SOA](soaMsg, qname) {
+			served.SOASerials = appendSerial(served.SOASerials, soa.Serial)
+		}
 	}
 	if len(served.Servers) == 0 {
 		return served, fmt.Errorf("no authoritative server of %s answered: %s", domain, strings.Join(served.Unreachable, "; "))
@@ -437,4 +466,14 @@ func appendTag(tags []uint16, tag uint16) []uint16 {
 		}
 	}
 	return append(tags, tag)
+}
+
+// appendSerial adds serial unless it is already present.
+func appendSerial(serials []uint32, serial uint32) []uint32 {
+	for _, s := range serials {
+		if s == serial {
+			return serials
+		}
+	}
+	return append(serials, serial)
 }

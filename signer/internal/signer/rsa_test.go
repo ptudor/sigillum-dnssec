@@ -17,10 +17,14 @@ import (
 
 // rsaBindKey mints a BIND-style RSA key of the given algorithm and returns
 // the DNSKEY with the private half in the BIND multi-field file format.
-func rsaBindKey(t *testing.T, alg uint8, flags uint16) (*dns.DNSKEY, string) {
+func rsaBindKey(t *testing.T, alg uint8, flags uint16, rsaBits ...int) (*dns.DNSKEY, string) {
 	t.Helper()
 	k := &dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600}, Flags: flags, Protocol: 3, Algorithm: alg}
-	priv, err := k.Generate(2048)
+	bits := 2048
+	if len(rsaBits) > 0 {
+		bits = rsaBits[0]
+	}
+	priv, err := k.Generate(bits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,14 +134,26 @@ func TestRSA_BindFileImportAndMismatch(t *testing.T) {
 	}
 }
 
-// A modulus below the accepted minimum is refused with a size message, not a
-// library error at signing time.
-func TestRSA_TooSmallRefused(t *testing.T) {
-	p, err := rand.Prime(rand.Reader, 256)
+// A legacy 512-bit RSASHA256 key remains usable for takeover continuity, while
+// anything below that compatibility floor is refused with a size message.
+func TestRSA_Legacy512AcceptedAndSmallerRefused(t *testing.T) {
+	k, file := rsaBindKey(t, dns.RSASHA256, 256, 512)
+	priv, err := ParsePrivateKeyFromFile(file)
 	if err != nil {
 		t.Fatal(err)
 	}
-	q, err := rand.Prime(rand.Reader, 256)
+	if got := RSAKeyBits(k); got != 512 {
+		t.Fatalf("legacy key is %d bits, want 512", got)
+	}
+	if err := ValidateKeyForImport("example.com", "zsk", k, priv); err != nil {
+		t.Fatalf("legacy 512-bit takeover key must remain usable: %v", err)
+	}
+
+	p, err := rand.Prime(rand.Reader, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := rand.Prime(rand.Reader, 128)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,8 +165,8 @@ func TestRSA_TooSmallRefused(t *testing.T) {
 	b64 := func(x *big.Int) string { return base64.StdEncoding.EncodeToString(x.Bytes()) }
 	fields := map[string]string{"modulus": b64(n), "publicexponent": b64(e), "privateexponent": b64(d), "prime1": b64(p), "prime2": b64(q)}
 	_, err = parseBindRSAPrivateKey(fields)
-	if err == nil || !strings.Contains(err.Error(), "at least 1024 bits") {
-		t.Fatalf("a 512-bit RSA key must be refused by size, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "at least 512 bits") {
+		t.Fatalf("a 256-bit RSA key must be refused by size, got %v", err)
 	}
 }
 

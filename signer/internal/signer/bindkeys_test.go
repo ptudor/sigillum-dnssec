@@ -163,9 +163,9 @@ func hasWarning(sel *ImportSelection, substr string) bool {
 	return false
 }
 
-// The selection keeps what resolvers can validate: the KSK the parent's DS
-// names, the ZSK signing the served zone — and explains itself, or refuses
-// with the reason, in every other situation.
+// Selection anchors trust at the KSK named by the parent's DS. Served state
+// only ranks compatible ZSKs; a conflicting deployment is evidence to report,
+// not the chain to preserve.
 func TestSelectImportKeys(t *testing.T) {
 	auto := TagChoice{}
 	pick := func(tag uint16) TagChoice { return TagChoice{Set: true, Tag: tag} }
@@ -231,6 +231,32 @@ func TestSelectImportKeys(t *testing.T) {
 		sel, err = SelectImportKeys([]*ImportCandidate{k, old, newer}, parentHolding([]*ImportCandidate{k}, nil), auto, auto)
 		if err != nil || sel.ZSK != newer || !strings.Contains(sel.ZSKReason, "newest") || !strings.Contains(sel.ZSKReason, "not checked") {
 			t.Fatalf("%+v, %v", sel, err)
+		}
+	})
+
+	t.Run("the parent-trusted algorithm wins over a broken served deployment", func(t *testing.T) {
+		k := fakeCandidate(6142, "ksk", dns.RSASHA256, day(2015, 1, 1))
+		z := fakeCandidate(32649, "zsk", dns.RSASHA256, day(2017, 1, 1))
+		servedK := fakeCandidate(16439, "ksk", dns.ED25519, day(2026, 1, 1))
+		servedZ := fakeCandidate(36503, "zsk", dns.ED25519, day(2026, 1, 1))
+		obs := parentHolding([]*ImportCandidate{k}, nil)
+		obs.ServedProbed = true
+		obs.Served = ServedKeys{
+			Servers:       []string{"a"},
+			DNSKEYs:       []*dns.DNSKEY{servedK.DNSKEY, servedZ.DNSKEY},
+			SOASigners:    []uint16{servedZ.Tag},
+			DNSKEYSigners: []uint16{servedK.Tag},
+			DNSKEYTTL:     3600,
+		}
+		sel, err := SelectImportKeys([]*ImportCandidate{k, z}, obs, auto, auto)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sel.KSK != k || sel.ZSK != z || !strings.Contains(sel.ZSKReason, "only usable ZSK") {
+			t.Fatalf("the parent-trusted algorithm must determine the compatible pair: %+v", sel)
+		}
+		if !hasWarning(sel, "not in the DNSKEY RRset served today") || !hasWarning(sel, "signed by ZSK 36503") {
+			t.Fatalf("the broken served deployment must be disclosed: %+v", sel.Warnings)
 		}
 	})
 

@@ -229,10 +229,11 @@ cycle, and a changed `output_dir` is populated on the next cycle after reload.
 
 If a zone is already signed with keys from another tool (`dnssec-keygen` /
 `dnssec-signzone`, `ldns-keygen` / `ldns-signzone`, or an earlier setup of
-your own), `import` takes it over without changing anything a resolver can
-see: the KSK whose DS the parent already holds keeps signing the DNSKEY RRset,
-and the ZSK that signs the served zone keeps signing it. The DS at the
-registrar stays as it is.
+your own), `import` takes it over without changing the DS at the registrar.
+The KSK named by that DS determines the algorithm. The importer then chooses
+a usable ZSK of the same algorithm, preferring the one served today when it is
+part of that chain. If the current deployment conflicts with the parent DS,
+the recoverable key pair wins and the conflict is reported instead of kept.
 
 Point `--keys-dir` at the other tool's key directory and look at the plan
 first:
@@ -256,11 +257,13 @@ Keys for example.com in /var/named/keys/example.com:
   19809  KSK   RSASHA512  2048  2017-07-08  absent     no       ok
   42493 (RSASHA1): ksk key for example.com uses RSASHA1 (algorithm 5): SHA-1 signatures are no longer treated as secure by validating resolvers (RFC 8624 §3.1), so this signer will not sign with it; …
   Parent: DS 47561/RSASHA512/SHA256
-  Served (2 servers): DNSKEY 47561, 12345 (TTL 3600); SOA signed by 12345; DNSKEY signed by 47561
+  Served (2 servers): DNSKEY 47561, 12345 (TTL 3600); SOA serial 1762900000 signed by 12345; DNSKEY signed by 47561
 
 Plan for example.com:
   KSK 47561 (RSASHA512, 2048 bits): its DS is at every parent server
   ZSK 12345 (RSASHA512, 2048 bits): it signs the served zone
+
+SOA handoff: 1762900100 (epoch policy) advances served serial 1762900000
 ```
 
 Drop `--dry-run` to import. The chosen KSK must have its DS at every parent
@@ -270,6 +273,9 @@ server; when the parent names a different key the import refuses (pass
 `--offline` skips the network checks, in which case the choice must be
 unambiguous or explicit. When the parent probe itself fails (no delegation
 yet, no network), the error says so and `--offline` is the way through.
+The first signed SOA serial must also advance every serial observed at the
+authoritative servers. An older unix-epoch source serial works with
+`serial_policy = "epoch"`; under `keep`, update the source serial first.
 
 Without `--keys-dir`, `--ksk` and `--zsk` name the two key files directly, as
 base names without the `.key`/`.private` extension:
@@ -281,13 +287,12 @@ sigillum-signer import example.com /path/to/zone.db \
   --config config.toml
 ```
 
-Imported RSASHA256 and RSASHA512 keys are used as they are, and the zone keeps
-its algorithm through ordinary rollovers (RSA keys the signer mints are
-2048-bit). Keys using SHA-1 (RSASHA1, RSASHA1-NSEC3-SHA1) are listed but
+Imported RSASHA256 and RSASHA512 keys are used as they are, including legacy
+512-bit takeover keys, and the zone keeps its algorithm through ordinary
+rollovers (RSA keys the signer mints are 2048-bit). Keys using SHA-1
+(RSASHA1, RSASHA1-NSEC3-SHA1) are listed but
 refused: validating resolvers no longer treat SHA-1 signatures as secure, so
-signing with them buys nothing. Once the zone is in, `rollover algorithm
-example.com ED25519` moves it to a current algorithm whenever you can update
-the DS at the parent.
+signing with them buys nothing.
 
 The key files sigillum-signer writes are in the same BIND private-key format
 (`Private-key-format: v1.3`) — RSA keys in the multi-field layout, ED25519 keys

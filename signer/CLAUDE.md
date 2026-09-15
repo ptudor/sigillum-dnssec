@@ -118,7 +118,7 @@ sigillum-signer add example.com /etc/sigillum-signer/zones/com/example/zone.db
 sigillum-signer remove example.com
 
 # Take over a zone another tool signed, keeping the KSK the parent's DS names and
-# the ZSK signing the served zone (README: "Migrating from another signer")
+# a compatible ZSK, preferring the served signer only within the parent-trusted algorithm (README: "Migrating from another signer")
 sigillum-signer import example.com /path/to/zone.db --keys-dir /var/named/keys/example.com --dry-run
 sigillum-signer import example.com /path/to/zone.db --keys-dir /var/named/keys/example.com
 

@@ -55,7 +55,7 @@ func Config(t *testing.T, dataDir string) *config.Config {
 // half, BIND private-key fields plus Created/Publish/Activate timestamps on
 // the private half) and returns the DNSKEY and the pair's base path. RSA
 // keys are 2048 bits.
-func WriteBindKeyPair(t *testing.T, dir, owner string, alg uint8, flags uint16, created time.Time) (*dns.DNSKEY, string) {
+func WriteBindKeyPair(t *testing.T, dir, owner string, alg uint8, flags uint16, created time.Time, rsaBits ...int) (*dns.DNSKEY, string) {
 	t.Helper()
 	k := &dns.DNSKEY{
 		Hdr:       dns.RR_Header{Name: dns.Fqdn(owner), Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
@@ -67,6 +67,9 @@ func WriteBindKeyPair(t *testing.T, dir, owner string, alg uint8, flags uint16, 
 	switch alg {
 	case dns.RSASHA1, dns.RSASHA1NSEC3SHA1, dns.RSASHA256, dns.RSASHA512:
 		bits = 2048
+		if len(rsaBits) > 0 {
+			bits = rsaBits[0]
+		}
 	case dns.ECDSAP384SHA384:
 		bits = 384
 	}

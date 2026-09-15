@@ -124,16 +124,20 @@ func TestImportKeysDir_DryRunWritesNothing(t *testing.T) {
 		}
 	}
 	assertNothingImported(t, f, cfgBefore)
+	if _, err := os.Stat(filepath.Join(f.dir, "state.json.lock")); !os.IsNotExist(err) {
+		t.Fatalf("dry run must not create the state lock file, got %v", err)
+	}
 }
 
-// A directory holding usable RSA keys, a SHA-1 KSK and a ZSK of another
-// algorithm imports the usable RSA pair, lists the rest, and produces a zone
-// whose signatures verify under the imported keys.
+// A directory holding usable RSA keys (including a legacy 512-bit ZSK), a
+// SHA-1 KSK and a ZSK of another algorithm imports the compatible RSA pair,
+// lists the rest, and produces a zone whose signatures verify under the
+// imported keys.
 func TestImportKeysDir_ChoosesUsableRSAPairAndSigns(t *testing.T) {
 	f := newImportFixture(t, "rsa.example")
 	dir := t.TempDir()
 	ksk, _ := dnssectest.WriteBindKeyPair(t, dir, f.domain, dns.RSASHA256, 257, importDay)
-	zsk, _ := dnssectest.WriteBindKeyPair(t, dir, f.domain, dns.RSASHA256, 256, importDay.Add(24*time.Hour))
+	zsk, _ := dnssectest.WriteBindKeyPair(t, dir, f.domain, dns.RSASHA256, 256, importDay.Add(24*time.Hour), 512)
 	sha1, _ := dnssectest.WriteBindKeyPair(t, dir, f.domain, dns.RSASHA1, 257, time.Date(2018, 8, 19, 0, 0, 0, 0, time.UTC))
 	other, _ := dnssectest.WriteBindKeyPair(t, dir, f.domain, dns.ED25519, 256, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
 
@@ -141,7 +145,7 @@ func TestImportKeysDir_ChoosesUsableRSAPairAndSigns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	for _, want := range []string{"SHA-1", "unusable", fmt.Sprintf("KSK %d (RSASHA256, 2048 bits)", ksk.KeyTag()), fmt.Sprintf("ZSK %d (RSASHA256, 2048 bits)", zsk.KeyTag()), "imported."} {
+	for _, want := range []string{"SHA-1", "unusable", fmt.Sprintf("KSK %d (RSASHA256, 2048 bits)", ksk.KeyTag()), fmt.Sprintf("ZSK %d (RSASHA256, 512 bits)", zsk.KeyTag()), "imported."} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output lacks %q:\n%s", want, out)
 		}

@@ -4,14 +4,18 @@
 
 - `sigillum-signer import --keys-dir` takes over a zone signed by another tool:
   every BIND-style key pair in the directory is listed, the parent's DS records
-  and the zone's authoritative servers are consulted, and the KSK the parent
-  names and the ZSK signing the served zone are chosen (or checked, with
-  `--ksk`/`--zsk` key tags). `--dry-run` shows the inventory and plan,
-  `--offline` skips the network checks, and a KSK the parent does not name is
+  and the zone's authoritative servers are consulted, and the parent-trusted
+  KSK fixes the algorithm before a compatible ZSK is chosen (or checked, with
+  `--ksk`/`--zsk` key tags). A conflicting served deployment is reported rather
+  than preserved, even when a validating resolver returns SERVFAIL for it; an
+  SOA-serial rollback is refused. `--dry-run` shows the inventory and plan
+  without creating a state lock; `--offline` skips the network checks, and a
+  KSK the parent does not name is
   refused without `--force`.
-- Sign with RSASHA256 and RSASHA512 keys, so a zone taken over with RSA keys
-  keeps its algorithm through ordinary rollovers (RSA keys the signer mints are
-  2048-bit); RSA private keys use BIND's multi-field layout on disk. RSASHA1
+- Sign with RSASHA256 and RSASHA512 keys, including legacy 512-bit takeover
+  keys, so a zone taken over with RSA keys keeps its algorithm through ordinary
+  rollovers (RSA keys the signer mints are 2048-bit); RSA private keys use
+  BIND's multi-field layout on disk. RSASHA1
   and RSASHA1-NSEC3-SHA1 keys are read and listed but never signed with.
 - The parent DS probe reports the DS records the parent holds.
 

@@ -16,7 +16,7 @@ Minimal, opinionated DNSSEC signing daemon for sysadmins managing zones on NSD o
 - Automatic signing on zone file changes or before signature expiry
 - Automatic ZSK rollover (pre-publish method); semi-automatic KSK rollover with DS record guidance
 - ED25519 by default (ECDSA P-256/P-384 also supported; RSASHA256/RSASHA512 for zones taken over from other signers); NSEC or NSEC3 denial of existence
-- `import --keys-dir` takes over a zone signed by another tool, keeping the KSK the parent's DS names and the ZSK signing the served zone
+- `import --keys-dir` anchors takeover at the KSK named by the parent's DS, then chooses a compatible ZSK; an incompatible served deployment is reported rather than preserved
 - Web dashboard for status and DS record copying; post-sign hooks for DNS server reload
 
 **Commands**: `serve`, `sign`, `add`, `remove`, `import`, `status`, `ds`, `dnskey`, `rollover`

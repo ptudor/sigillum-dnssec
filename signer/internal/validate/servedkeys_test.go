@@ -47,6 +47,9 @@ func signedChildZone(t *testing.T, inception, expiration time.Time) (ksk, zsk *d
 // only when none does.
 func TestProbeServedKeys(t *testing.T) {
 	lab := newParentLab(t)
+	// Model a validating resolver returning SERVFAIL for this broken zone.
+	// Import discovery must set CD so it can inspect and repair the servers.
+	lab.resolverRequiresCD()
 	v := lab.validator()
 	now := time.Now()
 	ksk, zsk, rrs := signedChildZone(t, now.Add(-time.Hour), now.Add(time.Hour))
@@ -65,6 +68,9 @@ func TestProbeServedKeys(t *testing.T) {
 	}
 	if fmt.Sprint(served.SOASigners) != fmt.Sprint([]uint16{zsk.KeyTag()}) || fmt.Sprint(served.DNSKEYSigners) != fmt.Sprint([]uint16{ksk.KeyTag()}) {
 		t.Fatalf("signers: SOA %v DNSKEY %v", served.SOASigners, served.DNSKEYSigners)
+	}
+	if fmt.Sprint(served.SOASerials) != fmt.Sprint([]uint32{1}) {
+		t.Fatalf("SOA serials: %v", served.SOASerials)
 	}
 	if served.StaleSignatures {
 		t.Fatal("in-window signatures are not stale")
