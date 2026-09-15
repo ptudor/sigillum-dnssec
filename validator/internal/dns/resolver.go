@@ -444,6 +444,21 @@ func (r *Resolver) CheckZoneCut(ctx context.Context, domain string) (bool, error
 // DiscoverZoneCuts discovers actual zone cuts between root and domain
 // Returns the list of actual zones in the chain (where NS records exist)
 func (r *Resolver) DiscoverZoneCuts(ctx context.Context, domain string) ([]string, error) {
+	interrupted := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// A socket can reach the context deadline before its timer goroutine
+		// sets ctx.Err(). Do not interpret that timeout as a possible zone cut.
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	if err := interrupted(); err != nil {
+		return nil, err
+	}
+
 	// Start with root
 	zones := []string{"."}
 
@@ -468,12 +483,11 @@ func (r *Resolver) DiscoverZoneCuts(ctx context.Context, domain string) ([]strin
 		}
 
 		isZone, err := r.CheckZoneCut(ctx, candidate)
+		// Check successful responses too: cancellation can race with a reply.
+		if ctxErr := interrupted(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if err != nil {
-			// A cancelled or expired context is not a zone-cut observation; stop
-			// so the caller reports the interruption rather than a guessed chain.
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
 			// On error, assume it might be a zone (fail-safe)
 			zones = append(zones, candidate)
 			continue
