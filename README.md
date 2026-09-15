@@ -40,8 +40,13 @@ the same name for its executable, Linux package, service, and service account.
 ## What makes it useful
 
 - **An explicit signing lifecycle.** ED25519 is the default; ECDSA P-256 and P-384
-  are also supported. Choose NSEC or NSEC3. ZSK rotation is automatic; KSK and
-  algorithm rollovers expose the operator steps and parent-DS checks.
+  are also supported, and RSASHA256/RSASHA512 for zones taken over from other
+  signers. Choose NSEC or NSEC3. ZSK rotation is automatic; KSK and algorithm
+  rollovers expose the operator steps and parent-DS checks.
+- **Migration without a DS change.** `import --keys-dir` reads the key directory
+  of the previous signer, checks the parent's DS and what the zone's servers
+  publish, and keeps the KSK the parent names and the ZSK signing the served
+  zone, so resolvers see no difference.
 - **Publication-aware rollover.** Configure whether a successful reload hook,
   an authoritative SOA probe, or writing the signed file confirms publication.
   Rollover timing follows that choice.

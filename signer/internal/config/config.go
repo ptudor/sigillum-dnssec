@@ -511,9 +511,11 @@ func (c *Config) Validate() error {
 		"ED25519":         true,
 		"ECDSAP256SHA256": true,
 		"ECDSAP384SHA384": true,
+		"RSASHA256":       true, // supported for zones taken over from other signers
+		"RSASHA512":       true,
 	}
 	if !validAlgorithms[c.DNSSEC.Algorithm] {
-		return fmt.Errorf("unsupported algorithm %q (supported: ED25519, ECDSAP256SHA256, ECDSAP384SHA384)", c.DNSSEC.Algorithm)
+		return fmt.Errorf("unsupported algorithm %q (supported: ED25519, ECDSAP256SHA256, ECDSAP384SHA384, RSASHA256, RSASHA512)", c.DNSSEC.Algorithm)
 	}
 
 	// Validate per-zone algorithms

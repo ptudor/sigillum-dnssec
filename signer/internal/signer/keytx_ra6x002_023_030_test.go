@@ -419,7 +419,7 @@ func otherPrivateFile(t *testing.T, cfg *config.Config, domain string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return []byte(formatPrivateKey(dnskey, priv))
+	return []byte(mustFormatPrivateKey(t, dnskey, priv))
 }
 
 // Every damaged form of a private backup half must be repaired from the
@@ -583,7 +583,7 @@ func TestSaveKeyFiles_TagCollisionNeverOverwritesDifferentKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	foreignKeyFile := []byte("; foreign\n" + foreignKey.String() + "\n")
-	foreignPrivFile := []byte(formatPrivateKey(foreignKey, foreignPriv))
+	foreignPrivFile := []byte(mustFormatPrivateKey(t, foreignKey, foreignPriv))
 	if err := os.WriteFile(backup+".key", foreignKeyFile, 0644); err != nil {
 		t.Fatal(err)
 	}

@@ -268,6 +268,19 @@ func generateDNSSECKey(domain, algorithm string, flags uint16) (*dns.DNSKEY, []b
 		privateKey = make([]byte, 48)
 		privKey.D.FillBytes(privateKey)
 
+	case "RSASHA256", "RSASHA512":
+		// RSA is supported so a zone imported from another signer keeps its
+		// algorithm through ordinary rollovers; new zones should use ED25519.
+		dnskey.Algorithm = dns.RSASHA256
+		if algorithm == "RSASHA512" {
+			dnskey.Algorithm = dns.RSASHA512
+		}
+		var err error
+		privateKey, err = generateRSAKey(dnskey)
+		if err != nil {
+			return nil, nil, err
+		}
+
 	default:
 		return nil, nil, fmt.Errorf("unsupported algorithm: %s", algorithm)
 	}
@@ -383,8 +396,13 @@ func releaseReservation(path string) {
 // carries (RA6X-047), so the file is readable by standard tools for recovery
 // or migration; Go's 64-byte expanded form is reduced to its seed only when
 // the embedded public suffix is consistent with it (RA6X-030). Files written
-// earlier in the 64-byte form remain readable by this signer.
-func formatPrivateKey(dnskey *dns.DNSKEY, privateKey []byte) string {
+// earlier in the 64-byte form remain readable by this signer. An RSA key is
+// written in BIND's multi-field form (see rsa.go).
+func formatPrivateKey(dnskey *dns.DNSKEY, privateKey []byte) (string, error) {
+	created := time.Now().UTC().Format("20060102150405")
+	if isRSA(dnskey.Algorithm) {
+		return formatRSAPrivateKey(dnskey, privateKey, created)
+	}
 	if dnskey.Algorithm == dns.ED25519 && len(privateKey) == ed25519.PrivateKeySize {
 		seed := privateKey[:ed25519.SeedSize]
 		if bytes.Equal(ed25519.NewKeyFromSeed(seed)[ed25519.SeedSize:], privateKey[ed25519.SeedSize:]) {
@@ -399,7 +417,7 @@ Created: %s
 		dnskey.Algorithm,
 		AlgorithmName(dnskey.Algorithm),
 		base64.StdEncoding.EncodeToString(privateKey),
-		time.Now().UTC().Format("20060102150405"))
+		created), nil
 }
 
 // RecoverKeyState attempts to load an existing key pair from disk and reconstruct
@@ -662,7 +680,13 @@ func validateLoadedKey(dnskey *dns.DNSKEY, domain, keyType string) error {
 		return fmt.Errorf("key flags %d do not match role %q (want %d)", dnskey.Flags, keyType, wantFlags)
 	}
 	switch dnskey.Algorithm {
-	case dns.ED25519, dns.ECDSAP256SHA256, dns.ECDSAP384SHA384:
+	case dns.ED25519, dns.ECDSAP256SHA256, dns.ECDSAP384SHA384, dns.RSASHA256, dns.RSASHA512:
+	case dns.RSASHA1, dns.RSASHA1NSEC3SHA1:
+		// The key material is ordinary RSA and would sign, but validating
+		// resolvers no longer accept SHA-1 signatures as secure (RFC 8624
+		// §3.1), so signing with it buys nothing and risks a bogus zone.
+		return fmt.Errorf("%s key for %s uses %s (algorithm %d): SHA-1 signatures are no longer treated as secure by validating resolvers (RFC 8624 §3.1), so this signer will not sign with it; roll the zone to RSASHA256 or a current algorithm with its present signer first, or import a key of a current algorithm whose DS the parent already holds",
+			keyType, domain, AlgorithmName(dnskey.Algorithm), dnskey.Algorithm)
 	default:
 		return fmt.Errorf("unsupported key algorithm %d in %s key for %s", dnskey.Algorithm, keyType, domain)
 	}
@@ -762,8 +786,13 @@ func ParseDNSKEYFromFile(content string) (*dns.DNSKEY, error) {
 // pair a freshly written .key with a stale .private of a different key (R-009), and a
 // standard BIND/ldns ED25519 key stores the private half as a 32-byte seed the raw signer
 // would otherwise reject (R-010). It accepts every key form this signer generates or
-// imports: 64-byte or 32-byte-seed ED25519, and 32/48-byte ECDSA P-256/P-384.
+// imports: 64-byte or 32-byte-seed ED25519, 32/48-byte ECDSA P-256/P-384, and RSA as
+// PKCS #1 DER (the SHA-1 variants included, so an import can report on them; they
+// are refused for signing by validateLoadedKey).
 func VerifyKeyPairCorrespondence(dnskey *dns.DNSKEY, privateKey []byte) error {
+	if isRSA(dnskey.Algorithm) || isSHA1RSA(dnskey.Algorithm) {
+		return verifyRSACorrespondence(dnskey, privateKey)
+	}
 	pubBytes, err := base64.StdEncoding.DecodeString(dnskey.PublicKey)
 	if err != nil {
 		return fmt.Errorf("decoding DNSKEY public key: %w", err)
@@ -828,14 +857,48 @@ func verifyECDSACorrespondence(curve elliptic.Curve, size int, privateKey, pubBy
 	return nil
 }
 
-// ParsePrivateKeyFromFile parses a private key from BIND format
+// ParsePrivateKeyFromFile parses a private key from BIND format into the
+// in-memory form signing uses: the raw PrivateKey field for ED25519/ECDSA, or
+// PKCS #1 DER assembled from the multi-field RSA layout when the file's
+// Algorithm field names an RSA algorithm.
 func ParsePrivateKeyFromFile(content string) ([]byte, error) {
-	for _, line := range splitLines(content) {
-		if len(line) > 12 && line[:12] == "PrivateKey: " {
-			return base64.StdEncoding.DecodeString(line[12:])
-		}
+	fields := parsePrivateKeyFields(content)
+	if alg, ok := privateKeyFileAlgorithm(fields); ok && (isRSA(alg) || isSHA1RSA(alg)) {
+		return parseBindRSAPrivateKey(fields)
+	}
+	if v, ok := fields["privatekey"]; ok {
+		return base64.StdEncoding.DecodeString(v)
 	}
 	return nil, fmt.Errorf("no PrivateKey field found in file")
+}
+
+// parsePrivateKeyFields splits a BIND private-key file into lowercase field
+// name → trimmed value. Later duplicates win, matching BIND's own reader.
+func parsePrivateKeyFields(content string) map[string]string {
+	fields := make(map[string]string)
+	for _, line := range splitLines(content) {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		fields[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+	}
+	return fields
+}
+
+// privateKeyFileAlgorithm reads the numeric algorithm from an "Algorithm: 8
+// (RSASHA256)" field.
+func privateKeyFileAlgorithm(fields map[string]string) (uint8, bool) {
+	v, ok := fields["algorithm"]
+	if !ok {
+		return 0, false
+	}
+	num, _, _ := strings.Cut(v, " ")
+	alg, err := strconv.ParseUint(num, 10, 8)
+	if err != nil {
+		return 0, false
+	}
+	return uint8(alg), true
 }
 
 // splitLines splits content into lines
@@ -866,22 +929,26 @@ func AlgorithmName(alg uint8) string {
 	return fmt.Sprintf("Unknown(%d)", alg)
 }
 
-// AlgorithmFromName returns the algorithm number from name, restricted to the
-// three algorithms this signer can actually generate and sign with (ED25519 and
-// ECDSA P-256/P-384). RSA names are intentionally rejected: generateDNSSECKey /
-// signRRSIG cannot produce or sign RSA keys, so advertising RSASHA256/RSASHA512
-// here would be a false promise (R-062). Keep this set in lockstep with the
-// key-generation and signing code.
-// Returns an error if the algorithm name is not recognized.
+// SupportedAlgorithmNames lists, in preference order, the algorithms this
+// signer can generate and sign with (R-062: the set must stay in lockstep
+// with generateDNSSECKey, signRRSIG and validateLoadedKey). RSA is here for
+// zones taken over from other signers and for registrars that accept nothing
+// else; ED25519 is the recommendation for anything new.
+var SupportedAlgorithmNames = []string{"ED25519", "ECDSAP256SHA256", "ECDSAP384SHA384", "RSASHA256", "RSASHA512"}
+
+// AlgorithmFromName returns the algorithm number for one of
+// SupportedAlgorithmNames. Names are case-sensitive, as in the config file.
 func AlgorithmFromName(name string) (uint8, error) {
 	names := map[string]uint8{
 		"ED25519":         dns.ED25519,
 		"ECDSAP256SHA256": dns.ECDSAP256SHA256,
 		"ECDSAP384SHA384": dns.ECDSAP384SHA384,
+		"RSASHA256":       dns.RSASHA256,
+		"RSASHA512":       dns.RSASHA512,
 	}
 	alg, ok := names[name]
 	if !ok {
-		return 0, fmt.Errorf("unsupported algorithm: %q (supported: ED25519, ECDSAP256SHA256, ECDSAP384SHA384)", name)
+		return 0, fmt.Errorf("unsupported algorithm: %q (supported: %s)", name, strings.Join(SupportedAlgorithmNames, ", "))
 	}
 	return alg, nil
 }

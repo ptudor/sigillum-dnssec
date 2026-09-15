@@ -83,7 +83,7 @@ data_dir = "/var/lib/sigillum-signer"
 poll_interval = "5m"
 
 [dnssec]
-algorithm = "ED25519"           # or ECDSAP256SHA256, ECDSAP384SHA384
+algorithm = "ED25519"           # or ECDSAP256SHA256, ECDSAP384SHA384 (RSASHA256/RSASHA512 for migrated zones)
 ksk_lifetime = "5y"             # How long before KSK rollover reminder
 zsk_lifetime = "90d"            # ZSK rolls automatically
 signature_validity = "14d"     # How long signatures are valid (1h–366d; the whole window must fit RFC 1982 serial arithmetic)
@@ -225,41 +225,92 @@ previous signed output is kept until the new source parses and publishes. A
 signed output that goes missing from `output_dir` is regenerated on the next
 cycle, and a changed `output_dir` is populated on the next cycle after reload.
 
-### Migrating from BIND
+### Migrating from another signer
 
-If you have existing BIND-style DNSSEC keys (from `dnssec-keygen` or similar), you can import them without changing your DS records at the registrar:
+If a zone is already signed with keys from another tool (`dnssec-keygen` /
+`dnssec-signzone`, `ldns-keygen` / `ldns-signzone`, or an earlier setup of
+your own), `import` takes it over without changing anything a resolver can
+see: the KSK whose DS the parent already holds keeps signing the DNSKEY RRset,
+and the ZSK that signs the served zone keeps signing it. The DS at the
+registrar stays as it is.
 
-The key files sigillum-signer writes are in the same BIND private-key format
-(`Private-key-format: v1.3`), with ED25519 keys stored as the 32-byte seed
-that BIND, ldns and RFC 8080 use, so they can be read back by those tools for
-recovery or migration; the DNSKEY and DS never change. Files written by older
-versions stored Go's 64-byte expanded ED25519 key and remain readable by
-sigillum-signer; they are not rewritten in place. A key passes through the seed
-serialization when it is imported or when a rollover stages its successor, so
-to hand a legacy file to another tool, convert its `PrivateKey:` value to the
-first 32 bytes (the seed) — the DNSKEY and DS stay the same.
+Point `--keys-dir` at the other tool's key directory and look at the plan
+first:
 
 ```bash
-# Import existing keys
+sigillum-signer import example.com /path/to/zone.db \
+  --keys-dir /var/named/keys/example.com --dry-run --config config.toml
+```
+
+Every `Kexample.com.+<alg>+<tag>.key`/`.private` pair in the directory is
+listed with its role, algorithm, size and creation date, whether the parent
+holds its DS, and whether the zone's authoritative servers publish it or sign
+with it today:
+
+```
+Keys for example.com in /var/named/keys/example.com:
+  TAG    ROLE  ALGORITHM  BITS  CREATED     PARENT DS  SERVED   STATUS
+  12345  ZSK   RSASHA512  2048  2025-11-12             signing  ok
+  47561  KSK   RSASHA512  2048  2025-11-11  present    signing  ok
+  42493  KSK   RSASHA1    2048  2018-08-19  absent     no       unusable
+  19809  KSK   RSASHA512  2048  2017-07-08  absent     no       ok
+  42493 (RSASHA1): ksk key for example.com uses RSASHA1 (algorithm 5): SHA-1 signatures are no longer treated as secure by validating resolvers (RFC 8624 §3.1), so this signer will not sign with it; …
+  Parent: DS 47561/RSASHA512/SHA256
+  Served (2 servers): DNSKEY 47561, 12345 (TTL 3600); SOA signed by 12345; DNSKEY signed by 47561
+
+Plan for example.com:
+  KSK 47561 (RSASHA512, 2048 bits): its DS is at every parent server
+  ZSK 12345 (RSASHA512, 2048 bits): it signs the served zone
+```
+
+Drop `--dry-run` to import. The chosen KSK must have its DS at every parent
+server; when the parent names a different key the import refuses (pass
+`--force` only when you are changing the DS at the parent yourself). `--ksk
+<tag>` and `--zsk <tag>` override the choice, and are held to the same checks.
+`--offline` skips the network checks, in which case the choice must be
+unambiguous or explicit. When the parent probe itself fails (no delegation
+yet, no network), the error says so and `--offline` is the way through.
+
+Without `--keys-dir`, `--ksk` and `--zsk` name the two key files directly, as
+base names without the `.key`/`.private` extension:
+
+```bash
 sigillum-signer import example.com /path/to/zone.db \
   --ksk /path/to/Kexample.com.+015+12345 \
   --zsk /path/to/Kexample.com.+015+67890 \
   --config config.toml
 ```
 
-The key paths are the base names without `.key`/`.private` extensions. For example, if your keys are:
-- `Kexample.com.+015+12345.key`
-- `Kexample.com.+015+12345.private`
+Imported RSASHA256 and RSASHA512 keys are used as they are, and the zone keeps
+its algorithm through ordinary rollovers (RSA keys the signer mints are
+2048-bit). Keys using SHA-1 (RSASHA1, RSASHA1-NSEC3-SHA1) are listed but
+refused: validating resolvers no longer treat SHA-1 signatures as secure, so
+signing with them buys nothing. Once the zone is in, `rollover algorithm
+example.com ED25519` moves it to a current algorithm whenever you can update
+the DS at the parent.
 
-Use: `--ksk Kexample.com.+015+12345`
+The key files sigillum-signer writes are in the same BIND private-key format
+(`Private-key-format: v1.3`) — RSA keys in the multi-field layout, ED25519 keys
+as the 32-byte seed that BIND, ldns and RFC 8080 use — so they can be read back
+by those tools for recovery or migration; the DNSKEY and DS never change. Files
+written by older versions stored Go's 64-byte expanded ED25519 key and remain
+readable by sigillum-signer; they are not rewritten in place. A key passes
+through the seed serialization when it is imported or when a rollover stages
+its successor, so to hand a legacy file to another tool, convert its
+`PrivateKey:` value to the first 32 bytes (the seed) — the DNSKEY and DS stay
+the same.
 
 The import command will:
-1. Read and validate the BIND-style key files
-2. Verify KSK (flag 257) and ZSK (flag 256)
-3. Convert to sigillum-signer's format
-4. Add the zone to config.toml
-5. Sign the zone
-6. Display the DS record for verification against your registrar
+1. List every key pair found and validate each one (owner, flags, algorithm,
+   private/public correspondence, and a test signature)
+2. Check the parent's DS records and what the zone's authoritative servers
+   serve, unless `--offline`
+3. Choose, or check, the KSK and ZSK and show the plan
+4. Sign the zone with exactly those keys, keep them in its own key store,
+   register the zone in config.toml and state, and print the DS to verify
+
+`import` never pushes a DS to a registrar: the parent already holds the right
+one, and that is what the takeover preserves.
 
 ### Key Information
 
@@ -464,8 +515,10 @@ Access at `http://127.0.0.1:8053` (or your configured address). For public acces
 | ED25519 | `ED25519` | Recommended, smallest signatures |
 | ECDSA P-256 | `ECDSAP256SHA256` | Wide registrar support |
 | ECDSA P-384 | `ECDSAP384SHA384` | Higher security margin |
+| RSA/SHA-256 | `RSASHA256` | For zones taken over from other signers, or registrars that accept nothing else; new keys are 2048-bit |
+| RSA/SHA-512 | `RSASHA512` | As RSASHA256 |
 
-ED25519 (algorithm 15) has excellent resolver support but some registrars may not accept it. Check your registrar before choosing.
+ED25519 (algorithm 15) has excellent resolver support but some registrars may not accept it. Check your registrar before choosing. RSASHA1 and RSASHA1-NSEC3-SHA1 keys can be read (`import` lists them) but are never signed with: validating resolvers no longer treat SHA-1 signatures as secure.
 
 ## File Locations
 

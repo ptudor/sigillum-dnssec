@@ -26,6 +26,9 @@ type ParentDSObservation struct {
 	TTL uint32
 	// Servers lists the parent servers (addresses) that answered.
 	Servers []string
+	// DSRecords is the union of DS records the parent servers hold for the
+	// domain, deduplicated, so a caller can name what the parent trusts.
+	DSRecords []*dns.DS
 	// ByNameserver maps every delegated parent nameserver name to the
 	// addresses it was queried at (RDAYBLUEX-003): the observation covers
 	// every NS identity of the delegation, not merely a set of addresses.
