@@ -373,6 +373,8 @@ func importWarnings(sel *ImportSelection, obs ImportObservation) (warnings []str
 	switch {
 	case len(s.DNSKEYs) == 0:
 		warnings = append(warnings, "no DNSKEY RRset is served today: the zone is currently unsigned at its authoritative servers")
+	case obs.ParentProbed && obs.DSPresentOnAll[sel.KSK.Tag] && !s.Published(sel.KSK.DNSKEY):
+		warnings = append(warnings, fmt.Sprintf("the served DNSKEY RRset does not contain KSK %d trusted by the parent DS, so that deployment cannot satisfy the chain; this import installs that KSK with compatible ZSK %d", sel.KSK.Tag, sel.ZSK.Tag))
 	case s.StaleSignatures:
 		warnings = append(warnings, "every signature served today has expired (or is not yet valid): the zone is already failing validation, so there are no cached signatures to preserve")
 	default:

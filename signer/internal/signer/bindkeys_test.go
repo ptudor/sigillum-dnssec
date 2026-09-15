@@ -255,7 +255,7 @@ func TestSelectImportKeys(t *testing.T) {
 		if sel.KSK != k || sel.ZSK != z || !strings.Contains(sel.ZSKReason, "only usable ZSK") {
 			t.Fatalf("the parent-trusted algorithm must determine the compatible pair: %+v", sel)
 		}
-		if !hasWarning(sel, "not in the DNSKEY RRset served today") || !hasWarning(sel, "signed by ZSK 36503") {
+		if !hasWarning(sel, "does not contain KSK 6142 trusted by the parent DS") || !hasWarning(sel, "installs that KSK with compatible ZSK 32649") || hasWarning(sel, "not in the DNSKEY RRset served today") {
 			t.Fatalf("the broken served deployment must be disclosed: %+v", sel.Warnings)
 		}
 	})
