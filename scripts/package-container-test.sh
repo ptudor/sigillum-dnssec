@@ -7,12 +7,24 @@ if command -v apt-get >/dev/null 2>&1; then
     apt-get install -y --no-install-recommends ca-certificates systemd passwd procps util-linux
     set -- /packages/*_amd64.deb
     test -f "$1"
+    # apt ignores a DEB's embedded signature; verify-signatures.sh checks it on the host.
     apt-get install -y --no-install-recommends "$@"
     format=deb
 else
+    rpm --import /keys/signing-key.asc
+    for package in /packages/*.rpm; do
+        test -f "$package"
+        # An unsigned package also exits 0, reporting only "digests OK".
+        result=$(rpm -K "$package")
+        printf '%s\n' "$result"
+        case $result in
+            *'signatures OK') ;;
+            *) echo "No verified signature on $package" >&2; exit 1 ;;
+        esac
+    done
     set -- /packages/*.x86_64.rpm
     test -f "$1"
-    dnf install -y --setopt=install_weak_deps=False --setopt=localpkg_gpgcheck=0 "$@" procps-ng util-linux
+    dnf install -y --setopt=install_weak_deps=False --setopt=localpkg_gpgcheck=1 "$@" procps-ng util-linux
     format=rpm
 fi
 
@@ -53,7 +65,7 @@ runuser -u sigillum-signer -- sigillum-signer sign --config /etc/sigillum-signer
 if [ "$format" = deb ]; then
     apt-get install -y --reinstall -o Dpkg::Options::=--force-confold "$@"
 else
-    dnf reinstall -y --setopt=localpkg_gpgcheck=0 "$@"
+    dnf reinstall -y --setopt=localpkg_gpgcheck=1 "$@"
 fi
 for service in $services; do
     config="/etc/$service/config.toml"

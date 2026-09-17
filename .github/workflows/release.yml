@@ -50,13 +50,23 @@ jobs:
           cache-dependency-path: |
             signer/go.sum
             validator/go.sum
-      - name: Build binaries and packages into a draft release
+      - name: Stage the release signing key
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          NFPM_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: sh scripts/load-release-key.sh
+      - name: Build and sign binaries and packages into a draft release
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           version: v2.18.1
           args: release --clean --release-notes=docs/release-notes/${{ github.ref_name }}.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NFPM_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+      - name: Verify signatures against the published key
+        run: sh scripts/verify-signatures.sh packaging/release-signing-key.asc
+      - name: Install the signed packages in Debian and Fedora
+        run: sh scripts/test-packages.sh packaging/release-signing-key.asc
       - name: Attest release archives, packages, and checksums
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
@@ -65,9 +75,15 @@ jobs:
             dist/*.deb
             dist/*.rpm
             dist/checksums.txt
+            dist/checksums.txt.sig
       - name: Publish the verified release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: gh release edit "$RELEASE_TAG" --draft=false
+      - name: Remove the staged signing key
+        if: always()
+        run: |
+          gpgconf --homedir "$RUNNER_TEMP/release-signing/gnupg" --kill all || true
+          rm -rf "$RUNNER_TEMP/release-signing"

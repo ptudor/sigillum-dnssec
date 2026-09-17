@@ -13,8 +13,11 @@ Security fixes target the latest release and the default branch. Older releases
 have no guaranteed backport schedule. This is an independently maintained project;
 there is no guaranteed response time or commercial support agreement.
 
-Release RPMs and DEBs are unsigned at the package level. Published release files
-have SHA-256 checksums and GitHub build provenance attestations. Verification
+Release RPMs, DEBs, and the `checksums.txt` manifest are signed with the project's
+OpenPGP release key, fingerprint `8C4F 58EF B945 4902 267D  9B3E 426C 4AA2 1A40 0728`,
+published in [`packaging/release-signing-key.asc`](packaging/release-signing-key.asc).
+Releases through 1.1.0 predate the key and are unsigned. Published release files
+also have SHA-256 checksums and GitHub build provenance attestations. Verification
 instructions are in [the release guide](docs/releases.md#verify-a-download).
 
 Dependency update proposals and Linux/FreeBSD vulnerability scans run weekly.

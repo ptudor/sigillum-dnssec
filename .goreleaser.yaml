@@ -1,4 +1,7 @@
-# Build with GoReleaser OSS v2.18.1. No signing keys or paid features required.
+# Build with GoReleaser OSS v2.18.1; no paid features. Packages and checksums.txt
+# are signed with the key at RELEASE_GPG_KEY_FILE, unlocked by NFPM_PASSPHRASE:
+# the release key in the release workflow, a throwaway from scripts/snapshot.sh
+# otherwise. rpmpack writes RSA signature tags only, so the key must be RSA.
 version: 2
 project_name: sigillum-dnssec
 env:
@@ -55,6 +58,13 @@ nfpms:
     section: net
     priority: optional
     mtime: '{{ .CommitDate }}'
+    rpm:
+      signature:
+        key_file: '{{ .Env.RELEASE_GPG_KEY_FILE }}'
+    deb:
+      signature:
+        key_file: '{{ .Env.RELEASE_GPG_KEY_FILE }}'
+        type: origin
     overrides:
       deb:
         dependencies: [ca-certificates, systemd, passwd]
@@ -93,6 +103,13 @@ nfpms:
     section: net
     priority: optional
     mtime: '{{ .CommitDate }}'
+    rpm:
+      signature:
+        key_file: '{{ .Env.RELEASE_GPG_KEY_FILE }}'
+    deb:
+      signature:
+        key_file: '{{ .Env.RELEASE_GPG_KEY_FILE }}'
+        type: origin
     overrides:
       deb:
         dependencies: [ca-certificates, systemd, passwd]
@@ -121,6 +138,18 @@ nfpms:
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+signs:
+  - artifacts: checksum
+    cmd: gpg
+    stdin: '{{ .Env.NFPM_PASSPHRASE }}'
+    args:
+      - --batch
+      - --pinentry-mode=loopback
+      - --passphrase-fd=0
+      - --local-user={{ .Env.RELEASE_GPG_FINGERPRINT }}
+      - --output=${signature}
+      - --detach-sign
+      - ${artifact}
 changelog:
   sort: asc
   filters:
@@ -133,6 +162,7 @@ release:
   prerelease: auto
   header: |
     Static Go binaries for the platforms named in each archive.
-    Linux RPM and DEB packages are unsigned and install without starting services.
+    Linux RPM and DEB packages are signed and install without starting services.
     See the README and docs/linux-packages.md before enabling a daemon.
-    Check SHA-256 hashes in checksums.txt and verify the GitHub build attestation.
+    Signing key 8C4F 58EF B945 4902 267D 9B3E 426C 4AA2 1A40 0728 also signs
+    checksums.txt; docs/releases.md covers signature and build attestation checks.

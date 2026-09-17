@@ -33,13 +33,17 @@ stops and disables the service when systemd is running, while preserving account
 and generated state. Private keys are never removed by package scripts.
 
 Download the matching packages and [verify them](releases.md#verify-a-download).
-They are unsigned local packages, not packages from an APT/YUM repository:
+They are signed local packages, not packages from an APT/YUM repository. DNF
+checks an RPM's signature once the [release key](releases.md#release-signing-key)
+is imported; APT does not check a local DEB's signature, so verify the signed
+`checksums.txt` before installing one:
 
 ```sh
 # Choose the tool(s) you need; use arm64/aarch64 assets on ARM machines.
 sudo apt install ./sigillum-signer_*_amd64.deb ./sigillum-validator_*_amd64.deb
 # Or:
-sudo dnf --setopt=localpkg_gpgcheck=0 install ./sigillum-signer-*.x86_64.rpm ./sigillum-validator-*.x86_64.rpm
+sudo rpm --import release-signing-key.asc
+sudo dnf --setopt=localpkg_gpgcheck=1 install ./sigillum-signer-*.x86_64.rpm ./sigillum-validator-*.x86_64.rpm
 ```
 
 ## Signer: enroll a real zone

@@ -82,15 +82,17 @@ the signer or validator you need. In a directory containing the downloaded files
 # Debian / Ubuntu
 sudo apt install ./sigillum-signer_*_amd64.deb ./sigillum-validator_*_amd64.deb
 
-# Fedora / RHEL family (local packages are unsigned)
-sudo dnf --setopt=localpkg_gpgcheck=0 install ./sigillum-signer-*.x86_64.rpm ./sigillum-validator-*.x86_64.rpm
+# Fedora / RHEL family, after importing the release key (see the verification instructions)
+sudo dnf --setopt=localpkg_gpgcheck=1 install ./sigillum-signer-*.x86_64.rpm ./sigillum-validator-*.x86_64.rpm
 ```
 
 Use the `arm64` DEBs or `aarch64` RPMs on ARM. Packages install binaries under
 `/usr/bin`, configuration under `/etc`, and systemd units. **They do not enable,
 start, or restart services.** Follow [Linux setup](docs/linux-packages.md) to configure
 nameserver access, publication hooks, and the validator’s recursive resolver.
-Package signatures and a hosted APT/YUM repository are not currently provided.
+Packages and `checksums.txt` are signed with the
+[release key](docs/releases.md#release-signing-key); a hosted APT/YUM repository
+is not provided.
 
 ## Configure the signer
 
@@ -203,7 +205,7 @@ Exercise signing and recovery on a test zone before enrolling production domains
 make build           # Host binaries in the two module directories
 make test            # Existing module test suites
 make release-check   # Validate GoReleaser configuration
-make snapshot        # All release binaries, archives, RPMs, and DEBs in dist/
+make snapshot        # All release binaries, archives, RPMs, and DEBs in dist/, throwaway-signed
 ```
 
 GitHub CI runs race tests on Linux amd64, Linux arm64, and macOS arm64. It builds
@@ -216,7 +218,7 @@ artifacts are cross-built; runtime acceptance belongs on a FreeBSD host.
 | [Signer manual](signer/README.md) | Signing, key management, registrar integration, hooks |
 | [Validator guide](validator/README.md) | HTTP API, trust anchors, resolver and proxy setup |
 | [Linux packages](docs/linux-packages.md) | Accounts, permissions, activation, upgrades, removal |
-| [Release guide](docs/releases.md) | GitHub setup, tags, checksums, provenance |
+| [Release guide](docs/releases.md) | GitHub setup, tags, signatures, checksums, provenance |
 | [Contributing](CONTRIBUTING.md) / [Security](SECURITY.md) | Changes, diagnostics, private vulnerability reports |
 
 **License:** [MIT](LICENSE). Commercial use, modification, and redistribution

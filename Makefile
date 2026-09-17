@@ -114,8 +114,9 @@ GO_LICENSE ?=
 release-check:
 	$(GORELEASER) check
 
+# Signs with a throwaway key and verifies the result; see scripts/snapshot.sh.
 snapshot:
-	$(GORELEASER) release --snapshot --clean
+	sh scripts/snapshot.sh $(GORELEASER)
 
 # Keep these steps ordered, including under make -j: packages must contain the
 # refreshed notices before the final check compares them with build metadata.

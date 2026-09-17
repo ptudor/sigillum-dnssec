@@ -87,16 +87,15 @@ jobs:
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
       - name: Check packaging scripts
         run: shellcheck -s sh packaging/*.sh scripts/*.sh
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          version: v2.18.1
+          install-only: true
       - name: Validate release configuration
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
-        with:
-          version: v2.18.1
-          args: check
-      - name: Build every release target and unsigned package
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
-        with:
-          version: v2.18.1
-          args: release --snapshot --clean
+        run: make release-check
+      - name: Build every release target and package, signed with a throwaway key
+        run: make snapshot
       - name: Verify third-party notices against every release binary
         run: python3 scripts/update-notices.py --check
       - name: Install, reinstall, and remove packages in Debian and Fedora
