@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.1 — 2026-09-16
+
+- Sign release RPMs, DEBs, and the `checksums.txt` manifest with the project's
+  OpenPGP release key, `8C4F 58EF B945 4902 267D 9B3E 426C 4AA2 1A40 0728`,
+  published in `packaging/release-signing-key.asc`. `rpm` and DNF verify the
+  packages once the key is imported. APT does not check a local DEB's signature,
+  so DEBs and archives are authenticated through the signed manifest.
+- The release workflow refuses to build unless its signing secret matches the
+  published key, and verifies every signature, including a DNF installation with
+  signature checking enforced, before attestation and publication.
+- CI and `make snapshot` sign with a throwaway key, so every build exercises the
+  signing path. Both executables are unchanged from 1.1.0.
+
 ## 1.1.0 — 2026-09-15
 
 - `sigillum-signer import --keys-dir` takes over a zone signed by another tool:

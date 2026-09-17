@@ -30,10 +30,11 @@ use a new version for corrected public artifacts.
 
 ## Public releases
 
-[Sigillum v1.1.0](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.1.0)
-adds key-directory takeover, RSA signing, and signing and validation fixes. See
-the [release notes](release-notes/v1.1.0.md) for features, upgrade guidance,
-downloads, and platform coverage. The [1.0.0 notes](release-notes/v1.0.0.md)
+[Sigillum v1.1.1](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.1.1)
+is 1.1.0 with signed packages and a signed manifest; see its
+[release notes](release-notes/v1.1.1.md). The [1.1.0 notes](release-notes/v1.1.0.md)
+cover key-directory takeover, RSA signing, upgrade guidance, and platform
+coverage, and the [1.0.0 notes](release-notes/v1.0.0.md)
 describe the first public release. Development snapshots are also
 available from successful [CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
 
