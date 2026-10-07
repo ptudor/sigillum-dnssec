@@ -153,11 +153,16 @@ func independentVerify(t *testing.T, records []dns.RR, expectUnsigned map[wireRR
 		}
 		verified := false
 		for _, sig := range sigs[k] {
+			// A resolver unpacks the RRSIG owner from the wire exactly as it
+			// unpacks the records', so give Verify (which compares the two
+			// spellings as strings) the same wire-derived spelling for both.
+			wireSig := dns.Copy(sig).(*dns.RRSIG)
+			wireSig.Hdr.Name = dns.CanonicalName(unescapeName(t, sig.Hdr.Name))
 			for _, dk := range keys {
 				if dk.KeyTag() != sig.KeyTag || dk.Algorithm != sig.Algorithm {
 					continue
 				}
-				if err := sig.Verify(dk, norm); err == nil {
+				if err := wireSig.Verify(dk, norm); err == nil {
 					verified = true
 				}
 			}

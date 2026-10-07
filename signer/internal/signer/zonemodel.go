@@ -44,14 +44,29 @@ func canonicalName(name string) string {
 }
 
 // canonicalLabel canonicalizes one presentation-format label.
+//
+// An asterisk is written bare only when the label is exactly "*", the one
+// spelling RFC 4592 §2.1.1 defines as a wildcard; in any other label ("*foo",
+// "**") it is escaped as `\*`. The wire form is identical either way, but
+// miekg/dns decides the RRSIG Labels count from the presentation prefix, so
+// a bare leading asterisk in an ordinary label would be signed as a wildcard
+// expansion and validators would then demand a non-existent closest-encloser
+// proof for an exact-match answer (RM51X-003). The canonical spelling is what
+// every signing and verification path sees (canonicalRRset).
 func canonicalLabel(label string) string {
+	raw := canonicalLabelBytes(label)
+	if len(raw) == 1 && raw[0] == '*' {
+		return "*"
+	}
 	var b strings.Builder
-	for _, c := range canonicalLabelBytes(label) {
+	for _, c := range raw {
 		switch {
 		case c == '.':
 			b.WriteString(`\.`)
 		case c == '\\':
 			b.WriteString(`\\`)
+		case c == '*':
+			b.WriteString(`\*`)
 		case c < '!' || c > '~':
 			fmt.Fprintf(&b, `\%03d`, c)
 		default:

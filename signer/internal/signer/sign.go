@@ -1435,6 +1435,13 @@ func (s *Signer) verifySignedZoneWithModel(m *zoneModel, domain string, input, s
 		if err := s.checkRRSIGWindow(sig, verifyNow); err != nil {
 			return err
 		}
+		// RFC 4034 §3.1.3 / RFC 4592 §2.1.1: the Labels field must match the
+		// owner, excluding only a genuine wildcard label. Verify would accept
+		// a lower count by reconstructing a wildcard owner, which is exactly
+		// how a real validator would then misread the answer (RM51X-003).
+		if want := rrsigLabels(k.name); sig.Labels != want {
+			return fmt.Errorf("RRSIG for %s %s carries Labels=%d, want %d (RFC 4034 §3.1.3)", sig.Hdr.Name, dns.TypeToString[sig.TypeCovered], sig.Labels, want)
+		}
 		wire := canonicalRRset(rrset)
 		candidates := dnskeysByTag[sig.KeyTag]
 		if len(candidates) == 0 {
@@ -1659,17 +1666,28 @@ func typeList(types []uint16) string {
 	return "[" + strings.Join(names, " ") + "]"
 }
 
+// rrsigLabels is the RFC 4034 §3.1.3 Labels value for an owner name: the
+// number of wire labels, less one when the leftmost label is the wildcard
+// label. Only a label that is exactly "*" is a wildcard (RFC 4592 §2.1.1);
+// "*foo" and "**" are ordinary labels and keep their full count. The
+// decision is made on the canonical spelling, where a wildcard label is the
+// only bare asterisk and an escaped asterisk is a wildcard too (RA6X-028).
+func rrsigLabels(name string) uint8 {
+	canon := canonicalName(name)
+	labels := dns.CountLabel(canon)
+	if canon == "*." || strings.HasPrefix(canon, "*.") {
+		labels--
+	}
+	return uint8(labels)
+}
+
 // createRRSIG creates an RRSIG record for signing
 func (s *Signer) createRRSIG(rrset []dns.RR, signingKey *dns.DNSKEY, domain string, inception, expiration time.Time) *dns.RRSIG {
 	name := rrset[0].Header().Name
-	labels := dns.CountLabel(name)
 
-	// RFC 4035 §5.3.1: For wildcards, the Labels field excludes the wildcard label
-	// So *.example.com has 2 labels, not 3. Judged on the canonical spelling so
-	// an escaped asterisk is a wildcard too (RA6X-028).
-	if strings.HasPrefix(canonicalName(name), "*.") {
-		labels--
-	}
+	// RFC 4035 §5.3.1: for a wildcard the Labels field excludes the wildcard
+	// label, so *.example.com has 2 labels, not 3.
+	labels := rrsigLabels(name)
 
 	return &dns.RRSIG{
 		Hdr: dns.RR_Header{
@@ -1680,7 +1698,7 @@ func (s *Signer) createRRSIG(rrset []dns.RR, signingKey *dns.DNSKEY, domain stri
 		},
 		TypeCovered: rrset[0].Header().Rrtype,
 		Algorithm:   signingKey.Algorithm,
-		Labels:      uint8(labels),
+		Labels:      labels,
 		OrigTtl:     rrset[0].Header().Ttl,
 		Expiration:  uint32(expiration.Unix()),
 		Inception:   uint32(inception.Unix()),
@@ -1689,7 +1707,25 @@ func (s *Signer) createRRSIG(rrset []dns.RR, signingKey *dns.DNSKEY, domain stri
 	}
 }
 
+// signRRSIG fills in the signature over rrset. The library recomputes the
+// Labels field from the owner's presentation spelling while signing, so the
+// value createRRSIG derived under RFC 4592 is checked afterwards: a
+// disagreement would already be baked into the signature and published, and
+// validators would treat the exact-match answer as a wildcard expansion
+// (RM51X-003).
 func (s *Signer) signRRSIG(rrsig *dns.RRSIG, rrset []dns.RR, key *dns.DNSKEY, privateKey []byte) error {
+	want := rrsig.Labels
+	if err := s.signRRSIGWithAlgorithm(rrsig, rrset, key, privateKey); err != nil {
+		return err
+	}
+	if rrsig.Labels != want {
+		return fmt.Errorf("RRSIG for %s %s: signing library set Labels=%d, want %d (RFC 4592 §2.1.1)",
+			rrsig.Hdr.Name, dns.TypeToString[rrsig.TypeCovered], rrsig.Labels, want)
+	}
+	return nil
+}
+
+func (s *Signer) signRRSIGWithAlgorithm(rrsig *dns.RRSIG, rrset []dns.RR, key *dns.DNSKEY, privateKey []byte) error {
 	switch key.Algorithm {
 	case dns.ED25519:
 		// crypto/ed25519.Sign PANICS if the key is not exactly 64 bytes. BIND/ldns and
