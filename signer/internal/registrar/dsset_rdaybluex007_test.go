@@ -3,6 +3,7 @@ package registrar
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ptudor/sigillum-dnssec/signer/internal/dnssectest"
 	signerpkg "github.com/ptudor/sigillum-dnssec/signer/internal/signer"
@@ -10,29 +11,43 @@ import (
 )
 
 // RDAYBLUEX-007: the desired DS set is phase-aware. The old KSK's DS is part
-// of it only while the rollover phase still requires it at the parent.
+// of it while the rollover phase still requires it at the parent — and, in
+// every later phase, until the generation carrying the new key(s) has
+// propagated (a stamped, elapsed horizon; RM51X-001).
 
 func TestRDAYBLUEX007_IncludesOldDSPhaseTable(t *testing.T) {
+	past := time.Now().Add(-time.Second)
+	future := time.Now().Add(time.Hour)
+	var unstamped time.Time
 	cases := []struct {
 		typ, state string
+		horizon    time.Time
 		want       bool
 	}{
-		{"ksk", statepkg.KSKRolloverStateDSAddWait, true},
-		{"ksk", statepkg.KSKRolloverStateDSPropagation, false},
-		{"ksk", statepkg.KSKRolloverStateRetiring, false},
-		{"algorithm", statepkg.AlgoRolloverStateDSAddWait, true},
-		{"algorithm", statepkg.AlgoRolloverStateDSPropagation, true},
-		{"algorithm", statepkg.AlgoRolloverStateOldDSRemoval, false},
-		{"algorithm", statepkg.AlgoRolloverStateRetiring, false},
-		{"zsk", statepkg.ZSKRolloverStatePrePublish, false},
-		{"zsk", statepkg.ZSKRolloverStateSigning, false},
+		{"ksk", statepkg.KSKRolloverStateDSAddWait, unstamped, true},
+		{"ksk", statepkg.KSKRolloverStateDSAddWait, past, true},
+		{"ksk", statepkg.KSKRolloverStateDSPropagation, unstamped, true},
+		{"ksk", statepkg.KSKRolloverStateDSPropagation, future, true},
+		{"ksk", statepkg.KSKRolloverStateDSPropagation, past, false},
+		{"ksk", statepkg.KSKRolloverStateRetiring, unstamped, true},
+		{"ksk", statepkg.KSKRolloverStateRetiring, past, false},
+		{"algorithm", statepkg.AlgoRolloverStateDSAddWait, past, true},
+		{"algorithm", statepkg.AlgoRolloverStateDSPropagation, past, true},
+		{"algorithm", statepkg.AlgoRolloverStateOldDSRemoval, unstamped, true},
+		{"algorithm", statepkg.AlgoRolloverStateOldDSRemoval, future, true},
+		{"algorithm", statepkg.AlgoRolloverStateOldDSRemoval, past, false},
+		{"algorithm", statepkg.AlgoRolloverStateRetiring, unstamped, true},
+		{"algorithm", statepkg.AlgoRolloverStateRetiring, past, false},
+		{"zsk", statepkg.ZSKRolloverStatePrePublish, past, false},
+		{"zsk", statepkg.ZSKRolloverStateSigning, past, false},
 	}
 	if IncludesOldDS(nil) {
 		t.Fatal("no rollover: active KSK only")
 	}
 	for _, c := range cases {
-		if got := IncludesOldDS(&statepkg.RolloverState{Type: c.typ, State: c.state}); got != c.want {
-			t.Errorf("%s/%s: IncludesOldDS = %v, want %v", c.typ, c.state, got, c.want)
+		r := &statepkg.RolloverState{Type: c.typ, State: c.state, PhaseHorizon: c.horizon}
+		if got := IncludesOldDS(r); got != c.want {
+			t.Errorf("%s/%s horizon=%v: IncludesOldDS = %v, want %v", c.typ, c.state, c.horizon, got, c.want)
 		}
 	}
 }
@@ -90,7 +105,11 @@ func TestRDAYBLUEX007_BuildDSSetByPhase(t *testing.T) {
 		t.Fatalf("ksk ds_add_wait: old+new, got %v", got)
 	}
 	for _, phase := range []string{statepkg.KSKRolloverStateDSPropagation, statepkg.KSKRolloverStateRetiring} {
-		state.Mutate(func() { zs.Rollover.State = phase })
+		state.Mutate(func() { zs.Rollover.State = phase; zs.Rollover.PhaseHorizon = time.Time{} })
+		if got := tags(t); len(got) != 2 || !got[oldTag] || !got[newTag] {
+			t.Fatalf("ksk %s before the new DNSKEY RRset propagated: old+new, got %v", phase, got)
+		}
+		state.Mutate(func() { zs.Rollover.PhaseHorizon = time.Now().Add(-time.Second) })
 		if got := tags(t); len(got) != 1 || !got[newTag] {
 			t.Fatalf("ksk %s: new only, got %v", phase, got)
 		}
@@ -110,7 +129,11 @@ func TestRDAYBLUEX007_BuildDSSetByPhase(t *testing.T) {
 		}
 	}
 	for _, phase := range []string{statepkg.AlgoRolloverStateOldDSRemoval, statepkg.AlgoRolloverStateRetiring} {
-		state.Mutate(func() { zs.Rollover.State = phase })
+		state.Mutate(func() { zs.Rollover.State = phase; zs.Rollover.PhaseHorizon = time.Time{} })
+		if got := tags(t); len(got) != 2 || !got[oldTag] || !got[newTag] {
+			t.Fatalf("algorithm %s before the new keys propagated: old+new, got %v", phase, got)
+		}
+		state.Mutate(func() { zs.Rollover.PhaseHorizon = time.Now().Add(-time.Second) })
 		if got := tags(t); len(got) != 1 || !got[newTag] {
 			t.Fatalf("algorithm %s: new only, got %v", phase, got)
 		}

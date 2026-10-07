@@ -21,11 +21,12 @@ import (
 	statepkg "github.com/ptudor/sigillum-dnssec/signer/internal/state"
 )
 
-// RDAYBLUEX-007 end to end against a Dynadot-shaped fake registrar: KSK
-// completion replaces with the new-only set, algorithm completion initially
-// retains both, the later automatic transition replaces with new-only
-// exactly once, a transient failure is retried without retiring keys, and
-// `registrar push` never re-adds the old DS in a removal/retirement phase.
+// RDAYBLUEX-007 end to end against a Dynadot-shaped fake registrar: a KSK
+// rollover replaces with the new-only set once the new DNSKEY RRset has
+// propagated (RM51X-001), algorithm completion retains both, the later
+// automatic transition replaces with new-only exactly once, a transient
+// failure is retried without retiring keys, and `registrar push` never
+// re-adds the old DS in a removal/retirement phase.
 
 // wellBehavedRegistrar stores DS records by key tag; PUT upserts, DELETE
 // wipes, GET lists. failPuts makes every PUT fail with 500.
@@ -166,6 +167,27 @@ registrar = "dynadot"
 	return &registrarLab{cfg: cfg, state: state, domain: domain, fake: fake}
 }
 
+// propagateNewKeys marks the rollover's generation as confirmed served with
+// one-second cache lifetimes, lets check stamp the propagation horizon, and
+// waits for that horizon to pass (RM51X-001).
+func (lab *registrarLab) propagateNewKeys(t *testing.T, check func(string) error) {
+	t.Helper()
+	zs := lab.state.GetZone(lab.domain)
+	lab.state.Mutate(func() {
+		zs.PublishedDNSKEYTTL, zs.PublishedMaxRRSIGTTL = 1, 1
+		now := time.Now().UTC()
+		zs.ConfirmPublication(now, now)
+	})
+	if err := check(lab.domain); err != nil {
+		t.Fatal(err)
+	}
+	r := zs.Rollover
+	if r == nil || r.PhaseHorizon.IsZero() {
+		t.Fatalf("the propagation horizon must be stamped from the confirmed publication: %+v", r)
+	}
+	time.Sleep(time.Until(r.PhaseHorizon) + 100*time.Millisecond)
+}
+
 func tagStrings(ids ...uint16) []string {
 	var out []string
 	for _, id := range ids {
@@ -192,8 +214,24 @@ func TestRDAYBLUEX007_KSKCompletionReplacesWithNewOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	MaybeAutoPublishDS(lab.cfg, lab.state, lab.domain, "rollover_complete")
+	if got := lab.fake.tags(); strings.Join(got, ",") != strings.Join(tagStrings(oldTag, newTag), ",") {
+		t.Fatalf("KSK completion must keep old+new until the new DNSKEY RRset has propagated, got %v (old %d new %d)", got, oldTag, newTag)
+	}
+	if _, deletes := lab.fake.counts(); deletes != 0 {
+		t.Fatalf("no destructive replace may happen before propagation, got %d DELETEs", deletes)
+	}
+	lab.propagateNewKeys(t, rm.CheckKSKRollover)
+	if err := rm.CheckKSKRollover(lab.domain); err != nil {
+		t.Fatal(err)
+	}
 	if got := lab.fake.tags(); strings.Join(got, ",") != fmt.Sprintf("%d", newTag) {
-		t.Fatalf("KSK completion must leave only the new DS at the registrar, got %v (old %d new %d)", got, oldTag, newTag)
+		t.Fatalf("once the new DNSKEY RRset has propagated the registrar must hold only the new DS, got %v (old %d new %d)", got, oldTag, newTag)
+	}
+	if _, deletes := lab.fake.counts(); deletes != 1 {
+		t.Fatalf("exactly one replace expected, got %d DELETEs", deletes)
+	}
+	if lab.state.GetZone(lab.domain).Rollover.DSRemovalPushedAt.IsZero() {
+		t.Fatal("the successful update must be recorded")
 	}
 	// A later explicit push in the propagation/retirement phases never
 	// resurrects the old DS.
@@ -228,10 +266,21 @@ func TestRDAYBLUEX007_AlgorithmRolloverReplacesNewOnlyExactlyOnceAtSafeTransitio
 	if err := rm.StartAlgorithmRollover(lab.domain, "ECDSAP256SHA256"); err != nil {
 		t.Fatal(err)
 	}
-	MaybeAutoPublishDS(lab.cfg, lab.state, lab.domain, "rollover_start")
 	newTag := lab.state.GetZone(lab.domain).Rollover.NewKeyID
+	// The new-algorithm DS is added only once the new keys and signatures
+	// have propagated (RM51X-001).
+	if err := rm.CheckAlgorithmRollover(lab.domain); err != nil {
+		t.Fatal(err)
+	}
+	if got := lab.fake.tags(); strings.Join(got, ",") != fmt.Sprintf("%d", oldTag) {
+		t.Fatalf("algorithm rollover start must not publish the new DS before propagation, got %v", got)
+	}
+	lab.propagateNewKeys(t, rm.CheckAlgorithmRollover)
+	if err := rm.CheckAlgorithmRollover(lab.domain); err != nil {
+		t.Fatal(err)
+	}
 	if got := lab.fake.tags(); strings.Join(got, ",") != strings.Join(tagStrings(oldTag, newTag), ",") {
-		t.Fatalf("algorithm rollover start publishes both, got %v", got)
+		t.Fatalf("after propagation the new DS is added alongside the old one, got %v", got)
 	}
 
 	// Completion enters the DS-propagation wait: both DS are retained and
@@ -310,8 +359,11 @@ func TestRDAYBLUEX007_TransientRegistrarFailureRetriesWithoutRetiring(t *testing
 	if err := rm.StartAlgorithmRollover(lab.domain, "ECDSAP256SHA256"); err != nil {
 		t.Fatal(err)
 	}
-	MaybeAutoPublishDS(lab.cfg, lab.state, lab.domain, "rollover_start")
 	newTag := lab.state.GetZone(lab.domain).Rollover.NewKeyID
+	lab.propagateNewKeys(t, rm.CheckAlgorithmRollover)
+	if err := rm.CheckAlgorithmRollover(lab.domain); err != nil {
+		t.Fatal(err)
+	}
 	if err := rm.CompleteAlgorithmRollover(lab.domain, time.Now().Add(-2*time.Second), 1); err != nil {
 		t.Fatal(err)
 	}

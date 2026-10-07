@@ -1460,7 +1460,7 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 	if rollover.Type != "ksk" && rollover.Type != "algorithm" {
 		return fmt.Errorf("cannot complete rollover type %q manually", rollover.Type)
 	}
-	if !rollover.NeedsOperator() || rollover.State == statepkg.AlgoRolloverStateOldDSRemoval {
+	if rollover.State != statepkg.KSKRolloverStateDSAddWait && rollover.State != statepkg.AlgoRolloverStateDSAddWait {
 		return fmt.Errorf("rollover for %s is in phase %s: retirement continues automatically (the daemon or `sigillum-signer sign` advances it); current action: %s", domain, rollover.State, rollover.Action)
 	}
 
@@ -1512,15 +1512,18 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 		fmt.Printf("KSK rollover for %s is entering its retirement wait.\n", domain)
 		fmt.Printf("Both KSKs stay published until %s (parent DS TTL); the old KSK is then retired automatically by the daemon or the next `sigillum-signer sign`.\n",
 			now.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339))
-		fmt.Println("You may remove the OLD DS record from your registrar now.")
+		fmt.Printf("OLD DS: %s.\n", rolloverMgr.OldDSRemovalAdvice(domain))
 	case "algorithm":
 		slog.Info("[CLI] Completing algorithm rollover", "domain", domain)
 		if err := rolloverMgr.CompleteAlgorithmRollover(domain, now, parentDSTTL); err != nil {
 			return fmt.Errorf("completing algorithm rollover: %w", err)
 		}
 		fmt.Printf("Algorithm rollover for %s is entering its retirement sequence.\n", domain)
-		fmt.Printf("Both algorithms stay published until %s (parent DS TTL). Then remove the OLD DS record (old algorithm) at your registrar; the old-algorithm keys are retired one DS TTL after it is gone from every parent server.\n",
+		fmt.Printf("Both algorithms stay published until %s (parent DS TTL). Then the OLD DS record (old algorithm) is removed at your registrar; the old-algorithm keys are retired one DS TTL after it is gone from every parent server.\n",
 			now.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339))
+		if !zoneState.Rollover.NewKeysPropagatedBy(now) {
+			fmt.Printf("Note: %s.\n", rolloverMgr.OldDSRemovalAdvice(domain))
+		}
 	}
 
 	// The key set does not change yet; re-sign so state and output stay coherent.
@@ -1536,9 +1539,9 @@ func runRolloverComplete(cmd *cobra.Command, args []string) error {
 
 	hookOK, _ := runPostSignHook(cfg, state, domain, zoneState.Path)
 
-	// Removing the old DS at the parent is safe from here: every resolver
-	// validates through a DS that matches a served KSK. Only the old KEY's
-	// retirement waits (above).
+	// The registrar receives the phase-correct set: new-only once the DNSKEY
+	// RRset carrying the new key has propagated (RM51X-001), old+new before
+	// that; the daemon installs the new-only set later in the latter case.
 	if hookOK {
 		MaybeAutoPublishDS(cfg, state, domain, "rollover_complete")
 	} else {
@@ -1598,16 +1601,22 @@ func runRolloverAlgorithm(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Algorithm rollover started for %s.\n", domain)
 	fmt.Printf("Old algorithm: %s\n", state.GetZone(domain).Rollover.OldAlgorithm)
 	fmt.Printf("New algorithm: %s\n\n", targetAlgorithm)
-	fmt.Println("Add the following DS record to your registrar:")
+	fmt.Println("The new DS record for your registrar will be:")
 	fmt.Println()
 	fmt.Println(ds.String())
 	fmt.Println()
-	fmt.Printf("After the new DS propagates, run: sigillum-signer rollover complete %s\n", domain)
-
-	if hookOK {
-		MaybeAutoPublishDS(cfg, state, domain, "rollover_start")
-	} else {
-		fmt.Printf("DS auto-publish skipped: the post-sign hook failed, so the new KSK is not confirmed served yet. Once it is, run `sigillum-signer registrar push %s`.\n", domain)
+	// RFC 6781 §4.1.4 / RM51X-001: the new-algorithm DS may appear at the
+	// parent only after every authoritative server serves the new keys and
+	// signatures and cached data without them has expired; a validator that
+	// enforces algorithm signalling would otherwise go bogus. The daemon (or
+	// `sign`) reports in status when that holds and, with registrar
+	// automation, adds the DS itself then.
+	fmt.Println("Do NOT publish it yet: the new algorithm's keys and signatures must first be confirmed served by every authoritative server and")
+	fmt.Println("cached data without them must expire (one DNSKEY/RRSIG TTL). `sigillum-signer status` reports when the DS may be published;")
+	fmt.Println("with registrar automation it is added automatically at that point.")
+	fmt.Printf("Once the new DS is at every parent server, run: sigillum-signer rollover complete %s\n", domain)
+	if !hookOK {
+		fmt.Println("The post-sign hook failed, so the new keys are not confirmed served yet; the daemon re-runs the hook every cycle.")
 	}
 
 	return nil

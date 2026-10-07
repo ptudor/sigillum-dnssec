@@ -350,9 +350,15 @@ sigillum-signer rollover status example.com --config config.toml
 nameserver, then keeps both KSKs signing until the parent's DS TTL has
 elapsed — a resolver that fetched the old-only DS set just before your change
 holds it that long and would fail if the old key vanished earlier. The daemon
-(or the next `sign`) retires the old KSK automatically after that wait and
-ends the rollover once the retired zone is confirmed served. Pass `--force`
-to skip the probe and start the wait now using `parent_ds_ttl`.
+(or the next `sign`) retires the old KSK automatically after that wait. The
+**old DS** may leave the parent only once the DNSKEY RRset carrying the new
+KSK has propagated: confirmed served by every authoritative server, plus one
+DNSKEY TTL so no resolver still holds the old-only key set against a new-only
+DS set (RFC 6781 §4.1.2). Registrar automation removes it at that point
+(retrying until it succeeds) and `status` tells you when it is safe to do by
+hand; the rollover ends once the retired zone is confirmed served and the old
+DS may go. Pass `--force` to skip the probe and start the wait now using
+`parent_ds_ttl`.
 
 Every probe (parent DS checks, `publication = "probe"`, `import`) must hear
 from every delegated nameserver. On a host with one address family, a
@@ -382,10 +388,16 @@ sigillum-signer rollover complete example.com --config config.toml
 ```
 
 During algorithm rollover, the zone is signed with both the old and new
-algorithm keys. `rollover complete` records that the new DS is at every parent
-server; after the parent's DS TTL the status asks you to remove the OLD DS,
-and one more DS TTL after it is gone from every parent server the
-old-algorithm keys and signatures are retired automatically (RFC 6781 §4.1.4).
+algorithm keys. Do **not** publish the new DS right away: a validator that
+enforces algorithm signalling treats a DS algorithm without matching keys and
+signatures as bogus, so the new DS may appear only once the new keys and
+signatures are confirmed served everywhere and cached data without them has
+expired. `status` reports when that holds (with registrar automation the DS
+is added automatically then). `rollover complete` records that the new DS is
+at every parent server; after the parent's DS TTL the OLD DS is removed (by
+automation or you, never before the new keys have propagated), and one more
+DS TTL after it is gone from every parent server the old-algorithm keys and
+signatures are retired automatically (RFC 6781 §4.1.4).
 
 ## NSD Integration
 

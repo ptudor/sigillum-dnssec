@@ -56,10 +56,15 @@ type DSPublisher interface {
 	PublishDS(domain, op string) (published bool, err error)
 }
 
-// OpRolloverOldDSRemoval is the DSPublisher operation for the automatic
-// transition into an algorithm rollover's old-DS-removal phase: the parent's
-// DS set is replaced with the new-only set.
+// OpRolloverOldDSRemoval is the DSPublisher operation that installs the
+// new-only DS set at the parent for a KSK or algorithm rollover once the
+// generation carrying the new key(s) has propagated (RM51X-001).
 const OpRolloverOldDSRemoval = "rollover_old_ds_removal"
+
+// OpRolloverNewDSAdd is the DSPublisher operation that additively publishes
+// an algorithm rollover's new-algorithm DS once the new keys and signatures
+// have propagated (RFC 6781 §4.1.4, RM51X-001).
+const OpRolloverNewDSAdd = "rollover_new_ds_add"
 
 // RolloverManager handles key rollover operations
 type RolloverManager struct {
@@ -200,8 +205,10 @@ func (rm *RolloverManager) activateRecorded(domain string, keyGen *KeyGenerator,
 // Both KSKs keep signing until CheckKSKRollover retires the old one after
 // that TTL — a resolver that fetched the old-only DS set just before the new
 // DS appeared holds it that long, and would go bogus if the old KSK vanished
-// from the DNSKEY RRset earlier. The old DS may be removed at the parent at
-// any time from here on.
+// from the DNSKEY RRset earlier. The old DS may leave the parent only once
+// the DNSKEY RRset carrying the new KSK has propagated (RFC 6781 §4.1.2,
+// RM51X-001): registrar automation waits for that in CheckKSKRollover and
+// the Action text tells a manual operator the same.
 func (rm *RolloverManager) CompleteKSKRollover(domain string, dsObservedAt time.Time, parentDSTTL uint32) error {
 	zoneState := rm.state.GetZone(domain)
 	if zoneState == nil {
@@ -229,24 +236,108 @@ func (rm *RolloverManager) CompleteKSKRollover(domain string, dsObservedAt time.
 		"new_key_id", zoneState.Rollover.NewKeyID,
 		"retire_after", dsObservedAt.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339))
 
+	if err := rm.stampNewKeyPropagation(zoneState); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
 	rm.state.Mutate(func() {
 		r := zoneState.Rollover
 		r.State = statepkg.KSKRolloverStateDSPropagation
 		r.DSObservedAt = dsObservedAt.UTC()
 		r.ParentDSTTL = parentDSTTL
-		r.PhaseStarted = time.Now().UTC()
-		r.Action = fmt.Sprintf("Automatic: both KSKs stay published until %s (parent DS TTL), then the old KSK is retired; the OLD DS may be removed at the registrar now",
-			r.DSObservedAt.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339))
+		r.PhaseStarted = now
+		r.Action = fmt.Sprintf("Automatic: both KSKs stay published until %s (parent DS TTL), then the old KSK is retired; %s",
+			r.DSObservedAt.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339), rm.oldDSRemovalAdvice(zoneState, now))
 		zoneState.ClearTransientWarnings()
 	})
 	metrics.RecordRolloverOperation(domain, "ksk", "ds_propagation")
 	return rm.state.Save()
 }
 
+// OldDSRemovalAdvice tells an operator whether the OLD DS may be removed at
+// the registrar for the zone's KSK or algorithm rollover, and why not yet.
+func (rm *RolloverManager) OldDSRemovalAdvice(domain string) string {
+	zoneState := rm.state.GetZone(domain)
+	if zoneState == nil || zoneState.Rollover == nil {
+		return ""
+	}
+	return rm.oldDSRemovalAdvice(zoneState, time.Now().UTC())
+}
+
+func (rm *RolloverManager) oldDSRemovalAdvice(zoneState *statepkg.ZoneState, now time.Time) string {
+	if ok, reason := rm.newKeysPropagated(zoneState, now); !ok {
+		return "do NOT remove the OLD DS at the registrar yet: " + reason + " (registrar automation waits for this as well; status reports when it is safe)"
+	}
+	return "the OLD DS may be removed at the registrar now (registrar automation does this itself)"
+}
+
+// newKeyFloor is the cache lifetime the generation introducing a rollover's
+// new key(s) must outlive before the parent's DS set may change: the
+// DNSKEY-TTL floor for a KSK rollover (R-006); for an algorithm rollover
+// also the largest signed RRset TTL, since a validator that enforces
+// algorithm signalling (RFC 6840 §5.11) needs the new algorithm's
+// signatures too, not only its keys.
+func (rm *RolloverManager) newKeyFloor(zoneState *statepkg.ZoneState, r *statepkg.RolloverState) time.Duration {
+	if r.Type == "algorithm" {
+		return rm.zskRetireFloor(zoneState)
+	}
+	return rm.dnskeyTTLFloor(zoneState)
+}
+
+// stampNewKeyPropagation records, once per KSK or algorithm rollover, when
+// the generation introducing the new key(s) was confirmed served and the
+// cache horizon the parent's DS set must not change before (RFC 6781
+// §4.1.2 / §4.1.4, RM51X-001): that publication plus the floor, never
+// earlier than the zone's remembered cache horizons (RA6X-027). Later
+// re-signs of the same key set do not move it. Nothing is stamped until a
+// generation signed after the rollover started is confirmed served.
+func (rm *RolloverManager) stampNewKeyPropagation(zoneState *statepkg.ZoneState) error {
+	r := zoneState.Rollover
+	if r == nil || (r.Type != "ksk" && r.Type != "algorithm") || !r.PhaseHorizon.IsZero() {
+		return nil
+	}
+	if !zoneState.PublishedSince(r.Started) {
+		return nil
+	}
+	published := zoneState.PublishedAt
+	horizon := published.Add(rm.newKeyFloor(zoneState, r))
+	if zoneState.DNSKEYCacheHorizon.After(horizon) {
+		horizon = zoneState.DNSKEYCacheHorizon
+	}
+	if r.Type == "algorithm" && zoneState.RRSIGCacheHorizon.After(horizon) {
+		horizon = zoneState.RRSIGCacheHorizon
+	}
+	rm.state.Mutate(func() {
+		r.PhaseFirstSigned = published
+		r.PhaseHorizon = horizon
+	})
+	return rm.state.Save()
+}
+
+// newKeysPropagated reports whether the parent's DS set may change for the
+// zone's KSK or algorithm rollover, with the reason it may not yet.
+func (rm *RolloverManager) newKeysPropagated(zoneState *statepkg.ZoneState, now time.Time) (bool, string) {
+	r := zoneState.Rollover
+	if r == nil {
+		return false, "no rollover in progress"
+	}
+	if !zoneState.PublishedSince(r.Started) || r.PhaseHorizon.IsZero() {
+		return false, "the DNSKEY RRset carrying the new key is not yet confirmed served by every authoritative server"
+	}
+	if now.Before(r.PhaseHorizon) {
+		return false, fmt.Sprintf("resolvers may still cache the DNSKEY RRset without the new key until %s", r.PhaseHorizon.Format(time.RFC3339))
+	}
+	return true, ""
+}
+
 // CheckKSKRollover advances the automatic phases of a KSK rollover
 // (RA6X-003): after the parent DS TTL has elapsed since the new DS was seen,
 // the old KSK is dropped from the zone; once that generation is confirmed
-// served (RA6X-004) the rollover is complete.
+// served (RA6X-004) the rollover is complete. Independently, once the
+// DNSKEY RRset carrying the new KSK has propagated (RM51X-001), registrar
+// automation installs the new-only DS set at the parent; the rollover does
+// not end before that update has succeeded, so a failed update is retried
+// every cycle and never forgotten.
 func (rm *RolloverManager) CheckKSKRollover(domain string) error {
 	zoneState := rm.state.GetZone(domain)
 	if zoneState == nil || zoneState.Rollover == nil || zoneState.Rollover.Type != "ksk" {
@@ -254,8 +345,14 @@ func (rm *RolloverManager) CheckKSKRollover(domain string) error {
 	}
 	r := zoneState.Rollover
 	now := time.Now().UTC()
+	if err := rm.stampNewKeyPropagation(zoneState); err != nil {
+		return err
+	}
 	switch r.State {
 	case statepkg.KSKRolloverStateDSPropagation:
+		if _, err := rm.pushOldDSRemoval(domain, zoneState); err != nil {
+			return err
+		}
 		retireAt := r.DSObservedAt.Add(effectiveParentDSTTL(r.ParentDSTTL))
 		if now.Before(retireAt) {
 			return nil
@@ -264,12 +361,22 @@ func (rm *RolloverManager) CheckKSKRollover(domain string) error {
 		rm.state.Mutate(func() {
 			r.State = statepkg.KSKRolloverStateRetiring
 			r.PhaseStarted = now
-			r.Action = "Automatic: old KSK removed from the zone; the rollover ends once that zone is confirmed served"
+			r.Action = "Automatic: old KSK removed from the zone; the rollover ends once that zone is confirmed served; " + rm.oldDSRemovalAdvice(zoneState, now)
 			zoneState.ForceResign = true
 		})
 		return rm.state.Save()
 	case statepkg.KSKRolloverStateRetiring:
+		settled, err := rm.pushOldDSRemoval(domain, zoneState)
+		if err != nil {
+			return err
+		}
 		if !zoneState.PublishedSince(r.PhaseStarted) {
+			return nil
+		}
+		if !settled {
+			// The retired zone is served, but the parent still owes the
+			// new-only DS set (not yet propagated, or the registrar update
+			// has not succeeded): keep the record so the update is retried.
 			return nil
 		}
 		slog.Info("[ROLLOVER] KSK rollover completed", "domain", domain,
@@ -669,7 +776,8 @@ func (rm *RolloverManager) StartAlgorithmRollover(domain, targetAlgorithm string
 			OldAlgorithm: oldAlgorithm,
 			NewAlgorithm: targetAlgorithm,
 			Started:      time.Now().UTC(),
-			Action:       fmt.Sprintf("Publish new DS record (algorithm %s) at registrar, then run: sigillum-signer rollover complete %s", targetAlgorithm, domain),
+			Action: fmt.Sprintf("Automatic: do NOT publish the new DS yet — the new algorithm's keys and signatures must first be confirmed served and cached data must expire; "+
+				"status reports when the new DS (algorithm %s) may be published (registrar automation adds it then); afterwards run: sigillum-signer rollover complete %s", targetAlgorithm, domain),
 		}
 
 		// Update keys to new algorithm (old keys are backed up and will be used during rollover)
@@ -731,13 +839,16 @@ func (rm *RolloverManager) CompleteAlgorithmRollover(domain string, dsObservedAt
 		"old_algorithm", zoneState.Rollover.OldAlgorithm,
 		"new_algorithm", zoneState.Rollover.NewAlgorithm)
 
+	if err := rm.stampNewKeyPropagation(zoneState); err != nil {
+		return err
+	}
 	rm.state.Mutate(func() {
 		r := zoneState.Rollover
 		r.State = statepkg.AlgoRolloverStateDSPropagation
 		r.DSObservedAt = dsObservedAt.UTC()
 		r.ParentDSTTL = parentDSTTL
 		r.PhaseStarted = time.Now().UTC()
-		r.Action = fmt.Sprintf("Automatic: both algorithms stay published until %s (parent DS TTL); then remove the OLD DS (algorithm %s) at the registrar",
+		r.Action = fmt.Sprintf("Automatic: both algorithms stay published until %s (parent DS TTL); then the OLD DS (algorithm %s) is removed at the registrar once the new keys have propagated",
 			r.DSObservedAt.Add(time.Duration(parentDSTTL)*time.Second).Format(time.RFC3339), r.OldAlgorithm)
 		zoneState.ClearTransientWarnings()
 	})
@@ -746,30 +857,86 @@ func (rm *RolloverManager) CompleteAlgorithmRollover(domain string, dsObservedAt
 }
 
 // pushOldDSRemoval asks the injected registrar automation (if any) to
-// replace the parent's DS set with the new-only set for an algorithm rollover
-// in its old-DS-removal phase (RDAYBLUEX-007). It is idempotent: a success is
-// recorded in DSRemovalPushedAt and never repeated; a failure is left for the
-// publisher to surface as a zone warning and is retried on the next check.
-// The phase itself never advances on the push — only the every-parent-server
-// probe seeing the old DS gone does that.
-func (rm *RolloverManager) pushOldDSRemoval(domain string, zoneState *statepkg.ZoneState) error {
+// replace the parent's DS set with the new-only set for a KSK rollover past
+// ds_add_wait or an algorithm rollover in its old-DS-removal phase
+// (RDAYBLUEX-007) — but only once the generation carrying the new key(s)
+// has propagated (RM51X-001). It is idempotent: a success is recorded in
+// DSRemovalPushedAt and never repeated; a failure is left for the publisher
+// to surface as a zone warning and is retried on the next check. settled
+// reports whether nothing more is owed to the parent: no automation at all,
+// or the update done. The phase itself never advances on the push.
+func (rm *RolloverManager) pushOldDSRemoval(domain string, zoneState *statepkg.ZoneState) (settled bool, err error) {
 	r := zoneState.Rollover
-	if rm.publisher == nil || r == nil || !r.DSRemovalPushedAt.IsZero() {
-		return nil
+	if rm.publisher == nil || r == nil {
+		return true, nil
+	}
+	if !r.DSRemovalPushedAt.IsZero() {
+		return true, nil
+	}
+	now := time.Now().UTC()
+	if ok, reason := rm.newKeysPropagated(zoneState, now); !ok {
+		slog.Debug("[ROLLOVER] registrar DS update to the new-only set deferred", "domain", domain, "reason", reason)
+		return false, nil
 	}
 	published, err := rm.publisher.PublishDS(domain, OpRolloverOldDSRemoval)
 	if err != nil {
-		slog.Warn("[ROLLOVER] Algorithm rollover: registrar DS update to the new-only set failed; retrying next cycle (the old DS stays at the parent until it succeeds)",
-			"domain", domain, "error", err)
-		return nil
+		slog.Warn("[ROLLOVER] registrar DS update to the new-only set failed; retrying next cycle (the old DS stays at the parent until it succeeds)",
+			"domain", domain, "type", r.Type, "error", err)
+		return false, nil
 	}
 	if !published {
-		return nil
+		// No registrar automation for this zone: the operator removes the
+		// old DS by hand, guided by the Action text.
+		return true, nil
 	}
 	rm.state.Mutate(func() {
-		r.DSRemovalPushedAt = time.Now().UTC()
-		r.Action = fmt.Sprintf("Automatic: registrar asked to hold only the new DS (algorithm %s); the old-algorithm keys are retired one parent DS TTL after the old DS is gone from every parent server", r.NewAlgorithm)
+		r.DSRemovalPushedAt = now
+		switch r.Type {
+		case "algorithm":
+			r.Action = fmt.Sprintf("Automatic: registrar asked to hold only the new DS (algorithm %s); the old-algorithm keys are retired one parent DS TTL after the old DS is gone from every parent server", r.NewAlgorithm)
+		default:
+			r.Action = "Automatic: registrar asked to hold only the new DS; the rollover ends once the retired zone is confirmed served"
+		}
 	})
+	return true, rm.state.Save()
+}
+
+// advanceAlgorithmDSAdd runs the automatic part of algo_ds_add_wait
+// (RFC 6781 §4.1.4, RM51X-001): the new-algorithm DS may be published only
+// once the new keys and signatures have propagated. Registrar automation
+// then adds it (once, recorded in DSAddPushedAt; a failure is retried every
+// cycle); otherwise the operator is asked. The Action text always states
+// the current situation; state is saved only when it changes.
+func (rm *RolloverManager) advanceAlgorithmDSAdd(domain string, zoneState *statepkg.ZoneState, now time.Time) error {
+	r := zoneState.Rollover
+	manual := fmt.Sprintf("Publish new DS record (algorithm %s) at registrar, then run: sigillum-signer rollover complete %s", r.NewAlgorithm, domain)
+	var action string
+	ok, reason := rm.newKeysPropagated(zoneState, now)
+	switch {
+	case !ok:
+		action = fmt.Sprintf("Automatic: do NOT publish the new DS yet — %s; the new DS (algorithm %s) may be published after that (registrar automation adds it then), followed by: sigillum-signer rollover complete %s",
+			reason, r.NewAlgorithm, domain)
+	case !r.DSAddPushedAt.IsZero():
+		action = fmt.Sprintf("Registrar automation added the new DS (algorithm %s); once it is at every parent server run: sigillum-signer rollover complete %s", r.NewAlgorithm, domain)
+	case rm.publisher == nil:
+		action = manual
+	default:
+		published, err := rm.publisher.PublishDS(domain, OpRolloverNewDSAdd)
+		switch {
+		case err != nil:
+			slog.Warn("[ROLLOVER] Algorithm rollover: registrar DS add failed; retrying next cycle", "domain", domain, "error", err)
+			action = fmt.Sprintf("Registrar automation could not add the new DS (algorithm %s) and retries every cycle; alternatively publish it yourself, then run: sigillum-signer rollover complete %s", r.NewAlgorithm, domain)
+		case published:
+			rm.state.Mutate(func() { r.DSAddPushedAt = now })
+			action = fmt.Sprintf("Registrar automation added the new DS (algorithm %s); once it is at every parent server run: sigillum-signer rollover complete %s", r.NewAlgorithm, domain)
+		default:
+			action = manual
+		}
+	}
+	if r.Action == action && (r.DSAddPushedAt.IsZero() || !r.DSAddPushedAt.Equal(now)) {
+		return nil
+	}
+	rm.state.Mutate(func() { r.Action = action })
 	return rm.state.Save()
 }
 
@@ -794,7 +961,12 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 	r := zoneState.Rollover
 	now := time.Now().UTC()
 	ttl := effectiveParentDSTTL(r.ParentDSTTL)
+	if err := rm.stampNewKeyPropagation(zoneState); err != nil {
+		return err
+	}
 	switch r.State {
+	case statepkg.AlgoRolloverStateDSAddWait:
+		return rm.advanceAlgorithmDSAdd(domain, zoneState, now)
 	case statepkg.AlgoRolloverStateDSPropagation:
 		if now.Before(r.DSObservedAt.Add(ttl)) {
 			return nil
@@ -802,19 +974,22 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 		rm.state.Mutate(func() {
 			r.State = statepkg.AlgoRolloverStateOldDSRemoval
 			r.PhaseStarted = now
-			r.Action = fmt.Sprintf("Remove the OLD DS record (algorithm %s, key tag %d) at your registrar; the old-algorithm keys are retired automatically one parent DS TTL after it is gone from every parent server", r.OldAlgorithm, r.OldKeyID)
+			r.Action = fmt.Sprintf("Remove the OLD DS record (algorithm %s, key tag %d) at your registrar — %s; the old-algorithm keys are retired automatically one parent DS TTL after it is gone from every parent server",
+				r.OldAlgorithm, r.OldKeyID, rm.oldDSRemovalAdvice(zoneState, now))
 		})
 		if err := rm.state.Save(); err != nil {
 			return err
 		}
 		// The safe transition for registrar automation (RDAYBLUEX-007): the
-		// parent's DS set may now become new-only.
-		return rm.pushOldDSRemoval(domain, zoneState)
+		// parent's DS set may now become new-only, once the new keys have
+		// propagated (RM51X-001).
+		_, err := rm.pushOldDSRemoval(domain, zoneState)
+		return err
 	case statepkg.AlgoRolloverStateOldDSRemoval:
 		if r.OldDSRemovedAt.IsZero() {
 			// A failed or interrupted registrar update is retried until it
 			// succeeds; the phase cannot advance while the old DS is served.
-			if err := rm.pushOldDSRemoval(domain, zoneState); err != nil {
+			if _, err := rm.pushOldDSRemoval(domain, zoneState); err != nil {
 				return err
 			}
 			if rm.probe == nil {

@@ -189,7 +189,11 @@ type RolloverState struct {
 	PhaseFirstSigned time.Time `json:"phase_first_signed,omitempty"`
 	// PhaseHorizon is the cache horizon snapshotted when the phase's key set
 	// was first confirmed published (RA6X-027): the phase may advance only
-	// after it, and later re-signs of the same set do not move it.
+	// after it, and later re-signs of the same set do not move it. For a KSK
+	// or algorithm rollover it is stamped once, from the confirmed
+	// publication of the generation that introduced the new key(s), and is
+	// the instant from which the parent's DS set may change (RFC 6781
+	// §4.1.2 / §4.1.4, RM51X-001); see NewKeysPropagatedBy.
 	PhaseHorizon time.Time `json:"phase_horizon,omitempty"`
 	// KSK/algorithm retirement gates (RA6X-003): when the new DS was seen at
 	// every parent server, the parent's DS TTL, and when the old DS was seen
@@ -204,7 +208,27 @@ type RolloverState struct {
 	// interrupted update is retried on a later cycle (or after a restart)
 	// and a successful one is never repeated.
 	DSRemovalPushedAt time.Time `json:"ds_removal_pushed_at,omitempty"`
-	Action            string    `json:"action"` // Human-readable next step
+	// DSAddPushedAt records when registrar automation added the new
+	// algorithm's DS for an algorithm rollover, which happens only once the
+	// new keys and signatures have propagated (RM51X-001). Zero until then.
+	DSAddPushedAt time.Time `json:"ds_add_pushed_at,omitempty"`
+	Action        string    `json:"action"` // Human-readable next step
+}
+
+// NewKeysPropagatedBy reports, for a KSK or algorithm rollover, whether the
+// generation that introduced the new key(s) — and, for an algorithm
+// rollover, the new algorithm's signatures — has been confirmed served by
+// every authoritative server AND every resolver cache that may still hold
+// the previous generation has expired, so the parent's DS set may change
+// (RFC 6781 §4.1.2 / §4.1.4, RM51X-001). The rollover manager stamps
+// PhaseHorizon with that instant from the confirmed publication; a zero
+// horizon (not yet confirmed, or a record written before this field was
+// stamped) means "not yet".
+func (r *RolloverState) NewKeysPropagatedBy(now time.Time) bool {
+	if r == nil || (r.Type != "ksk" && r.Type != "algorithm") {
+		return false
+	}
+	return !r.PhaseHorizon.IsZero() && !now.Before(r.PhaseHorizon)
 }
 
 // ConfirmPublication records that the generation signed at signedAt is
@@ -798,7 +822,8 @@ func rolloverStateEqual(a, b *RolloverState) bool {
 		a.OldAlgorithm == b.OldAlgorithm && a.NewAlgorithm == b.NewAlgorithm &&
 		a.Started.Equal(b.Started) && a.PhaseStarted.Equal(b.PhaseStarted) && a.PhaseFirstSigned.Equal(b.PhaseFirstSigned) &&
 		a.PhaseHorizon.Equal(b.PhaseHorizon) && a.DSObservedAt.Equal(b.DSObservedAt) && a.ParentDSTTL == b.ParentDSTTL &&
-		a.OldDSRemovedAt.Equal(b.OldDSRemovedAt) && a.DSRemovalPushedAt.Equal(b.DSRemovalPushedAt) && a.Action == b.Action
+		a.OldDSRemovedAt.Equal(b.OldDSRemovedAt) && a.DSRemovalPushedAt.Equal(b.DSRemovalPushedAt) &&
+		a.DSAddPushedAt.Equal(b.DSAddPushedAt) && a.Action == b.Action
 }
 
 func keysRolloverEqual(a, b *ZoneState) bool {
@@ -1070,8 +1095,13 @@ func (z *ZoneState) Status() string {
 // DS change at the registrar) rather than on an automatic timer or probe.
 func (r *RolloverState) NeedsOperator() bool {
 	switch r.State {
-	case KSKRolloverStateDSAddWait, AlgoRolloverStateDSAddWait, AlgoRolloverStateOldDSRemoval:
+	case KSKRolloverStateDSAddWait, AlgoRolloverStateOldDSRemoval:
 		return true
+	case AlgoRolloverStateDSAddWait:
+		// The new DS may be published only once the new algorithm's keys and
+		// signatures have propagated (RM51X-001); until then the phase waits
+		// on the automatic horizon, not on the operator.
+		return r.NewKeysPropagatedBy(time.Now())
 	}
 	return false
 }

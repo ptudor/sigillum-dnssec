@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	signerpkg "github.com/ptudor/sigillum-dnssec/signer/internal/signer"
 
@@ -58,17 +59,23 @@ func RegistrarFor(cfg *config.Config, domain string) (Registrar, error) {
 }
 
 // IncludesOldDS reports whether a rollover phase still requires the OLD KSK's
-// DS at the parent (RDAYBLUEX-007). The desired set is phase-aware:
+// DS at the parent (RDAYBLUEX-007). The desired set is phase-aware, and in
+// every phase the old DS stays until the generation that introduced the new
+// key(s) has propagated to every authoritative server and out of every
+// resolver cache (RolloverState.NewKeysPropagatedBy, RFC 6781 §4.1.2 /
+// §4.1.4, RM51X-001): a resolver holding the old-only DNSKEY RRset must
+// still find a matching DS.
 //
 //	KSK rollover:        ds_add_wait → old + new;
-//	                     ds_propagation_wait, retiring → new only (the new DS
-//	                     was observed at every parent server; the workflow
-//	                     authorizes old-DS removal from here and a later
-//	                     `registrar push` must never resurrect the old DS)
+//	                     ds_propagation_wait, retiring → new only once the
+//	                     new DNSKEY RRset has propagated (the new DS was
+//	                     observed at every parent server; from then on a
+//	                     later `registrar push` must never resurrect the
+//	                     old DS), old + new before that
 //	Algorithm rollover:  algo_ds_add_wait, algo_ds_propagation_wait → old + new
 //	                     (RFC 6781 §4.1.4: both DS through the first parent-DS
 //	                     propagation wait); algo_old_ds_removal_wait,
-//	                     algo_retiring → new only
+//	                     algo_retiring → new only once propagated
 //	No rollover:         active KSK only
 func IncludesOldDS(r *statepkg.RolloverState) bool {
 	if r == nil {
@@ -76,9 +83,15 @@ func IncludesOldDS(r *statepkg.RolloverState) bool {
 	}
 	switch r.Type {
 	case "ksk":
-		return r.State == statepkg.KSKRolloverStateDSAddWait
+		if r.State == statepkg.KSKRolloverStateDSAddWait {
+			return true
+		}
+		return !r.NewKeysPropagatedBy(time.Now())
 	case "algorithm":
-		return r.State == statepkg.AlgoRolloverStateDSAddWait || r.State == statepkg.AlgoRolloverStateDSPropagation
+		if r.State == statepkg.AlgoRolloverStateDSAddWait || r.State == statepkg.AlgoRolloverStateDSPropagation {
+			return true
+		}
+		return !r.NewKeysPropagatedBy(time.Now())
 	}
 	return false
 }

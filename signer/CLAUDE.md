@@ -83,8 +83,10 @@ Design constraints:
 
 - Registrar integration is **opt-in per zone** — a zone with no
   `registrar = "..."` line behaves exactly as before (copy-paste DS yourself).
-- The signer never deletes old DS records unprompted. Removal happens only as
-  part of a `rollover complete` that the operator explicitly runs.
+- The signer never deletes old DS records unprompted. Removal happens only
+  inside a KSK or algorithm rollover the operator explicitly started, and
+  only after the DNSKEY RRset carrying the new key has propagated to every
+  authoritative server and out of resolver caches (RFC 6781 §4.1.2).
 - Failures to reach the registrar are logged and surfaced in status output,
   but never cause signing itself to fail. The zone keeps serving the old
   signed output.
@@ -370,20 +372,31 @@ Update DS record at registrar. New DS:
 # 2. Once the new DS is at EVERY parent server, record that. Both KSKs keep
 #    signing until the parent's DS TTL has elapsed (a resolver that fetched
 #    the old-only DS set just before the change holds it that long); the
-#    daemon — or the next `sign` — then retires the old KSK, and the rollover
-#    ends once that zone is confirmed served. The old DS may be removed at the
-#    registrar as soon as step 2 succeeds.
+#    daemon — or the next `sign` — then retires the old KSK. The OLD DS may
+#    leave the parent only once the DNSKEY RRset carrying the new KSK has
+#    propagated: confirmed served by every authoritative server, plus one
+#    DNSKEY TTL (and any remembered cache horizon) so no resolver still holds
+#    the old-only RRset against a new-only DS set (RFC 6781 §4.1.2).
+#    Registrar automation installs the new-only set at that point and retries
+#    until it succeeds; `status` tells a manual operator when it is safe. The
+#    rollover ends once the retired zone is confirmed served and the old DS
+#    may go.
 $ sigillum-signer rollover complete example.com
 ```
 
 Phases: `ds_add_wait` (operator) → `ds_propagation_wait` (automatic) →
 `retiring` (automatic). `--force` skips the all-parents probe and starts the
 wait now with `dnssec.parent_ds_ttl` (default 24h). Algorithm rollovers use
-the conservative sequence: `algo_ds_add_wait` (operator adds the new DS) →
-`algo_ds_propagation_wait` → `algo_old_ds_removal_wait` (operator removes the
-old DS; observed at every parent server) → one more DS TTL → `algo_retiring`.
-Every wait is an absolute persisted time that survives restarts and cannot be
-shortened by a later TTL change.
+the conservative sequence (RFC 6781 §4.1.4): `algo_ds_add_wait` (first an
+automatic wait until the new algorithm's keys AND signatures are confirmed
+served and cached data without them has expired — a validator enforcing
+algorithm signalling would otherwise go bogus — then the new DS is added, by
+registrar automation or the operator) → `algo_ds_propagation_wait` →
+`algo_old_ds_removal_wait` (the old DS is removed, by automation or the
+operator, and observed gone at every parent server) → one more DS TTL →
+`algo_retiring`. Every wait is an absolute persisted time (`phase_horizon`
+for the new-key propagation) that survives restarts and cannot be shortened
+by a later TTL change.
 
 The daemon will remind you (in status output) if a rollover needs you.
 
@@ -414,13 +427,16 @@ type Registrar interface {
 
 ### When DS records are touched
 
-| Event                           | Operation at registrar          |
-|---------------------------------|---------------------------------|
-| `add` (new zone)                | `AddDS([new KSK])`              |
-| `import` (existing keys)        | none (verify only, never push)  |
-| `rollover start` (KSK/algo)     | `AddDS([new KSK])`              |
-| `rollover complete` (KSK/algo)  | `ReplaceDS([new KSK])`          |
-| ZSK rollover                    | nothing — ZSK doesn't touch DS  |
+| Event                                              | Operation at registrar                                   |
+|----------------------------------------------------|----------------------------------------------------------|
+| `add` (new zone)                                   | `AddDS([new KSK])`                                       |
+| `import` (existing keys)                           | none (verify only, never push)                           |
+| `rollover start` (KSK)                             | `AddDS([old, new KSK])`                                  |
+| `rollover algorithm`                               | nothing at start; `AddDS([old, new KSK])` by the daemon once the new keys and signatures have propagated |
+| `rollover complete` (KSK/algo)                     | `AddDS` (old+new) until the new DNSKEY RRset has propagated |
+| new DNSKEY RRset propagated (daemon, KSK)          | `ReplaceDS([new KSK])`, retried every cycle until it succeeds |
+| old-DS-removal phase (daemon, algorithm)           | `ReplaceDS([new KSK])`, once the new keys have propagated |
+| ZSK rollover                                       | nothing — ZSK doesn't touch DS                           |
 
 Auto-publish on `add` is deliberately additive, not destructive. If a publish
 attempt fails (e.g., upstream API outage), an `AddDS` leaves whatever the

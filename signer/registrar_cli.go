@@ -348,8 +348,10 @@ func (p dsAutoPublisher) PublishDS(domain, op string) (bool, error) {
 //     ReplaceDS (the old DS is removed); an algorithm rollover still retains
 //     both DS through this wait, so the set is (re)published additively and
 //     nothing is removed yet.
-//   - signerpkg.OpRolloverOldDSRemoval: an algorithm rollover entered its
-//     old-DS-removal wait; the new-only set is installed with ReplaceDS.
+//   - signerpkg.OpRolloverNewDSAdd: an algorithm rollover's new keys and
+//     signatures have propagated; the new-algorithm DS is added (RM51X-001).
+//   - signerpkg.OpRolloverOldDSRemoval: a KSK or algorithm rollover may now
+//     drop the old DS; the new-only set is installed with ReplaceDS.
 //
 // published reports whether an update was performed (false: no registrar,
 // or auto_publish off). Failures are recorded as zone warnings (a zero-DS
@@ -395,7 +397,7 @@ func autoPublishDS(cfg *config.Config, state *statepkg.State, domain, op string,
 	}
 	replace := false
 	switch op {
-	case "add", "rollover_start":
+	case "add", "rollover_start", signerpkg.OpRolloverNewDSAdd:
 		// Additive publish. For `add`, this avoids the failure mode where a
 		// destructive ReplaceDS clears valid DS at the registrar before the
 		// PUT lands — leaving a zone with no DS at all, which validators
