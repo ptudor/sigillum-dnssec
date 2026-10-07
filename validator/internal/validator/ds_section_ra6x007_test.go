@@ -46,7 +46,7 @@ func newRA6X007Fixture(t *testing.T) *ra6x007Fixture {
 func (f *ra6x007Fixture) validateChild(t *testing.T) *ZoneResult {
 	t.Helper()
 	v := f.m.newValidator()
-	zr, err := v.validateZone(testCtx(t), "child.test.", f.hierarchy, f.parent.keyRecords(), false)
+	zr, err := v.validateZone(testCtx(t), "child.test.", f.hierarchy, f.parent.keyRecords(), false, "")
 	if err != nil {
 		t.Fatalf("validateZone: %v", err)
 	}

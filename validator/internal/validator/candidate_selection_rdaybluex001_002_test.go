@@ -178,7 +178,7 @@ func TestRDAYBLUEX001_QuickModeStopsOnlyAfterAuthentication(t *testing.T) {
 	})
 	v := f.m.newValidator()
 	v.SetQuickMode(true)
-	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, f.parent.keyRecords(), false)
+	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, f.parent.keyRecords(), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

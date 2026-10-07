@@ -21,7 +21,7 @@ func TestRA6X019_LabelSkippingDelegationUsesActualParent(t *testing.T) {
 	child.serveDNSKEY(t, m)
 
 	v := m.newValidator()
-	zr, err := v.validateZone(testCtx(t), "child.branch.example.", []string{".", "example.", "child.branch.example."}, parent.keyRecords(), false)
+	zr, err := v.validateZone(testCtx(t), "child.branch.example.", []string{".", "example.", "child.branch.example."}, parent.keyRecords(), false, "")
 	if err != nil {
 		t.Fatalf("validateZone: %v", err)
 	}

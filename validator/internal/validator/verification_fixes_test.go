@@ -65,7 +65,6 @@ func TestIsDenialForType(t *testing.T) {
 // indeterminate/bogus parents stay fail-closed. ---
 
 func TestNextParentDNSKEY(t *testing.T) {
-	prev := []dnspkg.DNSKEYRecord{{KeyTag: 1}}
 	zoneKeys := []dnspkg.DNSKEYRecord{{KeyTag: 2}}
 
 	zr := func(status ValidationStatus, keys []dnspkg.DNSKEYRecord) *ZoneResult {
@@ -75,6 +74,9 @@ func TestNextParentDNSKEY(t *testing.T) {
 		return r
 	}
 
+	// Only a secure zone's DNSKEY set is authenticated; every other status
+	// clears the threaded keys and the walk explains the gap to validateZone
+	// through parentInsecure / indeterminateAncestor (RM51X-005).
 	tests := []struct {
 		name string
 		zr   *ZoneResult
@@ -83,13 +85,14 @@ func TestNextParentDNSKEY(t *testing.T) {
 		{"secure zone threads its own keys", zr(StatusSecure, zoneKeys), zoneKeys},
 		{"insecure zone clears the keys", zr(StatusInsecure, nil), nil},
 		{"insecure island of security clears the keys", zr(StatusInsecure, zoneKeys), nil},
-		{"indeterminate zone without keys keeps the previous keys", zr(StatusIndeterminate, nil), prev},
-		{"bogus zone without keys keeps the previous keys", zr(StatusBogus, nil), prev},
-		{"indeterminate zone with fetched keys threads them", zr(StatusIndeterminate, zoneKeys), zoneKeys},
+		{"indeterminate zone without keys clears the keys", zr(StatusIndeterminate, nil), nil},
+		{"bogus zone without keys clears the keys", zr(StatusBogus, nil), nil},
+		{"indeterminate zone with unauthenticated served keys clears the keys", zr(StatusIndeterminate, zoneKeys), nil},
+		{"bogus zone with served keys clears the keys", zr(StatusBogus, zoneKeys), nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := nextParentDNSKEY(prev, tt.zr)
+			got := nextParentDNSKEY(tt.zr)
 			if len(got) != len(tt.want) {
 				t.Fatalf("nextParentDNSKEY returned %d keys, want %d", len(got), len(tt.want))
 			}
@@ -102,26 +105,28 @@ func TestNextParentDNSKEY(t *testing.T) {
 	}
 }
 
-// A zone cut below an insecure delegation: with the parent keys cleared the
-// child reaches the insecure-ancestor branch and reads insecure; with the
-// nearest signed ancestor's keys still threaded (the pre-fix behavior) the
-// same child demands an impossible DS-absence proof and reads indeterminate.
-func TestChildOfInsecureZoneReadsInsecure(t *testing.T) {
+// A zone cut below an insecure delegation reads insecure through the
+// parentInsecure flag validateZone receives (see the R-033 fixture tests);
+// finalizeNoDSDelegation itself is only reached below a SECURE parent, so an
+// empty key set there is a caller error and fails closed to indeterminate
+// rather than laundering the delegation into insecure (RM51X-005).
+func TestNoDSDelegationWithoutParentKeysFailsClosed(t *testing.T) {
 	v := &Validator{}
 	signedAncestorKeys := []dnspkg.DNSKEYRecord{{KeyTag: 42}}
 
 	insecureParent := NewZoneResult("example.com.")
 	insecureParent.Status = StatusInsecure
-
-	threaded := nextParentDNSKEY(signedAncestorKeys, insecureParent)
-	if len(threaded) != 0 {
+	if threaded := nextParentDNSKEY(insecureParent); len(threaded) != 0 {
 		t.Fatalf("an insecure zone must clear the threaded parent keys, got %d keys", len(threaded))
 	}
 
 	child := NewZoneResult("sub.example.com.")
-	v.finalizeNoDSDelegation(child, "sub.example.com.", "example.com.", threaded, nil)
-	if child.Status != StatusInsecure {
-		t.Fatalf("child of an insecure zone must read insecure, got %s", child.Status)
+	v.finalizeNoDSDelegation(child, "sub.example.com.", "example.com.", nil, nil)
+	if child.Status != StatusIndeterminate {
+		t.Fatalf("DS absence without authenticated parent keys must fail closed to indeterminate, got %s", child.Status)
+	}
+	if len(child.Errors) == 0 || !strings.Contains(child.Errors[0], "no authenticated parent DNSKEY") {
+		t.Fatalf("missing explanatory error, got %v", child.Errors)
 	}
 
 	// The secure-parent path stays fail-closed: without a DS-absence proof the

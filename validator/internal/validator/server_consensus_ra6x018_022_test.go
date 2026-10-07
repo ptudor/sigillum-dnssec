@@ -38,7 +38,7 @@ func newDualServerFixture(t *testing.T) *dualServerFixture {
 func (f *dualServerFixture) validate(t *testing.T) *ZoneResult {
 	t.Helper()
 	v := f.m.newValidator()
-	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, f.parent.keyRecords(), false)
+	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, f.parent.keyRecords(), false, "")
 	if err != nil {
 		t.Fatalf("validateZone: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestRA6X018_PerServerVerdictsAreAuthentication(t *testing.T) {
 	f.m.clearFamilyOverrides()
 	f.m.drop("child.test.", dns.TypeDNSKEY)
 	v := f.m.newValidatorWithTimeout(300 * time.Millisecond)
-	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, f.parent.keyRecords(), false)
+	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, f.parent.keyRecords(), false, "")
 	if err != nil {
 		t.Fatalf("validateZone: %v", err)
 	}

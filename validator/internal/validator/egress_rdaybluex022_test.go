@@ -33,7 +33,7 @@ func TestRDAYBLUEX022_DelegationWithSiteLocalAddressIsNotDialed(t *testing.T) {
 	p.Allow = allow
 	v.SetEgressPolicy(p)
 
-	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, parent.keyRecords(), false)
+	zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, parent.keyRecords(), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

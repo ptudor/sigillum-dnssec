@@ -262,12 +262,13 @@ func TestFinalizeNoDSDelegation(t *testing.T) {
 	const parentZone = "example.com."
 	const child = "sub.example.com."
 
-	// Insecure parent (no authenticated DNSKEY threaded in): unsigned delegation is
-	// genuinely insecure and needs no proof.
+	// No authenticated parent DNSKEY threaded in: the walk handles an insecure
+	// ancestor before reaching this point, so an empty set is a caller error
+	// and fails closed to indeterminate rather than insecure (RM51X-005).
 	r1 := NewZoneResult(child)
 	v.finalizeNoDSDelegation(r1, child, parentZone, nil, nil)
-	if r1.Status != StatusInsecure {
-		t.Fatalf("no parent DNSKEY should yield insecure, got %s", r1.Status)
+	if r1.Status != StatusIndeterminate {
+		t.Fatalf("no parent DNSKEY should fail closed to indeterminate, got %s", r1.Status)
 	}
 
 	// Secure parent, valid absence proof → insecure.

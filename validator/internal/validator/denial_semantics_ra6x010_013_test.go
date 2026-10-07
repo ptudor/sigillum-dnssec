@@ -233,7 +233,7 @@ func TestRA6X010_NSECNXDOMAINSemantics(t *testing.T) {
 		m.respond("child.test.", dns.TypeDS, dns.RcodeSuccess, nil, parent.signedAuthority(t, deleg), nil)
 		child.serveDNSKEY(t, m)
 		v := m.newValidator()
-		zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, parent.keyRecords(), false)
+		zr, err := v.validateZone(testCtx(t), "child.test.", []string{".", "test.", "child.test."}, parent.keyRecords(), false, "")
 		if err != nil {
 			t.Fatalf("validateZone: %v", err)
 		}

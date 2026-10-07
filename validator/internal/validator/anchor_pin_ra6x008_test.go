@@ -111,7 +111,7 @@ func TestRA6X008_RootZoneRejectsMixedAnchorAttack(t *testing.T) {
 	v := m.newValidator()
 	v.SetAnchors(mixedAnchorSet(t, attackerRec))
 
-	zr, err := v.validateZone(testCtx(t), ".", []string{"."}, nil, false)
+	zr, err := v.validateZone(testCtx(t), ".", []string{"."}, nil, false, "")
 	if err != nil {
 		t.Fatalf("validateZone: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestRA6X008_RootZoneRejectsMixedAnchorAttack(t *testing.T) {
 		{ID: "KSK-2017", KeyTag: 20326, Algorithm: 8, DigestType: 2, Digest: realKSK2017Digest, ValidFrom: future},
 		{ID: "attacker", KeyTag: int(attackerRec.KeyTag), Algorithm: 13, DigestType: 2, Digest: mixedAnchorSet(t, attackerRec).Anchors[1].Digest, ValidFrom: "2017-02-02T00:00:00Z"},
 	}})
-	zr, err = v.validateZone(testCtx(t), ".", []string{"."}, nil, false)
+	zr, err = v.validateZone(testCtx(t), ".", []string{"."}, nil, false, "")
 	if err != nil {
 		t.Fatalf("validateZone: %v", err)
 	}

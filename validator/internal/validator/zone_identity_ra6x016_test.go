@@ -202,7 +202,7 @@ func TestRA6X016_ValidateZoneRejectsCrossZoneReplay(t *testing.T) {
 		parent.serveDS(t, m, b, nil, nil)
 		serve(m)
 		v := m.newValidator()
-		zr, err := v.validateZone(testCtx(t), "b.test.", hierarchy, parent.keyRecords(), false)
+		zr, err := v.validateZone(testCtx(t), "b.test.", hierarchy, parent.keyRecords(), false, "")
 		if err != nil {
 			t.Fatalf("validateZone: %v", err)
 		}

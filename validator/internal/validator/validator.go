@@ -240,6 +240,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 	var lastStatus ValidationStatus = StatusSecure
 	var parentDNSKEY []dnspkg.DNSKEYRecord // Track parent's DNSKEY for DS RRSIG verification
 	ancestorInsecure := false              // sticky: once any ancestor is insecure, descendants cannot be secure (R-033)
+	indeterminateAncestor := ""            // nearest ancestor that could not be authenticated; descendants cannot be verified below it (RM51X-005)
 	for _, zone := range zones {
 		select {
 		case <-ctx.Done():
@@ -261,7 +262,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 			result.Chain = append(result.Chain, *cachedResult)
 
 			// Update parent DNSKEY from cached result for next zone's DS verification
-			parentDNSKEY = nextParentDNSKEY(parentDNSKEY, cachedResult)
+			parentDNSKEY = nextParentDNSKEY(cachedResult)
 
 			// Track overall status from cached result
 			switch cachedResult.Status {
@@ -280,6 +281,9 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 				if lastStatus == StatusSecure || lastStatus == StatusInsecure {
 					lastStatus = StatusIndeterminate
 				}
+				if indeterminateAncestor == "" {
+					indeterminateAncestor = zone
+				}
 			}
 			continue
 		}
@@ -292,7 +296,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 
 		// Validate this zone (pass parent DNSKEY for DS RRSIG verification, and
 		// whether an ancestor is already insecure so a child below it stays insecure)
-		zoneResult, err := v.validateZone(ctx, zone, zones, parentDNSKEY, ancestorInsecure)
+		zoneResult, err := v.validateZone(ctx, zone, zones, parentDNSKEY, ancestorInsecure, indeterminateAncestor)
 		if err != nil {
 			// Zone validation error
 			zoneResult = NewZoneResult(zone)
@@ -301,7 +305,7 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 		}
 
 		// Update parent DNSKEY for next zone's DS verification
-		parentDNSKEY = nextParentDNSKEY(parentDNSKEY, zoneResult)
+		parentDNSKEY = nextParentDNSKEY(zoneResult)
 
 		// Cache the result for potential reuse
 		validatedZones[zone] = zoneResult
@@ -334,6 +338,9 @@ func (v *Validator) validateWithCache(ctx context.Context, domain string, depth 
 		case StatusIndeterminate:
 			if lastStatus == StatusSecure || lastStatus == StatusInsecure {
 				lastStatus = StatusIndeterminate
+			}
+			if indeterminateAncestor == "" {
+				indeterminateAncestor = zone
 			}
 			// A resource limit is surfaced at the top level as well, so an API
 			// caller sees why the verdict is indeterminate (RA6X-052).
@@ -465,21 +472,22 @@ func (v *Validator) emitComplete(depth int, result *ValidationResult) {
 }
 
 // nextParentDNSKEY decides which DNSKEY set to carry into the next (child)
-// zone's DS verification after a zone in the walk resolves. A proven-insecure
-// zone terminates the chain of trust, so its descendants must reach the
-// insecure-ancestor branch of finalizeNoDSDelegation (empty parent keys) and
-// read insecure — not be asked for a DS-absence proof that only the nearest
-// SIGNED ancestor's keys could have produced. An indeterminate or bogus zone
-// must NOT clear the keys: an unauthenticated parent would otherwise launder
-// its children into insecure (fail closed).
-func nextParentDNSKEY(prev []dnspkg.DNSKEYRecord, zr *ZoneResult) []dnspkg.DNSKEYRecord {
-	if zr.Status == StatusInsecure {
-		return nil
-	}
-	if len(zr.DNSKEY) > 0 {
+// zone's DS verification after a zone in the walk resolves. Only a SECURE
+// zone has an authenticated DNSKEY RRset (the set validateZone assigned after
+// the DS/anchor match and the RRSIG check), so only a secure zone hands keys
+// down. Every other status clears them: a proven-insecure zone terminates
+// the chain of trust; an indeterminate zone's served keys were never
+// authenticated and the previously threaded keys belong to an ancestor, so
+// verifying the child's DS under either would turn an availability failure
+// into bogus or a never-earned chain link into secure (RM51X-005). The walk
+// tells validateZone WHY the keys are absent (parentInsecure or
+// indeterminateAncestor), so an empty set is never mistaken for an insecure
+// ancestor (fail closed).
+func nextParentDNSKEY(zr *ZoneResult) []dnspkg.DNSKEYRecord {
+	if zr.Status == StatusSecure {
 		return zr.DNSKEY
 	}
-	return prev
+	return nil
 }
 
 // cnameGuard decides whether following domain→target must terminate. It returns a
@@ -1286,7 +1294,7 @@ func isUnqueryableRecordError(errText string) bool {
 
 // validateZone validates a single zone
 // parentDNSKEY is used for DS RRSIG verification (nil for root zone)
-func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []string, parentDNSKEY []dnspkg.DNSKEYRecord, parentInsecure bool) (*ZoneResult, error) {
+func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []string, parentDNSKEY []dnspkg.DNSKEYRecord, parentInsecure bool, indeterminateAncestor string) (*ZoneResult, error) {
 	result := NewZoneResult(zone)
 	start := time.Now()
 
@@ -1447,6 +1455,20 @@ func (v *Validator) validateZone(ctx context.Context, zone string, hierarchy []s
 		result.Warnings = append(result.Warnings,
 			"delegation is below an insecure (unsigned) ancestor; no authenticated chain to the root — treated as insecure")
 		markUsable(StatusInsecure, "")
+		return result, nil
+	}
+
+	// RM51X-005: below an ancestor that could not be authenticated there is no
+	// trusted DNSKEY set to verify this zone's DS against. The served records
+	// above stay as diagnostics, but no DS or DNSKEY verification runs: under
+	// an ancestor's stale keys it would fail (bogus for an availability
+	// problem), and under the parent's unauthenticated served keys it could
+	// succeed (a chain link nobody earned). The zone is indeterminate, like
+	// its ancestor, and the reason names that ancestor.
+	if zone != "." && indeterminateAncestor != "" {
+		result.Status = StatusIndeterminate
+		result.AddError(fmt.Sprintf("ancestor zone %s could not be authenticated; no authenticated chain of trust reaches this zone", indeterminateAncestor))
+		markUsable(StatusIndeterminate, "no authenticated chain of trust reaches this zone")
 		return result, nil
 	}
 
@@ -2128,15 +2150,19 @@ func rejectedNote(rejected []string) string {
 }
 
 // finalizeNoDSDelegation sets result.Status for a zone whose parent returned no DS record.
-// When the parent is secure (we hold its authenticated DNSKEY), declaring the zone
-// "insecure" requires an authenticated proof that the DS RRset is genuinely absent
-// (R-081). Without such a proof the result is indeterminate (no denial at all) or bogus
-// (a denial that contradicts itself or fails to verify) — never a silent downgrade.
+// It is reached only below a SECURE parent (validateZone returns earlier below an
+// insecure or unauthenticated ancestor), so declaring the zone "insecure" requires an
+// authenticated proof that the DS RRset is genuinely absent (R-081). Without such a
+// proof the result is indeterminate (no denial at all) or bogus (a denial that
+// contradicts itself or fails to verify) — never a silent downgrade.
 func (v *Validator) finalizeNoDSDelegation(result *ZoneResult, zone, parentZone string, parentDNSKEY []dnspkg.DNSKEYRecord, ds *parentDSResult) {
 	if len(parentDNSKEY) == 0 {
-		// The parent is not itself secured (insecure ancestor); there is no chain of
-		// trust to protect below it, so an unsigned delegation is genuinely insecure.
-		result.Status = StatusInsecure
+		// No authenticated parent keys means the walk did not establish the
+		// parent as secure; an insecure ancestor is handled before this point
+		// (parentInsecure), so an empty set here can only be a caller error.
+		// Fail closed rather than launder the delegation into insecure (RM51X-005).
+		result.Status = StatusIndeterminate
+		result.AddError("no authenticated parent DNSKEY set is available to verify the absence of a DS record")
 		return
 	}
 
