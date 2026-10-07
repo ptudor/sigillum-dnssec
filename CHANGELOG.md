@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+Fixes for the six High findings of the October 2026 review
+(`review/2026/10/REVIEW_MYTHOS51_XHIGH.md`); see
+`review/2026/10/HANDOVER_MYTHOS51_XHIGH.md` for the remaining work.
+
+- Signer: a KSK or algorithm rollover changes the parent's DS set only after
+  the DNSKEY RRset carrying the new key has propagated to every authoritative
+  server and out of resolver caches (one DNSKEY TTL, plus the largest signed
+  RRset TTL for an algorithm rollover). The old DS is removed, and the
+  new-algorithm DS added, by the daemon at that point; a failed registrar
+  update is retried every cycle and a KSK rollover does not end before it
+  succeeded. `rollover algorithm` no longer publishes a DS at start.
+  New persisted field `ds_add_pushed_at`; `phase_horizon` now also serves
+  KSK and algorithm rollovers (RM51X-001, RM51X-016).
+- Signer: parent-DS and publication probes cover every nameserver by
+  identity. An address this host has no route to (the other address family
+  on a single-stack host) is skipped when the same nameserver answers
+  elsewhere and is reported; a timeout or refusal still fails. A probe that
+  blocks an algorithm rollover phase is logged at Warn and shown in status
+  (RM51X-002).
+- Signer: owner names whose first label merely starts with `*` (`*foo`,
+  `**`) are signed with their full label count; the post-sign check rejects
+  a wildcard count on an ordinary owner. The canonical spelling escapes such
+  asterisks, so the RRSIG and NSEC owners for those names are written as
+  `\*foo` in the signed file (wire-identical) (RM51X-003).
+- Packages: the state directory is created on first installation only;
+  upgrades never apply ownership or modes to anything under it, closing a
+  symlink redirection of root's chown/chmod and preserving a `signed/`
+  directory re-grouped for the nameserver (RM51X-004, RM51X-020).
+- Validator: a zone whose ancestor could not be authenticated is reported
+  indeterminate with the ancestor named, instead of being verified under the
+  grandparent's stale keys (bogus) or the parent's unauthenticated served
+  keys (secure). An unsigned child of an indeterminate parent is not laundered
+  into insecure (RM51X-005).
+- Validator: an NXDOMAIN carrying a signed CNAME (or DNAME) at the queried
+  name is validated as an alias answer whose target is proven absent on its
+  own hop, so dangling aliases in correctly signed zones no longer read bogus
+  (RM51X-006).
+
 ## 1.1.1 — 2026-09-16
 
 - Sign release RPMs, DEBs, and the `checksums.txt` manifest with the project's
