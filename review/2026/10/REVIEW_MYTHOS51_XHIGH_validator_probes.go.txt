@@ -1,0 +1,235 @@
+package validator
+
+import (
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/miekg/dns"
+	dnspkg "github.com/ptudor/sigillum-dnssec/validator/internal/dns"
+)
+
+func dumpChain(t *testing.T, res *ValidationResult) {
+	t.Helper()
+	t.Logf("RESULT=%s errors=%v warnings=%v", res.Result, res.Errors, res.Warnings)
+	for _, z := range res.Chain {
+		t.Logf("  zone %-16s status=%-13s errors=%v", z.Zone, z.Status, z.Errors)
+		if z.DSValidation != nil {
+			t.Logf("     ds_validation: verified=%v err=%q", z.DSValidation.RRSIGVerified, z.DSValidation.Error)
+		}
+		if z.DenialProof != nil {
+			t.Logf("     denial_proof: verified=%v err=%q", z.DenialProof.Verified, z.DenialProof.Error)
+		}
+		if z.RecordValidation != nil {
+			t.Logf("     record_validation: verified=%v err=%q", z.RecordValidation.RRSIGVerified, z.RecordValidation.Error)
+		}
+	}
+}
+
+// PROBE F1: the parent's DNSKEY cannot be fetched (indeterminate), the child's
+// DS at the parent is fetched fine -> child verified under the GRANDPARENT's
+// keys -> bogus.
+func TestProbe_F1_IndeterminateParentMakesChildBogus(t *testing.T) {
+	f := newChainFixture(t)
+	child := f.addChild(t, "child.test.")
+	a := &dns.A{Hdr: rrHdr("www.child.test.", dns.TypeA), A: net.ParseIP("192.0.2.1")}
+	f.m.answer("www.child.test.", dns.TypeA, a, child.signZSK(t, a))
+	// Parent test. is NOT cached; its DNSKEY query is never answered.
+	f.m.drop("test.", dns.TypeDNSKEY)
+	cache := f.seedCache()
+	delete(cache, "test.")
+	res, err := f.v.validateWithCache(testCtx(t), "www.child.test.", 0, map[string]bool{}, cache)
+	if err != nil && res == nil {
+		t.Fatal(err)
+	}
+	dumpChain(t, res)
+	if res.Result == StatusBogus {
+		t.Errorf("CONFIRMED F1: transient parent DNSKEY failure produced overall verdict %s", res.Result)
+	}
+}
+
+// PROBE F5: the parent's DS query fails (indeterminate) AFTER its (unauthenticated)
+// DNSKEY RRset was fetched -> the unauthenticated keys are carried into the child's
+// DS verification -> child reads "secure".
+func TestProbe_F5_IndeterminateParentKeysAuthenticateChild(t *testing.T) {
+	f := newChainFixture(t)
+	f.parent.serveDNSKEY(t, f.m)
+	child := f.addChild(t, "child.test.")
+	a := &dns.A{Hdr: rrHdr("www.child.test.", dns.TypeA), A: net.ParseIP("192.0.2.1")}
+	f.m.answer("www.child.test.", dns.TypeA, a, child.signZSK(t, a))
+	// Root never answers test. DS.
+	f.m.drop("test.", dns.TypeDS)
+	cache := f.seedCache()
+	delete(cache, "test.")
+	res, err := f.v.validateWithCache(testCtx(t), "www.child.test.", 0, map[string]bool{}, cache)
+	if err != nil && res == nil {
+		t.Fatal(err)
+	}
+	dumpChain(t, res)
+	for _, z := range res.Chain {
+		if z.Zone == "child.test." && z.Status == StatusSecure {
+			t.Errorf("CONFIRMED F5: child.test. reads %s although its parent test. is %s (keys unauthenticated)", z.Status, res.Chain[1].Status)
+		}
+	}
+}
+
+// PROBE F2: the parent's NS set cannot be resolved -> the DS query falls back to
+// the CHILD's own servers; a child-only authoritative answers DS-at-apex with its
+// own NODATA (child-signed apex NSEC) -> "possible downgrade attack" bogus.
+func TestProbe_F2_ParentNSFailureFallsBackToChildServers(t *testing.T) {
+	f := newChainFixture(t)
+	child := f.addChild(t, "child.test.")
+	a := &dns.A{Hdr: rrHdr("www.child.test.", dns.TypeA), A: net.ParseIP("192.0.2.1")}
+	f.m.answer("www.child.test.", dns.TypeA, a, child.signZSK(t, a))
+	// The recursive resolver cannot answer "test. NS" (times out).
+	f.m.drop("test.", dns.TypeNS)
+	// The child's own server answers DS-at-apex the way a child-only
+	// authoritative does: NODATA from the child zone with the child's apex NSEC.
+	apex := nsecRR("child.test.", "www.child.test.", dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC, dns.TypeDNSKEY)
+	f.m.respond("child.test.", dns.TypeDS, dns.RcodeSuccess, nil, child.signedAuthority(t, apex), nil)
+	res, err := f.v.validateWithCache(testCtx(t), "www.child.test.", 0, map[string]bool{}, f.seedCache())
+	if err != nil && res == nil {
+		t.Fatal(err)
+	}
+	dumpChain(t, res)
+	if res.Result == StatusBogus {
+		t.Errorf("CONFIRMED F2: parent-NS lookup failure produced overall verdict %s", res.Result)
+	}
+}
+
+// PROBE F4: RFC 4034 §3.1.5 serial arithmetic — an expiration more than 2^31
+// seconds ahead is "in the past" for a real validator.
+func TestProbe_F4_SerialArithmetic(t *testing.T) {
+	now := time.Now().Unix()
+	sig := &dns.RRSIG{Inception: uint32(now - 3600), Expiration: uint32(now + 70*365*24*3600)}
+	t.Logf("expiration raw=%d (now+70y)", sig.Expiration)
+	ours := rrsigWireTimeValid(sig)
+	lib := sig.ValidityPeriod(time.Now())
+	t.Logf("rrsigWireTimeValid=%v  miekg ValidityPeriod (serial arithmetic)=%v", ours, lib)
+	if ours && !lib {
+		t.Errorf("CONFIRMED F4: validator accepts a signature that serial arithmetic rejects")
+	}
+	rec := dnspkg.RRSIGFromRR(sig, dnspkg.SectionAnswer, time.Now())
+	t.Logf("RRSIGFromRR IsValid=%v IsExpired=%v; VerifyRRSIGValid=%v", rec.IsValid, rec.IsExpired, VerifyRRSIGValid(rec))
+}
+
+// PROBE F7: NSEC3 hashing work is not charged to the budget; many distinct-salt
+// chains each redo the closest-encloser walk.
+func TestProbe_F7_NSEC3ChainCPU(t *testing.T) {
+	labels := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		labels = append(labels, "x")
+	}
+	qname := strings.Join(labels, ".") + ".example."
+	recs := make([]dnspkg.NSEC3Record, 0, 300)
+	for i := 0; i < 300; i++ {
+		recs = append(recs, dnspkg.NSEC3Record{
+			Owner: "AAAA.example.", HashedOwner: "0000000000000000000000000000000A",
+			Algorithm: 1, Flags: 0, Iterations: 100, Salt: fmt.Sprintf("%04X", i),
+			NextHashed: "0000000000000000000000000000000B", TypeBitmap: []string{"A"},
+		})
+	}
+	start := time.Now()
+	_, err := VerifyNSEC3Denial(qname, dns.TypeA, recs, "example.", dns.RcodeNameError)
+	t.Logf("300 chains x 100 iterations x 100-label qname: %v (err=%v)", time.Since(start), err)
+}
+
+// PROBE F9: an unsigned junk NSEC injected into an NSEC3 zone's denial response
+// diverts the proof to the NSEC path.
+func TestProbe_F9_InjectedNSECDivertsNSEC3Proof(t *testing.T) {
+	f := newChainFixture(t)
+	child := f.addChild(t, "child.test.")
+	// Build a genuine NSEC3 NXDOMAIN proof for nx.child.test. in child (salt "", 0 iterations).
+	salt := []byte{}
+	h := func(n string) string { return computeNSEC3Hash(n, salt, 0) }
+	mk := func(owner, next string, types ...uint16) *dns.NSEC3 {
+		return &dns.NSEC3{Hdr: rrHdr(owner+".child.test.", dns.TypeNSEC3), Hash: 1, Flags: 0, Iterations: 0, SaltLength: 0, Salt: "", HashLength: 20, NextDomain: next, TypeBitMap: types}
+	}
+	// Single-record ring covering everything but the apex: proves CE=apex, NC and wildcard covered.
+	apexHash := h("child.test.")
+	ring := mk(apexHash, apexHash, dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeDNSKEY, dns.TypeNSEC3PARAM)
+	authority := child.signedAuthority(t, ring)
+	f.m.respond("nx.child.test.", dns.TypeA, dns.RcodeNameError, nil, authority, nil)
+	res := f.validate(t, "nx.child.test.")
+	dumpChain(t, res)
+	t.Logf("baseline (clean NSEC3 NXDOMAIN) result=%s", res.Result)
+	// Now inject one UNSIGNED NSEC record into the Authority section.
+	junk := nsecRR("junk.child.test.", "zzz.child.test.", dns.TypeA)
+	f.m.respond("nx.child.test.", dns.TypeA, dns.RcodeNameError, nil, append(append([]dns.RR{}, authority...), junk), nil)
+	res2 := f.validate(t, "nx.child.test.")
+	dumpChain(t, res2)
+	if res.Result == StatusSecure && res2.Result == StatusBogus {
+		t.Errorf("CONFIRMED F9: one unsigned NSEC turned an authenticated NSEC3 denial from %s into %s", res.Result, res2.Result)
+	}
+}
+
+// PROBE F6: warnings appended to a chain copy alias the cached zone result.
+func TestProbe_F6_WarningAliasing(t *testing.T) {
+	cached := NewZoneResult("z.")
+	cached.Warnings = append(cached.Warnings, "w1", "w2", "w3") // cap 4, len 3
+	chain := []ZoneResult{}
+	chain = append(chain, *cached)
+	first := &chain[0]
+	first.Warnings = append(first.Warnings, "leaf-A")
+	chain = append(chain, *cached)
+	second := &chain[1]
+	second.Warnings = append(second.Warnings, "leaf-B")
+	t.Logf("first copy warnings: %v", chain[0].Warnings)
+	if chain[0].Warnings[3] != "leaf-A" {
+		t.Errorf("CONFIRMED F6: first copy's appended warning was overwritten to %q", chain[0].Warnings[3])
+	}
+}
+
+
+// PROBE F27: a dangling CNAME (target does not exist) inside a signed zone is
+// answered RCODE NXDOMAIN with the signed CNAME in Answer and the target's NSEC
+// in Authority (RFC 2308 §2.1). The validator treats the whole response as a
+// denial of the QNAME.
+func TestProbe_F27_DanglingCNAMEIsBogus(t *testing.T) {
+	f := newChainFixture(t)
+	child := f.addChild(t, "child.test.")
+	cname := &dns.CNAME{Hdr: rrHdr("www.child.test.", dns.TypeCNAME), Target: "dead.child.test."}
+	// NSEC chain of child.test.: apex -> www.child.test. -> apex. dead.* and *.child.test. both fall in the apex interval.
+	apex := nsecRR("child.test.", "www.child.test.", dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC, dns.TypeDNSKEY)
+	authority := child.signedAuthority(t, apex)
+	f.m.respond("www.child.test.", dns.TypeA, dns.RcodeNameError, []dns.RR{cname, child.signZSK(t, cname)}, authority, nil)
+	// And what the alias hop would see if it were followed: an authenticated NXDOMAIN for the target.
+	f.m.respond("dead.child.test.", dns.TypeA, dns.RcodeNameError, nil, authority, nil)
+	res := f.validate(t, "www.child.test.")
+	dumpChain(t, res)
+	if res.Result == StatusBogus {
+		t.Errorf("CONFIRMED F27: dangling CNAME in a correctly signed zone -> %s", res.Result)
+	}
+	// Control: the target alone validates as a secure NXDOMAIN.
+	res2 := f.validate(t, "dead.child.test.")
+	t.Logf("control: dead.child.test. alone -> %s", res2.Result)
+}
+
+// PROBE F11: an alias target whose label contains an escaped dot is miscounted
+// by GetZoneLabels, so a non-wildcard answer is treated as wildcard-synthesized.
+func TestProbe_F11_EscapedDotTargetReadsAsWildcard(t *testing.T) {
+	f := newChainFixture(t)
+	child := f.addChild(t, "child.test.")
+	target := `a\.b.child.test.`
+	cname := &dns.CNAME{Hdr: rrHdr("www.child.test.", dns.TypeCNAME), Target: target}
+	f.m.answer("www.child.test.", dns.TypeA, cname, child.signZSK(t, cname))
+	a := &dns.A{Hdr: rrHdr(target, dns.TypeA), A: net.ParseIP("192.0.2.9")}
+	sig := child.signZSK(t, a) // Labels = dns.CountLabel = 3 (escape-aware)
+	t.Logf("RRSIG labels=%d; GetZoneLabels=%d; dns.CountLabel=%d", sig.Labels, GetZoneLabels(target), dns.CountLabel(target))
+	f.m.answer(target, dns.TypeA, a, sig)
+	res := f.validate(t, "www.child.test.")
+	dumpChain(t, res)
+	for _, c := range res.CNAMEChains {
+		t.Logf("alias %s -> %s result=%s err=%q", c.Source, c.Target, c.Result, c.Error)
+		for _, z := range c.Chain {
+			if z.RecordValidation != nil {
+				t.Logf("   target record_validation: wildcard=%v src=%q err=%q", z.RecordValidation.Wildcard, z.RecordValidation.WildcardSource, z.RecordValidation.Error)
+			}
+		}
+	}
+	if res.Result == StatusBogus {
+		t.Errorf("CONFIRMED F11: escaped-dot alias target -> %s", res.Result)
+	}
+}
