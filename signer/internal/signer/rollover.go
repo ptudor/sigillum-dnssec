@@ -33,6 +33,11 @@ type ParentDSObservation struct {
 	// addresses it was queried at (RDAYBLUEX-003): the observation covers
 	// every NS identity of the delegation, not merely a set of addresses.
 	ByNameserver map[string][]string
+	// Skipped lists addresses this host has no route to (typically the
+	// other address family on a single-stack host) that were left out
+	// because another address of the same nameserver answered (RM51X-002).
+	// Every nameserver identity is still covered by Servers.
+	Skipped []string
 }
 
 // ParentDSProbe queries every authoritative server of the parent zone for the
@@ -821,8 +826,14 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 			}
 			obs, err := rm.probe.ProbeParentDS(domain, []*dns.DNSKEY{oldKSK})
 			if err != nil {
-				slog.Debug("[ROLLOVER] algorithm rollover: parent DS probe failed; retrying next cycle", "domain", domain, "error", err)
-				return nil
+				// The phase cannot advance until the probe succeeds; say so
+				// where the operator looks (status) rather than at Debug
+				// (RM51X-002).
+				slog.Warn("[ROLLOVER] algorithm rollover: parent DS probe failed; retrying next cycle", "domain", domain, "state", r.State, "error", err)
+				return rm.noteBlockedPhase(zoneState, fmt.Sprintf("the parent DS probe failed (%v); it is retried every cycle", err))
+			}
+			if err := rm.clearBlockedPhase(zoneState); err != nil {
+				return err
 			}
 			if !obs.AbsentOnAll[r.OldKeyID] {
 				return nil
@@ -868,6 +879,74 @@ func (rm *RolloverManager) CheckAlgorithmRollover(domain string) error {
 		return rm.state.Save()
 	}
 	return nil
+}
+
+// blockedPhasePrefix marks the transient zone warning that explains why an
+// automatic rollover phase is not advancing (RM51X-002). One such warning is
+// kept per zone: a new reason replaces the previous one, and a probe that
+// succeeds removes it.
+const blockedPhasePrefix = "rollover is waiting: "
+
+// noteBlockedPhase records why the current rollover phase cannot advance,
+// replacing an earlier reason. State is saved only when the text changed.
+func (rm *RolloverManager) noteBlockedPhase(zoneState *statepkg.ZoneState, reason string) error {
+	msg := blockedPhasePrefix + reason
+	changed := false
+	rm.state.Mutate(func() {
+		kept := zoneState.Warnings[:0:0]
+		for _, w := range zoneState.Warnings {
+			if strings.HasPrefix(w, blockedPhasePrefix) {
+				if w == msg {
+					kept = append(kept, w)
+					continue
+				}
+				changed = true
+				continue
+			}
+			kept = append(kept, w)
+		}
+		if !containsString(kept, msg) {
+			kept = append(kept, msg)
+			changed = true
+		}
+		zoneState.Warnings = kept
+	})
+	if !changed {
+		return nil
+	}
+	return rm.state.Save()
+}
+
+// clearBlockedPhase removes the blocked-phase warning once the probe behind
+// it succeeds. State is saved only when a warning was removed.
+func (rm *RolloverManager) clearBlockedPhase(zoneState *statepkg.ZoneState) error {
+	removed := false
+	rm.state.Mutate(func() {
+		kept := zoneState.Warnings[:0:0]
+		for _, w := range zoneState.Warnings {
+			if strings.HasPrefix(w, blockedPhasePrefix) {
+				removed = true
+				continue
+			}
+			kept = append(kept, w)
+		}
+		if removed {
+			zoneState.Warnings = kept
+		}
+	})
+	if !removed {
+		return nil
+	}
+	return rm.state.Save()
+}
+
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func maxUint32(a, b uint32) uint32 {

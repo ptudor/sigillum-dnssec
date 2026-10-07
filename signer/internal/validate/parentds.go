@@ -1,10 +1,12 @@
 package validate
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -23,6 +25,13 @@ import (
 // responses are retried over TCP, and every response must echo the question
 // it answers. A delegation that cannot be covered completely is an error, so
 // no safety gate advances on a partial view.
+//
+// Coverage is judged per identity, not per address (RM51X-002): a host with
+// one address family cannot reach the other family's addresses at all, and
+// that local condition must not make every probe fail forever. An address
+// whose exchange fails with a local route error is skipped when another
+// address of the same nameserver answers; any other failure still fails the
+// probe, and so does a nameserver none of whose addresses answered.
 
 // nsTarget is one delegated nameserver identity with the addresses it
 // resolved to (host:port, deduplicated, sorted).
@@ -223,6 +232,99 @@ func (v *Validator) discoverNSWith(zone string, query func(string, uint16) (*dns
 	return targets, nil
 }
 
+// isLocalRouteError reports whether a transport error means this host has
+// no route for the destination's address family (or cannot source a packet
+// to it), as opposed to a server that did not answer. Only such an error may
+// be skipped, and only when another address of the same nameserver identity
+// answered (RM51X-002). A timeout is never a route error: the packet left
+// this host and the server, or the path to it, is at fault.
+func isLocalRouteError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	for _, code := range []syscall.Errno{syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.EADDRNOTAVAIL, syscall.EAFNOSUPPORT} {
+		if errors.Is(err, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// probeFailure names a nameserver address that a probe could not use, with
+// the identities it serves.
+type probeFailure struct {
+	server string
+	names  []string
+	err    error
+}
+
+func (e *probeFailure) Error() string {
+	return fmt.Sprintf("%s (%s): %v", e.server, strings.Join(e.names, ","), e.err)
+}
+
+func (e *probeFailure) Unwrap() error { return e.err }
+
+// answeredServer is one authoritative answer from a probed address.
+type answeredServer struct {
+	server string
+	msg    *dns.Msg
+}
+
+// probeIdentities queries every address of every nameserver identity for
+// qname/qtype and returns the authoritative answers in address order plus
+// the addresses that were skipped. Every identity must answer from at least
+// one of its addresses. An address whose exchange fails with a local route
+// error (isLocalRouteError) is skipped when another address of the same
+// identity answered; a timeout, refusal, non-authoritative or mismatched
+// answer fails the probe even if another address answered, and so does an
+// identity none of whose addresses answered. The failure names the address
+// and the identities it serves (RM51X-002).
+func (v *Validator) probeIdentities(targets []nsTarget, qname string, qtype uint16) ([]answeredServer, []string, error) {
+	addrs, byName, namesOf := flattenTargets(targets)
+	answers := map[string]*dns.Msg{}
+	failures := map[string]error{}
+	for _, server := range addrs {
+		msg, err := queryDirect(server, qname, qtype, v.timeout)
+		if err != nil {
+			failures[server] = err
+			continue
+		}
+		answers[server] = msg
+	}
+	for _, t := range targets {
+		answered := false
+		var unreachable *probeFailure
+		for _, a := range byName[t.name] {
+			if _, ok := answers[a]; ok {
+				answered = true
+				continue
+			}
+			err := failures[a]
+			if !isLocalRouteError(err) {
+				return nil, nil, &probeFailure{server: a, names: namesOf[a], err: err}
+			}
+			if unreachable == nil {
+				unreachable = &probeFailure{server: a, names: namesOf[a], err: err}
+			}
+		}
+		if !answered {
+			return nil, nil, &probeFailure{server: unreachable.server, names: unreachable.names,
+				err: fmt.Errorf("no address of nameserver %s is reachable from this host: %w", t.name, unreachable.err)}
+		}
+	}
+	var out []answeredServer
+	var skipped []string
+	for _, server := range addrs {
+		if msg, ok := answers[server]; ok {
+			out = append(out, answeredServer{server: server, msg: msg})
+		} else {
+			skipped = append(skipped, server)
+		}
+	}
+	return out, skipped, nil
+}
+
 // flattenTargets returns the unique addresses of every target (sorted) and
 // the nameserver names each address represents.
 func flattenTargets(targets []nsTarget) (addrs []string, byName map[string][]string, namesOf map[string][]string) {
@@ -276,7 +378,10 @@ func ownerRecords[T dns.RR](msg *dns.Msg, qname string) []T {
 // of them or absent from all of them, plus the largest DS TTL seen. A server
 // that cannot be queried, or that does not answer authoritatively for
 // exactly the question asked, makes the probe fail: a decision must not be
-// taken on a partial view. Only DS records owned by the domain count.
+// taken on a partial view. The one exception is an address this host has no
+// route to, which is skipped when another address of the same nameserver
+// answered and reported in Skipped (RM51X-002). Only DS records owned by the
+// domain count.
 //
 // The two predicates are deliberately different (RDAYBLUEX-008):
 //
@@ -295,7 +400,7 @@ func (v *Validator) ProbeParentDS(domain string, ksks []*dns.DNSKEY) (signerpkg.
 	if err != nil {
 		return obs, err
 	}
-	parents, byName, namesOf := flattenTargets(targets)
+	_, byName, _ := flattenTargets(targets)
 	obs.ByNameserver = byName
 	expected := map[uint16][]*dns.DS{}
 	algorithm := map[uint16]uint8{}
@@ -314,11 +419,13 @@ func (v *Validator) ProbeParentDS(domain string, ksks []*dns.DNSKEY) (signerpkg.
 	exactCount := map[uint16]int{} // servers holding an exact supported digest for the key
 	anyCount := map[uint16]int{}   // servers holding any DS with the key's tag and algorithm
 	seenDS := map[string]bool{}    // DS records already listed in obs.DSRecords
-	for _, server := range parents {
-		msg, err := queryDirect(server, qname, dns.TypeDS, v.timeout)
-		if err != nil {
-			return obs, fmt.Errorf("DS query to parent server %s (%s) failed: %w", server, strings.Join(namesOf[server], ","), err)
-		}
+	answers, skipped, err := v.probeIdentities(targets, qname, dns.TypeDS)
+	if err != nil {
+		return obs, fmt.Errorf("DS query to parent server %w", &probeFailureVerb{err})
+	}
+	obs.Skipped = skipped
+	for _, a := range answers {
+		server, msg := a.server, a.msg
 		obs.Servers = append(obs.Servers, server)
 		dsRecords := ownerRecords[*dns.DS](msg, qname)
 		for _, ds := range dsRecords {
@@ -355,29 +462,45 @@ func (v *Validator) ProbeParentDS(domain string, ksks []*dns.DNSKEY) (signerpkg.
 		}
 	}
 	for tag := range algorithm {
-		obs.PresentOnAll[tag] = len(expected[tag]) > 0 && exactCount[tag] == len(parents)
+		obs.PresentOnAll[tag] = len(expected[tag]) > 0 && exactCount[tag] == len(answers)
 		obs.AbsentOnAll[tag] = anyCount[tag] == 0
 	}
 	return obs, nil
 }
 
+// probeFailureVerb renders a probeFailure as "ADDR (NAMES) failed: ERR" so a
+// caller can prefix it with the query it was making.
+type probeFailureVerb struct{ err error }
+
+func (e *probeFailureVerb) Error() string {
+	var pf *probeFailure
+	if errors.As(e.err, &pf) {
+		return fmt.Sprintf("%s (%s) failed: %v", pf.server, strings.Join(pf.names, ","), pf.err)
+	}
+	return e.err.Error()
+}
+
+func (e *probeFailureVerb) Unwrap() error { return e.err }
+
 // ProbePublishedSerial reports whether every authoritative server of the zone
 // serves the SOA with the given serial (publication confirmation for
 // dnssec.publication = "probe", RA6X-004). Any server that cannot be queried
 // or serves another serial means "not yet"; a delegation that cannot be
-// covered completely is an error. Only an authoritative SOA owned by the
-// zone counts.
+// covered completely is an error. An address this host has no route to is
+// skipped when another address of the same nameserver answers, and named in
+// the details (RM51X-002). Only an authoritative SOA owned by the zone counts.
 func (v *Validator) ProbePublishedSerial(domain string, serial uint32) (bool, string, error) {
 	qname := dns.Fqdn(domain)
-	servers, err := v.resolveAllNS(qname)
+	targets, err := v.discoverNS(qname)
 	if err != nil {
 		return false, "", err
 	}
-	for _, server := range servers {
-		msg, err := queryDirect(server, qname, dns.TypeSOA, v.timeout)
-		if err != nil {
-			return false, fmt.Sprintf("SOA query to %s failed: %v", server, err), nil
-		}
+	answers, skipped, err := v.probeIdentities(targets, qname, dns.TypeSOA)
+	if err != nil {
+		return false, fmt.Sprintf("SOA query to %v", &probeFailureVerb{err}), nil
+	}
+	for _, a := range answers {
+		server, msg := a.server, a.msg
 		soas := ownerRecords[*dns.SOA](msg, qname)
 		if len(soas) == 0 {
 			return false, fmt.Sprintf("%s returned no SOA", server), nil
@@ -387,7 +510,11 @@ func (v *Validator) ProbePublishedSerial(domain string, serial uint32) (bool, st
 			return false, fmt.Sprintf("%s serves serial %d, published %d", server, served, serial), nil
 		}
 	}
-	return true, fmt.Sprintf("serial %d served by %d server(s)", serial, len(servers)), nil
+	details := fmt.Sprintf("serial %d served by %d server(s)", serial, len(answers))
+	if len(skipped) > 0 {
+		details += fmt.Sprintf("; %d address(es) skipped, no local route: %s", len(skipped), strings.Join(skipped, ", "))
+	}
+	return true, details, nil
 }
 
 // ProbeServedKeys asks every authoritative server of domain for its DNSKEY

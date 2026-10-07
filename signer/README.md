@@ -354,6 +354,13 @@ holds it that long and would fail if the old key vanished earlier. The daemon
 ends the rollover once the retired zone is confirmed served. Pass `--force`
 to skip the probe and start the wait now using `parent_ds_ttl`.
 
+Every probe (parent DS checks, `publication = "probe"`, `import`) must hear
+from every delegated nameserver. On a host with one address family, a
+nameserver's addresses in the family you lack are skipped as long as that
+nameserver answers over the family you have; the skipped addresses are named
+in the output. A timeout or refusal is never skipped, and a nameserver with
+no reachable address fails the probe.
+
 Rollover timers count from *confirmed* publication, not from the file write:
 with a post-sign hook the hook must succeed for that generation (the daemon
 re-runs a failed hook every cycle and after restarts); without one the write

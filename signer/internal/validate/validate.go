@@ -854,6 +854,11 @@ func (v *Validator) resolverReachable() bool {
 // be NOERROR and be authoritative (RDAYBLUEX-003): a referral, a lame or
 // recursive answer, or a response to another question is an error, never
 // data. A truncated answer is retried over TCP (R-050).
+// directExchange performs the authoritative exchange behind queryDirect. A
+// package variable so tests can inject transport failures (a route error for
+// one address family) that a real network cannot produce deterministically.
+var directExchange = exchangeTC
+
 func queryDirect(server, qname string, qtype uint16, timeout time.Duration) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(qname), qtype)
@@ -861,7 +866,7 @@ func queryDirect(server, qname string, qtype uint16, timeout time.Duration) (*dn
 	m.RecursionDesired = false
 
 	c := &dns.Client{Timeout: timeout}
-	r, err := exchangeTC(c, m, server)
+	r, err := directExchange(c, m, server)
 	if err != nil {
 		return nil, err
 	}
