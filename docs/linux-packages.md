@@ -20,7 +20,10 @@ other documentation.
 | HTTP default | `127.0.0.1:8053` | `127.0.0.1:8791` |
 
 Configuration is root-owned, mode `0640`, and readable by the corresponding daemon
-group. Account and state directories are created on installation. Signer keys
+group. Accounts and state directories are created on first installation only:
+upgrades never change the owner or mode of anything under `/var/lib/<package>`,
+so a `signed/` directory re-grouped for the nameserver keeps that group, and the
+package scripts never follow an entry inside the daemon-owned tree. Signer keys
 are in a `0700` directory. Units live in `/usr/lib/systemd/system`. The
 validator's state directory holds its last-known-good root-anchor cache
 (`root_anchors_cache_path`), written after every usable download and read

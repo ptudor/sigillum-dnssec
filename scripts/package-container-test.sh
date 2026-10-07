@@ -54,11 +54,28 @@ for service in $services; do
     printf 'preserve state\n' > "/var/lib/$service/package-test-sentinel"
 done
 
+for service in $services; do
+    test "$(stat -c '%U %G %a' "/var/lib/$service")" = "$service $service 750"
+done
+test "$(stat -c '%U %G %a' /var/lib/sigillum-signer/keys)" = 'sigillum-signer sigillum-signer 700'
+test "$(stat -c '%U %G %a' /var/lib/sigillum-signer/signed)" = 'sigillum-signer sigillum-signer 750'
+
 sigillum-signer version | grep '^sigillum-signer '
 sigillum-validator -version | grep '^sigillum-validator '
 runuser -u sigillum-validator -- sigillum-validator -check -config /etc/sigillum-validator/config.toml
 # Empty zone set: verify account permissions without modifying a live zone.
 runuser -u sigillum-signer -- sigillum-signer sign --config /etc/sigillum-signer/config.toml
+
+# Package scripts must never follow an entry the service account controls inside
+# its own state directory (a planted symlink would redirect root's chown/chmod),
+# and must keep operator changes such as a signed/ directory re-grouped for the
+# nameserver. Both are exercised by the reinstall below.
+runuser -u sigillum-signer -- sh -c \
+    'mv /var/lib/sigillum-signer/keys /var/lib/sigillum-signer/keys.orig && ln -s /etc/systemd/system /var/lib/sigillum-signer/keys'
+chgrp daemon /var/lib/sigillum-signer/signed
+chmod 0755 /var/lib/sigillum-signer/signed
+chgrp daemon /var/lib/sigillum-validator
+systemd_dir_before=$(stat -c '%U %G %a' /etc/systemd/system)
 
 # Reinstall through the package manager with a locally edited configuration.
 # conffile retention uses the same package-manager mechanism on version upgrades.
@@ -77,6 +94,13 @@ for service in $services; do
         exit 1
     fi
 done
+test "$(stat -c '%U %G %a' /etc/systemd/system)" = "$systemd_dir_before"
+test -L /var/lib/sigillum-signer/keys
+test "$(stat -c '%U %G %a' /var/lib/sigillum-signer/keys.orig)" = 'sigillum-signer sigillum-signer 700'
+test "$(stat -c '%U %G %a' /var/lib/sigillum-signer/signed)" = 'sigillum-signer daemon 755'
+test "$(stat -c '%U %G %a' /var/lib/sigillum-validator)" = 'sigillum-validator daemon 750'
+rm /var/lib/sigillum-signer/keys
+mv /var/lib/sigillum-signer/keys.orig /var/lib/sigillum-signer/keys
 if [ "$format" = deb ]; then
     # Deliberate word splitting: this is a fixed list of package names.
     # shellcheck disable=SC2086
