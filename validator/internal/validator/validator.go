@@ -563,7 +563,9 @@ func (v *Validator) followAlias(ctx context.Context, domain, target string, dept
 // zone's servers for the queried type and accepts only an Answer-section
 // CNAME owned by the queried name; CNAMEs at other owners or in other
 // sections are never followed (RA6X-015). The result is unauthenticated,
-// which is fine: the answer can be no better than the chain above it.
+// which is fine: the answer can be no better than the chain above it. An
+// NXDOMAIN response is consulted too: it carries the alias when the chain's
+// final name does not exist (RFC 2308 §2.1, RM51X-006).
 func (v *Validator) discoverAliasTarget(ctx context.Context, domain, leafZone string) string {
 	nsSet, err := v.resolver.ResolveNSSet(ctx, leafZone)
 	if err != nil || nsSet == nil || len(nsSet.Records) == 0 {
@@ -581,7 +583,7 @@ func (v *Validator) discoverAliasTarget(ctx context.Context, domain, leafZone st
 		default:
 		}
 		qr, err := v.resolver.QueryRecordAuthoritative(ctx, addr, domain, v.leafType())
-		if err != nil || qr == nil || qr.Error != "" || qr.RCode != dns.RcodeSuccess {
+		if err != nil || qr == nil || qr.Error != "" || (qr.RCode != dns.RcodeSuccess && qr.RCode != dns.RcodeNameError) {
 			continue
 		}
 		for _, c := range answerCNAMEsOwnedBy(qr.CNAME, domain) {
@@ -709,7 +711,7 @@ func (v *Validator) leafCandidateError(qr *dnspkg.QueryResult, domain, zone stri
 		return nil
 	}
 
-	if isDenialForType(qr, v.leafType()) {
+	if isDenialForType(qr, domain, v.leafType()) {
 		if nsecCands := denialNSECCandidates(qr.NSEC); len(nsecCands) > 0 {
 			proof := verifyNSECDenialWithRRSIGB(v.budget, domain, v.leafType(), nsecCands, dnskeys, zone, qr.RawResponse, qr.RCode)
 			if !proof.Verified {
@@ -904,7 +906,9 @@ func (v *Validator) verifyActualRecord(ctx context.Context, domain, zone string,
 
 	// Check for NXDOMAIN/NODATA with NSEC/NSEC3 proofs. Only Answer/Authority
 	// records are denial candidates; Additional is never evidence (RA6X-007).
-	if isDenialForType(queryResult, v.leafType()) {
+	// An NXDOMAIN that carries an alias at the queried name is not a denial
+	// of that name and continues to the alias path below (RM51X-006).
+	if isDenialForType(queryResult, domain, v.leafType()) {
 		nsecCands := denialNSECCandidates(queryResult.NSEC)
 		nsec3Cands := denialNSEC3Candidates(queryResult.NSEC3)
 		// Check for denial proofs if this is NXDOMAIN or NODATA
@@ -1109,9 +1113,20 @@ func (v *Validator) verifyDNAMEAnswer(validation *RecordValidation, domain, zone
 // records alone must not divert a response that answers the query into the
 // NODATA verification path; only a CNAME-free NOERROR response whose answer
 // section is empty for the queried type is a NODATA candidate.
-func isDenialForType(qr *dnspkg.QueryResult, qtype uint16) bool {
+//
+// NXDOMAIN denies the queried name only when nothing in the Answer section
+// redirects it. RFC 1034 §4.3.2 and RFC 2308 §2.1 let a server return the
+// CNAME chain together with NXDOMAIN when the chain's final name does not
+// exist; the RCODE and the NSEC/NSEC3 records then describe that final name,
+// not the queried one. Such a response is an alias answer: the CNAME RRset
+// at the queried name is authenticated like any other alias and the target
+// is validated on its own hop, where its NXDOMAIN is proven (RM51X-006).
+// Evaluating the denial for the queried name instead would fail, since that
+// name exists, and report a dangling CNAME in a correctly signed zone as
+// bogus.
+func isDenialForType(qr *dnspkg.QueryResult, domain string, qtype uint16) bool {
 	if qr.RCode == dns.RcodeNameError {
-		return true
+		return len(answerCNAMEsOwnedBy(qr.CNAME, domain)) == 0
 	}
 	return qr.RCode == dns.RcodeSuccess && len(qr.CNAME) == 0 && !answerContainsType(qr, qtype)
 }

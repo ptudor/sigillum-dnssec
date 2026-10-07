@@ -37,6 +37,21 @@ func TestIsDenialForType(t *testing.T) {
 			miekgdns.TypeA, true,
 		},
 		{
+			"NXDOMAIN with a CNAME at the queried name is an alias answer, not a denial (RM51X-006)",
+			&dnspkg.QueryResult{RCode: miekgdns.RcodeNameError, NSEC: nsec, CNAME: []dnspkg.CNAMERecord{{Name: "host.example.com.", Target: "gone.example.com.", Section: dnspkg.SectionAnswer}}},
+			miekgdns.TypeA, false,
+		},
+		{
+			"NXDOMAIN with a CNAME at another owner is still a denial of the queried name",
+			&dnspkg.QueryResult{RCode: miekgdns.RcodeNameError, NSEC: nsec, CNAME: []dnspkg.CNAMERecord{{Name: "other.example.com.", Target: "gone.example.com.", Section: dnspkg.SectionAnswer}}},
+			miekgdns.TypeA, true,
+		},
+		{
+			"NXDOMAIN with a CNAME at the queried name outside the Answer section is still a denial",
+			&dnspkg.QueryResult{RCode: miekgdns.RcodeNameError, NSEC: nsec, CNAME: []dnspkg.CNAMERecord{{Name: "host.example.com.", Target: "gone.example.com.", Section: dnspkg.SectionAuthority}}},
+			miekgdns.TypeA, true,
+		},
+		{
 			"CNAME answer is not a denial",
 			&dnspkg.QueryResult{RCode: miekgdns.RcodeSuccess, CNAME: []dnspkg.CNAMERecord{{Name: "host.example.com.", Target: "t.example.com."}}, AnswerTypes: []uint16{miekgdns.TypeCNAME}},
 			miekgdns.TypeA, false,
@@ -54,7 +69,7 @@ func TestIsDenialForType(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isDenialForType(tt.qr, tt.qtype); got != tt.want {
+			if got := isDenialForType(tt.qr, "host.example.com.", tt.qtype); got != tt.want {
 				t.Errorf("isDenialForType = %v, want %v", got, tt.want)
 			}
 		})
