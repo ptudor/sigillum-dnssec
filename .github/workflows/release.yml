@@ -58,7 +58,7 @@ jobs:
       - name: Build and sign binaries and packages into a draft release
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
-          version: v2.18.1
+          version: v2.18.2
           args: release --clean --release-notes=docs/release-notes/${{ github.ref_name }}.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

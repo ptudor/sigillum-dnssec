@@ -1,4 +1,4 @@
-# Build with GoReleaser OSS v2.18.1; no paid features. Packages and checksums.txt
+# Build with GoReleaser OSS v2.18.2; no paid features. Packages and checksums.txt
 # are signed with the key at RELEASE_GPG_KEY_FILE, unlocked by NFPM_PASSPHRASE:
 # the release key in the release workflow, a throwaway from scripts/snapshot.sh
 # otherwise. rpmpack writes RSA signature tags only, so the key must be RSA.

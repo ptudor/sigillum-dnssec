@@ -1,6 +1,6 @@
 # Builds and releases
 
-The repository uses GitHub Actions and GoReleaser OSS **v2.18.1**. The checked-in
+The repository uses GitHub Actions and GoReleaser OSS **v2.18.2**. The checked-in
 `.goreleaser.yaml` builds the binaries, archives, RPMs, DEBs, and SHA-256 manifest.
 It does not require GoReleaser Pro or a personal access token. GnuPG signs the
 packages and the manifest: tagged releases use the
@@ -14,7 +14,7 @@ The selected Go toolchain is recorded in `.go-version`.
 | Push to `main` or a pull request | Vet and race tests on Linux amd64, Linux arm64, and macOS arm64; all release targets cross-built and signed with a throwaway key; signatures verified and package installation/reinstallation/removal exercised in Debian and Fedora containers |
 | Manual **CI → Run workflow** | The same checks and downloadable snapshot artifacts |
 | Push a `vMAJOR.MINOR.PATCH` tag, optionally with a prerelease suffix | Required CI, a draft GitHub Release with binaries, signed packages and signed checksums, verification against the published key, build provenance attestation, then automatic publication |
-| Weekly Dependabot run | Pull requests for Go dependencies and SHA-pinned GitHub Actions |
+| Newly disclosed dependency advisories | Dependabot alerts; automatic version-update and security-update pull requests are disabled |
 | Push, pull request, weekly schedule, or release | Vulnerability scans for Linux/FreeBSD builds and a redacted secret scan of full Git history |
 
 Release permissions are limited to the publishing job. Checkout does not retain
@@ -30,13 +30,15 @@ use a new version for corrected public artifacts.
 
 ## Public releases
 
-[Sigillum v1.1.1](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.1.1)
-is 1.1.0 with signed packages and a signed manifest; see its
-[release notes](release-notes/v1.1.1.md). The [1.1.0 notes](release-notes/v1.1.0.md)
-cover key-directory takeover, RSA signing, upgrade guidance, and platform
-coverage, and the [1.0.0 notes](release-notes/v1.0.0.md)
-describe the first public release. Development snapshots are also
-available from successful [CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
+[Sigillum v1.2.0](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.2.0)
+fixes DNSKEY propagation during rollover, validation trust boundaries, and
+package upgrades, and refreshes dependencies; see its
+[release notes](release-notes/v1.2.0.md). The [1.1.1 notes](release-notes/v1.1.1.md)
+cover signed packages, and the [1.1.0 notes](release-notes/v1.1.0.md) describe
+key-directory takeover and RSA signing.
+The [1.0.0 notes](release-notes/v1.0.0.md) describe the first public release.
+Development snapshots are available from successful
+[CI runs](https://github.com/ptudor/sigillum-dnssec/actions/workflows/ci.yml).
 
 The project uses the [MIT license](../LICENSE). Archives and packages also carry
 [third-party notices](../THIRD_PARTY_NOTICES.md) for their compiled dependencies.
@@ -44,7 +46,7 @@ CI checks those notices against every release binary.
 
 ## Local rehearsal
 
-Install GoReleaser v2.18.1, GnuPG, and the Go version in `.go-version`, then run:
+Install GoReleaser v2.18.2, GnuPG, and the Go version in `.go-version`, then run:
 
 ```sh
 make release-check
@@ -79,6 +81,13 @@ receive no clock-control privileges or reference-clock devices. To check package
 signed by another key, pass its public key file as the first argument.
 
 ## Update dependencies
+
+Dependency maintenance includes Go modules, the Go toolchain, SHA-pinned GitHub
+Actions, and the pinned release and security tools. Dependabot alerts and the
+weekly security workflow remain enabled; dependency updates are integrated here
+without automatic pull requests. Keep `.go-version` and module `toolchain`
+directives aligned, review upstream changes, and preserve the minimum Go version
+unless an updated dependency requires raising it.
 
 Apply dependency updates and run the module’s tests and `go mod tidy`. Rebuild
 all release targets, refresh the compiled dependency notices, and rebuild the

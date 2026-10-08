@@ -63,7 +63,7 @@ the same name for its executable, Linux package, service, and service account.
 ## Install
 
 Download binaries and packages from the
-[1.1.1 release](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.1.1).
+[1.2.0 release](https://github.com/ptudor/sigillum-dnssec/releases/tag/v1.2.0).
 Choose the file matching your OS and architecture, then follow the
 [verification instructions](docs/releases.md#verify-a-download).
 Development snapshots are also available from successful
