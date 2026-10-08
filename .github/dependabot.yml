@@ -1,9 +1,14 @@
+# Dependency maintenance covers Go modules and toolchains, pinned GitHub Actions,
+# third-party notices, and package verification.
+# Keep alerts and scheduled security scans enabled. Automatic security-update
+# PRs are disabled separately in the repository settings.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     groups:
       actions:
         patterns: ['*']
@@ -11,7 +16,7 @@ updates:
     directory: /signer
     schedule:
       interval: weekly
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 0
     groups:
       go-dependencies:
         patterns: ['*']
@@ -19,7 +24,7 @@ updates:
     directory: /validator
     schedule:
       interval: weekly
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 0
     groups:
       go-dependencies:
         patterns: ['*']
