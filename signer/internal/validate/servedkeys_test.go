@@ -2,6 +2,8 @@ package validate
 
 import (
 	"crypto"
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"testing"
 	"time"
@@ -16,11 +18,16 @@ func signedChildZone(t *testing.T, inception, expiration time.Time) (ksk, zsk *d
 	const zone = "child.parent.test."
 	mk := func(flags uint16) (*dns.DNSKEY, crypto.Signer) {
 		k := &dns.DNSKEY{Hdr: dns.RR_Header{Name: zone, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600}, Flags: flags, Protocol: 3, Algorithm: dns.ED25519}
-		priv, err := k.Generate(256)
-		if err != nil {
-			t.Fatal(err)
+		// Fixed test-only keys avoid randomly generating tag zero, which
+		// dns.RRSIG.Sign rejects as an unset key tag.
+		var seed [ed25519.SeedSize]byte
+		seed[0], seed[1] = byte(flags), byte(flags>>8)
+		priv := ed25519.NewKeyFromSeed(seed[:])
+		k.PublicKey = base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey))
+		if k.KeyTag() == 0 {
+			t.Fatal("test key must have a nonzero tag")
 		}
-		return k, priv.(crypto.Signer)
+		return k, priv
 	}
 	ksk, kskPriv := mk(257)
 	zsk, zskPriv := mk(256)
