@@ -35,7 +35,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## Go runtime and standard library (go1.27.1)
+## Go runtime and standard library (go1.27.4)
 
 Source: https://go.dev/LICENSE
 
@@ -213,6 +213,34 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+## github.com/pandatix/go-abnf v0.5.5
+
+### LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2024 Lucas TESSON - PandatiX <lucastesson@protonmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## github.com/pelletier/go-toml/v2 v2.4.3
 
 ### LICENSE
@@ -242,7 +270,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## github.com/prometheus/client_golang v1.24.1
+## github.com/prometheus/client_golang v1.25.0
 
 ### LICENSE
 
@@ -723,7 +751,7 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 ```
 
-## github.com/prometheus/common v0.72.0
+## github.com/prometheus/common v0.73.1
 
 ### LICENSE
 
@@ -941,7 +969,7 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 ```
 
-## github.com/prometheus/procfs v0.22.0
+## github.com/prometheus/procfs v0.23.0
 
 ### LICENSE
 
@@ -1342,7 +1370,7 @@ SoundCloud Ltd. (http://soundcloud.com/).
       of your accepting any such warranty or additional liability.
 ```
 
-## github.com/spf13/pflag v1.0.10
+## github.com/spf13/pflag v1.1.0
 
 ### LICENSE
 
@@ -1377,7 +1405,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## golang.org/x/net v0.59.0
+## golang.org/x/net v0.62.0
 
 ### LICENSE
 
@@ -1411,7 +1439,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## golang.org/x/sys v0.48.0
+## golang.org/x/sys v0.50.0
 
 ### LICENSE
 

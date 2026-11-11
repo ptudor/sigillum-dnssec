@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         module: ['signer', 'validator']
-        target: [linux, freebsd]
+        target: [linux, freebsd, darwin]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,7 +32,7 @@ jobs:
             signer/go.sum
             validator/go.sum
       - name: Install pinned vulnerability scanner
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
       - name: Scan the production target
         working-directory: ${{ matrix.module }}
         env:
@@ -41,6 +41,7 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           govulncheck -scan=module
+          govulncheck -scan=package ./...
           govulncheck ./...
 
   secrets:

@@ -1,6 +1,6 @@
 # Builds and releases
 
-The repository uses GitHub Actions and GoReleaser OSS **v2.18.2**. The checked-in
+The repository uses GitHub Actions and GoReleaser OSS **v2.20.0**. The checked-in
 `.goreleaser.yaml` builds the binaries, archives, RPMs, DEBs, and SHA-256 manifest.
 It does not require GoReleaser Pro or a personal access token. GnuPG signs the
 packages and the manifest: tagged releases use the
@@ -15,7 +15,7 @@ The selected Go toolchain is recorded in `.go-version`.
 | Manual **CI → Run workflow** | The same checks and downloadable snapshot artifacts |
 | Push a `vMAJOR.MINOR.PATCH` tag, optionally with a prerelease suffix | Required CI, a draft GitHub Release with binaries, signed packages and signed checksums, verification against the published key, build provenance attestation, then automatic publication |
 | Newly disclosed dependency advisories | Dependabot alerts; automatic version-update and security-update pull requests are disabled |
-| Push, pull request, weekly schedule, or release | Vulnerability scans for Linux/FreeBSD builds and a redacted secret scan of full Git history |
+| Push, pull request, weekly schedule, or release | Vulnerability scans for Linux/FreeBSD/macOS builds and a redacted secret scan of full Git history |
 
 Release permissions are limited to the publishing job. Checkout does not retain
 credentials, PR jobs cannot publish releases, and actions are pinned to commit
@@ -46,7 +46,7 @@ CI checks those notices against every release binary.
 
 ## Local rehearsal
 
-Install GoReleaser v2.18.2, GnuPG, and the Go version in `.go-version`, then run:
+Install GoReleaser v2.20.0, GnuPG, and the Go version in `.go-version`, then run:
 
 ```sh
 make release-check

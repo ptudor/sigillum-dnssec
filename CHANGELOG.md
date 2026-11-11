@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Build both services with Go 1.27.4 and update `golang.org/x/net` to
+  v0.62.0, addressing the standard-library and network-module advisories
+  reported by the scheduled security checks.
+- Update the Prometheus client and support modules, the Go system library,
+  and the signer's flag parser; regenerate compiled dependency notices.
+- Update GoReleaser to v2.20.0, its SHA-pinned Action to v7.3.0, and
+  `govulncheck` to v1.9.0. Security checks now scan imported packages and
+  reachable code on macOS as well as Linux and FreeBSD, alongside the
+  existing module checks.
+
 ## 1.2.0 — 2026-10-07
 
 Fixes for the six High findings of the October 2026 review
